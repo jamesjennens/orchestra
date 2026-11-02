@@ -846,6 +846,9 @@ admin.os.fsync = fsync
 print(admin.restore_http_state(Path(sys.argv[2]), credentials='keep'))
 '''
 
+    @unittest.skipUnless(os.name == 'posix', 'SIGTERM semantics are POSIX: on Windows os.kill(pid, SIGTERM) is '
+                         'TerminateProcess, which ends the process at once with no handler and no finally (CI run '
+                         '41368962769), so nothing in the process can remove the temporary')
     def test_r6_a_stop_during_the_state_write_leaves_no_temporary_and_the_live_state_as_it_was(self):
         """Review R6 (test_p6)."""
         live = self.state_pair()
@@ -871,7 +874,8 @@ print(admin.restore_http_state(Path(sys.argv[2]), credentials='keep'))
         kept = sorted(self.root.glob('http-state.json.before-restore-*'))
         self.assertEqual(1, len(kept), kept)
         self.assertTrue(kept[0].name.endswith('.records.sqlite3'))
-        self.assertEqual(0o600, kept[0].stat().st_mode & 0o777)
+        if os.name == 'posix':                                              # Windows has no 0600 (CI run 41368962769)
+            self.assertEqual(0o600, kept[0].stat().st_mode & 0o777)
         import sqlite3
         holder = sqlite3.connect(str(kept[0]))
         try:
