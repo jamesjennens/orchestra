@@ -582,9 +582,10 @@ class StateRestoreRealBdTests(RealRuntimeCase):
         self.assertNotEqual(0, code)
         self.assertIn('an http_service.py process (pid %d)' % service.pid, err)
         self.assertIn('The live HTTP state was not changed.', err)
-        self.assertIn('To restore it, either retire the clone (admin.py retire-project hr1d --actor OPERATOR '
-                      '--reason REASON) and run this restore-new again', err)       # review R7: the way out
-        self.assertIn('restore-new hr1 NEWNAME --restore-http-state --credentials revoke', err)
+        self.assertIn('To restore the HTTP state, run restore-new hr1 NEWNAME --restore-http-state --credentials '
+                      'revoke into a NEW name; the clone hr1d can then be retired', err)   # review R7, r3 N1
+        self.assertNotIn('run restore-new again', err)                    # the clone exists: never the same name
+        self.assertNotIn('..', err)
         self.assertEqual(started['sha'], sha(self.live))
         self.assertEqual([], sorted(p.name for p in self.root.glob('.http-state-restore-*')))
 
@@ -609,6 +610,79 @@ class StateRestoreRealBdTests(RealRuntimeCase):
                     self.assertFalse(self.exists('hr2d'))
                     self.assertEqual(before, sha(self.live))
                 self.stop_process(service)
+    # -- r3 (review of r2, request 01a19984) ----------------------------------------------------------
+    def test_n1_the_way_out_the_failure_names_is_the_one_that_works(self):
+        """Review N1 (Q7): the state stage fails after the project restored; the path the message names is run."""
+        self.new_project('hn1')
+        admin.run_bd(self.root, 'hn1', ['create', 'an issue the clone will hold'])
+        self.office()
+        self.backup('hn1')
+        self.stop_web()
+        failing = ValueError('the state could not be written: No space left on device')   # a kit refusal: exit 1
+        with mock.patch.object(admin, '_write_restored_http_state', side_effect=failing):
+            code, out, err = self.main('restore-new', 'hn1', 'hn1d', '--restore-http-state', '--credentials', 'keep')
+        self.assertNotEqual(0, code)
+        self.assertIn('The project hn1d was restored, but the HTTP state was NOT restored', err)
+        self.assertIn('run restore-new hn1 NEWNAME --restore-http-state --credentials keep into a NEW name', err)
+        self.assertIn('retire-project hn1d --actor OPERATOR --reason REASON, with --force when it holds issues', err)
+        self.assertIn('its name stays reserved', err)
+        self.assertIn('is kept as', err)                                   # the copies of the live pair are named
+        self.assertNotIn('run this restore-new again', err)
+        # the way out, as the message says it
+        code, out, err = self.main('restore-new', 'hn1', 'hn1e', '--restore-http-state', '--credentials', 'keep')
+        self.assertEqual(0, code, err or out)
+        code, out, err = self.main('retire-project', 'hn1d', '--actor', 'ops', '--reason', 'state restore failed')
+        self.assertNotEqual(0, code)                                       # it holds an issue: --force is needed
+        self.assertIn('--force', out + err)
+        code, out, err = self.main('retire-project', 'hn1d', '--actor', 'ops', '--reason', 'state restore failed', '--force')
+        self.assertEqual(0, code, err or out)
+        code, out, err = self.main('restore-new', 'hn1', 'hn1d', '--restore-http-state', '--credentials', 'keep')
+        self.assertNotEqual(0, code)                                       # the name stays reserved, as said
+        self.assertIn('retired', out + err)
+
+    def test_n4_a_stop_between_the_halves_is_said_in_the_notice(self):
+        """Review N4 (Q6b): the JSON restored, the records file as it was, both copies beside the state."""
+        self.a_backed_up_office('hn4')
+        records_live = Path(str(self.live) + '.records.sqlite3')
+        records_before = sha(records_live)
+        real = shutil.copyfile
+
+        def stop_at_the_records(source, destination, *a, **k):
+            if str(source) == str(self.root / 'backups' / admin.HTTP_STATE_RECORDS):
+                raise admin.TerminatedBySignal(signal.SIGTERM)          # what the guard turns a SIGTERM into
+            return real(source, destination, *a, **k)
+        with mock.patch('shutil.copyfile', side_effect=stop_at_the_records):
+            code, out, err = self.main('restore-new', 'hn4', 'hn4d', '--restore-http-state', '--credentials', 'keep')
+        self.assertNotEqual(0, code)
+        self.assertIn('the HTTP state was only HALF restored: its JSON %s is the backup\'s, its records file was left '
+                      'as it was' % self.live, err)
+        self.assertEqual(records_before, sha(records_live))
+        kept = sorted(self.root.glob('http-state.json.before-restore-*'))
+        self.assertEqual(2, len(kept), kept)
+        for path in kept:
+            self.assertIn(str(path), err)
+
+    def test_n3_a_set_recorded_degraded_is_restored_with_its_reason_first_and_not_called_a_pair(self):
+        """Review N3 (Q13), through the command."""
+        self.a_backed_up_office('hn3')                                     # a complete pair in backups/ first
+        named = self.root / 'named-state.json'
+        shutil.copy(str(self.live), str(named))                            # no records file beside it
+        config = self.root / 'deployment.private.json'
+        document = json.loads(config.read_text(encoding='utf-8'))
+        document['http_state'] = str(named)
+        config.write_text(json.dumps(document), encoding='utf-8')
+        self.addCleanup(lambda: named.unlink() if named.exists() else None)
+        code, out, err = self.main('backup', 'hn3')
+        self.assertNotEqual(0, code)
+        self.assertEqual('degraded', self.read_status()['http_state']['status'])
+        code, out, err = self.main('restore-new', 'hn3', 'hn3d', '--restore-http-state', '--credentials', 'keep')
+        self.assertEqual(0, code, err or out)                              # not refused: it may be the only set
+        state_text = out[out.index('WARNING: the backup run'):]
+        self.assertTrue(state_text.startswith('WARNING: the backup run that made this set recorded the HTTP state '
+                                              'DEGRADED: the HTTP state %s has no records file beside it' % named))
+        self.assertIn('is from an earlier run', state_text.splitlines()[0])
+        self.assertNotIn('HTTP state pair', out)
+        self.assertIn('Restored the HTTP state files from a backup set recorded DEGRADED', out)
 
 # --------------------------------------------------------------------- F5 and the time, no tracker needed
 class StateFilesTests(unittest.TestCase):
@@ -784,6 +858,30 @@ print(admin.restore_http_state(Path(sys.argv[2]), credentials='keep'))
         self.assertNotEqual(0, done.returncode)
         self.assertEqual([], sorted(p.name for p in self.root.glob('.http-state-*')))
         self.assertEqual(before, sha(live))
+
+    def test_n2_with_the_live_json_gone_the_records_file_is_still_kept_and_said_replaced(self):
+        """Review N2 (Q5)."""
+        live = self.state_pair()
+        from http_auth import Store
+        Store(live).records.put('result', 'after-the-backup', {'result': 2}, ttl=3600)
+        records_live = Path(str(live) + '.records.sqlite3')
+        records_before = records_live.read_bytes()
+        live.unlink()
+        out = admin.restore_http_state(self.root, credentials='keep')
+        kept = sorted(self.root.glob('http-state.json.before-restore-*'))
+        self.assertEqual(1, len(kept), kept)
+        self.assertTrue(kept[0].name.endswith('.records.sqlite3'))
+        self.assertEqual(0o600, kept[0].stat().st_mode & 0o777)
+        import sqlite3
+        holder = sqlite3.connect(str(kept[0]))
+        try:
+            dump_kept = '\n'.join(holder.iterdump())
+        finally:
+            holder.close()
+        self.assertIn('after-the-backup', dump_kept)
+        self.assertNotEqual(records_before, records_live.read_bytes())     # the live one was replaced
+        self.assertIn('The live records file %s WAS there and is replaced' % records_live, out)
+        self.assertIn(str(kept[0]), out)
 
 # ------------------------------------------------------------------------------------------------ F6
 @unittest.skipUnless(os.name == 'posix', 'SIGTERM semantics are POSIX')

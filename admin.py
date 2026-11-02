@@ -6707,8 +6707,33 @@ def _restore_http_state(root, named=None, credentials='keep', now=None):
     # kittrial-5bb.500 r2 (review R3, R4): what the live state holds that the restore changes, by name,
     # read BEFORE anything is written; the backup's values stand and the operator is told.
     changes=http_state_changes(live,document)
+    # r3 (review N3): a backup set the run record calls degraded is still restored (a host-loss
+    # restore may have only this set), but its reason is said first and it is not called a pair.
+    degraded=http_state_recorded_degraded(root)
     # The live pair is kept: copied aside, mode 0600, before it is replaced.
     aside=keep_live_http_state(live,records_live)
+    try:
+        return _write_restored_http_state(root,live,records,records_live,document,aside,changes,degraded,
+                                          when,how,disagreement,now,sessions,stored,revoked_before,unused,credentials)
+    except BaseException as error:
+        # The notice of restore-new names the copies kept and what was written (r3, review N4, N5).
+        error.http_state_kept=aside
+        raise
+
+def http_state_recorded_degraded(root):
+    """The reason backups/backup-status.json gives when its run recorded the HTTP state degraded, else None."""
+    try:
+        entry=read_backup_status(root).get('http_state')
+    except (OSError,ValueError,KeyError,TypeError,AttributeError):
+        return None
+    if isinstance(entry,dict) and entry.get('status')=='degraded':
+        return str(entry.get('reason') or 'no reason recorded')
+    return None
+
+def _write_restored_http_state(root,live,records,records_live,document,aside,changes,degraded,
+                               when,how,disagreement,now,sessions,stored,revoked_before,unused,credentials):
+    import shutil
+    import tempfile
     handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-restore-')
     try:
         with os.fdopen(handle,'w',encoding='utf-8') as stream:
@@ -6718,7 +6743,7 @@ def _restore_http_state(root, named=None, credentials='keep', now=None):
         os.chmod(temp,0o600)
         # Review R1: a plain http_service started while the project restored (it takes no lock) is
         # looked for again here, immediately before the replace, while the office lock is still held.
-        refuse_running_http_service(root,live,tail='The live HTTP state was not changed.')
+        refuse_running_http_service(root,live,tail='The live HTTP state was not changed.',again='')
         os.replace(temp,str(live))
     finally:
         if os.path.exists(temp):os.unlink(temp)
@@ -6731,6 +6756,10 @@ def _restore_http_state(root, named=None, credentials='keep', now=None):
             os.chmod(temp,0o600)
             os.replace(temp,str(records_live))
             restored.append(HTTP_STATE_RECORDS)
+        except BaseException as error:
+            # r3 (review N4): a stop between the halves leaves the JSON restored and the records file as it was.
+            error.http_state_json_restored=str(live)
+            raise
         finally:
             if os.path.exists(temp):os.unlink(temp)
         records_note=''
@@ -6739,9 +6768,15 @@ def _restore_http_state(root, named=None, credentials='keep', now=None):
                       ('the live records file %s was left as it was.'%records_live if records_live.exists()
                        else 'there is no live records file (%s does not exist), so none was written.'%records_live))
     stamp=_utc_text(when)
-    lines=['Restored the HTTP state %s (%s) to %s (mode 0600).%s'
-           %('pair' if len(restored)==2 else 'JSON half only',', '.join(restored),live,records_note),
-           'The HTTP state in this backup is from %s UTC (%s old; %s).'%(stamp,_age_text(now-when),how)]
+    if degraded:
+        what='files from a backup set recorded DEGRADED'
+    else:
+        what='pair' if len(restored)==2 else 'JSON half only'
+    lines=(['WARNING: the backup run that made this set recorded the HTTP state DEGRADED: %s. It was restored as it '
+            'is; check it before relying on it.'%degraded] if degraded else [])
+    lines+=['Restored the HTTP state %s (%s) to %s (mode 0600).%s'
+            %(what,', '.join(restored),live,records_note),
+            'The HTTP state in this backup is from %s UTC (%s old; %s).'%(stamp,_age_text(now-when),how)]
     if disagreement:lines.append(disagreement)
     lines.append('Every session in it was revoked (%d): users and agents must sign in again.'%len(sessions))
     if credentials=='revoke':
@@ -6754,7 +6789,8 @@ def _restore_http_state(root, named=None, credentials='keep', now=None):
     lines.append('Passwords changed since %s UTC are back to their values at that time.'%stamp)
     lines.extend(changes)
     if aside:
-        lines.append('The live HTTP state it replaced was kept as %s (mode 0600).'%', '.join(map(str,aside)))
+        lines.append('The live HTTP state it replaced was kept as %s (mode 0600). These copies hold password and '
+                     'credential hashes: delete them once the restore is verified.'%', '.join(map(str,aside)))
     return '\n'.join(lines)
 
 def http_state_changes(live,document):
@@ -6763,7 +6799,10 @@ def http_state_changes(live,document):
     Accounts and agents disabled in the live state but enabled in the backup come back ENABLED;
     those created since the backup are not in it. Nothing is merged: the backup's values stand."""
     if not live.is_file():
-        return ['There was no live HTTP state at %s, so nothing in it was replaced.'%live]
+        records_live=Path(str(live)+'.records.sqlite3')
+        return ['There was no live HTTP state JSON at %s, so no account or agent in it was replaced.%s'
+                %(live,(' The live records file %s WAS there and is replaced (a copy is kept, below).'%records_live)
+                       if records_live.is_file() else '')]
     try:
         current=record_json.loads(read_regular_text(live))
         if not isinstance(current,dict):raise ValueError('not a state document')
@@ -6809,7 +6848,7 @@ def keep_live_http_state(live,records_live):
     file goes to a temporary name and is renamed, so a stop leaves no half copy. The paths kept."""
     import shutil
     import tempfile
-    if not live.is_file():
+    if not live.is_file() and not records_live.is_file():
         return []
     stamp=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())
     target=Path('%s.before-restore-%s'%(live,stamp))
@@ -6818,7 +6857,8 @@ def keep_live_http_state(live,records_live):
         number+=1                                   # two restores in one second: never over an earlier copy
         target=Path('%s.before-restore-%s-%d'%(live,stamp,number))
     kept=[]
-    pairs=[(live,target)]
+    # r3 (review N2): the records file is kept whenever it is a file, the JSON beside it or not.
+    pairs=[(live,target)] if live.is_file() else []
     if records_live.is_file():
         pairs.append((records_live,Path(str(target)+'.records.sqlite3')))
     for source,destination in pairs:
@@ -6867,14 +6907,14 @@ def office_service_lock(root):
 #: What ``http_service_processes`` looks for in a process's arguments: the script, or the module of ``-m``.
 HTTP_SERVICE_NAMES=('http_service.py','http_service')
 
-def refuse_running_http_service(root,live,tail='Nothing was changed.'):
+def refuse_running_http_service(root,live,tail='Nothing was changed.',again=', then run restore-new again'):
     """Raise the refusal of ``--restore-http-state`` when an http_service process serves ``live``."""
     pids=http_service_processes(root,live)
     if pids:
         raise ValueError('Refusing --restore-http-state: an http_service.py process (pid %s) is serving this '
-                         'runtime\'s HTTP state. Stop the service first, then run restore-new again: a running '
+                         'runtime\'s HTTP state. Stop the service first%s: a running '
                          'service keeps the state in memory and writes it back over the restored file, so the '
-                         'restore would be silently undone. %s'%(', '.join(map(str,pids)),tail))
+                         'restore would be silently undone. %s'%(', '.join(map(str,pids)),again,tail))
 
 def http_service_processes(root,live):
     """Pids of other ``http_service.py`` processes serving this runtime's HTTP state (Linux ``/proc``).
@@ -12589,12 +12629,22 @@ def _main():
                     with signal_termination_guard():
                         http_text=restore_http_state(root,credentials=args.credentials)
                 except BaseException as error:
-                    # Review R7: no new command during the freeze; the exact way out instead.
-                    print('The project %s was restored, but the HTTP state was NOT: %s. Any live HTTP state it replaced '
-                          'is kept beside it as <state>.before-restore-<UTC time>. To restore it, either retire the clone (admin.py retire-project %s --actor OPERATOR '
-                          '--reason REASON) and run this restore-new again, or run restore-new %s NEWNAME '
-                          '--restore-http-state --credentials %s into a new name.'
-                          %(args.destination,error,args.destination,args.project,args.credentials),
+                    # Review R7, r3 N1: no new command during the freeze; the one way out that works.
+                    half=getattr(error,'http_state_json_restored',None)
+                    kept=getattr(error,'http_state_kept',None) or []
+                    if half:
+                        state=('the HTTP state was only HALF restored: its JSON %s is the backup\'s, its records file was '
+                               'left as it was'%half)
+                    else:
+                        state='the HTTP state was NOT restored'
+                    print('The project %s was restored, but %s: %s.%s To restore the HTTP state, run restore-new %s '
+                          'NEWNAME --restore-http-state --credentials %s into a NEW name; the clone %s can then be '
+                          'retired (admin.py retire-project %s --actor OPERATOR --reason REASON, with --force when it '
+                          'holds issues), and its name stays reserved: a retired name is never reused.'
+                          %(args.destination,state,str(error).rstrip('.'),
+                            (' The live HTTP state before this restore is kept as %s (mode 0600).'%', '.join(map(str,kept)))
+                            if kept else '',
+                            args.project,args.credentials,args.destination,args.destination),
                           file=sys.stderr)
                     raise
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
