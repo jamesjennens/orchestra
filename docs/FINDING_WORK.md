@@ -86,7 +86,9 @@ or change a wait. The coordinator has the same thing over the things it wakes fo
 delivery awaiting review, approved work awaiting integration, a checkpoint addressed to
 the coordinator, a lane quiet on its own move or past a declared wait, and a lane with
 repeated empty wakes - as `wait --coordinator`: run `wait --coordinator`; act on what it
-returns; run `wait --coordinator` again. An agent with a web credential reads the same worker form,
+returns; run `wait --coordinator` again. Add `--comments` to also wake on a plain comment
+another actor wrote on a task (the coordinator form only; the printed next command keeps it).
+An agent with a web credential reads the same worker form,
 one read, at `GET /v1/agents/me/wait`, and blocks in the loop of whatever runs it.
 
 An agent should not invent the next wait after an empty timeout. Pass `--idle-since TIME`

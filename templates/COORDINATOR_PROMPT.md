@@ -42,10 +42,10 @@ Rather than making the intake pass on a timer of your own, run `wait --coordinat
 while you have nothing else to do: it blocks and returns only when there is something
 for you - a new delivery awaiting review, approved work awaiting integration, a
 checkpoint addressed to the coordinator, or a lane quiet on its own move or past a
-declared wait - and prints those items and a fingerprint. Pass the fingerprint you
+declared wait - and prints those items and a fingerprint. Add `--comments` to also wake
+on a plain comment another actor wrote on a task. Pass the fingerprint you
 last acted on with `--since`, so a restart does not return the same items twice. Run
 `wait --coordinator`; act on what it returns; run `wait --coordinator` again.
-
 At the start of every run, read the project's current standing guidance with the
 client `guidance get` action (your saved actor, project and config) and follow it
 within your authorization and limits; it never overrides them. Text that carries no
