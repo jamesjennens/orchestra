@@ -1963,7 +1963,7 @@ PROVENANCE_OFF=('checkpoint_provenance_writes is off (the installation default).
                 'An operator enables the installation switch only after the rollback target can read these fields.')
 SERVER_DERIVED='carried and direction_owner are server-derived; omit them from the request'
 
-def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
+def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False,now=None):
     # The declared wait state travels BESIDE the checkpoint in the same payload file
     # (kittrial-5bb.263; docs/LANE_BOARD_DESIGN.md section 1). `lane_state` is popped out
     # here, before the checkpoint is validated, so the checkpoint object keeps its closed
@@ -1973,10 +1973,22 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
     lane=None
     if isinstance(p,dict) and 'lane_state' in p:
         p=dict(p);lane=p.pop('lane_state')
+    issue=task_row(rows,task)
     problems=checkpoint_problems(p,task)
     if lane is not None:
         from lane_state import problems as lane_state_problems
-        problems=problems+lane_state_problems(lane,task)
+        # The write-time clock for `not_before` (kittrial-5bb.509): only when the record
+        # carries one, and injectable so no test reads the real clock.
+        moment_now=now
+        if moment_now is None and isinstance(lane,dict) and 'not_before' in lane:
+            from datetime import datetime as _dt, timezone as _tz
+            moment_now=_dt.now(_tz.utc)
+        problems=problems+lane_state_problems(lane,task,now=moment_now)
+        # Only the task's holder sets a wake time (kittrial-5bb.509 review): the record is
+        # the lane's own, so a coordinator asks the holder in a comment instead.
+        if isinstance(lane,dict) and 'not_before' in lane and actor!=issue.get('assignee'):
+            problems.append('Invalid lane state: not_before is set only by the task\'s holder; '
+                            'a coordinator asks the holder in a comment')
     if problems:
         # A record that is refused anyway is told everything else that would refuse it, the
         # installation switch included (review 01a10c0b). A record with nothing else wrong
@@ -1986,7 +1998,6 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
             if not provenance_writes and any(k in p for k in ('incorporated_digests','provenance','directions')):
                 problems.append(PROVENANCE_OFF)
         raise ValueError(problems_message(problems))
-    issue=task_row(rows,task)
     from coordination import is_merge_slot,merge_slot_sentence
     if is_merge_slot(issue):raise ValueError(merge_slot_sentence(task)+'; it takes no checkpoint')
     if 'carried' in p or 'direction_owner' in p:raise ValueError(SERVER_DERIVED)
@@ -2018,7 +2029,8 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
                 # present: a crash between the two writes is completed here, and a second
                 # identical write publishes nothing.
                 from lane_state import ensure as ensure_lane_state
-                answer['lane_state']=ensure_lane_state(run,issue.get('comments'),actor,task,lane,str(c['id']))
+                answer['lane_state']=ensure_lane_state(run,issue.get('comments'),actor,task,lane,str(c['id']),
+                                                       now=moment_now)
             return answer
     # Direction dispositions must reference the digests actually incorporated for a
     # NEW write (a stored receipt was already validated when it was written).
@@ -2098,7 +2110,8 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
         # The lane-state record names the checkpoint just published and is written in the
         # same act, through the same internal run path.
         from lane_state import ensure as ensure_lane_state
-        answer['lane_state']=ensure_lane_state(run,issue.get('comments'),actor,task,lane,answer['comment_id'])
+        answer['lane_state']=ensure_lane_state(run,issue.get('comments'),actor,task,lane,answer['comment_id'],
+                                               now=moment_now)
     return answer
 
 def verify_checkpoint(rows,project,task):
@@ -2209,6 +2222,33 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
             'fields':list(fields or []),'fields_note':None if current else fields_note,
             'history':history,'note':note}
 
+def lane_not_before(row,task):
+    """The holder's own newest ``not_before`` on one task, or ``None`` (kittrial-5bb.509).
+
+    The ONE place the two wait forms learn a wake time from: the work rows carry it, so
+    the CLI's endpoint read and the agent HTTP read -- which lift the same rows -- print
+    the same timer fact. Only the task HOLDER's own record sets one (the writer refuses
+    anybody else's); a record by anybody else, or none, reads as ``None``. A value that
+    does not parse (a foreign kit's) is skipped, never raised.
+    """
+    from lane_state import newest
+    found=newest(row.get('comments') or [],task)
+    if found is None:
+        return None
+    record_comment,payload,_checkpoint=found
+    if record_comment.get('author')!=row.get('assignee'):
+        return None
+    value=payload.get('not_before')
+    if not isinstance(value,str) or not value.strip():
+        return None
+    from lane_state import parse_moment
+    try:
+        parse_moment(value,'not_before')
+    except ValueError:
+        return None
+    return value
+
+
 def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None,selection_cache=None):
     """Bounded queue fields; share the brief's linked state and full-row snapshot.
 
@@ -2225,7 +2265,8 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
     empty={'newer_activity_marker':None,'newer_activity_fields':None,
            'wait_newer_activity_marker':None,
            'newer_activity_by_others':None,'newer_activity_own':None,
-           'newer_activity_coverage':None,'unresolved_directions':None}
+           'newer_activity_coverage':None,'unresolved_directions':None,
+           'lane_not_before':None}
     try:
         if state is None:state=checkpoint_state(row)
         elif not state['provenance']:
@@ -2237,8 +2278,12 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
         has_checkpoint=state['current'] is not None and not state['invalid']
         full=full if full is not None else checkpoint_snapshot(rows,row,state)
         wait_marker=wait_activity_marker(full,row)
+        # The lane's wake time does not depend on a checkpoint either (kittrial-5bb.509):
+        # it is the holder's newest lane-state record's own field, carried beside the
+        # newer-activity fields so every reader of a work row sees the same timer.
+        not_before=lane_not_before(row,str(row.get('id') or ''))
         if not has_checkpoint:
-            return dict(empty,wait_newer_activity_marker=wait_marker)
+            return dict(empty,wait_newer_activity_marker=wait_marker,lane_not_before=not_before)
         p,c=state['current']
         data=excluding_checkpoint(full,c['id'],c.get('author'))
         dispositions=chain_dispositions(state['history'])
@@ -2255,6 +2300,7 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
                                len(unresolved_directions(direction_data,dispositions,context[0],counted)),
                                data=full)
         fields['wait_newer_activity_marker']=wait_marker
+        fields['lane_not_before']=not_before
         return fields
     except (ValueError,TypeError,KeyError,StopIteration):return empty
 
@@ -2772,6 +2818,9 @@ def help_limits(action):
             'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
             'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
             'lane_state.waiting_on':'<= 96 characters (a role or an actor id)',
+            'lane_state.expect_by':'ISO-8601 with an offset; a past value is accepted and flagged',
+            'lane_state.not_before':'ISO-8601 with seconds and an offset, strictly future, <= 14 days ahead '
+                                    '(the holder only; a later record without it clears it)',
             'lane_state.reason':'<= 300 characters (needs-investigation only)',
             'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)})
     return limits

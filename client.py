@@ -529,8 +529,14 @@ class _InlineWait:
                           'contribution_id', 'pending_review_items', 'redelivered',
                           'guidance_version', 'wait_newer_activity_marker')
     COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                            'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation')
-    OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation')
+                            'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation',
+                            'timer-due')
+    OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation', 'timer-due')
+    #: kittrial-5bb.509: a pending not_before caps the sleep at the time remaining plus
+    #: TIMER_WAKE_EPSILON, so the wait re-reads at the due instant; a re-poll while the
+    #: reader's clock has not caught up runs no faster than TIMER_REPOLL_SECONDS.
+    TIMER_WAKE_EPSILON = 1.0
+    TIMER_REPOLL_SECONDS = 5.0
     EMPTY_WAKE_TRIGGER = 3
     LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
     AWAITING_REVIEW_STATES = ('awaiting-review', 'legacy-review-ready')
@@ -876,11 +882,78 @@ class _InlineWait:
                                          and item.get('whose_move') == 'you'])
 
     @staticmethod
-    def worker_view(items):
+    def _lane_not_before(item):
+        """One item's lane ``not_before`` -- at the top level or in its attention block."""
+        if not isinstance(item, dict):
+            return None
+        value = item.get('lane_not_before')
+        if value is None:
+            attention = item.get('attention')
+            if isinstance(attention, dict):
+                value = attention.get('lane_not_before')
+        return value if isinstance(value, str) and value.strip() else None
+
+    @staticmethod
+    def _timer_rows(items, now_epoch):
+        """The pending and the due timers of one worker read (kittrial-5bb.509).
+
+        Kept identical to ``waiting._timer_rows``: the corpus test fails if the two
+        copies drift. A not-yet-due timer is listed but never fingerprinted; a due one
+        is one stable move row; a value that does not parse is skipped.
+        """
+        pending, due = [], []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            task = item.get('task')
+            value = _InlineWait._lane_not_before(item)
+            if task is None or not value:
+                continue
+            try:
+                moment = _InlineWait.parse_instant(value)
+            except ValueError:
+                continue
+            if moment > now_epoch:
+                pending.append({'task': _InlineWait._scalar(task),
+                                'not_before': _InlineWait._scalar(value)})
+            else:
+                due.append({'task': _InlineWait._scalar(task), 'whose_move': 'you',
+                            'trigger': 'timer-due', 'not_before': _InlineWait._scalar(value)})
+        pending.sort(key=lambda row: (str(row.get('not_before') or ''), str(row.get('task') or '')))
+        due.sort(key=lambda row: str(row.get('task') or ''))
+        return pending, due
+
+    @staticmethod
+    def _earliest_timer_epoch(view):
+        """The earliest pending ``not_before`` of one wait read, as epoch seconds, or ``None``."""
+        earliest = None
+        for timer in view.get('timers') or []:
+            if not isinstance(timer, dict):
+                continue
+            value = timer.get('not_before')
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                epoch = _InlineWait.parse_instant(value)
+            except ValueError:
+                continue
+            if earliest is None or epoch < earliest:
+                earliest = epoch
+        return earliest
+
+    @staticmethod
+    def worker_view(items, now=None):
         rows = _InlineWait.movement(items)
-        return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'worker', 'items': rows,
+        moment = datetime.datetime.now(datetime.timezone.utc) if now is None else now
+        pending, due = _InlineWait._timer_rows(items, (moment - _InlineWait._EPOCH).total_seconds())
+        if due:
+            rows = _InlineWait._sorted_rows(list(rows) + due)
+        view = {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'worker', 'items': rows,
                 'fingerprint': _InlineWait.digest(_InlineWait._sorted_rows(
                     [_InlineWait._worker_fingerprinted(row) for row in rows]))}
+        if pending:
+            view['timers'] = pending
+        return view
 
     @staticmethod
     def _lane_row(lane, entry=None):
@@ -910,6 +983,16 @@ class _InlineWait:
                 'empty_wakes_24h': lane.get('empty_wakes_24h')
                 if isinstance(lane.get('empty_wakes_24h'), int) else 0,
                 'at': _InlineWait._scalar(lane.get('empty_wake_at'))}
+
+    @staticmethod
+    def _timer_row(lane, entry):
+        """One due timer a coordinator must look at, reduced to stable fields (no age)."""
+        return {'lane': _InlineWait._scalar(lane.get('lane')),
+                'actor': _InlineWait._scalar(lane.get('actor')),
+                'task': _InlineWait._scalar(entry.get('task')),
+                'state': _InlineWait._scalar(entry.get('state')),
+                'waiting_on': _InlineWait._scalar(entry.get('waiting_on')),
+                'not_before': _InlineWait._scalar(entry.get('not_before'))}
 
     @staticmethod
     def _fault_row(lane, fault):
@@ -965,6 +1048,8 @@ class _InlineWait:
                              or entry.get('next_actor') == 'coordinator')
                 if addressed:
                     triggers['checkpoint-to-coordinator'].append(_InlineWait._lane_row(lane, entry))
+                if entry.get('timer_due'):
+                    triggers['timer-due'].append(_InlineWait._timer_row(lane, entry))
             fault = lane.get('needs_investigation')
             if isinstance(fault, dict):
                 triggers['needs-investigation'].append(_InlineWait._fault_row(lane, fault))
@@ -1130,6 +1215,17 @@ class _InlineWait:
                 remember(answer)
                 return _InlineWait.EXIT_TIMEOUT, answer
             nap = interval if timeout is None else min(interval, max(0.0, timeout - elapsed))
+            # A pending timer caps the sleep at the time remaining (kittrial-5bb.509): the
+            # wait re-reads at the due instant, and the due row that read returns IS the
+            # wake. The wall clock walks with the caller's monotonic clock (tests drive
+            # both), and a re-poll while the reader's clock has not caught up never runs
+            # faster than TIMER_REPOLL_SECONDS.
+            earliest = _InlineWait._earliest_timer_epoch(view)
+            if earliest is not None:
+                wall_now = (time.time() if now is None else now) + (clock() - started)
+                remaining = earliest - wall_now
+                nap = min(nap, remaining + _InlineWait.TIMER_WAKE_EPSILON
+                          if remaining > 0 else _InlineWait.TIMER_REPOLL_SECONDS)
             if nap <= 0:
                 answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
                                        reset=False)

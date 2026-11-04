@@ -508,6 +508,46 @@ class BriefRouteCase(TeamHarness):
         self.assertEqual(['Decide page size'],
                          [item['text'] for item in brief['checkpoint']['open_items']])
 
+    def test_a_wake_time_on_the_checkpoint_follows_the_two_write_rules(self):
+        """kittrial-5bb.509: the web writer enforces the same two rules as the native one.
+
+        The clock is the service's own injectable one, so the moments come from the
+        test's clock, never hard-coded; and a wake time is the HOLDER's only.
+        """
+        from datetime import datetime, timedelta, timezone
+        self.claim(self.carl)
+        soon = (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        base = self.path('/tasks/%s/checkpoints' % self.task)
+        lane = {'schema_version': 1, 'task': self.task, 'state': 'working'}
+        # A past wake time is refused at write: the lane has nothing left to wake for.
+        refused = self.request('POST', base, {'previous': None, 'summary': 'Set a timer',
+                                              'lane_state': dict(lane, not_before=past)},
+                               token=self.carl)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertIn('strictly in the future', refused.data['error']['message'])
+        # Only the holder sets one: the owner posting on the assignee's task is refused.
+        denied = self.request('POST', base, {'previous': None, 'summary': 'Set a timer',
+                                             'lane_state': dict(lane, not_before=soon)},
+                              token=self.olive)
+        self.assertEqual(422, denied.status, denied.data)
+        self.assertIn("set only by the task's holder", denied.data['error']['message'])
+        # The holder's own future wake time is written with the checkpoint...
+        waiting = dict(lane, state='waiting-on-coordinator', waiting_on='coordinator',
+                       not_before=soon)
+        set_timer = self.request('POST', base, {'previous': None, 'summary': 'Waiting for the wake',
+                                                'lane_state': waiting}, token=self.carl)
+        self.assertEqual(201, set_timer.status, set_timer.data)
+        self.assertEqual(soon, set_timer.data['checkpoint']['lane_state']['not_before'])
+        # ...and a later checkpoint from the holder without one clears it.
+        cleared = self.request('POST', base, {'previous': set_timer.data['checkpoint']['id'],
+                                              'summary': 'Woke on time',
+                                              'lane_state': {'schema_version': 1, 'task': self.task,
+                                                             'state': 'working'}},
+                               token=self.carl)
+        self.assertEqual(201, cleared.status, cleared.data)
+        self.assertNotIn('not_before', cleared.data['checkpoint']['lane_state'])
+
     def test_not_found_is_uniform(self):
         self.assert_uniform_not_found('/tasks/%s/brief' % self.task)
         missing = self.request('GET', self.path('/tasks/task_missing/brief'), token=self.olive)

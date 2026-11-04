@@ -8,6 +8,7 @@ cannot write or alter a lane-state-v1 record of another lane.
 import json
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,15 +33,17 @@ class Writes:
         self.calls.append(list(argv))
         if argv[:2] != ['comments', 'add']:
             raise AssertionError('unexpected native call: %r' % (argv,))
-        cid = 'w%d' % len(self.calls)
+        # Number from the task's live comment count, so two saves in one test (a second
+        # store) cannot mint colliding ids.
+        cid = 'w%d' % (len(self.data[0]['comments']) + 1)
         self.data[0]['comments'].append(comment(cid, argv[3], author=self.actor))
         return json.dumps({'id': cid})
 
 
-def save(data, **changes):
-    store = Writes(data)
+def save(data, actor='alice/session', now=None, **changes):
+    store = Writes(data, actor=actor)
     payload = checkpoint(data, **changes)
-    result = b.save_checkpoint(data, PROJECT, TASK, payload, 'alice/session', store.run)
+    result = b.save_checkpoint(data, PROJECT, TASK, payload, actor, store.run, now=now)
     return result, store
 
 
@@ -135,6 +138,106 @@ class ValidationTests(unittest.TestCase):
     def test_every_fault_is_reported_at_once(self):
         found = lane_state.problems(dict(schema_version=1, task='other', state='nope', waiting_on='x'), TASK)
         self.assertGreaterEqual(len(found), 3)
+
+
+class NotBeforeTests(unittest.TestCase):
+    """The holder's optional wake time (kittrial-5bb.509).
+
+    Every write-time rule runs against an injected clock, never the real one. The read
+    path passes no clock: a record whose wake time has passed is still usable, exactly
+    like a past ``expect_by``.
+    """
+
+    now = datetime(2026, 11, 4, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_a_future_wake_time_within_fourteen_days_is_accepted(self):
+        for value in ('2026-11-04T12:00:01Z', '2026-11-18T12:00:00Z', '2026-11-04T07:01:00-05:00'):
+            with self.subTest(value=value):
+                kept = lane_state.validate(dict(WAITING, not_before=value), TASK, now=self.now)
+                self.assertEqual(kept['not_before'], value)
+        # A working lane may promise a wake time too: the timer is about the lane's next
+        # turn, not only a declared wait state.
+        lane_state.validate(dict(schema_version=1, task=TASK, state='working',
+                                 not_before='2026-11-05T09:00:00Z'), TASK, now=self.now)
+
+    def test_a_wake_time_not_strictly_future_is_refused_at_write(self):
+        for value in ('2026-11-04T11:59:59Z', '2026-11-04T12:00:00Z'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'strictly in the future'):
+                    lane_state.validate(dict(WAITING, not_before=value), TASK, now=self.now)
+
+    def test_a_wake_time_more_than_fourteen_days_out_is_refused_at_write(self):
+        for value in ('2026-11-18T12:00:01Z', '2027-01-01T00:00:00Z'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'more than 14 days ahead'):
+                    lane_state.validate(dict(WAITING, not_before=value), TASK, now=self.now)
+
+    def test_a_wake_time_without_seconds_is_refused_at_write(self):
+        with self.assertRaisesRegex(ValueError, 'seconds and an offset'):
+            lane_state.validate(dict(WAITING, not_before='2026-11-05T17:30Z'), TASK, now=self.now)
+        # The shape is a WRITE-time rule: without a clock only the moment itself is
+        # checked, so a reader never refuses a stored record over its spelling.
+        lane_state.validate(dict(WAITING, not_before='2026-11-05T17:30Z'), TASK)
+
+    def test_a_due_wake_time_stays_readable(self):
+        kept = lane_state.validate(dict(WAITING, checkpoint='c1', not_before='2000-01-01T00:00:00Z'),
+                                   TASK, 'c1')
+        self.assertEqual(kept['not_before'], '2000-01-01T00:00:00Z')
+        # An unparseable value is refused everywhere: it names no moment at all.
+        with self.assertRaisesRegex(ValueError, 'not_before'):
+            lane_state.validate(dict(WAITING, not_before='tomorrow'), TASK)
+
+    def test_a_fault_never_carries_a_wake_time(self):
+        fault = dict(schema_version=1, task=TASK, state=lane_state.FAULT_STATE, reason='stuck on a lock')
+        lane_state.validate(fault, TASK)
+        with self.assertRaisesRegex(ValueError, 'a fault\\s+is not a wait'):
+            lane_state.validate(dict(fault, not_before='2026-11-05T09:00:00Z'), TASK, now=self.now)
+
+    def test_the_writer_applies_the_write_time_rules_with_the_supplied_clock(self):
+        data = rows()
+        before = list(data[0]['comments'])
+        with self.assertRaisesRegex(ValueError, 'strictly in the future'):
+            save(data, now=self.now, lane_state=dict(WAITING, not_before='2026-11-04T11:00:00Z'))
+        self.assertEqual(data[0]['comments'], before)
+
+    def test_the_wake_time_is_written_by_the_holder_only(self):
+        # No author rule predates the wake time: ``newest`` (lane_state.py:284) takes the
+        # newest usable record by ANY author, and the checkpoint writer never gated on the
+        # assignee. The holder rule is the wake time's own, at the writer.
+        data = rows()
+        before = list(data[0]['comments'])
+        with self.assertRaisesRegex(ValueError, "set only by the task's holder"):
+            save(data, actor='bob/session', now=self.now,
+                 lane_state=dict(WAITING, not_before='2026-11-04T13:00:00Z'))
+        self.assertEqual(data[0]['comments'], before)
+        save(data, now=self.now, lane_state=dict(WAITING, not_before='2026-11-04T13:00:00Z'))
+        self.assertEqual(lane_state.newest(data[0]['comments'], TASK)[1]['not_before'],
+                         '2026-11-04T13:00:00Z')
+
+    def test_a_later_record_without_a_wake_time_clears_it(self):
+        data = rows()
+        save(data, now=self.now, lane_state=dict(WAITING, not_before='2026-11-04T13:00:00Z'))
+        self.assertEqual(b.lane_not_before(data[0], TASK), '2026-11-04T13:00:00Z')
+        save(data, now=self.now, lane_state=dict(WAITING))
+        self.assertIsNone(b.lane_not_before(data[0], TASK))
+
+    def test_a_foreign_record_never_sets_the_work_row_wake_time(self):
+        # ``newest`` reads any author's record; the wake time is the holder's own, so the
+        # work-row producer ignores one written by somebody else even when it is newest.
+        data = rows()
+        result, _store = save(data, now=self.now, lane_state=dict(WAITING))
+        data[0]['comments'].append(comment('ls-foreign', lane_state.PREFIX + canonical_bytes(
+            dict(schema_version=1, task=TASK, checkpoint=result['comment_id'], state='idle',
+                 not_before='2026-11-05T09:00:00Z')).decode(), author='bob/session'))
+        self.assertEqual(lane_state.newest(data[0]['comments'], TASK)[1]['not_before'],
+                         '2026-11-05T09:00:00Z')
+        self.assertIsNone(b.lane_not_before(data[0], TASK))
+
+    def test_the_work_row_carries_the_wake_time_for_both_transports(self):
+        data = rows()
+        save(data, now=self.now, lane_state=dict(WAITING, not_before='2026-11-04T13:00:00Z'))
+        fields = b.checkpoint_queue_fields(data, data[0])
+        self.assertEqual(fields['lane_not_before'], '2026-11-04T13:00:00Z')
 
 
 class WriterTests(unittest.TestCase):

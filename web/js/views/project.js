@@ -181,6 +181,11 @@ export function lanesPanel(ctx, project) {
       h('div', { class: 'small muted' },
         'In that state ', ageText(entry.state_age_seconds),
         entry.expect_by ? [' · expected ', time(entry.expect_by)] : null,
+        // The holder's own wake time (kittrial-5bb.509): the SERVER says whether it has
+        // come due (not_before_due); this page never reads a clock of its own.
+        entry.not_before ? (entry.not_before_due
+          ? [' · ', h('span', { class: 'chip warn', 'data-flag': 'timer' }, 'Overdue')]
+          : [' · due ', time(entry.not_before)]) : null,
         entry.state_since ? [' · since ', time(entry.state_since)] : null),
       // A late wait says so in words: the Late chip plus the plain sentence it
       // explains (mock-up lanes.html:60 'Late / expected today 20:00, 2 hours ago').

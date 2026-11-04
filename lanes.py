@@ -215,15 +215,27 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     checkpoint = newest_checkpoint(row)
     declared = found is not None
     wait_state = waiting_on = expect_by = None
+    not_before = not_before_due = None
     checkpoint_id = None
     since = None
     if declared:
-        _record, payload, checkpoint_comment = found
+        record_comment, payload, checkpoint_comment = found
         checkpoint_id = str(payload.get('checkpoint'))
         since = checkpoint_comment.get('created_at')
         wait_state = payload.get('state')
         waiting_on = payload.get('waiting_on')
         expect_by = payload.get('expect_by')
+        # A wake time is the HOLDER's own (kittrial-5bb.509): the writer refuses anybody
+        # else's, and the reader takes it only from the lane's own record, so a record by
+        # anybody else declares a state but never a timer for this lane. A value that does
+        # not parse is skipped, never a failed read.
+        value = payload.get('not_before')
+        if isinstance(value, str) and value.strip() and record_comment.get('author') == actor:
+            try:
+                not_before_due = parse_moment(value, 'not_before') <= now
+                not_before = value
+            except ValueError:
+                not_before = not_before_due = None
     else:
         if checkpoint is not None:
             checkpoint_id = str(checkpoint[1].get('id'))
@@ -253,6 +265,9 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         'state': wait_state,
         'waiting_on': waiting_on,
         'expect_by': expect_by,
+        'not_before': not_before,
+        'not_before_due': not_before_due,
+        'timer_due': False,
         'declared': declared,
         'inferred': not declared,
         'checkpoint': checkpoint_id,
@@ -290,6 +305,7 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
     if now is None:
         now = datetime.now(timezone.utc)
     threshold = parsed.idle_minutes * 60
+    from lane_state import parse_moment
     from lifecycle import integration_evidence
     from review_state import reverts_by_task
     from reserved_comments import is_record_anchor
@@ -346,6 +362,22 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
             if named:
                 flags[name] = named
         last_write = lane_writes(rows, registry, holder)
+        # A due timer whose lane has not acted (kittrial-5bb.509): the coordinator
+        # trigger's own rule, computed here where the lane's newest write anywhere (any
+        # task, plus registry activity) is known -- acting on ANY task after the due
+        # instant means the lane woke. The grace is the read's idle threshold, the same
+        # argument the other flags take. timer_due is not one of FLAG_NAMES: it is the
+        # coordinator wait's trigger, not a lane-board flag.
+        for entry in entries:
+            if not entry.get('not_before'):
+                continue
+            try:
+                wake = parse_moment(entry['not_before'], 'not_before')
+            except ValueError:
+                continue
+            entry['timer_due'] = (wake <= now
+                                  and (now - wake).total_seconds() >= threshold
+                                  and (last_write is None or last_write < wake))
         lanes.append({
             'lane': names.get(holder, holder),
             'actor': holder,

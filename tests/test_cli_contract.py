@@ -185,8 +185,10 @@ class WorkHelpContractTests(unittest.TestCase):
                                        'claiming'})
         self.assertEqual(result['total'], 1)
         self.assertEqual(result['your_move'], {'count': 1, 'text': '1 of your tasks need your action'})
-        # Every existing field remains; owned authored wait context is additive.
-        self.assertEqual(set(result['items'][0]), ITEM_FIELDS | {'checkpoint_wait'})
+        # Every existing field remains; owned authored wait context is additive, and so is
+        # the holder's declared wake time `lane_not_before` (kittrial-5bb.509: empty when
+        # the lane never set one, so an older reader that ignores it is unaffected).
+        self.assertEqual(set(result['items'][0]), ITEM_FIELDS | {'checkpoint_wait', 'lane_not_before'})
 
     def test_brief_shape_is_backward_compatible(self):
         result = briefing.brief(rows(), PROJECT, TASK)

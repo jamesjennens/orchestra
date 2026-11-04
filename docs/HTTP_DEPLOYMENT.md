@@ -13,8 +13,9 @@ coordinator view.
 Each authorized project costs one canonical wait read: queue and lane triggers
 come from the same snapshot. `triggers` groups `checkpoint-to-coordinator`,
 `awaiting-review`, `awaiting-integration`, `lane-quiet`, `needs-investigation` (a lane-raised fault,
-kittrial-5bb.398) and `empty-wake` (a lane with three different empty worker wakes in 24 hours,
-kittrial-5bb.397), and `items` carries
+kittrial-5bb.398), `empty-wake` (a lane with three different empty worker wakes in 24 hours,
+kittrial-5bb.397) and `timer-due` (a lane whose set wake time came due without the lane acting,
+kittrial-5bb.509), and `items` carries
 those rows with their trigger. `idle_minutes` has the lane board's range
 1–10080 (default 15). For one project, `fingerprint` is byte-identical to the CLI
 coordinator fingerprint for the same actor, threshold and state. For multiple
@@ -2916,7 +2917,8 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   own on `/v1/agents/me` included) does. The set-up wizard writes the coordinator's
   `.orchestra/AGENT.md` for an agent with an effective grant (guidance first, never claim a
   worker task, then deliveries awaiting review, approved work awaiting integration,
-  checkpoints addressed to it and quiet lanes, with the coordinator routes), and its setup
+  checkpoints addressed to it, quiet lanes and lanes whose set wake time came due, with
+  the coordinator routes), and its setup
   prompt names the extension's coordinator role; every other agent gets the worker's
   AGENT.md, unchanged. web/js/agentSetup.js exports the text for Orchestra Bridge.
 - An agent may hold at most 20 credentials **that still work**; revoked and expired ones

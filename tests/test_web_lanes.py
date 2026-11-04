@@ -90,7 +90,7 @@ class LanesRouteCase(ServerHarness):
 
     def plant_declared_wait(self, task_id, actor, age_seconds=2 * 86400,
                             state='waiting-on-coordinator', waiting_on='coordinator',
-                            expect_by=None):
+                            expect_by=None, not_before=None):
         """Plant the checkpoint and the lane-state record a lane declared its wait with.
 
         Timestamps are set by the test, so the threshold's effect on the flags is the
@@ -104,6 +104,8 @@ class LanesRouteCase(ServerHarness):
                    'state': state, 'waiting_on': waiting_on}
         if expect_by is not None:
             payload['expect_by'] = expect_by
+        if not_before is not None:
+            payload['not_before'] = not_before
         comments.append({'id': 'comment_lane_state_planted', 'issue_id': task_id, 'author': actor,
                          'text': lane_state.PREFIX + canonical_bytes(payload).decode(),
                          'created_at': stamp})
@@ -163,6 +165,31 @@ class LanesRouteCase(ServerHarness):
         mine = self.lane_row(self.lanes(self.carl).data, self.ids['carl'])['needs_investigation']
         self.assertEqual({k: v for k, v in fault.items() if k != 'age_seconds'},
                          {k: v for k, v in mine.items() if k != 'age_seconds'})
+
+    def test_a_holders_wake_time_reaches_the_lanes_entries(self):
+        """kittrial-5bb.509: the holder's set wake time is one more declared field.
+
+        The rule itself (the grace, the lane's own newest write) is the board read's,
+        tested over ``lanes.read``; here the route answers the fields the page and the
+        coordinator wait read. Timestamps are the test's own, never the machine's.
+        """
+        self.plant_coordination(operators=[self.ids['olive']])
+        moment = datetime.now(timezone.utc)
+        soon = (moment + timedelta(minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        just_past = (moment - timedelta(seconds=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.plant_declared_wait(self.carl_task, self.ids['carl'], not_before=soon)
+        self.plant_declared_wait(self.dana_task, self.ids['dana'], not_before=just_past)
+        every = self.lanes(self.olive).data
+        _row, entry = self.held_entry(every, self.carl_task)
+        self.assertEqual(soon, entry['not_before'])
+        self.assertFalse(entry['not_before_due'])
+        self.assertFalse(entry['timer_due'])
+        # Past its moment but inside the read's 15-minute grace: shown due, not yet the
+        # coordinator's trigger.
+        _row, entry = self.held_entry(every, self.dana_task)
+        self.assertEqual(just_past, entry['not_before'])
+        self.assertTrue(entry['not_before_due'])
+        self.assertFalse(entry['timer_due'])
 
     # -- the threshold is the page's argument ----------------------------------
     def test_the_threshold_reaches_the_one_read_and_the_flags_change_with_it(self):
@@ -461,6 +488,13 @@ class LanesPageTests(unittest.TestCase):
         self.assertTrue(any(f == 'waiting_too_long: Waiting too long: alpha-1' for f in flags), flags)
         self.assertTrue(any(f == 'expect_by_passed: Expect-by passed: alpha-1' for f in flags), flags)
         self.assertTrue(any(f == "your_move_idle: Holder's move idle: alpha-3" for f in flags), flags)
+        # kittrial-5bb.509: a set wake time reads as the local time it is due, a due one
+        # as the Overdue chip -- both from the read's own fields; the page reads no clock,
+        # so the raw instants never reach the text.
+        self.assertIn('due', lowered)
+        self.assertNotIn('2026-10-18T09:30:00Z', text)
+        self.assertNotIn('2026-10-17T19:00:00Z', text)
+        self.assertEqual(['timer: Overdue'], [f for f in flags if f.startswith('timer:')], flags)
         self.assertTrue(seen['freeText'], seen['text'])
         self.assertIn('Holds nothing', seen['freeText'][0])
         self.assertIn('5 min', seen['freeText'][0])

@@ -430,6 +430,7 @@ export function checkpointForm(ctx, pid, tid, initialBrief) {
       ['waiting-on-review', 'Waiting on review'], ['waiting-on-user', 'Waiting on user'], ['idle', 'Idle']] }),
     field({ id: 'cp-waiting', label: 'Waiting on', hint: 'For a waiting state, name coordinator, reviewer, user, or an exact actor ID.' }),
     field({ id: 'cp-expect', label: 'Expected by', hint: 'Optional time with timezone, for example 2026-10-14T12:00:00Z.' }),
+    field({ id: 'cp-not-before', label: 'Not before', hint: 'Optional wake time with timezone and seconds, for example 2026-11-05T17:30:00Z. Only the holder sets it: strictly in the future, at most 14 days ahead. The wait wakes at this time; a later checkpoint without it clears it.' }),
     h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'primary' }, 'Save checkpoint'),
       h('button', { type: 'button', onclick: async () => {
         try { context = await ctx.api.brief(pid, tid); contextReadFailed = false; showContext(); }
@@ -475,6 +476,7 @@ export function checkpointForm(ctx, pid, tid, initialBrief) {
       body.lane_state = { schema_version: 1, task: tid, state: v['cp-lane'] };
       if (v['cp-waiting']) body.lane_state.waiting_on = v['cp-waiting'];
       if (v['cp-expect']) body.lane_state.expect_by = v['cp-expect'];
+      if (v['cp-not-before']) body.lane_state.not_before = v['cp-not-before'];
     }
     status.hidden = true;
     try {
