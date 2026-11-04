@@ -654,6 +654,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # The checkpoint-independent wait marker (kittrial-5bb.369) is omitted by
             # the same older page and honestly reads unknown.
             'wait_newer_activity_marker': None,
+            # The holder's declared wake time (kittrial-5bb.509) is carried by the same
+            # row family; this older page omits it, so it honestly reads None.
+            'lane_not_before': None,
             'newer_activity_by_others': None,
             'newer_activity_own': None, 'newer_activity_coverage': None,
             'unresolved_directions': None})

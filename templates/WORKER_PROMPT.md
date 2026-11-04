@@ -169,7 +169,9 @@ same checkpoint payload's sibling `lane_state` key (`state`; `waiting_on`, a rol
 actor id, required with a waiting state; and an optional `expect_by`, ISO-8601 with an
 offset, where a past value is accepted and flagged; and an optional `not_before`, a full
 ISO-8601 time with seconds and an offset, strictly in the future, that only the holder
-sets and that the blocking wait wakes you at - a later record without it clears it), set
+sets and that the blocking wait wakes you at - a later record without it clears it; set
+it when you must act at a set time and end your turn inside that wait, never at the
+prompt), set
 at claim, at every checkpoint
 and whenever a wait begins, so `work lanes` shows the board and flags a wait that has run
 too long. Do not merge, deploy, edit another

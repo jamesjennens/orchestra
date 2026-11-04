@@ -20,7 +20,7 @@ Each run, in this order:
 2. GET REPLACE_SERVER_URL/v1/agents/me/next. Your own tasks come first in the reply: review requests, then a task you left blocked, then one in progress. Blocked and in-progress tasks flag newer activity. Read brief/history; reconcile unknown coverage. Reading acknowledges nothing. GET REPLACE_SERVER_URL/v1/agents/me/wait is the same read; act on it; read it again.
 3. Only if none of your own tasks needs action: claim exactly one offered task. A task assigned to somebody else is held. A parent/coordination task is not an inbox.
 Git access to the code host, not the Orchestra server: ssh -T git@github.com; git ls-remote <repository URL>; without it, record a checkpoint and claim nothing.
-4. Checkpoint with lane_state (state; waiting_on role or actor; optional expect_by; optional not_before wake time, holder only) at claim, checkpoint and wait.
+4. Checkpoint with lane_state (state; waiting_on role or actor; optional expect_by) at claim, checkpoint and wait.
 
 A task of yours with changes requested is your work until you deliver a revision: "nothing changed" never applies to it.
 Otherwise, if nothing changed, say so in one line and stop; stop without acting only when every task of yours is with the reviewer or the coordinator.
