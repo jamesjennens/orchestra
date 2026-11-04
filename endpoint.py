@@ -1648,6 +1648,13 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             read_context = {}
             if action in ('work', 'wait') and args[:1] != ['summary']:
                 read_context['comment_authority'] = comment_contact_authority(root,path,operators,authority_config)
+                if (action == 'wait' and '--coordinator' in args) or (action == 'work' and args[:1] == ['lanes']):
+                    store = authority_config.store if authority_config is not None else (root / 'http-state.json')
+                    try:
+                        import http_authority
+                        read_context['authority_state'] = http_authority.read_state(store)
+                    except Exception:
+                        read_context['authority_state'] = None
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,
                                 verifiers=configured_verifiers(root),

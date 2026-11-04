@@ -572,6 +572,9 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     // that only an https service with its own certificate answers (kittrial-5bb.203).
     certificate: () => call('GET', '/v1/service/certificate'),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
+    disableAgent: (aid) => mutate('POST', `/v1/agents/${encodeURIComponent(aid)}/disable`, {}),
+    enableAgent: (aid) => mutate('POST', `/v1/agents/${encodeURIComponent(aid)}/enable`, {}),
+    releaseAgentClaims: (aid, body = {}) => mutate('POST', `/v1/agents/${encodeURIComponent(aid)}/release-claims`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),
     // kittrial-5bb.365: the agent's history, its owner's view.
     agentHistory: (aid) => call('GET', `/v1/agents/${aid}/history`),

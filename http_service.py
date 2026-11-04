@@ -2057,12 +2057,42 @@ class InProcessBackend:
         carries the same name and id.
         """
         from lanes import read as lanes_read
+        from sessions import read_registry, session_retired
         rows = [dict(task, issue_type=task.get('issue_type') or 'task',
                      labels=task.get('labels') or [], dependencies=task.get('dependencies') or [],
                      comments=task.get('comments') or [])
                 for task in self._project_rows(project_id)]
-        return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
-                          journal=None, scope=scope)
+        registry = getattr(self, 'session_registry', None)
+        if not isinstance(registry, dict):
+            registry = {'schema_version': 1, 'records': {}}
+            root = getattr(self, 'root', None)
+            if root is not None:
+                try:
+                    pdir = Path(root) / 'projects' / project_id
+                    if pdir.is_dir():
+                        registry = read_registry(pdir)
+                except Exception:
+                    registry = {'schema_version': 1, 'records': {}}
+        extra_live_sessions = set()
+        operators = None
+        coord_fn = getattr(self, 'host_coordination', None)
+        if callable(coord_fn):
+            try:
+                coord = coord_fn(project_id)
+                if isinstance(coord, dict):
+                    if isinstance(coord.get('operators'), list):
+                        operators = list(coord['operators'])
+                    for item in coord.get('sessions') or []:
+                        if isinstance(item, dict) and not session_retired(item):
+                            s_actor = item.get('actor')
+                            if isinstance(s_actor, str) and s_actor.strip():
+                                extra_live_sessions.add(s_actor.strip())
+            except Exception:
+                pass
+        return lanes_read(rows, actor, registry, list(args),
+                          operators=operators, journal=None, scope=scope,
+                          project=project_id, authority_state=self.service.state,
+                          extra_live_sessions=extra_live_sessions)
 
     def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """The disposable model's queue and board at one locked state."""
@@ -10555,15 +10585,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         aid = ctx.params['aid']
         payload = dict(ctx.payload or {})
-        refuse_unknown_fields(payload, ('dry_run',), 'An agent claim release')
+        refuse_unknown_fields(payload, ('dry_run', 'tasks'), 'An agent claim release')
         dry_run = bool(payload.get('dry_run'))
+        requested_tasks = None
+        if 'tasks' in payload and payload['tasks'] is not None:
+            raw_tasks = payload['tasks']
+            if not isinstance(raw_tasks, list) or any(
+                    not isinstance(t, str) or not t.strip() for t in raw_tasks):
+                raise HttpError(400, 'invalid_request', 'tasks must be a list of task ids')
+            requested_tasks = []
+            seen_tasks = set()
+            for t in raw_tasks:
+                tid = t.strip()
+                if tid not in seen_tasks:
+                    seen_tasks.add(tid)
+                    requested_tasks.append(tid)
         if ctx.idempotency_key is None and not dry_run:
             raise invalid('Send an Idempotency-Key: releasing claims writes')
         # The record's ownership is judged before what the server can do with it,
         # so a caller with no right to the agent keeps the service's own 404.
         agent = self.service.get_agent(ctx.principal, aid)
-        if 'tasks.assign' not in self.backend.ROUTES:
-            raise not_implemented('Canonical task assignment is unavailable on this server')
         actor = agent.get('actor') or agent.get('id')
         from claim_limit import held_undelivered
         projects = list(agent.get('projects') or [])
@@ -10577,18 +10618,41 @@ class ApiHandler(BaseHTTPRequestHandler):
                     'You cannot release claims in %s, so nothing was released: %s'
                     % (project_id, refusal.message),
                     {'project': project_id, 'released': []}) from None
-        planned, released, failed = [], [], []
-        truncated = False
+        by_project = []
         for project_id in projects:
             read = self.backend.agent_tasks(project_id, actor)
             held = held_undelivered(read.get('tasks') or [])
             if not read.get('complete'):
                 raise conflict('The agent\'s held tasks could not be read completely, so no claim '
                                'was released.', {'project': project_id, 'held_readable': False})
+            by_project.append((project_id, held))
+        if requested_tasks is not None:
+            held_ids = {row.get('id') for _pid, held in by_project for row in held
+                        if isinstance(row.get('id'), str)}
+            unheld = [tid for tid in requested_tasks if tid not in held_ids]
+            if unheld:
+                raise HttpError(
+                    400,
+                    'invalid_request',
+                    'Task %s is not an open claim held by agent %s; nothing was released'
+                    % (unheld[0], aid),
+                    {'agent': aid, 'not_held': unheld, 'released': []})
+            allowed = set(requested_tasks)
+            by_project = [
+                (project_id, [row for row in held if row.get('id') in allowed])
+                for project_id, held in by_project
+            ]
+        if (not dry_run and (requested_tasks is None or any(held for _pid, held in by_project))
+                and 'tasks.assign' not in self.backend.ROUTES):
+            raise not_implemented('Canonical task assignment is unavailable on this server')
+        planned, released, failed = [], [], []
+        truncated = False
+        for project_id, held in by_project:
             if len(held) > self.CLAIM_RELEASE_LIMIT:
                 truncated = True
             counts = {'project': project_id, 'held': len(held),
-                      'tasks': [row.get('id') for row in held]}
+                      'tasks': [row.get('id') for row in held],
+                      'items': [{'id': row.get('id'), 'title': row.get('title')} for row in held]}
             planned.append(counts)
             for row in held[:self.CLAIM_RELEASE_LIMIT]:
                 if dry_run:

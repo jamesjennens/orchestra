@@ -30,7 +30,7 @@ LANES_LIMIT_DEFAULT = 20
 IDLE_WINDOW_HOURS = 24
 #: The open-item kinds the coordinator helper keeps; the prose fallback below uses them.
 PROSE_WAIT_ITEMS = ('blocker', 'question', 'dependency')
-FLAG_NAMES = ('waiting_too_long', 'expect_by_passed', 'your_move_idle')
+FLAG_NAMES = ('waiting_too_long', 'expect_by_passed', 'your_move_idle', 'holder_retired')
 COVERAGE = ('One lane per registered session name; a task with no lane reads as its assignee actor. '
             'The declared state, who it waits on and expect_by come from the newest usable '
             'Kind: lane-state-v1 record; inferred true marks a row whose state is not declared. '
@@ -94,12 +94,116 @@ def _newest(values):
 
 def registry_names(registry):
     """``actor -> registered lane name`` from a validated session registry."""
+    from sessions import session_retired
     records = registry.get('records') if isinstance(registry, dict) else None
     names = {}
     for record in (records or {}).values():
-        if isinstance(record, dict) and isinstance(record.get('actor'), str):
+        if isinstance(record, dict) and isinstance(record.get('actor'), str) and not session_retired(record):
             names[record['actor']] = str(record.get('name') or record['actor'])
     return names
+
+
+def live_session_actors(registry):
+    """Actors whose session record in ``registry`` is present and not retired (kittrial-5bb.510)."""
+    from sessions import session_retired
+    records = registry.get('records') if isinstance(registry, dict) else None
+    actors = set()
+    for record in (records or {}).values():
+        if (isinstance(record, dict) and isinstance(record.get('actor'), str)
+                and record['actor'] and not session_retired(record)):
+            actors.add(record['actor'])
+    return actors
+
+
+def holder_retired(holder, live_sessions=(), project=None, authority_state=None, operators=None, now=None):
+    """True when ``holder`` is a disabled agent, an agent no longer granted on ``project``,
+    or an actor with no live registration on ``project`` (kittrial-5bb.510).
+    """
+    if not isinstance(holder, str) or not holder:
+        return True
+    head = holder.split('/', 1)[0]
+    live = set(live_sessions or ())
+    if isinstance(authority_state, dict):
+        import http_authority
+        agents = authority_state.get('agents') or {}
+        if head in agents:
+            agent = agents.get(head)
+            if not isinstance(agent, dict) or not agent.get('enabled', False):
+                return True
+            if project:
+                if project not in (agent.get('projects') or []):
+                    return True
+                if not http_authority.account_in_project(authority_state, agent.get('owner'), project):
+                    return True
+            return False
+        if holder in live or head in live:
+            return False
+        if project:
+            users = authority_state.get('users') or {}
+            if head in users and http_authority.account_in_project(authority_state, head, project):
+                return False
+            now_ts = (now.timestamp() if isinstance(now, datetime)
+                      else float(now) if isinstance(now, (int, float))
+                      else datetime.now(timezone.utc).timestamp())
+            for cred in (authority_state.get('credentials') or {}).values():
+                if not isinstance(cred, dict) or cred.get('agent_id') or cred.get('revoked'):
+                    continue
+                if cred.get('project_id') != project:
+                    continue
+                expires = cred.get('expires_at')
+                if isinstance(expires, (int, float)) and expires <= now_ts:
+                    continue
+                if not http_authority.account_in_project(authority_state, cred.get('user_id'), project):
+                    continue
+                cred_actor = cred.get('actor') or cred.get('user_id')
+                if cred_actor in (holder, head):
+                    return False
+        return True
+    if holder in live or head in live:
+        return False
+    if operators and (holder in operators or head in operators):
+        return False
+    return True
+
+
+def apply_holder_retired_row(lane, retired):
+    """Set or clear ``holder_retired`` on one lane row and its held task entries."""
+    if not isinstance(lane, dict):
+        return
+    held = [entry for entry in (lane.get('held') or []) if isinstance(entry, dict)]
+    active = bool(retired and held)
+    for entry in held:
+        current = [flag for flag in (entry.get('flags') or []) if flag != 'holder_retired']
+        if active:
+            current.append('holder_retired')
+        entry['flags'] = current
+    flag_tasks = dict(lane.get('flag_tasks') or {})
+    if active:
+        flag_tasks['holder_retired'] = [entry['task'] for entry in held if entry.get('task')]
+    else:
+        flag_tasks.pop('holder_retired', None)
+    lane['holder_retired'] = active
+    lane['flag_tasks'] = flag_tasks
+
+
+def flag_retired_holders(board, live_sessions=(), project=None, authority_state=None, operators=None, now=None):
+    """Recompute ``holder_retired`` across ``board['items']`` and ``board['flags']``."""
+    if not isinstance(board, dict):
+        return board
+    live = set(live_sessions or ())
+    items = [row for row in (board.get('items') or []) if isinstance(row, dict)]
+    for lane in items:
+        actor = lane.get('actor')
+        retired = holder_retired(actor, live_sessions=live, project=project,
+                                 authority_state=authority_state, operators=operators, now=now)
+        apply_holder_retired_row(lane, retired)
+    flags = dict(board.get('flags') or {})
+    flags['holder_retired'] = max(int(flags.get('holder_retired') or 0),
+                                  sum(1 for row in items if row.get('holder_retired')))
+    if sum(1 for row in items if row.get('holder_retired')) == 0 and board.get('total', len(items)) == len(items):
+        flags['holder_retired'] = 0
+    board['flags'] = flags
+    return board
 
 
 def lane_writes(rows, registry, actor):
@@ -279,7 +383,8 @@ def _review(row, task, evidence, revert_map, revert_problems, operators, journal
         return None, str(error)[:300]
 
 
-def read(rows, actor, registry, args, now=None, operators=None, journal=None, scope='all', comment_authority=None):
+def read(rows, actor, registry, args, now=None, operators=None, journal=None, scope='all',
+         comment_authority=None, project=None, authority_state=None, extra_live_sessions=None):
     """The bounded lanes page. ``rows`` is the export, ``registry`` the session registry.
 
     ``scope`` is ``'all'`` on the host route and the bound-key coordinator route, and
@@ -301,6 +406,11 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
     else:
         revert_map, revert_problems = {}, {}
     names = registry_names(registry)
+    live_sessions = live_session_actors(registry)
+    if extra_live_sessions:
+        live_sessions.update(a.strip() for a in extra_live_sessions
+                             if isinstance(a, str) and a.strip())
+    project_id = project or (journal.name if journal is not None else None)
     from fault_clear import host_journal as fault_journal, open_faults
     faults = open_faults([row for row in rows if isinstance(row, dict)],
                          fault_journal(journal)[0] if journal is not None else None)
@@ -340,6 +450,12 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
             review, error = _review(row, task, evidence, revert_map, revert_problems, operators, journal)
             entries.append(held_task(row, task, holder, now, threshold, review=review, error=error,
                                      comment_authority=comment_authority))
+        retired = holder_retired(holder, live_sessions=live_sessions, project=project_id,
+                                 authority_state=authority_state, operators=operators, now=now)
+        if retired:
+            for entry in entries:
+                if 'holder_retired' not in entry['flags']:
+                    entry['flags'].append('holder_retired')
         flags = {}
         for name in FLAG_NAMES:
             named = [entry['task'] for entry in entries if name in entry['flags']]
@@ -362,6 +478,7 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
             'waiting_too_long': 'waiting_too_long' in flags,
             'expect_by_passed': 'expect_by_passed' in flags,
             'your_move_idle': 'your_move_idle' in flags,
+            'holder_retired': 'holder_retired' in flags,
             'flag_tasks': flags,
         })
     # Lanes that hold nothing: every registered session whose newest write anywhere is
@@ -393,6 +510,7 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
             'waiting_too_long': False,
             'expect_by_passed': False,
             'your_move_idle': False,
+            'holder_retired': False,
             'flag_tasks': {},
         })
     existing={lane['actor'] for lane in lanes}
@@ -400,7 +518,8 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
         lanes.append(dict(lane=names.get(holder,holder),actor=holder,idle=False,held=[],
                           state=None,waiting_on=None,expect_by=None,inferred=False,state_since=None,
                           state_age_seconds=None,last_write=None,last_write_age_seconds=None,
-                          waiting_too_long=False,expect_by_passed=False,your_move_idle=False,flag_tasks={}))
+                          waiting_too_long=False,expect_by_passed=False,your_move_idle=False,
+                          holder_retired=False,flag_tasks={}))
     # A raised fault is shown even for a lane that holds nothing and wrote long ago: it stays
     # until a coordinator clears it, so it must not depend on the lane being otherwise listed.
     existing={lane['actor'] for lane in lanes}
@@ -408,7 +527,8 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
         lanes.append(dict(lane=names.get(holder,holder),actor=holder,idle=False,held=[],
                           state=None,waiting_on=None,expect_by=None,inferred=False,state_since=None,
                           state_age_seconds=None,last_write=None,last_write_age_seconds=None,
-                          waiting_too_long=False,expect_by_passed=False,your_move_idle=False,flag_tasks={}))
+                          waiting_too_long=False,expect_by_passed=False,your_move_idle=False,
+                          holder_retired=False,flag_tasks={}))
     for lane in lanes:
         fault = faults.get(lane['actor'])
         if fault is None:

@@ -89,6 +89,7 @@ const LANE_FLAGS = [
   ['waiting_too_long', 'Waiting too long'],
   ['expect_by_passed', 'Expect-by passed'],
   ['your_move_idle', "Holder's move idle"],
+  ['holder_retired', 'Holder retired'],
 ];
 
 // The server's ages are whole seconds; said as a rough span, never re-derived from a clock.
