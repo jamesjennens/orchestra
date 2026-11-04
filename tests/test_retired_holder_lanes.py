@@ -251,8 +251,8 @@ class RetiredHolderUnitAndWebTests(ServerHarness):
         self.assertEqual([tid], web_row['flag_tasks']['holder_retired'])
         self.assertEqual(1, web_lanes.data['flags']['holder_retired'])
 
-        # And a retired session record in .sessions.json is excluded by sessions.read_registry /
-        # host_reads.coordination and flagged by lanes.read.
+        # And an actor with no record in .sessions.json at all is flagged by lanes.read,
+        # while a live SSH session present in sessions.read_registry(path) is not.
         with tempfile.TemporaryDirectory() as tmp:
             pdir = Path(tmp)
             (pdir / '.sessions.json').write_text(
@@ -265,17 +265,9 @@ class RetiredHolderUnitAndWebTests(ServerHarness):
                             'actor': LIVE_ACTOR,
                             'created_at': '2026-09-15T10:00:00Z',
                         },
-                        RET_REQ: {
-                            'request_id': RET_REQ,
-                            'name': 'retired-ssh',
-                            'actor': RET_ACTOR,
-                            'created_at': '2026-09-15T09:00:00Z',
-                            'retired': True,
-                        },
                     },
                     'owners': {
                         LIVE_ACTOR: 'person:olive',
-                        RET_ACTOR: 'person:olive',
                     },
                 }),
                 encoding='utf-8',
@@ -297,6 +289,105 @@ class RetiredHolderUnitAndWebTests(ServerHarness):
             self.assertFalse(by_actor[LIVE_ACTOR]['holder_retired'])
             self.assertTrue(by_actor[RET_ACTOR]['holder_retired'])
             self.assertEqual(1, board['flags']['holder_retired'])
+            self.assertNotIn('holder_retired_unknown', board)
+
+    def test_unreadable_authority_state_does_not_flag_live_web_agent_and_marks_holder_retired_unknown(self):
+        """Review r1 item unreadable-state-flags-everyone: when http_authority.read_state raises
+        (or authority_state is not a dict), a live enabled web agent holding a task is NOT
+        flagged holder_retired, and the board reports holder_retired_unknown: true."""
+        aid, secret = self.make_agent('LiveWebAgentWhenStateUnreadable')
+        tid = self.create_task(self.olive, self.project, 'Held by live web agent').data['id']
+        claimed = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, tid), {}, token=secret
+        )
+        self.assertEqual(200, claimed.status, claimed.data)
+
+        # 1. Direct lanes.read when authority_state could not be read (None):
+        board = lanes.read(
+            [_task_row(tid, aid)],
+            self.olive_id,
+            {'schema_version': 1, 'records': {}},
+            [],
+            now=FIXED_NOW,
+            project=self.project,
+            authority_state=None,
+        )
+        row = next(r for r in board['items'] if r['actor'] == aid)
+        self.assertFalse(row['holder_retired'])
+        self.assertNotIn('holder_retired', row['held'][0]['flags'])
+        self.assertNotIn('holder_retired', row['flag_tasks'])
+        self.assertEqual(0, board['flags']['holder_retired'])
+        self.assertIs(True, board.get('holder_retired_unknown'))
+
+        # 2. flag_retired_holders when authority_state is None:
+        recomputed = lanes.flag_retired_holders(
+            dict(board), project=self.project, authority_state=None, now=FIXED_NOW
+        )
+        self.assertIs(True, recomputed.get('holder_retired_unknown'))
+        self.assertEqual(0, recomputed['flags']['holder_retired'])
+        self.assertFalse(recomputed['items'][0]['holder_retired'])
+
+    def test_truncated_board_preserves_full_holder_retired_count_across_pages(self):
+        """Review r1 item count-logic: with limit below the number of lanes, flags['holder_retired']
+        is the full board count across all lanes, not just the current page's count."""
+        aid1, sec1 = self.make_agent('RetiredOne')
+        aid2, sec2 = self.make_agent('RetiredTwo')
+        live_aid, live_sec = self.make_agent('ActiveThree')
+        t1 = self.create_task(self.olive, self.project, 'Task 1').data['id']
+        t2 = self.create_task(self.olive, self.project, 'Task 2').data['id']
+        t3 = self.create_task(self.olive, self.project, 'Task 3').data['id']
+        for tid, tok in ((t1, sec1), (t2, sec2), (t3, live_sec)):
+            self.assertEqual(
+                200,
+                self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, tid), {}, token=tok).status,
+            )
+        for aid, key in ((aid1, 'disable-ret1-key'), (aid2, 'disable-ret2-key')):
+            self.assertEqual(
+                200,
+                self.request('POST', '/v1/agents/%s/disable' % aid, {}, token=self.olive, key=key).status,
+            )
+
+        # Truncate to limit=1 (3 lanes total, 2 retired holders):
+        page1 = lanes.read(
+            [_task_row(t1, aid1), _task_row(t2, aid2), _task_row(t3, live_aid)],
+            self.olive_id,
+            {'schema_version': 1, 'records': {}},
+            ['--limit', '1', '--offset', '0'],
+            now=FIXED_NOW,
+            project=self.project,
+            authority_state=self.service.state,
+        )
+        self.assertEqual(3, page1['total'])
+        self.assertEqual(1, len(page1['items']))
+        self.assertEqual(1, page1['next_offset'])
+        self.assertEqual(2, page1['flags']['holder_retired'])
+
+        # Re-running flag_retired_holders on the truncated page preserves the full count (2),
+        # even on the last page where 0 rows on that page are holder_retired!
+        page3 = lanes.read(
+            [_task_row(t1, aid1), _task_row(t2, aid2), _task_row(t3, live_aid)],
+            self.olive_id,
+            {'schema_version': 1, 'records': {}},
+            ['--limit', '1', '--offset', '2'],
+            now=FIXED_NOW,
+            project=self.project,
+            authority_state=self.service.state,
+        )
+        self.assertEqual(3, page3['total'])
+        self.assertEqual(1, len(page3['items']))
+        self.assertFalse(page3['items'][0]['holder_retired'])
+        self.assertEqual(2, page3['flags']['holder_retired'])
+        after_flag = lanes.flag_retired_holders(
+            dict(page3), project=self.project, authority_state=self.service.state, now=FIXED_NOW
+        )
+        self.assertEqual(2, after_flag['flags']['holder_retired'])
+
+        # And over HTTP GET /v1/projects/{pid}/lanes?limit=1:
+        http_page = self.request('GET', '/v1/projects/%s/lanes?limit=1' % self.project, token=self.olive)
+        self.assertEqual(200, http_page.status, http_page.data)
+        self.assertEqual(3, http_page.data['total'])
+        self.assertEqual(1, len(http_page.data['items']))
+        self.assertEqual(2, http_page.data['flags']['holder_retired'])
 
     def test_release_claims_tasks_field_narrows_to_intersection_and_never_widens(self):
         """Addition 2: ``tasks`` narrows what release-claims releases to the dry-run set."""
@@ -569,7 +660,8 @@ class RealBdRetiredHolderLanesTests(unittest.TestCase):
         self.assertEqual(0, self.bd('update', t_ret, '--status', 'in_progress').returncode)
 
         # Write the project's host session registry (<project>/.sessions.json), read by
-        # sessions.read_registry(path) at sessions.py:38-60.
+        # sessions.read_registry(path) at sessions.py:38-60. RET_ACTOR has no record in the
+        # registry at all.
         (self.project / '.sessions.json').write_text(
             json.dumps({
                 'schema_version': 1,
@@ -580,29 +672,36 @@ class RealBdRetiredHolderLanesTests(unittest.TestCase):
                         'actor': LIVE_ACTOR,
                         'created_at': '2026-09-15T10:00:00Z',
                     },
-                    RET_REQ: {
-                        'request_id': RET_REQ,
-                        'name': 'ssh-retired',
-                        'actor': RET_ACTOR,
-                        'created_at': '2026-09-15T09:00:00Z',
-                        'retired': True,
-                    },
                 },
                 'owners': {
                     LIVE_ACTOR: 'person:alex',
-                    RET_ACTOR: 'person:alex',
                 },
             }),
             encoding='utf-8',
         )
 
-        # Write an http-state.json that has NO web agent and NO worker credential for LIVE_ACTOR.
+        # Write an http-state.json that has NO web agent and NO worker credential for LIVE_ACTOR,
+        # plus one live enabled web agent (agt_live_web) to verify unreadable authority state below.
+        web_aid = 'agt_live_web'
+        res_web = self.bd('create', 'Web agent task', '--assignee', web_aid, '--json')
+        self.assertEqual(res_web.returncode, 0, res_web.stderr)
+        t_web = json.loads(res_web.stdout)['id']
+        self.assertEqual(0, self.bd('update', t_web, '--status', 'in_progress').returncode)
+
         (self.root / 'http-state.json').write_text(
             json.dumps({
                 'schema_version': 1,
                 'users': {'usr_alex': {'id': 'usr_alex', 'username': 'alex', 'status': 'active'}},
                 'memberships': {'pp': {'usr_alex': 'owner'}},
-                'agents': {},
+                'agents': {
+                    web_aid: {
+                        'id': web_aid,
+                        'name': 'LiveWebAgent',
+                        'owner': 'usr_alex',
+                        'enabled': True,
+                        'projects': ['pp'],
+                    }
+                },
                 'credentials': {},
             }),
             encoding='utf-8',
@@ -615,6 +714,7 @@ class RealBdRetiredHolderLanesTests(unittest.TestCase):
             )
         self.assertEqual(0, reply['returncode'], reply.get('stderr'))
         board = json.loads(reply['stdout'])
+        self.assertNotIn('holder_retired_unknown', board)
         by_actor = {row['actor']: row for row in board['items']}
 
         # Named case (Addition 1): LIVE_ACTOR is registered only in the host session
@@ -625,12 +725,35 @@ class RealBdRetiredHolderLanesTests(unittest.TestCase):
         self.assertNotIn('holder_retired', live_row['held'][0]['flags'])
         self.assertNotIn('holder_retired', live_row['flag_tasks'])
 
-        # Meanwhile, RET_ACTOR IS flagged holder_retired.
+        # Live enabled web agent (web_aid) -> NOT flagged!
+        web_row = by_actor[web_aid]
+        self.assertFalse(web_row['holder_retired'])
+
+        # Meanwhile, RET_ACTOR (no record in registry at all) IS flagged holder_retired.
         ret_row = by_actor[RET_ACTOR]
         self.assertTrue(ret_row['holder_retired'])
         self.assertIn('holder_retired', ret_row['held'][0]['flags'])
         self.assertEqual([t_ret], ret_row['flag_tasks']['holder_retired'])
         self.assertEqual(1, board['flags']['holder_retired'])
+
+        # Review r1 item unreadable-state-flags-everyone: when http_authority.read_state raises,
+        # the live enabled web agent holding t_web is NOT flagged, and holder_retired_unknown: true
+        # is set on the board.
+        import http_authority
+        with mock.patch.dict(os.environ, {'PATH': f'{self.bd_path.parent}:{os.environ.get("PATH", "")}'}), \
+             mock.patch.object(http_authority, 'read_state', side_effect=OSError('http-state locked')):
+            reply_unreadable = rb.endpoint.execute(
+                self.root,
+                {'action': 'work', 'project': 'pp', 'actor': LIVE_ACTOR, 'args': ['lanes']},
+            )
+        self.assertEqual(0, reply_unreadable['returncode'], reply_unreadable.get('stderr'))
+        unreadable_board = json.loads(reply_unreadable['stdout'])
+        self.assertIs(True, unreadable_board.get('holder_retired_unknown'))
+        self.assertEqual(0, unreadable_board['flags']['holder_retired'])
+        unreadable_by_actor = {row['actor']: row for row in unreadable_board['items']}
+        self.assertFalse(unreadable_by_actor[web_aid]['holder_retired'])
+        self.assertNotIn('holder_retired', unreadable_by_actor[web_aid]['held'][0]['flags'])
+        self.assertNotIn('holder_retired', unreadable_by_actor[web_aid]['flag_tasks'])
 
 
 if __name__ == '__main__':

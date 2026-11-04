@@ -94,75 +94,70 @@ def _newest(values):
 
 def registry_names(registry):
     """``actor -> registered lane name`` from a validated session registry."""
-    from sessions import session_retired
     records = registry.get('records') if isinstance(registry, dict) else None
-    names = {}
-    for record in (records or {}).values():
-        if isinstance(record, dict) and isinstance(record.get('actor'), str) and not session_retired(record):
-            names[record['actor']] = str(record.get('name') or record['actor'])
-    return names
+    return {record['actor']: str(record.get('name') or record['actor'])
+            for record in (records or {}).values()
+            if isinstance(record, dict) and isinstance(record.get('actor'), str)}
 
 
 def live_session_actors(registry):
-    """Actors whose session record in ``registry`` is present and not retired (kittrial-5bb.510)."""
-    from sessions import session_retired
+    """Actors whose session record in ``registry`` is present (kittrial-5bb.510)."""
     records = registry.get('records') if isinstance(registry, dict) else None
-    actors = set()
-    for record in (records or {}).values():
-        if (isinstance(record, dict) and isinstance(record.get('actor'), str)
-                and record['actor'] and not session_retired(record)):
-            actors.add(record['actor'])
-    return actors
+    return {record['actor']
+            for record in (records or {}).values()
+            if isinstance(record, dict) and isinstance(record.get('actor'), str) and record['actor']}
 
 
 def holder_retired(holder, live_sessions=(), project=None, authority_state=None, operators=None, now=None):
     """True when ``holder`` is a disabled agent, an agent no longer granted on ``project``,
     or an actor with no live registration on ``project`` (kittrial-5bb.510).
+
+    When ``authority_state`` could not be read (not a ``dict``), retirement is unknown
+    and ``False`` is returned so an unreadable or locked state file never flags live
+    web agents or web users as retired.
     """
+    if not isinstance(authority_state, dict):
+        return False
     if not isinstance(holder, str) or not holder:
         return True
     head = holder.split('/', 1)[0]
     live = set(live_sessions or ())
-    if isinstance(authority_state, dict):
-        import http_authority
-        agents = authority_state.get('agents') or {}
-        if head in agents:
-            agent = agents.get(head)
-            if not isinstance(agent, dict) or not agent.get('enabled', False):
-                return True
-            if project:
-                if project not in (agent.get('projects') or []):
-                    return True
-                if not http_authority.account_in_project(authority_state, agent.get('owner'), project):
-                    return True
-            return False
-        if holder in live or head in live:
-            return False
+    import http_authority
+    agents = authority_state.get('agents') or {}
+    if head in agents:
+        agent = agents.get(head)
+        if not isinstance(agent, dict) or not agent.get('enabled', False):
+            return True
         if project:
-            users = authority_state.get('users') or {}
-            if head in users and http_authority.account_in_project(authority_state, head, project):
-                return False
-            now_ts = (now.timestamp() if isinstance(now, datetime)
-                      else float(now) if isinstance(now, (int, float))
-                      else datetime.now(timezone.utc).timestamp())
-            for cred in (authority_state.get('credentials') or {}).values():
-                if not isinstance(cred, dict) or cred.get('agent_id') or cred.get('revoked'):
-                    continue
-                if cred.get('project_id') != project:
-                    continue
-                expires = cred.get('expires_at')
-                if isinstance(expires, (int, float)) and expires <= now_ts:
-                    continue
-                if not http_authority.account_in_project(authority_state, cred.get('user_id'), project):
-                    continue
-                cred_actor = cred.get('actor') or cred.get('user_id')
-                if cred_actor in (holder, head):
-                    return False
-        return True
+            if project not in (agent.get('projects') or []):
+                return True
+            if not http_authority.account_in_project(authority_state, agent.get('owner'), project):
+                return True
+        return False
     if holder in live or head in live:
         return False
     if operators and (holder in operators or head in operators):
         return False
+    if project:
+        users = authority_state.get('users') or {}
+        if head in users and http_authority.account_in_project(authority_state, head, project):
+            return False
+        now_ts = (now.timestamp() if isinstance(now, datetime)
+                  else float(now) if isinstance(now, (int, float))
+                  else datetime.now(timezone.utc).timestamp())
+        for cred in (authority_state.get('credentials') or {}).values():
+            if not isinstance(cred, dict) or cred.get('agent_id') or cred.get('revoked'):
+                continue
+            if cred.get('project_id') != project:
+                continue
+            expires = cred.get('expires_at')
+            if isinstance(expires, (int, float)) and expires <= now_ts:
+                continue
+            if not http_authority.account_in_project(authority_state, cred.get('user_id'), project):
+                continue
+            cred_actor = cred.get('actor') or cred.get('user_id')
+            if cred_actor in (holder, head):
+                return False
     return True
 
 
@@ -198,10 +193,22 @@ def flag_retired_holders(board, live_sessions=(), project=None, authority_state=
                                  authority_state=authority_state, operators=operators, now=now)
         apply_holder_retired_row(lane, retired)
     flags = dict(board.get('flags') or {})
-    flags['holder_retired'] = max(int(flags.get('holder_retired') or 0),
-                                  sum(1 for row in items if row.get('holder_retired')))
-    if sum(1 for row in items if row.get('holder_retired')) == 0 and board.get('total', len(items)) == len(items):
+    if not isinstance(authority_state, dict):
         flags['holder_retired'] = 0
+        board['holder_retired_unknown'] = True
+    else:
+        board.pop('holder_retired_unknown', None)
+        # ``previous`` is the full-board ``flags['holder_retired']`` count that ``lanes.read``
+        # computed across all ``board['total']`` lanes BEFORE slicing ``board['items']`` to
+        # the current page's ``limit``. When the board is truncated (``total > len(items)`` or
+        # ``next_offset`` is set), ``items`` only holds one page of rows, so ``max(previous,
+        # count)`` keeps the full-board count rather than shrinking it to the page's count;
+        # only when ``count == 0`` on an untruncated board is the full count reset to 0.
+        previous = int(flags.get('holder_retired') or 0)
+        count = sum(1 for row in items if row.get('holder_retired'))
+        flags['holder_retired'] = max(previous, count)
+        if count == 0 and board.get('total', len(items)) == len(items) and board.get('next_offset') is None:
+            flags['holder_retired'] = 0
     board['flags'] = flags
     return board
 
@@ -567,7 +574,7 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
     lanes.sort(key=lambda row: (0 if row['needs_investigation'] else 1, 0 if row['held'] else 1, 0 if row['flag_tasks'] else 1,
                                 str(row['lane']), str(row['actor'])))
     page = lanes[parsed.offset:parsed.offset + parsed.limit]
-    return {
+    result = {
         'schema': 'lanes-v1',
         'generated_at': now.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
         'idle_minutes': parsed.idle_minutes,
@@ -579,3 +586,6 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
                       needs_investigation=sum(1 for row in lanes if row.get('needs_investigation'))),
         'coverage': COVERAGE,
     }
+    if not isinstance(authority_state, dict):
+        result['holder_retired_unknown'] = True
+    return result

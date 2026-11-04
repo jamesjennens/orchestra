@@ -2057,7 +2057,7 @@ class InProcessBackend:
         carries the same name and id.
         """
         from lanes import read as lanes_read
-        from sessions import read_registry, session_retired
+        from sessions import read_registry
         rows = [dict(task, issue_type=task.get('issue_type') or 'task',
                      labels=task.get('labels') or [], dependencies=task.get('dependencies') or [],
                      comments=task.get('comments') or [])
@@ -2083,7 +2083,7 @@ class InProcessBackend:
                     if isinstance(coord.get('operators'), list):
                         operators = list(coord['operators'])
                     for item in coord.get('sessions') or []:
-                        if isinstance(item, dict) and not session_retired(item):
+                        if isinstance(item, dict):
                             s_actor = item.get('actor')
                             if isinstance(s_actor, str) and s_actor.strip():
                                 extra_live_sessions.add(s_actor.strip())

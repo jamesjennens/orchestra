@@ -76,25 +76,12 @@ def owners(path):
     return dict(owner_map(read_registry(path)))
 
 
-def session_retired(record):
-    """True when a session registry record has been marked retired."""
-    if not isinstance(record, dict):
-        return True
-    return bool(record.get('retired') or record.get('status') == 'retired' or record.get('retired_at'))
-
-
 def validate(data):
     if not isinstance(data,dict) or not {'schema_version','records'}.issubset(data) or set(data)-{'schema_version','records','resumes','runs','owners'} or type(data['schema_version']) is not int or data['schema_version']!=1 or not isinstance(data['records'],dict):
         raise ValueError('Invalid session registry')
     actors=set()
     for key,r in data['records'].items():
-        if not isinstance(key,str) or not UUID.fullmatch(key) or not isinstance(r,dict) or not {'request_id','actor','name','created_at'}.issubset(r) or set(r)-{'request_id','actor','name','created_at','retired','retired_at','status'}:
-            raise ValueError('Invalid session record')
-        if 'retired' in r and type(r['retired']) is not bool:
-            raise ValueError('Invalid session record')
-        if 'status' in r and r['status'] not in (None,'active','retired'):
-            raise ValueError('Invalid session record')
-        if 'retired_at' in r and r['retired_at'] is not None and not isinstance(r['retired_at'],str):
+        if not isinstance(key,str) or not UUID.fullmatch(key) or not isinstance(r,dict) or set(r)!={'request_id','actor','name','created_at'}:
             raise ValueError('Invalid session record')
         if r['request_id']!=key or not isinstance(r['actor'],str) or not r['actor'].startswith('session-') or not UUID.fullmatch(r['actor'][8:]) or r['actor'] in actors:
             raise ValueError('Duplicate or invalid session actor')

@@ -35,7 +35,7 @@ def _no_arguments(request, action):
 def coordination(request, path, operators):
     """The ``host-coordination`` answer. ``operators`` is the installation's operator list."""
     _no_arguments(request, 'host-coordination')
-    from sessions import owner_map, read_registry, session_retired
+    from sessions import owner_map, read_registry
     document = {'schema_version': 1, 'operators': sorted(operators), 'sessions': None, 'sessions_note': None}
     try:
         data = read_registry(path)
@@ -45,8 +45,6 @@ def coordination(request, path, operators):
     owners = owner_map(data)
     sessions = {}
     for record in data['records'].values():
-        if session_retired(record):
-            continue
         actor = record.get('actor')
         if isinstance(actor, str) and actor not in sessions:
             principal = owners.get(actor)
