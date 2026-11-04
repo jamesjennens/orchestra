@@ -1253,6 +1253,20 @@ class InProcessBackend:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
+        if operation == 'approve':
+            # kittrial-5bb.516: an approve summary is checked as the canonical write checks it
+            # (review_workflow.validate's ``limited`` and execute's ``check_plain_text``), with the endpoint
+            # backend's own answer for a refusal, so this backend never stores what bd would refuse: no empty
+            # summary (a same-person approval would then carry no basis sentence) and no control characters.
+            from review_workflow import check_plain_text
+            if 'summary' not in payload:
+                # The endpoint backend's own field check (EndpointBackend, 'payload is missing fields').
+                raise invalid('Canonical review payload is missing fields: summary')
+            try:
+                limited(payload.get('summary'), 'summary')
+                check_plain_text({'summary': payload.get('summary')})
+            except ValueError as error:
+                raise invalid('Canonical command rejected the request', 'ValueError: %s' % error) from None
         summary = (payload.get('summary') or '')[:1200]
         operation_id = payload.get('operation_id')
         items, resolutions = [], []

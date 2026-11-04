@@ -213,6 +213,24 @@ class RealStackTests(held.RealStackTests):
         self.assertEqual(before, self.comments(task))
         self.assertEqual('awaiting-review', self.review(task)['state'])
 
+    def test_the_endpoint_refuses_an_empty_or_control_character_approve_summary_as_the_in_process_backend_does(self):
+        """kittrial-5bb.516: what the real endpoint and bd answer for an approve whose summary is missing, empty,
+        blank or carries a control character. tests/test_agent_approval.py asserts the in-process backend gives the
+        very same answers (CANONICAL_SUMMARY_REFUSALS)."""
+        import test_agent_approval
+        task, contribution = self.deliver('casey')
+        before = self.comments(task)
+        seen = {}
+        for name, body in test_agent_approval.SUMMARY_CASES.items():
+            self.count += 1
+            payload = dict(operation='approve', schema_version=1, operation_id='op-sum-%d' % self.count,
+                           previous=contribution, contribution=contribution, **body)
+            answer = self.request('POST', '%s/%s/reviews' % (self.tasks, task), payload, token=self.tokens['alex'])
+            seen[name] = (answer.status, answer.data['error']['code'], answer.data['error']['message'],
+                          answer.data['error'].get('detail'))
+        self.assertEqual(test_agent_approval.CANONICAL_SUMMARY_REFUSALS, seen)
+        self.assertEqual(before, self.comments(task))
+        self.assertEqual('awaiting-review', self.review(task)['state'])
 
 if __name__ == '__main__':
     unittest.main()

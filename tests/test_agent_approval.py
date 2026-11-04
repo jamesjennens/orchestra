@@ -30,6 +30,27 @@ PERSONS_WORK = API.OWN_PARTY_AGENT[0] + API.BY_AGENT_NEXT
 PERSONS_TASK = API.OWN_PARTY_AGENT[2] + API.BY_AGENT_NEXT
 
 
+#: kittrial-5bb.516: approve summaries the canonical write refuses, and what it answers (status, code, message,
+#: detail), as tests/test_coordinator_grant_real.py measures on the real endpoint and bd. The in-process backend
+#: must answer the same.
+SUMMARY_CASES = {
+    'missing': {},
+    'empty': {'summary': ''},
+    'blank': {'summary': '   '},
+    'control-character': {'summary': 'App\x07roved by a coordinator agent of the same person as the agent that '
+                                     'delivered it (project setting agent_approval: by-agent).'},
+}
+CANONICAL_SUMMARY_REFUSALS = {
+    'missing': (422, 'invalid_payload', 'Canonical review payload is missing fields: summary', None),
+    'empty': (422, 'invalid_payload', 'Canonical command rejected the request',
+              'ValueError: summary: must not be empty (limit 1200 characters)'),
+    'blank': (422, 'invalid_payload', 'Canonical command rejected the request',
+              'ValueError: summary: must not be empty (limit 1200 characters)'),
+    'control-character': (422, 'invalid_payload', 'Canonical command rejected the request',
+                          'ValueError: summary must be plain text (no control characters)'),
+}
+
+
 class SamePerson(test_coordinator_grant.Grants):
     """cora is a coordinator; her agent Heron holds the coordinator grant; Egret is her second agent."""
 
@@ -274,6 +295,32 @@ class DefaultTests(SamePerson):
                 'operation': 'approve', 'contribution': ind_cid, 'summary': 'x' * API.SUMMARY_MAX}, token=self.tokens['olive'])
             self.assertEqual(201, fits.status, fits.data)
             self.assertIn(API.SUMMARY_MAX, calls)
+
+    def test_the_in_process_backend_refuses_an_approve_summary_as_the_canonical_write_does(self):
+        """kittrial-5bb.516: a missing, empty or blank approve summary and a control-character forgery of the basis
+        sentence are refused with exactly the endpoint's answers (CANONICAL_SUMMARY_REFUSALS, measured on the real
+        endpoint by test_coordinator_grant_real); nothing is stored. An honest summary is stored as written, and a
+        same-person approval still ends with the server's sentence."""
+        ind_task, ind_cid = self.deliver(self.tokens['carl'])
+        for who_name, who in (('person', self.tokens['olive']), ('agent', self.agent)):
+            for name, body in SUMMARY_CASES.items():
+                with self.subTest(who=who_name, case=name):
+                    answer = self.request('POST', self.base(ind_task) + '/reviews',
+                                          dict(operation='approve', contribution=ind_cid, **body), token=who)
+                    error = answer.data['error']
+                    self.assertEqual(CANONICAL_SUMMARY_REFUSALS[name],
+                                     (answer.status, error['code'], error['message'], error.get('detail')), answer.data)
+                    self.assertEqual(self.state_of(ind_task), 'awaiting-review')
+        honest = 'Checked the diff and the tests; approving.'
+        ok = self.request('POST', self.base(ind_task) + '/reviews', {
+            'operation': 'approve', 'contribution': ind_cid, 'summary': honest}, token=self.tokens['olive'])
+        self.assertEqual(201, ok.status, ok.data)
+        self.assertEqual(self.approval_summary(ind_task), honest)
+        sib_task, sib_cid = self.deliver(self.other)
+        same = self.request('POST', self.base(sib_task) + '/reviews', {
+            'operation': 'approve', 'contribution': sib_cid, 'summary': honest}, token=self.agent)
+        self.assertEqual(201, same.status, same.data)
+        self.assertEqual(self.approval_summary(sib_task), honest + ' ' + API.SAME_PERSON_APPROVAL)
 
     def test_next_actions_keep_a_siblings_work_out_for_an_agent_without_a_grant(self):
         by_heron, _ = self.deliver(self.agent)
