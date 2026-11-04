@@ -1111,6 +1111,8 @@ class Service:
         self._self_check_throttle_audited = {}   # agent id -> time of its last audited 429 (at most one a window)
         self._note_times = {}        # (from project, to project) -> times of its recent notes (kittrial-5bb.447)
         self._note_throttle_audited = {}   # (from project, to project) -> time of its last audited 429
+        self._member_note_times = {}       # (kind, person, project) -> times of recent member notes (kittrial-5bb.508)
+        self._member_note_throttle_audited = {}   # (kind, person, project) -> time of its last audited 429
 
     # -- helpers ---------------------------------------------------------------
     def claim_gate(self, agent_id):
@@ -3552,6 +3554,14 @@ class Service:
     NOTE_WINDOW = 3600
     NOTE_ID = re.compile(r'cnote-[0-9a-f]{24}\Z')
     NOTE_SETTLED = ('replied', 'noted')
+    #: Member notes (kittrial-5bb.508; docs/design/MEMBER_NOTES_DESIGN.md): at most this many an hour from one
+    #: person to one project's coordinators, and this many coordinator replies an hour by one coordinator.
+    MEMBER_NOTE_RATE = 10
+    MEMBER_REPLY_RATE = 60
+    #: The roles that may write to a project's coordinators and read their own threads; a viewer may not.
+    MEMBER_NOTE_ROLES = ('contributor', 'coordinator', 'owner')
+    MEMBER_THREADS_PAGE = 50
+    MEMBER_THREAD_ITEMS = 100
 
     def _note_store(self, write=False):
         """The notes record; a damaged one reads as empty and refuses a write (503)."""
@@ -3579,7 +3589,16 @@ class Service:
                 and isinstance(note.get('thread'), str)):
             return False
         settled = note.get('settled')
-        return settled is None or (isinstance(settled, dict) and settled.get('how') in self.NOTE_SETTLED)
+        if not (settled is None or (isinstance(settled, dict) and settled.get('how') in self.NOTE_SETTLED)):
+            return False
+        if 'kind' in note:
+            # A member note (kittrial-5bb.508): written inside one project, to its coordinator role, or back to
+            # the one member whose thread it is. Any other shape is damage and reads as no note.
+            to = note['to']
+            return (note['kind'] == 'member' and note['from']['project'] == to['project']
+                    and to.get('role') in ('coordinator', 'member') and isinstance(note['from'].get('user_id'), str)
+                    and (to['role'] == 'coordinator' or isinstance(to.get('user_id'), str)))
+        return True
 
     def _notes(self):
         return [note for note in self._note_store()['notes'] if self._note_ok(note)]
@@ -3606,6 +3625,212 @@ class Service:
                 raise error
             recent.append(now)
             self._note_times[pair] = recent
+
+    def member_note_admit(self, user_id, project, replying=False):
+        """Count one member note by ``user_id`` to ``project``'s coordinators (or one coordinator reply) against
+        the hourly limit, or refuse it with 429 and Retry-After. Like :meth:`note_admit`: every authorized attempt
+        counts, a 429 does not, and only the first 429 of a key in a window is audited."""
+        limit = self.MEMBER_REPLY_RATE if replying else self.MEMBER_NOTE_RATE
+        with self.store.lock:
+            now = self._now()
+            key = ('reply' if replying else 'note', user_id, project)
+            recent = [moment for moment in self._member_note_times.get(key, []) if moment > now - self.NOTE_WINDOW]
+            if len(recent) >= limit:
+                self._member_note_times[key] = recent
+                wait = min(self.NOTE_WINDOW, max(1, int(math.ceil(recent[0] + self.NOTE_WINDOW - now))))
+                error = throttled('Too many %s to this project: at most %d an hour. Send it again in %d seconds.'
+                                  % ('replies' if replying else 'notes to its coordinators', limit, wait))
+                error.retry_after = wait
+                audited = self._member_note_throttle_audited.get(key)
+                if audited is not None and now - self.NOTE_WINDOW < audited <= now:
+                    error.quiet_audit = True
+                else:
+                    self._member_note_throttle_audited[key] = now
+                raise error
+            recent.append(now)
+            self._member_note_times[key] = recent
+
+    def _project_role(self, project_id, user_id):
+        return ((self.state.get('memberships') or {}).get(project_id) or {}).get(user_id)
+
+    @staticmethod
+    def _is_person_session(principal):
+        return principal.via != 'credential' and not principal.agent_id
+
+    @staticmethod
+    def _mine_in_thread(note, user_id):
+        """Whether a member note is part of ``user_id``'s own thread: written by that person to the coordinators,
+        or written back to that person. Judged note by note, so another member's thread is never matched."""
+        if note.get('kind') != 'member':
+            return False
+        if note['to'].get('role') == 'member':
+            return note['to'].get('user_id') == user_id
+        return note['from'].get('kind') == 'person' and note['from'].get('user_id') == user_id
+
+    def member_view(self, note, user_id):
+        """A member note as its sender reads it: who wrote it as a kind and a display name only (never an account,
+        agent or actor id), its settlement as how and when, and whether it is an unread reply."""
+        sender = note['from']
+        settled = note.get('settled')
+        return {'id': note['id'], 'kind': 'member', 'project': note['to']['project'], 'thread': note['thread'],
+                'reply_to': note.get('reply_to'), 'created_at': note['created_at'], 'text': note['text'],
+                'from': {'kind': sender.get('kind') if sender.get('kind') in ('person', 'agent') else 'person',
+                         'name': sender.get('name'), 'project': sender['project'],
+                         'you': sender.get('kind') == 'person' and sender.get('user_id') == user_id},
+                'to': {'project': note['to']['project'], 'role': note['to']['role']},
+                'settled': {'how': settled['how'], 'at': settled.get('at')} if settled else None,
+                'unread': note['to']['role'] == 'member' and settled is None}
+
+    def write_member_note(self, principal, project, text, reply_to, mode):
+        """Keep one member note in ``project`` (kittrial-5bb.508). Returns ``(note, dropped)``.
+
+        ``mode='coordinators'``: a PERSON's session (never an agent's credential) holding contributor, coordinator
+        or owner in ``project`` writes to its coordinator role, or follows up in its own thread (``reply_to`` is
+        a note of that person's own thread; any other id is the same 404 as a missing one).
+        ``mode='member'``: a coordinator (an owner, a coordinator person, or an agent holding an effective
+        grant) replies to a member's note; ``reply_to`` is required, the reply is addressed to that member, and it
+        settles the thread's earlier notes to the coordinators. Text is 1-NOTE_TEXT_MAX characters of plain text."""
+        from review_workflow import plain_text
+        from reserved_comments import reserved_match
+        with self.store.lock:
+            self._refresh_authority(principal)
+            role = self._project_role(project, principal.user_id)
+            if mode == 'coordinators':
+                if not self._is_person_session(principal):
+                    raise forbidden('Only a person, signed in, writes to the coordinators of a project; an agent '
+                                    'cannot start or continue a member note')
+                if role not in self.MEMBER_NOTE_ROLES:
+                    raise forbidden('Writing to the coordinators of a project needs the contributor role or above '
+                                    'in it; a viewer may only read')
+            else:
+                if role not in ('owner', 'coordinator'):
+                    raise forbidden('Only the coordinators of this project reply to a member note')
+                if principal.agent_id:
+                    agent = self.state['agents'].get(principal.agent_id)
+                    grant = self.coordinator_view(project, agent) if isinstance(agent, dict) else None
+                    if not (grant and grant['effective']):
+                        raise forbidden('Only the coordinators of this project reply to a member note')
+                if reply_to is None:
+                    raise invalid('A reply to a member needs reply_to, the id of the note it answers')
+            self.member_note_admit(principal.user_id, project, replying=mode == 'member')
+            if not isinstance(text, str) or not text.strip():
+                raise invalid('A note must be 1-%d characters of text' % self.NOTE_TEXT_MAX)
+            if len(text) > self.NOTE_TEXT_MAX:
+                raise invalid('A note is at most %d characters; this one is %d.' % (self.NOTE_TEXT_MAX, len(text)))
+            try:
+                plain_text(text, 'A note')
+            except ValueError as error:
+                raise invalid(str(error)) from None
+            if reserved_match(text) is not None:
+                raise invalid('A note cannot start with a reserved machine-record prefix')
+            store = self._note_store(write=True)
+            notes = [note for note in store['notes'] if self._note_ok(note)]
+            parent = None
+            if reply_to is not None:
+                parent = next((n for n in notes if n['id'] == reply_to and n.get('kind') == 'member'
+                               and n['to']['project'] == project), None)
+                if mode == 'member':
+                    if parent is not None and (parent['to']['role'] != 'coordinator'
+                                               or parent['from'].get('kind') != 'person'):
+                        parent = None
+                elif parent is not None and not self._mine_in_thread(parent, principal.user_id):
+                    parent = None
+                if parent is None:
+                    raise not_found('There is no note %s in this project' % reply_to)
+            now = now_iso(self._now())
+            agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+            note = {'schema_version': 1, 'id': 'cnote-' + secrets.token_hex(12), 'kind': 'member',
+                    'from': {'project': project, 'user_id': principal.user_id, 'agent_id': principal.agent_id,
+                             'kind': 'agent' if principal.agent_id else 'person', 'actor': principal.actor,
+                             'name': (agent.get('name') if isinstance(agent, dict) else None)
+                             or self._owner_name(principal.user_id)},
+                    'to': ({'project': project, 'role': 'coordinator', 'installation': None} if mode == 'coordinators'
+                           else {'project': project, 'role': 'member', 'user_id': parent['from']['user_id'],
+                                 'installation': None}),
+                    'text': text, 'reply_to': reply_to, 'thread': parent['thread'] if parent else None,
+                    'created_at': now, 'settled': None}
+            note['thread'] = note['thread'] or note['id']
+            settling = []
+            if parent is not None and mode == 'member':
+                cut = notes.index(parent)
+                settling = [n for n in notes[:cut + 1] if n['thread'] == parent['thread'] and n['settled'] is None
+                            and n['to']['role'] == 'coordinator' and n.get('kind') == 'member']
+            elif parent is not None and parent['to']['role'] == 'member' and parent['settled'] is None:
+                settling = [parent]
+            for earlier in settling:
+                earlier['settled'] = {'by': principal.user_id, 'actor': principal.actor, 'at': now,
+                                      'how': 'replied', 'reply': note['id']}
+            notes.append(note)
+            addressed = [n for n in notes if n['to']['project'] == project]
+            excess = max(0, len(addressed) - self.NOTES_KEPT)
+            victims = set()
+            if excess:
+                # Settled first, member notes before the cross-project notes of the coordinators, oldest first.
+                order = sorted(addressed, key=lambda n: (n['settled'] is None, n.get('kind') != 'member',
+                                                         n['created_at']))
+                victims = {n['id'] for n in order[:excess]}
+                notes = [n for n in notes if n['id'] not in victims]
+            store['notes'] = notes
+            if victims:
+                dropped = store['dropped'].get(project)
+                store['dropped'][project] = (dropped if type(dropped) is int else 0) + len(victims)
+            self.store.save()
+            return dict(note), len(victims)
+
+    def member_threads_for(self, principal, project):
+        """``principal``'s own member threads in ``project``: ``[{thread, unread, updated_at, items}]``, newest
+        activity first, items oldest first (at most MEMBER_THREAD_ITEMS newest ones). A person's session holding
+        contributor or above only; another member's notes are never matched."""
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if not self._is_person_session(principal):
+                raise forbidden('Only a person, signed in, reads their own member threads')
+            if self._project_role(project, principal.user_id) not in self.MEMBER_NOTE_ROLES:
+                raise forbidden('Reading your threads with the coordinators needs the contributor role or above')
+            mine = [n for n in self._notes() if n['to']['project'] == project
+                    and self._mine_in_thread(n, principal.user_id)]
+        threads = {}
+        for note in mine:
+            threads.setdefault(note['thread'], []).append(note)
+        found = []
+        for position, (thread, items) in enumerate(threads.items()):
+            # Items stay in the order they were stored: two notes in the same second keep the order they came in.
+            found.append({'thread': thread, 'project': project, 'order': position,
+                          'unread': sum(1 for n in items if n['to']['role'] == 'member' and n['settled'] is None),
+                          'updated_at': items[-1]['created_at'],
+                          'items': [self.member_view(n, principal.user_id) for n in items[-self.MEMBER_THREAD_ITEMS:]]})
+        found.sort(key=lambda t: (t['updated_at'], t.pop('order')), reverse=True)
+        return found
+
+    def my_unread_threads(self, principal):
+        """The caller's member threads, in every project where they hold contributor or above now, with an unread
+        reply, newest first: ``(threads, more)``, each ``{project, thread, unread, updated_at, items}`` where items
+        are the unread replies only. A person's session only; an agent has no threads."""
+        if not self._is_person_session(principal):
+            return [], False
+        with self.store.lock:
+            projects = {project for project, members in (self.state.get('memberships') or {}).items()
+                        if isinstance(members, dict) and members.get(principal.user_id) in self.MEMBER_NOTE_ROLES}
+            unread = [n for n in self._notes() if n.get('kind') == 'member' and n['to']['role'] == 'member'
+                      and n['to'].get('user_id') == principal.user_id and n['settled'] is None
+                      and n['to']['project'] in projects]
+        threads = {}
+        for note in unread:
+            threads.setdefault((note['to']['project'], note['thread']), []).append(note)
+        found = []
+        for position, ((project, thread), items) in enumerate(threads.items()):
+            found.append({'project': project, 'thread': thread, 'unread': len(items), 'order': position,
+                          'updated_at': items[-1]['created_at'],
+                          'items': [self.member_view(n, principal.user_id) for n in items]})
+        found.sort(key=lambda t: (t['updated_at'], t.pop('order')), reverse=True)
+        return found[:self.MEMBER_THREADS_PAGE], len(found) > self.MEMBER_THREADS_PAGE
+
+    def note_is_to_member(self, project_id, note_id, user_id):
+        """Whether ``note_id`` is a coordinator's reply to ``user_id`` in ``project_id``. It answers for the
+        addressee alone, so it is no oracle for anyone else about whether a note exists."""
+        with self.store.lock:
+            return any(n['id'] == note_id and n['to']['project'] == project_id and n['to'].get('role') == 'member'
+                       and n['to'].get('user_id') == user_id for n in self._notes())
 
     def write_note(self, principal, from_project, to_project, text, reply_to, linked, unlinked_sentence):
         """Keep one note from ``from_project``'s coordinator to ``to_project``'s coordinator role.
@@ -3671,7 +3896,12 @@ class Service:
         """The notes to ``project_id``'s coordinators (``box='to'``) or sent from it (``'sent'``), newest first."""
         side = 'to' if box == 'to' else 'from'
         with self.store.lock:
+            # A note to the coordinators (cross-project or from a member) is the project's inbox (box 'to'); a
+            # coordinator's reply to a member is something the project sent (box 'sent'), and is never in the inbox.
+            # A member's own note is in the inbox, not in 'sent'.
             found = [dict(note) for note in self._notes() if note[side]['project'] == project_id
+                     and (note['to'].get('role') == 'coordinator' if box == 'to'
+                          else not (note.get('kind') == 'member' and note['to'].get('role') == 'coordinator'))
                      and (not unsettled_only or note['settled'] is None)]
             dropped = self._note_store()['dropped'].get(project_id) if box == 'to' else None
         found.sort(key=lambda note: (note['created_at'], note['id']), reverse=True)
@@ -3685,6 +3915,12 @@ class Service:
             note = next((n for n in self._notes() if n['id'] == note_id and n['to']['project'] == project_id), None)
             if note is None:
                 raise not_found('Note not found')
+            if note['to'].get('role') == 'member':
+                # A coordinator's reply to a member is read, and marked so, by that member alone, in a person's
+                # session (kittrial-5bb.508); to anyone else it is the same 404 as a missing note.
+                if (note['to'].get('user_id') != principal.user_id or not self._is_person_session(principal)
+                        or self._project_role(project_id, principal.user_id) not in self.MEMBER_NOTE_ROLES):
+                    raise not_found('Note not found')
             if note['settled'] is not None:
                 raise conflict('This note is already settled (%s)' % note['settled']['how'],
                                {'settled': dict(note['settled'])})
@@ -3722,7 +3958,9 @@ class Service:
     def unsettled_notes_to(self, projects):
         wanted = set(projects)
         with self.store.lock:
-            found = [dict(note) for note in self._notes() if note['to']['project'] in wanted and note['settled'] is None]
+            # Only notes to the coordinator role: a coordinator's reply to a member (kittrial-5bb.508) wakes no one.
+            found = [dict(note) for note in self._notes() if note['to']['project'] in wanted and note['settled'] is None
+                     and note['to'].get('role') == 'coordinator']
         found.sort(key=lambda note: (note['created_at'], note['id']))
         return found
 

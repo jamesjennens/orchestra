@@ -505,6 +505,13 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     writeNote: (pid, toProject, text, replyTo) => mutate('POST', `/v1/projects/${pid}/notes`,
       replyTo ? { to_project: toProject, text, reply_to: replyTo } : { to_project: toProject, text }),
     noteNoted: (pid, nid) => mutate('POST', `/v1/projects/${pid}/notes/${nid}/noted`, {}),
+    // kittrial-5bb.508: member notes. A person writes to the project's coordinators (or follows up in their own
+    // thread), a coordinator replies to a member, and a person reads their own threads and unread replies.
+    writeMemberNote: (pid, text, replyTo) => mutate('POST', `/v1/projects/${pid}/notes`,
+      replyTo ? { to: 'coordinators', text, reply_to: replyTo } : { to: 'coordinators', text }),
+    replyToMember: (pid, replyTo, text) => mutate('POST', `/v1/projects/${pid}/notes`, { to: 'member', text, reply_to: replyTo }),
+    myNoteThreads: (pid) => call('GET', `/v1/projects/${pid}/notes`, { params: { box: 'mine' } }),
+    myNotes: () => call('GET', '/v1/me/notes'),
     // kittrial-5bb.453: the program view (the Program page).
     programView: (pid, cursor) => call('GET', `/v1/projects/${pid}/program`, { params: cursor ? { cursor } : {} }),
     mergeSlot: (pid) => call('GET', `/v1/projects/${pid}/merge-slot`),
