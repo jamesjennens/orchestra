@@ -356,11 +356,32 @@ for the caller, then reports:
   honoured only from its launch; on the host the key's projects, or any for an operator's unbound key. Every other
   project's path is resolved by `execute`, after the gate.
 - **Areas:** each `program.area.*` entry with its link state, the same as the program-links read gives (.446's one
-  fact). For a readable area: open tasks, lanes `waiting_too_long` and `expect_by_passed` (from `lanes.read`,
+  fact). For a readable area: open tasks, lanes `waiting_too_long`, `expect_by_passed` and `your_move_idle` (from `lanes.read`,
   `idle_minutes` passed through as on the Lanes page) and, on the web, its coordinators. Otherwise "not visible to
   you": a missing area gives the same row.
   - **Open tasks:** open, in progress or blocked, not an epic, not a requirement record (`requirement`,
     `brd-section`), and nothing the queue never lists as work (event and gate rows, the merge slot, record anchors).
+  - **Lane rows** (kittrial-5bb.507): under an area's counts, its lane rows, one per lane, at most 50 lanes (and 50
+    held tasks a lane); `lanes_total` is the number of lanes the reader's scope shows and `lanes_more` says so when
+    rows were cut. A lane row carries the holder's display name (resolved as the area's Lanes page resolves it; the
+    actor id is dropped and never shown), `idle`, the three flags, and per held task its id, title, state, who it
+    waits on, expect-by and flags. The counts (`waiting_too_long`, `expect_by_passed` and now `your_move_idle`) and
+    the rows come from the one `lanes.read` of the reader's scope, so the idle count equals the rows flagged. The
+    page shows them in a collapsed details under the area's row, linking to `#/p/{area}/lanes`.
+  - **The scope rule:** the program never shows more of an area than that area's own Lanes page shows the same
+    reader. Each readable area is read with the scope `_lanes_scope` gives that reader for it (`all` for an
+    operator, owner, coordinator, superuser or coordinator grant of the area; otherwise `own`, the reader's own
+    lane). This is a change: a contributor of an area used to see the whole area's counts in the program, and now
+    sees their own lane's. ONE exception: a person or agent who coordinates or owns the PROGRAM project reads an
+    area's lanes whole (`all`) when the link is `linked`, live and owner-accepted on both sides. The area owner's
+    acceptance is the consent. They must still be able to read the area at all (the readable set), and the
+    exception ends at once, on the next read, when the link is revoked, left or only proposed, or when either role
+    is lost (the role is checked live on every read, and again after it). A reader without the program role gets
+    their own area scope even over a linked area.
+  - **A hidden row has none of this:** an area the reader may not read, one that does not exist, and a row hidden by
+    the recheck after the read carry no count, no lane row, no holder and no task title. The service names the
+    scope of each area it asks for (`--lanes-as`, honoured only from its launch like `--readable`); an area it did
+    not name is read as the program's own lane only, never wider.
   - **The program's side first** (review of .453, B1): an area whose program side is not in (proposed, left, not
     accepted by an owner) is never read, by any caller, so a proposed entry tells nothing about whether a project of
     that name exists. Only an area whose program side is in is read for the one fact, and only a readable one for

@@ -1538,12 +1538,15 @@ class InProcessBackend:
                 'coverage': 'the in-process backend holds no native reference records'}
 
     def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
-                decisions_offset=0, suggestions_offset=0):
+                decisions_offset=0, suggestions_offset=0, lanes_as=None):
         """kittrial-5bb.453: the program view from this backend's own link reads. It holds no native rows (a test may
-        give some in ``native_rows``, {project: rows}), so a readable area has no open task and no lane, and the
-        program no requirement; the rules are the endpoint's (program_view, program_decisions), over the same link
-        facts and the service's own state."""
+        give some in ``native_rows``, {project: rows}), so a readable area has no open task and the program no
+        requirement; the rules are the endpoint's (program_view, program_decisions), over the same link facts and
+        the service's own state. The lanes of a readable area are this backend's own tasks (or the area's
+        ``native_rows``), read by ``lanes.read`` with the scope ``lanes_as`` names for it, as the endpoint does
+        (kittrial-5bb.507); without ``lanes_as`` every lane is read."""
         import program_view
+        native = getattr(self, 'native_rows', None) or {}
         items = self.reference_links(project_id).get('items') or []
         entries = program_view.area_keys(items)
         page = entries[offset:offset + limit]
@@ -1566,11 +1569,22 @@ class InProcessBackend:
             if not exists or area not in set(readable or ()):
                 areas.append(program_view.area_row(area, state))
             else:
-                areas.append(program_view.area_row(area, state, program_view.area_details([], {})))
+                scope, lane_actor = program_view.lanes_scope_for_area(lanes_as, area, state, 'program',
+                                                                      lanes_as is not None)
+                area_rows = native.get(area) if area in native else self._project_rows(area)
+                from lanes import read as lanes_read
+                lane_page = lanes_read(
+                    [dict(task, issue_type=task.get('issue_type') or 'task', labels=task.get('labels') or [],
+                          dependencies=task.get('dependencies') or [], comments=task.get('comments') or [])
+                     for task in area_rows],
+                    lane_actor, {'schema_version': 1, 'records': {}},
+                    ['--idle-minutes', str(idle_minutes), '--limit', str(program_view.LANE_ROWS_MAX)],
+                    journal=None, scope=scope)
+                areas.append(program_view.area_row(
+                    area, state, program_view.area_details([], lane_page['flags'], lane_page)))
         requirements = {'items': [], 'total': 0, 'next_offset': None, 'scope': program_view.REQUIREMENTS_SCOPE}
         import copy
         import program_decisions
-        native = getattr(self, 'native_rows', None) or {}
         sides = {area: program_view.program_side(project_id, area, own, memberships, users) for area, own in entries}
         on_page = {area for area, _ in page}
         states = {area: ('in' if area in on_page else 'not-checked') for area, side in sides.items() if side == 'in'}
@@ -3543,14 +3557,18 @@ class EndpointBackend:
         return payload
 
     def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
-                decisions_offset=0, suggestions_offset=0):
+                decisions_offset=0, suggestions_offset=0, lanes_as=None):
         """kittrial-5bb.453: one page of the program view through the endpoint's read-only `program` action, with the
-        caller's readable projects as the service's own --readable arguments (the .449 rule)."""
+        caller's readable projects as the service's own --readable arguments (the .449 rule). ``lanes_as`` is
+        {area: [scope, elevated, actor]}, the Lanes scope of the caller for each area (kittrial-5bb.507); an area it
+        does not name is read as the program's own lane only."""
         args = ['--offset', str(offset), '--limit', str(limit), '--idle-minutes', str(idle_minutes),
                 '--requirements-offset', str(requirements_offset), '--decisions-offset', str(decisions_offset),
                 '--suggestions-offset', str(suggestions_offset)]
         args += ['--readable'] + [arg for project in sorted(readable) for arg in ('--readable', project)][1:] \
             if readable else ['--readable']
+        for area, (scope, elevated, lane_actor) in sorted((lanes_as or {}).items()):
+            args += ['--lanes-as', '%s|%s|%d|%s' % (area, scope, 1 if elevated else 0, lane_actor)]
         reply = self._endpoint('program', project_id, self.actor_namespace + '/read', args)
         payload = self._checked(reply, 'program', reading=True)
         if not isinstance(payload, dict):
@@ -12863,6 +12881,39 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: Reads of one page when rights change under it (review of .453, B2): each re-read leaves out the areas lost.
     PROGRAM_READS_MAX = 3
 
+    def _program_coordinates(self, principal, program):
+        """Whether the caller coordinates or owns the PROGRAM project now (a live check, nothing cached)."""
+        try:
+            self.service.check_authority(principal, program, CAP_COORDINATE)
+        except HttpError:
+            return False
+        return True
+
+    def _program_lanes_as(self, principal, program, readable, offset, limit):
+        """``({area: [scope, elevated, actor]}, {area: elevated})`` for the areas on this page that the caller reads.
+
+        Each readable area is read with the scope the caller's OWN Lanes page for it has (``_lanes_scope``), so the
+        program never shows more of an area than that area's Lanes page does, with ONE exception (PROGRAM_DESIGN.md
+        section 5): a person or agent who coordinates or owns the PROGRAM project reads an area's lanes whole when
+        the link is live on both sides, because the area's owner accepting the link is the consent. The role is
+        checked live here for every read; the endpoint widens only for a link it finds ``linked`` in the same read,
+        so a revoked or never-accepted link, or a lost role, ends it at once. The caller must still be able to read
+        the area at all (``readable``).
+        """
+        import program_view
+        items = self.backend.reference_links(program).get('items') or []
+        on_page = [area for area, _ in program_view.area_keys(items)[offset:offset + limit]]
+        coordinates = self._program_coordinates(principal, program)
+        actor = self._lanes_actor(principal)
+        found, wide = {}, {}
+        for area in on_page:
+            if area not in readable:
+                continue
+            scope, _basis, _role = self._lanes_scope(principal, area)
+            found[area] = [scope, coordinates and scope == 'own', actor]
+            wide[area] = coordinates and scope == 'own'
+        return found, wide
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/program')
     def program_view_read(self, ctx):
         """The program view, the program manager's dashboard (kittrial-5bb.453; PROGRAM_DESIGN.md sections 5, 9.4).
@@ -12902,20 +12953,34 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         readable = list(self._readable_projects(ctx.principal))
         for attempt in range(self.PROGRAM_READS_MAX):
+            lanes_as, wide = self._program_lanes_as(ctx.principal, pid, readable, state['o'], limit)
             result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw), readable=readable,
                                  decisions_offset=offsets['decisions_offset'],
-                                 suggestions_offset=offsets['suggestions_offset']))
+                                 suggestions_offset=offsets['suggestions_offset'], lanes_as=lanes_as))
             lost = []
             for row in (result.get('areas') or {}).get('items') or []:
                 if not isinstance(row, dict) or not row.get('visible'):
                     continue
                 try:
                     row['coordinators'] = self.service.coordinators_of(ctx.principal, row['area'])
+                    if wide.get(row['area']) and not self._program_coordinates(ctx.principal, pid):
+                        # The program role that widened this area's lanes is gone since the read.
+                        raise forbidden('no longer coordinating the program')
                 except HttpError:
                     lost.append(row['area'])
                     hidden = program_view.area_row(row['area'], row['state'])
                     row.clear()
                     row.update(hidden)
+                    continue
+                # The lane rows name their holders as the Lanes page does; the id the endpoint read them by is
+                # dropped, so an id is never shown.
+                self._lane_display_names(row.get('lanes_rows') or [], row['area'])
+                for lane in row.get('lanes_rows') or []:
+                    lane.pop('actor', None)
+                    lane['lane'] = lane.get('display_name', lane.get('lane'))
+                    for entry in lane.get('held') or []:
+                        if entry.get('waiting_on_name') is not None:
+                            entry['waiting_on'] = entry['waiting_on_name']
             if not lost:
                 break
             # Review of .453, B2 (N1): a right lost after the read. The row is hidden above, and the page is read
@@ -15021,34 +15086,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # ('coordinator', 'reviewer', 'user') stays the server's role word, an actor
         # id resolves to its display name, 'you' stays 'you', and unknown stays
         # absent, so the page never decides a name from an id (assignee_names).
-        try:
-            wanted = []
-            for lane in body.get('items') or []:
-                if not isinstance(lane, dict):
-                    continue
-                if isinstance(lane.get('actor'), str):
-                    wanted.append(lane.get('actor'))
-                for entry in lane.get('held') or []:
-                    if (isinstance(entry, dict) and isinstance(entry.get('waiting_on'), str)
-                            and entry.get('waiting_on') != 'you'):
-                        wanted.append(entry.get('waiting_on'))
-            names = self._actor_names(wanted, ctx.params['pid'])
-        except Exception:
-            names = {}
-        for lane in body.get('items') or []:
-            if not isinstance(lane, dict):
-                continue
-            actor = lane.get('actor')
-            lane['display_name'] = (names.get(actor, lane.get('lane'))
-                                    if isinstance(actor, str) else lane.get('lane'))
-            for entry in lane.get('held') or []:
-                if not isinstance(entry, dict):
-                    continue
-                waited = entry.get('waiting_on')
-                if isinstance(waited, str) and waited and waited != 'you':
-                    entry['waiting_on_name'] = names.get(waited, waited)
-                else:
-                    entry['waiting_on_name'] = None
+        self._lane_display_names(body.get('items') or [], ctx.params['pid'])
         continuation = body.get('next_offset')
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())
@@ -15208,6 +15246,42 @@ class ApiHandler(BaseHTTPRequestHandler):
                             'idle_minutes must be %d to %d (one minute to seven days)'
                             % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
         return minutes
+
+    def _lane_display_names(self, lanes, project_id):
+        """Display names for lane rows, in place (the Lanes route's own step, shared with the program view).
+
+        Each lane gets ``display_name`` and each held entry ``waiting_on_name``, from ``_actor_names`` for
+        ``project_id``: display only, never used for authority. A role word and 'you' stay words, and a
+        lane with no resolvable name keeps its label.
+        """
+        try:
+            wanted = []
+            for lane in lanes:
+                if not isinstance(lane, dict):
+                    continue
+                if isinstance(lane.get('actor'), str):
+                    wanted.append(lane.get('actor'))
+                for entry in lane.get('held') or []:
+                    if (isinstance(entry, dict) and isinstance(entry.get('waiting_on'), str)
+                            and entry.get('waiting_on') != 'you'):
+                        wanted.append(entry.get('waiting_on'))
+            names = self._actor_names(wanted, project_id)
+        except Exception:
+            names = {}
+        for lane in lanes:
+            if not isinstance(lane, dict):
+                continue
+            actor = lane.get('actor')
+            lane['display_name'] = (names.get(actor, lane.get('lane'))
+                                    if isinstance(actor, str) else lane.get('lane'))
+            for entry in lane.get('held') or []:
+                if not isinstance(entry, dict):
+                    continue
+                waited = entry.get('waiting_on')
+                if isinstance(waited, str) and waited and waited != 'you':
+                    entry['waiting_on_name'] = names.get(waited, waited)
+                else:
+                    entry['waiting_on_name'] = None
 
     @staticmethod
     def _lanes_actor(principal):

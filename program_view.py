@@ -114,21 +114,91 @@ def open_task(row):
     return not requirement_record(row.get('labels'))
 
 
-def area_details(rows, lanes_flags):
-    """A readable area's numbers: its open tasks and its lanes waiting long (lanes.read's own flags)."""
+LANES_ARG = '--lanes-as'
+#: At most this many lane rows an area, and held tasks a lane (section 5): the rest is counted, not listed.
+LANE_ROWS_MAX = 50
+LANES_MORE = 'Showing %d of %d lanes; the area\'s own Lanes page lists the rest.'
+
+
+def split_lanes_as(args):
+    """``(the other arguments, {area: (scope, elevated, actor)} or None)``: the web service gives, for each area
+    on the page, the Lanes scope its caller reads that area with (the area's own Lanes rule), whether the caller
+    coordinates the program (which widens ``own`` to ``all`` only for a link that is live on both sides), and the
+    actor the caller's own lane is found by. Each is ``--lanes-as area|scope|0-or-1|actor``."""
+    rest, found, index = [], None, 0
+    args = list(args)
+    while index < len(args):
+        if args[index] != LANES_ARG:
+            rest.append(args[index])
+            index += 1
+            continue
+        found = {} if found is None else found
+        parts = args[index + 1].split('|', 3) if index + 1 < len(args) else []
+        if len(parts) != 4 or parts[1] not in ('all', 'own') or parts[2] not in ('0', '1') or not parts[0]:
+            raise ValueError('Invalid program read: %s takes area|all-or-own|0-or-1|actor' % LANES_ARG)
+        found[parts[0]] = (parts[1], parts[2] == '1', parts[3])
+        index += 2
+    return rest, found
+
+
+def lanes_scope_for_area(given, area, link, program_actor, by_service):
+    """``(scope, actor)`` an area's lanes are read with. A caller other than the web service reads ``all`` (the
+    host's own rule). The web service always names the scope of each area it asks for; an area it did not name is
+    read as the program's own lane only, never wider. ``own`` becomes ``all`` for a program coordinator only when
+    the link is ``linked`` (live, owner-accepted on both sides): the owner accepting the link is the consent."""
+    if not by_service:
+        return 'all', program_actor
+    if given is None or area not in given:
+        return 'own', program_actor
+    scope, elevated, actor = given[area]
+    if scope == 'own' and elevated and link == 'linked':
+        return 'all', actor
+    return scope, actor
+
+
+def lane_rows(page):
+    """The lane rows of a ``lanes.read`` page, cut to LANE_ROWS_MAX: per lane its holder, whether it is idle, the
+    three flags, and what it holds (task, title, state, who it waits on, expect-by, flags). ``actor`` is kept for
+    the service to resolve the holder's name and is dropped there; it is never shown."""
+    rows = []
+    for lane in (page or {}).get('items') or []:
+        if not isinstance(lane, dict) or len(rows) >= LANE_ROWS_MAX:
+            continue
+        held = [{'task': entry.get('task'), 'title': entry.get('title'), 'state': entry.get('state'),
+                 'waiting_on': entry.get('waiting_on'), 'expect_by': entry.get('expect_by'),
+                 'flags': list(entry.get('flags') or [])}
+                for entry in (lane.get('held') or [])[:LANE_ROWS_MAX] if isinstance(entry, dict)]
+        rows.append({'lane': lane.get('lane'), 'actor': lane.get('actor'), 'idle': bool(lane.get('idle')),
+                     'held': held, 'held_total': len(lane.get('held') or []),
+                     'waiting_too_long': bool(lane.get('waiting_too_long')),
+                     'expect_by_passed': bool(lane.get('expect_by_passed')),
+                     'your_move_idle': bool(lane.get('your_move_idle'))})
+    return rows
+
+
+def area_details(rows, lanes_flags, lane_page=None):
+    """A readable area's numbers: its open tasks and its lanes' flags (lanes.read's own counts, over the lanes the
+    reader's scope shows), and the lane rows behind them."""
     flags = lanes_flags or {}
+    shown = lane_rows(lane_page)
+    total = int((lane_page or {}).get('total') or 0)
     return {'open_tasks': sum(1 for row in rows or [] if open_task(row)), 'rows_read': len(rows or []),
             'lanes': {'waiting_too_long': int(flags.get('waiting_too_long') or 0),
-                      'expect_by_passed': int(flags.get('expect_by_passed') or 0)}}
+                      'expect_by_passed': int(flags.get('expect_by_passed') or 0),
+                      'your_move_idle': int(flags.get('your_move_idle') or 0)},
+            'lanes_rows': shown, 'lanes_total': max(total, len(shown)),
+            'lanes_more': LANES_MORE % (len(shown), total) if total > len(shown) else None}
 
 
 def area_row(area, state, details=None):
     """One row of the areas section. Without details (not readable, or no such project) the row is the area's
-    name, its link state and the one sentence: no number, no coordinator."""
+    name, its link state and the one sentence: no number, no coordinator, no lane row."""
     if details is None:
         return {'area': area, 'state': state, 'visible': False, 'note': NOT_VISIBLE}
     return {'area': area, 'state': state, 'visible': True, 'open_tasks': details['open_tasks'],
-            'lanes': dict(details['lanes']), 'rows_read': details['rows_read'], 'coordinators': None}
+            'lanes': dict(details['lanes']), 'rows_read': details['rows_read'], 'coordinators': None,
+            'lanes_rows': [dict(row) for row in details.get('lanes_rows') or []],
+            'lanes_total': details.get('lanes_total', 0), 'lanes_more': details.get('lanes_more')}
 
 
 def citations_to(snap, program, area):

@@ -1385,6 +1385,8 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
     from read_cache import cached_export_rows
     args,given=trace_read.split_readable(list(args))
     if given is not None and not by_service:raise ValueError(trace_read.READABLE_REFUSED)
+    args,lanes_given=program_view.split_lanes_as(args)
+    if lanes_given is not None and not by_service:raise ValueError(trace_read.READABLE_REFUSED)
     readable=frozenset(given or ()) if by_service else key_projects
     facts=None if (by_service or key_projects is None) else key_projects
     options=program_view.parse_args(args)
@@ -1449,11 +1451,15 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
         area_path,area_rows,area_governance=loaded
         import lanes
         from sessions import read_registry
-        flags=lanes.read(area_rows,actor,read_registry(area_path),
-                         ['--idle-minutes',str(options['idle_minutes']),'--limit','1'],now=when,operators=operators,
-                         journal=area_path,scope='all',
-                         comment_authority=comment_contact_authority(root,area_path,operators,authority_config))['flags']
-        areas.append(program_view.area_row(area,link,program_view.area_details(area_rows,flags)))
+        # Section 5: the lanes are read with the scope the caller's own Lanes page for this area has (the service
+        # names it per area; an area it did not name is read as the program's own lane only), widened to the whole
+        # area only for a program coordinator over a link live on both sides. Counts and rows come from the one read.
+        scope,lanes_actor=program_view.lanes_scope_for_area(lanes_given,area,link,actor,by_service)
+        page=lanes.read(area_rows,lanes_actor,read_registry(area_path),
+                        ['--idle-minutes',str(options['idle_minutes']),'--limit',str(program_view.LANE_ROWS_MAX)],
+                        now=when,operators=operators,journal=area_path,scope=scope,
+                        comment_authority=comment_contact_authority(root,area_path,operators,authority_config))
+        areas.append(program_view.area_row(area,link,program_view.area_details(area_rows,page['flags'],page)))
         read_rows[area]=area_rows
         journals[area]=area_path
         snap=trace_read.Snapshot(area_rows,area,now=when,operators=operators,verifiers=configured_verifiers(root),

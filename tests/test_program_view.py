@@ -69,8 +69,9 @@ class RowTests(unittest.TestCase):
         details = program_view.area_details([{'id': 'n-1', 'status': 'open', 'issue_type': 'task'}],
                                             {'waiting_too_long': 2, 'expect_by_passed': 1, 'your_move_idle': 5})
         self.assertEqual({'area': 'north', 'state': 'linked', 'visible': True, 'open_tasks': 1,
-                          'lanes': {'waiting_too_long': 2, 'expect_by_passed': 1}, 'rows_read': 1,
-                          'coordinators': None}, program_view.area_row('north', 'linked', details))
+                          'lanes': {'waiting_too_long': 2, 'expect_by_passed': 1, 'your_move_idle': 5}, 'rows_read': 1,
+                          'coordinators': None, 'lanes_rows': [], 'lanes_total': 0, 'lanes_more': None},
+                         program_view.area_row('north', 'linked', details))
 
     def test_the_link_state_is_the_program_links_reads(self):
         owner, memberships, users = 'usr_' + 'a' * 16, {'prog': {}, 'north': {}}, {}
@@ -192,7 +193,7 @@ class WebTests(LinkCase):
     def test_each_reader_sees_numbers_only_for_the_areas_it_reads(self):
         rows = {row['area']: row for row in self.view(self.tokens['vera'])['areas']['items']}
         self.assertTrue(rows['north']['visible'])
-        self.assertEqual((0, {'waiting_too_long': 0, 'expect_by_passed': 0}),
+        self.assertEqual((0, {'waiting_too_long': 0, 'expect_by_passed': 0, 'your_move_idle': 0}),
                          (rows['north']['open_tasks'], rows['north']['lanes']))
         self.assertIn('nora', [p['display_name'] for p in rows['north']['coordinators']['people']])
         self.assertEqual(program_view.area_row('south', 'linked'), rows['south'])
@@ -562,7 +563,7 @@ console.log(JSON.stringify({text:host.textContent,
         read = {'coverage': {'text': '1 of 2 linked areas readable; 12 rows read'},
                 'areas': {'items': [
                     {'area': 'north', 'state': 'linked', 'visible': True, 'open_tasks': 3,
-                     'lanes': {'waiting_too_long': 1, 'expect_by_passed': 0}, 'rows_read': 12,
+                     'lanes': {'waiting_too_long': 1, 'expect_by_passed': 0, 'your_move_idle': 2}, 'rows_read': 12,
                      'coordinators': {'people': [{'display_name': '<img src=x onerror=1>Nora', 'role': 'owner'}],
                                       'agents': []}},
                     {'area': 'south', 'state': 'linked', 'visible': False, 'note': 'not visible to you'}]},
@@ -576,7 +577,7 @@ console.log(JSON.stringify({text:host.textContent,
         self.assertEqual(done.returncode, 0, done.stderr)
         out = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual(0, out['markup'])
-        self.assertEqual(['northlinked310<img src=x onerror=1>Nora (owner)', 'southlinkednot visible to you'],
+        self.assertEqual(['northlinked3102<img src=x onerror=1>Nora (owner)', 'southlinkednot visible to you'],
                          out['rows'])
         for words in ('1 of 2 linked areas readable', program_view.INTERFACES_NOT_AVAILABLE,
                       program_view.DECISIONS_SCOPE, 'no-area-cites'):
