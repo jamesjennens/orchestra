@@ -21,6 +21,7 @@ sys.path.insert(0, str(KIT / 'tests'))
 import http_service
 import review_workflow
 import test_coordinator_grant
+import work
 
 API = http_service.ApiHandler
 STRICT = API.OWN_PARTY_AGENT[0] + API.OWN_PARTY_AGENT[3]
@@ -54,8 +55,23 @@ CANONICAL_SUMMARY_REFUSALS = {
 class SamePerson(test_coordinator_grant.Grants):
     """cora is a coordinator; her agent Heron holds the coordinator grant; Egret is her second agent."""
 
+    #: kittrial-5bb.515: whether the backend's ``review`` help lists ``approval_basis`` (release B). False serves
+    #: the help of an endpoint from before the readers' release, so these tests keep proving the sentence form
+    #: (the text gate and its fallback); tests/test_approval_basis_writers.py proves the field form.
+    ADVERTISED = False
+
     def setUp(self):
         super().setUp()
+        if not self.ADVERTISED:
+            served = work.help_payload
+
+            def older_help(action='work'):
+                answer = dict(served(action))
+                answer.pop('optional_fields', None)
+                return answer
+            patch = unittest.mock.patch.object(work, 'help_payload', older_help)
+            patch.start()
+            self.addCleanup(patch.stop)
         self.assertEqual(200, self.grant().status)
         self.other, self.other_id = self.agent_with_id('cora', 'Egret')
 

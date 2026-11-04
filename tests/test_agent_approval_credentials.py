@@ -698,7 +698,10 @@ class RealBdTests(test_coordinator_grant_real.RealStackTests):
         self.assertEqual('awaiting-integration', self.review(task)['state'])
         written = self.comments(task)[len(before):]
         self.assertEqual([self.agent_actor], [author for author, _ in written], written)
-        self.assertIn(WORKER_CREDENTIAL_BASIS, written[0][1])
+        # kittrial-5bb.515 B: the real endpoint advertises approval_basis, so bd holds the field, not a sentence.
+        record = json.loads(written[0][1].split('\n', 1)[1])
+        self.assertEqual('same-person-worker-credential', record['approval_basis'])
+        self.assertNotIn(WORKER_CREDENTIAL_BASIS, written[0][1])
         self.assertNotIn(AGENT_BASIS, written[0][1])
 
     def test_shape_3_the_bare_account_id_is_refused_with_its_own_sentence_and_bd_writes_nothing(self):
@@ -720,7 +723,9 @@ class RealBdTests(test_coordinator_grant_real.RealStackTests):
         self.assertEqual(201, approved.status, approved.data)
         written = self.comments(task)[len(before):]
         self.assertEqual([self.agent_actor], [author for author, _ in written], written)
-        self.assertIn(AGENT_BASIS, written[0][1])
+        record = json.loads(written[0][1].split('\n', 1)[1])          # kittrial-5bb.515 B: the field
+        self.assertEqual('same-person-agent', record['approval_basis'])
+        self.assertNotIn(AGENT_BASIS, written[0][1])
         self.assertNotIn(WORKER_CREDENTIAL_BASIS, written[0][1])
 
 

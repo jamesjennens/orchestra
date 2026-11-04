@@ -98,7 +98,7 @@ class RealStackTests(held.RealStackTests):
 
     def test_another_agent_of_its_person_is_approved_and_bd_holds_the_basis(self):
         """kittrial-5bb.438 through the real endpoint: by default cora's coordinator agent approves the work of
-        her other agent, written under its own name with the basis in the summary; strict, it writes nothing."""
+        her other agent, written under its own name with the basis as a field of the record; strict, it writes nothing."""
         self.assertEqual(200, self.grant().status)
         made = self.request('POST', '/v1/agents', {'name': 'Egret', 'working_directory': '/home/x/egret', 'projects': ['pp']},
                             token=self.tokens['cora'])
@@ -111,7 +111,10 @@ class RealStackTests(held.RealStackTests):
         self.assertEqual('awaiting-integration', self.review(task)['state'])
         written = self.comments(task)[len(before):]
         self.assertEqual([self.agent_actor], [author for author, _ in written], written)
-        self.assertIn(http_service.ApiHandler.SAME_PERSON_APPROVAL, written[0][1])
+        # kittrial-5bb.515: the real endpoint advertises approval_basis, so the basis is a field of the record and
+        # the sentence is no longer appended (tests/test_approval_basis_writers.py has the fallback).
+        self.assertIn('"approval_basis":"same-person-agent"', written[0][1].replace(' ', ''))
+        self.assertNotIn(http_service.ApiHandler.SAME_PERSON_APPROVAL, written[0][1])
         strict = self.request('PUT', '/v1/projects/pp/agent-approval', {'agent_approval': 'by-person'},
                               token=self.tokens['alex'])
         self.assertEqual(200, strict.status, strict.data)

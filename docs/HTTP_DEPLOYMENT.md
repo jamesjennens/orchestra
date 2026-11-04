@@ -2485,12 +2485,20 @@ credential approved anything; this is the one place where that is lifted.
     re-runs set-up from My agents, which writes the current file. Nothing is lost by not doing so: who may
     approve is unchanged by this release.
 - **An approval only this setting let through says so.**
-  - The web service appends to its summary: "Approved by a coordinator agent of the same person
-    as the agent that delivered it (project setting agent_approval: by-agent)."
+  - The web service records the approval's `approval_basis` (`same-person-agent`, or
+    `same-person-worker-credential` for a worker credential of its person) as a field of
+    the `approve` record, and the approver's summary stays their own words (kittrial-5bb.515,
+    release B). It does so only when the endpoint's machine-readable `review` help lists
+    `approval_basis` under `optional_fields.approve`; for an endpoint that does not (a kit before
+    the readers' release), it appends to the summary instead: "Approved by a coordinator agent of
+    the same person as the agent that delivered it (project setting agent_approval: by-agent)."
+    The route answers `422` to a request body that names `approval_basis`. Release order and the
+    rollback boundary are in [OPERATIONS.md](OPERATIONS.md#the-approval-basis-field-release-order-and-rollback-kittrial-5bb515).
   - The audit event of the review write carries `same_person_coordinator: true`, the author,
     the assignee, the mode, and who set it (or `default`) and when.
-  - If the caller's summary leaves no room for that sentence within the 1200-character bound,
-    the route answers `422` and says how many characters to cut. Nothing is written.
+  - In the sentence form, if the caller's summary leaves no room for that sentence within the
+    1200-character bound, the route answers `422` and says how many characters to cut. Nothing is
+    written. The field form appends nothing, so the whole 1200 characters are the approver's.
   - The web route refuses a caller-written basis sentence on `approve` or `recommend` with `422`
     (after NFKC, casefold, Unicode format-character removal, whitespace collapse and
     punctuation/bracket stripping; lookalike letters remain), while the host route does not, so
