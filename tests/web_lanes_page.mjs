@@ -76,8 +76,14 @@ function board(idleMinutes, extra) {
 
 let scopeExtra = {};
 const calls = [];
-function transport(method, path) {
+const nudgeBodies = [];
+function transport(method, path, _headers, body) {
   calls.push(method + ' ' + path);
+  if (method === 'POST' && path === '/v1/projects/alpha/nudges') {
+    const parsed = body ? JSON.parse(body) : {};
+    nudgeBodies.push(parsed);
+    return Promise.resolve({ status: 201, data: { nudge: { id: 'nudge-' + '0'.repeat(24), lane: parsed.lane, message: parsed.message, state: 'pending' }, coalesced: false } });
+  }
   if (path === '/v1/projects/alpha') return Promise.resolve({ status: 200, data: PROJECT });
   if (path.startsWith('/v1/projects/alpha/tasks')) {
     return Promise.resolve({ status: 200,
@@ -198,5 +204,85 @@ for (const [name, extra] of Object.entries(variants)) {
   out.scopeSentences[name] = fresh.all((e) => e.tagName === 'P' && e.textContent.includes('idle minutes'))
     .map((e) => e.textContent);
 }
+// 8. Lane nudge slice 3 (kittrial-5bb.513):
+//    - nudge sentence under each lane row (plain text, never innerHTML);
+//    - Nudge button shown only when data.can_nudge === true AND lane.carrier_seen === true;
+//    - lane with carrier_seen: false shows the no-carrier sentence and no button;
+//    - closed-list form (message, reason, optional note <= 200);
+//    - declared-wait confirmation required before sending on a declared waiting-on-* lane.
+const waitingCarried = Object.assign({}, JSON.parse(JSON.stringify(WAITING_LANE)), {
+  carrier_seen: true,
+  nudge: { id: 'nudge-1', message: 'resume', state: 'delivered', requested_at: '2026-10-17T19:50:00Z',
+    requested_by_display: '<b>Cora</b>', outcome_at: '2026-10-17T19:51:00Z', outcome_detail: null },
+});
+const guessedCarried = Object.assign({}, JSON.parse(JSON.stringify(GUESSED_LANE)), {
+  carrier_seen: true,
+  nudge: { id: 'nudge-2', message: 'restart', state: 'failed', requested_at: '2026-10-17T19:40:00Z',
+    requested_by_display: 'Olive', outcome_at: '2026-10-17T19:41:00Z', outcome_detail: 'not-at-prompt' },
+});
+const freeNoCarrier = Object.assign({}, JSON.parse(JSON.stringify(FREE_LANE)), {
+  carrier_seen: false,
+  nudge: { id: 'nudge-3', message: 'resume', state: 'not-deliverable', requested_at: '2026-10-17T19:00:00Z',
+    requested_by_display: 'Olive', outcome_at: '2026-10-17T19:15:00Z', outcome_detail: 'no-carrier' },
+});
+// 8a. can_nudge: false (even with PROJECT.role === 'owner' and scope: 'all') shows NO Nudge button.
+scopeExtra = {
+  scope: 'all', scope_basis: 'project-role', scope_role: 'owner', can_nudge: false,
+  items: [waitingCarried, guessedCarried, freeNoCarrier],
+};
+const unauthPanel = view.lanesPanel(ctx, PROJECT);
+document.body.append(unauthPanel);
+await settle();
+out.nudgeButtonsWhenCannotNudge = unauthPanel.all((e) => e.attributes && e.attributes['data-nudge-button']).map((e) => e.attributes['data-nudge-button']);
+// 8b. can_nudge: true shows Nudge button only on rows with carrier_seen: true (waitingCarried, guessedCarried)
+//     and shows the no-carrier sentence and no button on freeNoCarrier (carrier_seen: false).
+scopeExtra = {
+  scope: 'all', scope_basis: 'project-role', scope_role: 'owner', can_nudge: true,
+  items: [waitingCarried, guessedCarried, freeNoCarrier],
+};
+const nudgePanel = view.lanesPanel(ctx, PROJECT);
+document.body.append(nudgePanel);
+await settle();
+out.nudgeLines = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge']).map((e) => e.textContent);
+out.nudgeBoldTags = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge']).reduce((n, e) => n + e.all((c) => c.tagName === 'B').length, 0);
+out.noCarrierLines = nudgePanel.all((e) => e.attributes && e.attributes['data-no-carrier']).map((e) => e.textContent);
+out.nudgeButtonsWhenCanNudge = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-button']).map((e) => e.attributes['data-nudge-button']);
+// Open the form on the declared-wait lane (session-a).
+const waitBtn = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-button'] === 'session-a')[0];
+await waitBtn.dispatch('click');
+await settle();
+const msgSelect = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-message'] === 'session-a')[0];
+const rsnSelect = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-reason'] === 'session-a')[0];
+const noteInput = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-note'] === 'session-a')[0];
+const ackBox = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-ack-wait'] === 'session-a')[0];
+const waitWarn = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-wait-warning'])[0];
+const sendBtn = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-submit'] === 'session-a')[0];
+const statusSpan = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-status'] === 'session-a')[0];
+out.nudgeMessageOptions = msgSelect.all((e) => e.tagName === 'OPTION').map((e) => e.value);
+out.nudgeReasonOptions = rsnSelect.all((e) => e.tagName === 'OPTION').map((e) => e.value);
+out.nudgeNoteMaxlength = noteInput.attributes.maxlength;
+out.nudgeWaitWarning = waitWarn ? waitWarn.textContent : null;
+// Attempt to send without checking the declared-wait confirmation: refused before any POST.
+await sendBtn.dispatch('click');
+await settle();
+out.nudgeUnconfirmedStatus = statusSpan.textContent;
+out.nudgeUnconfirmedSent = nudgeBodies.length;
+// Check the confirmation, select restart + api-error + note, and send.
+ackBox.checked = true;
+msgSelect.value = 'restart';
+rsnSelect.value = 'api-error';
+noteInput.value = 'model 529 at prompt';
+await sendBtn.dispatch('click');
+await settle();
+out.nudgeConfirmedBody = nudgeBodies[0] || null;
+// Open the form on the guessed-wait lane (session-c, declared: false, inferred: true): no confirmation needed.
+const guessedBtn = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-button'] === 'session-c')[0];
+await guessedBtn.dispatch('click');
+await settle();
+out.guessedHasWaitWarning = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-wait-warning']).length;
+const guessedSend = nudgePanel.all((e) => e.attributes && e.attributes['data-nudge-submit'] === 'session-c')[0];
+await guessedSend.dispatch('click');
+await settle();
+out.nudgeGuessedBody = nudgeBodies[1] || null;
 out.calls = calls;
 console.log(JSON.stringify(out));

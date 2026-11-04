@@ -4199,6 +4199,46 @@ class Service:
                         nudges.effective(record, now, now_iso, self._carried), self.state['users'], self.state['agents']))
         return found
 
+    def carrier_seen_views(self, project_id, lanes):
+        """Whether a carrier for each named lane's account sent a heartbeat within ``nudges.CARRIER_WINDOW`` (90 s).
+
+        Uses the slice 2 ``_carrier_registry`` and the same reach rule as :meth:`_carrier_sees` (enabled agent
+        granted ``project_id``, live account in ``project_id``, ``full_actor_parties == {user_id}``, and ``lane``
+        listed in the heartbeat's ``lanes``). Never raises: a damaged registry reads as ``False``.
+        """
+        wanted = {lane for lane in lanes if isinstance(lane, str)}
+        found = {lane: False for lane in wanted}
+        if not wanted:
+            return found
+        now = self._now()
+        with self.store.lock:
+            try:
+                registry = self._carrier_registry()
+            except HttpError:
+                return found
+            if project_id not in (self.state.get('projects') or {}):
+                return found
+            parties = {lane: full_actor_parties(self.state, lane, project_id) for lane in wanted}
+            agents = self.state.get('agents') if isinstance(self.state.get('agents'), dict) else {}
+            for agent_id, entry in registry.items():
+                if not isinstance(entry, dict):
+                    continue
+                seen = entry.get('seen_ts')
+                if type(seen) not in (int, float) or not (now - nudges.CARRIER_WINDOW <= seen <= now):
+                    continue
+                agent = agents.get(agent_id)
+                if not isinstance(agent, dict) or not agent.get('enabled') \
+                        or project_id not in (agent.get('projects') or []):
+                    continue
+                user_id = entry.get('user_id') if isinstance(entry.get('user_id'), str) else agent.get('user_id')
+                if not isinstance(user_id, str) or not account_in_project(self.state, user_id, project_id):
+                    continue
+                reached = entry.get('lanes') if isinstance(entry.get('lanes'), list) else ()
+                for lane in wanted:
+                    if not found[lane] and lane in reached and parties[lane] == {user_id}:
+                        found[lane] = True
+        return found
+
     # -- the nudge carrier (kittrial-5bb.415; docs/NUDGE_CARRIER.md) -----------------------------
     CARRIERS_DAMAGED = 'The record of nudge carriers in the service state is damaged (it is not an object).'
     NUDGE_CLOSED = 'This nudge request is closed.'

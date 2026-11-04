@@ -411,3 +411,16 @@ declared-wait detail.
 The lanes read that finds the lane runs without the service-wide lock; only the authority re-check and
 the write are under it. Two refusals are not audited, as everywhere in the service and older than this
 route: a 422 from the shared body parser before the route runs, and the 409 of a key reused with another body.
+
+Lanes page and coordinator guide (kittrial-5bb.513, slice 3): `GET /v1/projects/{pid}/lanes` carries
+`can_nudge` (true when `Service.check_authority(principal, pid, CAP_COORDINATE)` passes, the exact check
+`POST /v1/projects/{pid}/nudges` enforces) and each row carries `carrier_seen` (whether a carrier for that
+lane's account sent a heartbeat within `nudges.CARRIER_WINDOW`, 90 seconds). On the Lanes page
+(`web/js/views/project.js`, `web/js/api.js`), each row renders its `nudge` sentence as plain text when a
+nudge exists; a row with `carrier_seen: false` shows the no-carrier sentence (`No supervisor is running for
+this lane’s owner, so a nudge cannot be delivered.`) and no button; and a row with `carrier_seen: true` shows
+the `Nudge` button only when `can_nudge` is true, opening the closed-list form (`message` in `resume`,
+`restart`; `reason` in `stalled-at-prompt`, `api-error`, `lost-wake`, `no-answer`, `other`; optional audit-only
+`note` of at most 200 characters) and requiring the declared-wait confirmation (`acknowledge_declared_wait:
+true`) before sending when the lane holds a task in a declared `waiting-on-*` state. The coordinator guide
+(`agent_prompts.LANE_NUDGE` and `web/js/agentSetup.js`) carries the matching nudge rules word for word.

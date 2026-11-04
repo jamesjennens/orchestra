@@ -518,6 +518,166 @@ class LanesPageTests(unittest.TestCase):
         self.assertIn('No access', seen['refusal'])
         self.assertIn('Your access to this project has ended.', seen['refusal'])
         self.assertTrue(seen['refusalHasRetry'])
+        # Slice 3 (kittrial-5bb.513): nudge status line as plain text (never innerHTML),
+        # no-carrier sentence when carrier_seen is false, button gated on server-computed
+        # can_nudge and per-row carrier_seen, closed message/reason lists + 200-char note,
+        # and declared-wait confirmation before sending.
+        self.assertEqual(3, len(seen['nudgeLines']), seen['nudgeLines'])
+        self.assertIn('by <b>Cora</b> (resume): delivered', seen['nudgeLines'][0])
+        self.assertIn('by Olive (restart): failed: not at prompt', seen['nudgeLines'][1])
+        self.assertIn('by Olive (resume): not deliverable (no carrier seen)', seen['nudgeLines'][2])
+        self.assertEqual(0, seen['nudgeBoldTags'])
+        self.assertEqual(['No supervisor is running for this lane\u2019s owner, so a nudge cannot be delivered.'],
+                         seen['noCarrierLines'])
+        self.assertEqual([], seen['nudgeButtonsWhenCannotNudge'])
+        self.assertEqual(['session-a', 'session-c'], seen['nudgeButtonsWhenCanNudge'])
+        self.assertEqual(['resume', 'restart'], seen['nudgeMessageOptions'])
+        self.assertEqual(['stalled-at-prompt', 'api-error', 'lost-wake', 'no-answer', 'other'],
+                         seen['nudgeReasonOptions'])
+        self.assertEqual('200', seen['nudgeNoteMaxlength'])
+        self.assertIn('This lane says it is waiting on coordinator since', seen['nudgeWaitWarning'])
+        self.assertIn('Nudge it anyway?', seen['nudgeWaitWarning'])
+        self.assertEqual('Confirm that you have read what this lane says it is waiting on before sending.',
+                         seen['nudgeUnconfirmedStatus'])
+        self.assertEqual(0, seen['nudgeUnconfirmedSent'])
+        self.assertEqual({'lane': 'session-a', 'message': 'restart', 'reason': 'api-error',
+                          'note': 'model 529 at prompt',
+                          'acknowledge_declared_wait': True}, seen['nudgeConfirmedBody'])
+        self.assertEqual(0, seen['guessedHasWaitWarning'])
+        self.assertEqual({'lane': 'session-c', 'message': 'resume', 'reason': 'stalled-at-prompt'},
+                         seen['nudgeGuessedBody'])
+
+
+import time
+import agent_prompts
+import nudges
+import test_lane_nudge_carrier as carrier_tests
+
+
+class LanesNudgeSlice3Tests(carrier_tests.CarrierCase):
+    """Slice 3 (kittrial-5bb.513): server-computed can_nudge, per-row carrier_seen, and coordinator guide."""
+
+    def test_can_nudge_equals_whether_the_nudge_post_is_accepted_across_principals(self):
+        # Carl is a listed installation operator (sees every lane on GET /lanes) without CAP_COORDINATE;
+        # self.agent starts without a coordinator grant, then receives one.
+        self.plant_coordination(operators=[self.ids['carl']])
+        unganted_agent = self.agent
+        cases = [
+            ('owner', self.tokens['olive'], True),
+            ('coordinator', self.tokens['cora'], True),
+            ('superuser', self.admin, True),
+            ('operator-without-coordinate', self.tokens['carl'], False),
+            ('contributor', self.tokens['dave'], False),
+            ('viewer', self.tokens['vera'], False),
+            ('agent-without-grant', unganted_agent, False),
+        ]
+        for label, token, expected in cases:
+            with self.subTest(who=label):
+                self.later(1000)
+                read = self.lanes(token)
+                self.assertEqual(200, read.status, read.data)
+                post = self.nudge(token, self.ids['dave'])
+                accepted = (post.status == 201)
+                self.assertEqual(expected, accepted, (label, post.status, post.data))
+                self.assertIs(read.data.get('can_nudge'), accepted, (label, read.data))
+
+        # Now grant the agent CAP_COORDINATE and verify both flip to True together.
+        granted = self.granted_agent()
+        self.later(1000)
+        read = self.lanes(granted)
+        self.assertEqual(200, read.status, read.data)
+        post = self.nudge(granted, self.ids['dave'])
+        self.assertEqual(201, post.status, post.data)
+        self.assertIs(read.data.get('can_nudge'), True)
+
+    def test_carrier_seen_reflects_heartbeat_within_carrier_window_per_lane(self):
+        # Freeze the base clock so boundary checks on CARRIER_WINDOW (90 s) are exact.
+        base_now = time.time()
+        self.shift = 0
+        self.service._now = lambda: base_now + self.shift
+
+        # 1. No heartbeat: both rows answer carrier_seen=False.
+        initial = self.lanes(self.tokens['olive']).data
+        by_actor = {row['actor']: row for row in initial['items']}
+        self.assertIs(by_actor[self.ids['carl']]['carrier_seen'], False)
+        self.assertIs(by_actor[self.ids['dave']]['carrier_seen'], False)
+
+        # 2. Fresh heartbeat for carl's lane within nudges.CARRIER_WINDOW (90 s):
+        # carl is True, dave stays False.
+        secret, agent_id = self.carrier('carl')
+        beat = self.beat(secret, [self.ids['carl']])
+        self.assertEqual(200, beat.status, beat.data)
+        self.assertEqual(90, nudges.CARRIER_WINDOW)
+        fresh = self.lanes(self.tokens['olive']).data
+        by_actor = {row['actor']: row for row in fresh['items']}
+        self.assertIs(by_actor[self.ids['carl']]['carrier_seen'], True)
+        self.assertIs(by_actor[self.ids['dave']]['carrier_seen'], False)
+
+        # Still inside CARRIER_WINDOW (89 s): carrier_seen stays True.
+        self.shift += nudges.CARRIER_WINDOW - 1
+        still_fresh = self.lanes(self.tokens['olive']).data
+        by_actor = {row['actor']: row for row in still_fresh['items']}
+        self.assertIs(by_actor[self.ids['carl']]['carrier_seen'], True)
+
+        # 3. Past CARRIER_WINDOW (91 s > 90 s): heartbeat is stale, carrier_seen is False.
+        self.shift += 2
+        stale = self.lanes(self.tokens['olive']).data
+        by_actor = {row['actor']: row for row in stale['items']}
+        self.assertIs(by_actor[self.ids['carl']]['carrier_seen'], False)
+
+        # 4. A fresh heartbeat from a disabled carrier agent does not count as seen.
+        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+        self.service.state['agents'][agent_id]['enabled'] = False
+        disabled = self.lanes(self.tokens['olive']).data
+        by_actor = {row['actor']: row for row in disabled['items']}
+        self.assertIs(by_actor[self.ids['carl']]['carrier_seen'], False)
+
+    def test_coordinator_guide_lane_nudge_matches_agent_setup_and_is_coordinator_only(self):
+        agent = {'id': 'agent_7', 'name': 'kestrel', 'owner': 'usr_cora'}
+        empty_classes = {'review': [], 'integrate': [], 'stale': [], 'unclaimed': [],
+                         'claimable': [], 'blocked': [], 'status': []}
+        coord_projects = [{'id': 'alpha', 'name': 'Alpha', 'role': 'coordinator',
+                           'can_approve': True, 'can_work': True, 'classes': empty_classes}]
+        worker_projects = [{'id': 'alpha', 'name': 'Alpha', 'role': 'contributor',
+                            'can_approve': False, 'can_work': True, 'classes': empty_classes}]
+        coord_prompt = agent_prompts.build_prompt(
+            agent, 'Cora Coordinator', coord_projects, '2026-10-17T20:00:00Z', 'https://coord.example')['text']
+        self.assertIn(agent_prompts.LANE_NUDGE, coord_prompt)
+        worker_prompt = agent_prompts.build_prompt(
+            agent, 'Carl Worker', worker_projects, '2026-10-17T20:00:00Z', 'https://coord.example')['text']
+        self.assertNotIn(agent_prompts.LANE_NUDGE, worker_prompt)
+
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        script = """
+            const m = await import(process.argv[1]);
+            const coordPayload = m.secretlessPayload({
+                agent: { id: 'agent_7', name: 'kestrel', owner_display_name: 'Cora',
+                         projects: ['alpha'], coordinates: [{ project: 'alpha', effective: true }] },
+                setup: {},
+            }, 'https://coord.example');
+            const workerPayload = m.secretlessPayload({
+                agent: { id: 'agent_7', name: 'kestrel', owner_display_name: 'Carl',
+                         projects: ['alpha'], coordinates: [] },
+                setup: {},
+            }, 'https://coord.example');
+            console.log(JSON.stringify({
+                laneNudge: m.LANE_NUDGE,
+                coord: m.agentGuide(coordPayload),
+                worker: m.agentGuide(workerPayload),
+            }));
+        """
+        done = test_http_web.run_node_module(
+            self, node, script, (KIT / 'web' / 'js' / 'agentSetup.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(agent_prompts.LANE_NUDGE, out['laneNudge'])
+        self.assertIn(agent_prompts.LANE_NUDGE, out['coord'])
+        self.assertIn('## Nudging a stalled lane', out['coord'])
+        self.assertNotIn(agent_prompts.LANE_NUDGE, out['worker'])
+        self.assertNotIn('## Nudging a stalled lane', out['worker'])
 
 
 if __name__ == '__main__':

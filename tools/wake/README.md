@@ -110,6 +110,13 @@ If a harness can only be started by an action a person takes, no poll-and-wake
 script can help: say so in one line and stop. **A lane must not end its turn to
 wait without a waker.**
 
+For an interactive lane that stops at its prompt outside `client.py wait` (for
+example after a model API error), a coordinator can request a fixed `resume` or
+`restart` nudge from the Lanes page (`POST /v1/projects/PROJECT/nudges`,
+`docs/LANE_BOARD_DESIGN.md` section 12 and `docs/HTTP_DEPLOYMENT.md`), carried
+out by the reference supervisor in `tools/nudge/` (`tools/nudge/README.md` and
+`docs/NUDGE_CARRIER.md`; design `docs/design/LANE_NUDGE_DESIGN.md`).
+
 ## Set it up (all platforms)
 
 1. Copy `wake.sh` or `wake.ps1` into this lane's own private directory, for

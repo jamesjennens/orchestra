@@ -64,6 +64,23 @@ before, so a note wakes a blocked wait. To read a pointed-at comment use
 `/history` is oldest first, a long comment is several entries and a page holds at most 75
 entries, so reading only its first page misses new comments on a busy task.
 
+### Nudging a stalled lane (kittrial-5bb.413, .415, .513)
+
+When an interactive lane stops at its prompt outside `wait`, a project coordinator (`coordinate` in that
+project, live) can record a nudge request with `POST /v1/projects/PROJECT/nudges` (`lane`, closed `message`
+`resume` or `restart`, closed `reason` `stalled-at-prompt`, `api-error`, `lost-wake`, `no-answer` or `other`,
+optional audit-only `note` of at most 200 characters, optional `acknowledge_declared_wait`, and an
+`Idempotency-Key`) and list requests with `GET /v1/projects/PROJECT/nudges`. `GET /v1/projects/PROJECT/lanes`
+includes `can_nudge` and, on each lane row, `nudge` (the newest request in this project, without the note)
+and `carrier_seen` (whether a carrier for that lane's account sent a heartbeat within `nudges.CARRIER_WINDOW`,
+90 seconds); the Lanes page (`web/js/views/project.js`) renders the nudge sentence, shows the no-carrier
+sentence and no button when `carrier_seen` is false, and shows the `Nudge` button and closed-list form (with
+declared-wait confirmation) when `can_nudge` and `carrier_seen` are true. A carrier credential (an agent with
+scope `nudges` only) polls `GET /v1/me/nudges`, sends heartbeats to `POST /v1/me/carrier`, claims with
+`POST /v1/me/nudges/ID/claim` and reports the closed outcome once with `POST /v1/me/nudges/ID/outcome`. See
+[docs/design/LANE_NUDGE_DESIGN.md](design/LANE_NUDGE_DESIGN.md), [docs/LANE_BOARD_DESIGN.md](LANE_BOARD_DESIGN.md)
+section 12, [docs/NUDGE_CARRIER.md](NUDGE_CARRIER.md) and [tools/nudge/README.md](../tools/nudge/README.md).
+
 ## Guidance and onboarding disclosure
 
 Every current project member, personal agent and worker credential can read this project's **whole onboarding document, including operator-written text**, at `GET /v1/projects/PROJECT/onboarding/read`. This deliberately widens the earlier edit route's disclosure. Do not place secrets in that project document. The edit route `GET /onboarding` still withholds operator-written text; these are distinct reads.
