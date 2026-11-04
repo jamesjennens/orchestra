@@ -302,7 +302,7 @@ class DelegationTests(unittest.TestCase):
     def test_a_record_without_its_journal_entry_grants_nothing(self):
         result = self.write(request())
         (self.project / d.JOURNAL_DIR / (result['record']['sha256'] + '.json')).unlink()
-        self.refused('no delegation is recorded')
+        self.refused('unhonoured comment')
 
     def test_lost_revoke_receipt_does_not_restore_grant(self):
         self.write(request())
@@ -429,10 +429,10 @@ class DelegationTests(unittest.TestCase):
         # (the comment author is the native --actor label), with no journal entry: nothing.
         record = d.make_record(request(), project=PROJECT, recorded_by=OWNER, via='session', account=OWNER, at=AT[1])
         self.native.comment('pp-dec', d.body(record), author='lane-agent')
-        self.refused('no delegation is recorded')
+        self.refused('unhonoured comment')
         # Even with a journal entry, a comment whose native author is not the recorder is not it.
         d.publish(self.project, record)
-        self.refused('no delegation is recorded')
+        self.refused('unhonoured comment')
         # A record claiming an agent wrote it as a session cannot be built at all.
         with self.assertRaises(ValueError):
             d.make_record(request(), project=PROJECT, recorded_by=AGENT, via='session', account=AGENT, at=AT[1])
@@ -444,7 +444,7 @@ class DelegationTests(unittest.TestCase):
                      comment['text'].replace('coordinator-grant', AGENT)):
             with self.subTest(text=text[:40]):
                 comment['text'] = text
-                self.refused('no delegation is recorded')
+                self.refused('unhonoured comment')
         record = result['record']
         self.assertIsNone(d.parse_comment({'author': OWNER, 'text': d.body(record)}, project='other', decision='pp-dec'))
         self.assertIsNone(d.parse_comment({'author': OWNER, 'text': d.body(record)}, project=PROJECT, decision='pp-x'))
@@ -475,7 +475,7 @@ class DelegationTests(unittest.TestCase):
         moved = Path(self.tmp.name) / 'elsewhere'
         journal.rename(moved)
         journal.symlink_to(moved, target_is_directory=True)
-        self.refused('no delegation is recorded')
+        self.refused('unhonoured comment')
         self.assertFalse(d.journaled(self.project, result['record']))
 
     def test_the_journal_entry_validates_for_a_backup(self):
@@ -504,6 +504,88 @@ class DelegationTests(unittest.TestCase):
         self.assertTrue(items['pp-dec']['in_force'])
         self.assertFalse(items['pp-old']['in_force'])
         self.assertIn('revoked', items['pp-old']['reason'])
+
+    # -- kittrial-5bb.469 --------------------------------------------------------------------
+    def test_a_decision_whose_only_delegation_comment_is_unhonoured_is_listed_with_its_reason(self):
+        result = self.write(request())
+        (self.project / d.JOURNAL_DIR / (result['record']['sha256'] + '.json')).unlink()
+        items = d.listing([self.row()], PROJECT, state(), self.project, ['ops'])
+        self.assertEqual(['pp-dec'], [item['decision'] for item in items])
+        self.assertFalse(items[0]['in_force'])
+        self.assertIn('unhonoured comment', items[0]['reason'])
+        self.assertIn('record a new decision', items[0]['reason'])
+        self.refused('unhonoured comment')
+        self.refused('record a new decision')
+
+    def test_a_decision_with_no_delegation_comment_is_not_listed(self):
+        self.assertEqual([], d.listing([self.row()], PROJECT, state(), self.project, ['ops']))
+
+    def test_closing_a_decision_does_not_end_its_delegation_and_the_listing_says_so(self):
+        self.write(request())
+        self.row()['status'] = 'closed'
+        self.assertEqual(['capabilities', 'references'], self.check()['scope'])
+        item = d.listing([self.row()], PROJECT, state(), self.project, ['ops'])[0]
+        self.assertTrue(item['in_force'])
+        self.assertEqual('closed', item['status'])
+        self.assertTrue(any('closing does not end a delegation: revoke it to end it' in note
+                            for note in item['notes']), item['notes'])
+        # A contributor reopening it changes nothing either way.
+        self.row()['status'] = 'open'
+        self.assertEqual(['capabilities', 'references'], self.check()['scope'])
+        item = d.listing([self.row()], PROJECT, state(), self.project, ['ops'])[0]
+        self.assertTrue(item['in_force'])
+        self.assertEqual([], item['notes'])
+        # Only revoke ends it; a closed revoked decision carries no in-force line.
+        self.write(request(action='revoke', operation_id='revoke'), at=AT[2])
+        self.row()['status'] = 'closed'
+        item = d.listing([self.row()], PROJECT, state(), self.project, ['ops'])[0]
+        self.assertFalse(item['in_force'])
+        self.assertEqual([], item['notes'])
+
+    def test_a_retyped_delegation_decision_stays_in_force_listed_and_revocable(self):
+        self.write(request())
+        self.row()['issue_type'] = 'task'
+        self.assertIn(d.LABEL, self.row()['labels'])
+        self.assertEqual(['capabilities', 'references'], self.check()['scope'])
+        item = d.listing([self.row()], PROJECT, state(), self.project, ['ops'])[0]
+        self.assertTrue(item['in_force'])
+        self.assertEqual('task', item['issue_type'])
+        self.assertTrue(any('typed task' in note for note in item['notes']), item['notes'])
+        self.write(request(action='revoke', operation_id='revoke'), at=AT[2])
+        self.refused('was revoked')
+
+    def test_the_delegation_label_alone_never_creates_authority(self):
+        self.row()['issue_type'] = 'task'
+        self.row()['labels'].append(d.LABEL)
+        self.refused('no delegation is recorded')
+        self.assertEqual([], d.listing([self.row()], PROJECT, state(), self.project, ['ops']))
+        # Nor does it let a grant land on a non-decision issue.
+        with self.assertRaisesRegex(d.DelegationRefusal, 'not a decision issue'):
+            self.write(request())
+        self.assertEqual([], self.row()['comments'])
+        # A plain task without the label is still refused outright.
+        self.row()['labels'].remove(d.LABEL)
+        self.refused('not a decision issue')
+
+    def test_the_label_is_added_before_the_comment_so_a_crash_after_publish_leaves_it_listed_in_force(self):
+        real = d.publish
+
+        def crash_after(journal, record):
+            real(journal, record)
+            raise OSError('crashed after publish')
+        with mock.patch.object(d, 'publish', side_effect=crash_after):
+            with self.assertRaisesRegex(OSError, 'crashed after publish'):
+                self.write(request())
+        self.assertIn(d.LABEL, self.row()['labels'])
+        items = d.listing([self.row()], PROJECT, state(), self.project, ['ops'])
+        self.assertEqual([True], [item['in_force'] for item in items])
+        self.assertEqual(['capabilities', 'references'], self.check()['scope'])
+
+    def test_a_refused_write_adds_no_label(self):
+        self.row()['issue_type'] = 'task'
+        with self.assertRaises(d.DelegationRefusal):
+            self.write(request())
+        self.assertNotIn(d.LABEL, self.row()['labels'])
 
 
 class ReservedTests(unittest.TestCase):

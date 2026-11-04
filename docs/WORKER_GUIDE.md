@@ -335,7 +335,11 @@ later the trace read, follow a requirement to its design, plan, tasks and code.
 - **Delegated decisions.** A coordinator agent decides, and accepts reference and capability
   records, only within a person owner's delegation; the project's Settings page lists the
   delegations in force and what each says must be escalated. Anything outside every delegation
-  goes to the owner as a question. See docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance".
+  goes to the owner as a question. Closing a decision issue does not end its delegation; only
+  the owner's revoke does, and the list says so. A decision whose delegation comment lost its host
+  journal entry is listed as "unhonoured": ask the owner to record a new decision. Many comments
+  on a decision issue slow its reads, and a read that times out refuses. See docs/HTTP_DEPLOYMENT.md,
+  "Delegated record acceptance".
 
 ## Look up reference facts
 
