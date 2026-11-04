@@ -208,6 +208,25 @@ Once any approve record with the snapshot has been written, rolling the deployme
 
 The fully rollback-safe sequence is a staged release: ship a **tolerant reader** first (accept and ignore the optional field, write nothing new), deploy it, and only then ship the **writer** and the gate that reads the snapshot; rolling the writer back to the tolerant reader is then safe. That staging needs two integration cycles, so this change does not deliver it. Deriving the approval-time assignee from native tracker events instead of the payload was also rejected: assignment changes are not present in `bd export --all`, and the Dolt commit timestamps in `bd history` are batched and can be rewritten by a backup restore (kittrial-5bb.44's own 2026-09-27 edits carry 2026-09-29 commit timestamps), so they cannot be ordered reliably against comment timestamps. Until the staged release lands, the snapshot is a deliberate forward-only schema addition documented here.
 
+## The approve record's `approval_basis` (kittrial-5bb.515)
+
+An `approve` record may carry an additive `approval_basis` field: why the server let the approval through. The
+two values are `same-person-agent` (approved under the project setting `agent_approval: by-agent`, a
+coordinator agent approving another agent of its person) and `same-person-worker-credential` (the same setting,
+a coordinator agent approving a worker credential of its own person, kittrial-5bb.519); who set the setting and
+when stays in the audit entry). The vocabulary is closed, `validate` refuses any other value, and only the web service writes the
+field (`check_write_fields` refuses it from the host `review` action and from `review --file`; the web route
+refuses a request body that names it). The projection carries it as `approval_basis` (`basis`, `text`,
+`comment_id`, `author`, `timestamp`) only while the approval stands, `brief` prints it on an `Approval basis:`
+line, and the task page shows it as its own line apart from the summary. A record without the field is the old
+form: its summary is the approver's text, whatever it says, and no basis is shown.
+
+Like `assignee_at_approval` the field is additive for readers and not for writers: a kit built before the
+field validates the approve field set exactly and refuses a record that carries it. It is therefore released
+in two steps, readers (A) and then writers (B), and B is gated by the endpoint listing `approval_basis` for
+`approve` in the `optional_fields` of its machine-readable `review` help. See docs/OPERATIONS.md, "The approval
+basis field: release order and rollback", for the order and the rollback boundary.
+
 ## Reverting integrated work
 
 A revert of already-integrated work is an **explicit, audited record**, not a newer `integrated=failed` lifecycle fact. Only a coordinator/operator may record one, and only on the coordination host. The record is its own reserved machine comment (`Kind: integration-revert-v1`), so it is never part of the `contribution-review-v1` chain and never moves that chain's `previous` pointer:

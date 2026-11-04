@@ -713,6 +713,10 @@ def help_payload(action='work'):
         ]
         import review_recommendations
         payload['limits'] = dict(review_workflow_limits(), **review_recommendations.help_limits())
+        # kittrial-5bb.515: the fields each operation accepts beyond its required set. A writer that wants to
+        # use one reads this first (the web service writes approval_basis only when it is listed for approve).
+        import review_workflow
+        payload['optional_fields'] = review_workflow.help_optional_fields()
         payload['rounds_limits'] = {
             'rounds / items per round': '20 / 50',
             'attestations / holds per round': '10 / 10',

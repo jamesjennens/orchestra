@@ -1770,7 +1770,16 @@ class InProcessBackend:
         records_standing = self._standing_recommendations(task, records)
         standing = [self._recommendation_view(record) for record in records_standing]
         import review_recommendations as rec
+        approved = ([r for r in records if r['kind'] == 'approve'][-1:]
+                    if task.get('review_state') == 'approved' else [])
+        basis = approved[0].get('approval_basis') if approved else None
+        import review_workflow
         return {'state': task.get('review_state') or 'none', 'contribution': contribution,
+                # Additive (kittrial-5bb.515): why the server let the standing approval through, only when it
+                # carries the field (an approval written before it has none).
+                **({'approval_basis': {'basis': basis, 'text': review_workflow.APPROVAL_BASES.get(basis, basis),
+                                       'author': approved[0]['actor'], 'at': approved[0]['created_at']}}
+                   if isinstance(basis, str) and basis else {}),
                 # Additive (kittrial-5bb.115): advice to approve the current contribution.
                 'recommendation': standing[0] if standing else None,
                 # Each in full: the brief route leaves out the author's own person and shows the next.
@@ -4306,6 +4315,10 @@ class EndpointBackend:
                            'pending_review_requests': pending_review_requests,
                            'declined_review_requests': declined_review_requests,
                            'withdrawal': withdrawal,
+                           # Additive (kittrial-5bb.515): why the server let the approval through, from the
+                           # record's own field and present only when it has one. An older endpoint, or an
+                           # approval written before the field, has none, and its summary is only a summary.
+                           **self._approval_basis_view(review.get('approval_basis')),
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
                            # The newest few carry their whole content (a kit before that
@@ -4358,6 +4371,15 @@ class EndpointBackend:
                 'changes_since_checkpoint': data.get('changes_since_checkpoint')
                 if isinstance(data.get('changes_since_checkpoint'), dict)
                 else self._no_checkpoint_section(task_id) if data.get('checkpoint') is None else None}
+
+    @staticmethod
+    def _approval_basis_view(raw):
+        """The page's ``approval_basis`` block from the canonical projection's, or nothing."""
+        if not isinstance(raw, dict) or not isinstance(raw.get('basis'), str) or not raw['basis']:
+            return {}
+        text = raw.get('text')
+        return {'approval_basis': {'basis': raw['basis'], 'text': text if isinstance(text, str) and text else raw['basis'],
+                                   'author': raw.get('author'), 'at': raw.get('timestamp')}}
 
     @staticmethod
     def _no_checkpoint_section(task):

@@ -2045,6 +2045,54 @@ hazard as the `assignee_at_approval` snapshot): reconcile with
 `admin.py void-record` on each affected record, or stay forward. Turning the switch
 off again does not remove records already written; it only stops new ones.
 
+### The approval basis field: release order and rollback (kittrial-5bb.515)
+
+An approval that only the project's `agent_approval: by-agent` setting let through (a coordinator agent
+approving the work of another agent of its person, kittrial-5bb.438, or of a worker credential of its person,
+kittrial-5bb.519) is recorded as a field of the `approve` record, `approval_basis`, with the closed value
+`same-person-agent` or `same-person-worker-credential`. Before this change the web service wrote
+a sentence into the approver's summary instead (and refused a caller-written summary that contained it, a
+text gate that can only be narrowed). The field is the server's own statement: `check_write_fields` refuses it
+from every writer but the web service (the host `review` action and `review --file` refuse it; the web route
+answers 422 to a request body that names it), and `validate` accepts only the vocabulary.
+
+**It ships as two commits and two releases, readers first.**
+
+* **Release A (readers).** The kit reads the field and shows it: `review TASK` and `brief` carry
+  `approval_basis` (basis, text, author, comment id, timestamp) only for an approval that has one, the text
+  brief prints it as its own `Approval basis:` line, and the task page shows it as its own line apart from the
+  summary. The endpoint lists `approval_basis` for `approve` in `optional_fields` of its machine-readable
+  `review --help`. Nothing writes the field: the service still appends the sentence.
+* **Release B (writers).** The web route, and the in-process backend, write `approval_basis` instead of
+  appending the sentence, **only when the endpoint it talks to lists `approval_basis` for `approve` in that
+  `optional_fields`**. That advertisement is the one gate; there is no other switch. An endpoint without it
+  (a kit before A) keeps receiving the sentence, so a service at B with an older endpoint never writes a record
+  that endpoint would refuse.
+
+**Integrate B only after A has been released and EVERY reader the owner runs has A.** A kit before A validates
+the `approve` field set exactly and refuses a record that carries the field with `Invalid review workflow
+fields`, so the whole review chain of that task stops reading ("Malformed contribution-review history;
+operator reconciliation required"). Readers to count: the web service's own endpoint, the host client, the
+goomba lane kits that read bundles, the office installation, and any installation that could receive a restored
+backup of a project from here. Check each one's `review --help` lists `approval_basis` under
+`optional_fields.approve` before B goes out.
+
+**Rollback boundary.** Rolling B back to A is safe: A reads both forms, and the service goes back to the
+sentence. **Once B has written fields, never roll back to a kit before A**: every task whose approval carries
+the field is then unreadable there (the same hazard as `assignee_at_approval`). Reconcile such a task with
+`admin.py void-record` on the approve record, or stay forward. Before B has written anything, a rollback below
+A is as safe as it was.
+
+**Old approvals stay as they were.** An approval written before B keeps the sentence inside its summary and no
+field. The page, `review` and `brief` show a basis only from the field; the sentence in an old summary is plain
+text with no badge, and the audit entry (`same_person_coordinator`, with the setting's mode, who set it and
+when) remains the authority for those.
+
+**Later (C, not built): remove the text gate.** Once B has shipped everywhere and no kit appends the sentence,
+the sentence is ordinary text. Then `_contains_same_person_approval` and its uses can go, together with the
+`SAME_PERSON_APPROVAL` constant in the writer (it must stay as the fallback for an older endpoint until then).
+It needs its own release after B; it is filed as a task, not built here.
+
 ### Checkpoint provenance write switch
 
 kittrial-5bb.1 lets a checkpoint record which activity it incorporated (per-entry
