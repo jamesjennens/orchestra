@@ -322,6 +322,10 @@ class TeamHarness(ServerHarness):
 
     def review(self, token, operation, task=None, **extra):
         body = {'operation': operation}
+        if operation == 'approve':
+            # An approval carries a summary, as the canonical write requires (kittrial-5bb.516: the in-process
+            # backend now refuses a missing one exactly as the endpoint does).
+            body['summary'] = 'Approved.'
         body.update(extra)
         return self.request('POST', self.path('/tasks/%s/reviews' % (task or self.task)), body,
                             token=token)
