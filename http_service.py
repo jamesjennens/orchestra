@@ -52,7 +52,7 @@ import actor_names
 import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
-from review_workflow import TEXT_LIMITS
+from review_workflow import TEXT_LIMITS, limited
 import claim_limit
 import handover_steps
 import project_setup
@@ -6919,16 +6919,38 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _normalize_basis_text(text):
-        folded = unicodedata.normalize('NFKC', text).casefold()
-        stripped = ''.join(
+        """The form two texts are compared in for the basis sentence (kittrial-5bb.485).
+
+        NFKD, so a precomposed letter and a letter with a combining mark meet, and so do fullwidth letters;
+        case folded; then every format character (Cf), mark (M*), punctuation (P*), symbol (S*) and bracket
+        is dropped and ALL whitespace removed, so that 'same-person', 'same person' and 'sameperson' are one.
+        """
+        folded = unicodedata.normalize('NFKD', unicodedata.normalize('NFKD', text).casefold())
+        return ''.join(
             ch for ch in folded
             if unicodedata.category(ch) != 'Cf'
-            and not unicodedata.category(ch).startswith('P')
+            and unicodedata.category(ch)[0] not in 'MPS'
+            and not ch.isspace()
             and ch not in '[](){}<>'
         )
-        return ' '.join(stripped.split())
 
-    def _contains_same_person_approval(self, summary):
+    def _refuse_overlong_summary(self, summary, recommending):
+        """Refuse a summary over the field limit with what the canonical write says, before any normalization.
+
+        The text is the one review_workflow.limited (the canonical check) gives; an approve is wrapped as the
+        canonical command's refusal is (``Canonical command rejected the request`` with the ValueError as
+        detail), a recommendation carries it as its message; both 422 ``invalid_payload``.
+        """
+        if not isinstance(summary, str) or len(summary) <= self.SUMMARY_MAX:
+            return
+        try:
+            limited(summary, 'summary')
+        except ValueError as error:
+            detail = 'ValueError: %s' % error
+            raise invalid(str(error) if recommending else 'Canonical command rejected the request', detail) from None
+
+    def _contains_same_person_approval(self, summary, recommending=False):
+        self._refuse_overlong_summary(summary, recommending)
         if not isinstance(summary, str):
             return False
         target = self._normalize_basis_text(self.SAME_PERSON_APPROVAL)
@@ -14402,7 +14424,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
                     raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
                                     else self.NOT_INDEPENDENT)
-                if self._contains_same_person_approval(payload.get('summary')):
+                if self._contains_same_person_approval(payload.get('summary'), True):
                     raise invalid('The recommendation summary may not contain %r; the server adds that sentence itself'
                                   % self.SAME_PERSON_APPROVAL)
                 # One standing recommendation for a contribution from each PERSON

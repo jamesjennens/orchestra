@@ -12,6 +12,7 @@ tests/test_coordinator_grant_real.py.
 """
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -168,6 +169,14 @@ class DefaultTests(SamePerson):
             'fullwidth-paren': 'ok. ' + base_sentence.replace('(', '\uff08').replace(')', '\uff09'),
             'bang': 'ok. ' + base_sentence[:-1] + '!',
             'split-before-period': 'ok. ' + base_sentence[:-1] + ' .',
+            # kittrial-5bb.485: each one is caught by one rule of API._normalize_basis_text alone.
+            'hyphen': 'ok. ' + base_sentence.replace('same person', 'same-person'),
+            'combining-mark': 'ok. A\u0301pproved' + base_sentence[8:],
+            'precomposed-accent': 'ok. \u00c1pproved' + base_sentence[8:],
+            'two-accents': 'ok. \u00c1ppr\u00f6ved' + base_sentence[8:],
+            'symbol-in-word': 'ok. Appro\u2713ved' + base_sentence[8:],
+            'currency-between-words': 'ok. ' + base_sentence.replace('same person', 'same\u20acperson'),
+            'fullwidth-letters': 'ok. \uff21\uff50\uff50\uff52\uff4f\uff56\uff45\uff44' + base_sentence[8:],
         }
         # 0. Order against the 403 party refusal (f4-order-test): a forged summary on own work gives 403, not 422.
         own_task, own_cid = self.deliver(self.agent)
@@ -226,6 +235,45 @@ class DefaultTests(SamePerson):
         self.assertEqual(self.approval_summary(sib_task), similar + ' ' + API.SAME_PERSON_APPROVAL)
         event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
         self.assertEqual(event['author'], self.other_id)
+
+    def test_an_over_long_summary_is_refused_with_the_canonical_wording_before_any_normalization(self):
+        # kittrial-5bb.485 R5: tests/test_coordinator_grant_real.py pins that this is what the canonical write says.
+        calls = []
+        real = API._normalize_basis_text
+
+        def counting(text):
+            calls.append(len(text))
+            return real(text)
+
+        ind_task, ind_cid = self.deliver(self.tokens['carl'])
+        approve_said = ('Canonical command rejected the request',
+                        'ValueError: summary: %d characters, the limit is %d')
+        with unittest.mock.patch.object(API, '_normalize_basis_text', staticmethod(counting)):
+            for size in (API.SUMMARY_MAX + 1, 200000):
+                text = 'x' * size
+                for who in (self.tokens['olive'], self.agent):
+                    with self.subTest(op='approve', size=size):
+                        answer = self.request('POST', self.base(ind_task) + '/reviews', {
+                            'operation': 'approve', 'contribution': ind_cid, 'summary': text}, token=who)
+                        error = answer.data['error']
+                        self.assertEqual((422, 'invalid_payload', approve_said[0], approve_said[1] % (size, API.SUMMARY_MAX)),
+                                         (answer.status, error['code'], error['message'], error['detail']), answer.data)
+                with self.subTest(op='recommend', size=size):
+                    answer = self.request('POST', self.base(ind_task) + '/reviews', {
+                        'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-long-%d' % size,
+                        'contribution': ind_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+                        'verdict': 'approve', 'summary': text, 'items': []}, token=self.agent)
+                    error = answer.data['error']
+                    said = 'summary: %d characters, the limit is %d' % (size, API.SUMMARY_MAX)
+                    self.assertEqual((422, 'invalid_payload', said, 'ValueError: ' + said),
+                                     (answer.status, error['code'], error['message'], error['detail']), answer.data)
+            self.assertEqual([], calls)
+            self.assertEqual(self.state_of(ind_task), 'awaiting-review')
+            # The counter does count: a summary at the limit is normalized (the sentence once, the summary once).
+            fits = self.request('POST', self.base(ind_task) + '/reviews', {
+                'operation': 'approve', 'contribution': ind_cid, 'summary': 'x' * API.SUMMARY_MAX}, token=self.tokens['olive'])
+            self.assertEqual(201, fits.status, fits.data)
+            self.assertIn(API.SUMMARY_MAX, calls)
 
     def test_next_actions_keep_a_siblings_work_out_for_an_agent_without_a_grant(self):
         by_heron, _ = self.deliver(self.agent)

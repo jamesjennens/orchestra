@@ -181,6 +181,38 @@ class RealStackTests(held.RealStackTests):
         other, second = self.deliver('drew')
         self.assertEqual(201, self.approve(self.tokens['alex'], other, second).status)
 
+    def test_the_gate_refuses_an_over_long_summary_exactly_as_the_canonical_write_does(self):
+        """kittrial-5bb.485 R5: with the gate's length refusal switched off the real endpoint and bd answer for an
+        over-long approve and recommend; with it on, the gate answers with the very same status, code, message and
+        detail. tests/test_agent_approval.py pins that the gate gives it before any normalization."""
+        import unittest.mock
+        task, contribution = self.deliver('casey')
+        text = 'x' * (http_service.ApiHandler.SUMMARY_MAX + 1)
+        before = self.comments(task)
+
+        def asked():
+            self.count += 1
+            approve = self.request('POST', '%s/%s/reviews' % (self.tasks, task), dict(
+                operation='approve', schema_version=1, operation_id='op-long-a-%d' % self.count, previous=contribution,
+                contribution=contribution, summary=text), token=self.tokens['alex'])
+            recommend = self.request('POST', '%s/%s/reviews' % (self.tasks, task), dict(
+                operation='recommend', schema_version=1, operation_id='op-long-r-%d' % self.count,
+                contribution=contribution, commit=fixes.CONTRIBUTION['commit'], verdict='approve', summary=text,
+                items=[]), token=self.agent)
+            return [(a.status, a.data['error']['code'], a.data['error']['message'], a.data['error'].get('detail'))
+                    for a in (approve, recommend)]
+
+        with unittest.mock.patch.object(http_service.ApiHandler, '_refuse_overlong_summary', lambda *a: None):
+            canonical = asked()
+        gate = asked()
+        self.assertEqual(canonical, gate)
+        self.assertEqual([(422, 'invalid_payload', 'Canonical command rejected the request',
+                           'ValueError: summary: 1201 characters, the limit is 1200'),
+                          (422, 'invalid_payload', 'summary: 1201 characters, the limit is 1200',
+                           'ValueError: summary: 1201 characters, the limit is 1200')], gate)
+        self.assertEqual(before, self.comments(task))
+        self.assertEqual('awaiting-review', self.review(task)['state'])
+
 
 if __name__ == '__main__':
     unittest.main()

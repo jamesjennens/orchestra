@@ -249,3 +249,22 @@ It gets its own design note when it is scheduled.
 - It does not let the site change installation switches.
 - It does not give the server any view of an agent's PC beyond what the agent itself reports, labelled as its claim.
 - It does not design the requirements-gathering phase (§8).
+
+## 10. The server-recorded approval basis (kittrial-5bb.485; design only, nothing built)
+
+Today the server records why an approval was let through (kittrial-5bb.438, `agent_approval: by-agent`) by appending one sentence to the caller's summary (`ApiHandler.SAME_PERSON_APPROVAL`, http_service.py:6916) and refusing a caller-written summary that contains it (`_contains_same_person_approval`). That is a text gate: kittrial-5bb.485 narrows its escapes (NFKD with marks dropped, symbols dropped, all whitespace removed, the length refusal first), but a text gate can only ever be narrowed. The end state has no gate: the basis is a field the server writes and the caller cannot.
+
+**The field.** An additive optional field on the `approve` record, `approval_basis`, added to the optional fields of `approve` (a new `OPTIONAL['approve']` entry beside review_workflow.py:117; `assignee_at_approval`, defined at :194, is today allowed for `approve` by hand at :609-610). Its value is a short token naming the basis, for example `same-person-agent`, plus the setting that allowed it (`by-agent`), who set it and when (the data the audit entry already holds: `agent_approval`, `agent_approval_set_by`, `agent_approval_set_at`). It is length-limited like every record text (field_limits.py). The caller cannot send it: the route refuses the field in a request body, and `execute` stamps it.
+
+**Rollout, readers first, then writers.** The `approve` field set is validated EXACTLY (review_workflow.py:90-118, :593-606). Every reader on a kit without the field refuses a record that carries it ("Invalid review workflow fields"): the host client, an older endpoint during a rollback, and bundles reviewed on another lane. So:
+1. Release the readers: a kit whose `validate` allows the field and whose readers ignore or show it. Nothing writes it yet.
+2. Wait until no supported reader predates step 1 (the host client, every endpoint, every lane that reviews bundles).
+3. Only then release the writer, behind the same release gate as other additive record fields. Adding the field is not rollback-safe once written (the note at review_workflow.py:187-193 says the same of `assignee_at_approval`): rolling the writer back leaves records older readers cannot read, so the writer step is the one with no way back and is its own release.
+
+**Both forms stay readable.** Approvals already written keep the sentence inside their summary and no field. A reader treats a record with the field as authoritative and a record without it as the old form, where the sentence (compared as `_normalize_basis_text` does) is the only evidence. The gate that refuses a caller-written sentence stays for as long as the old form can still be written, that is until the writer step has shipped everywhere and the sentence is no longer appended; after that the sentence is ordinary text and the gate can go.
+
+**What people see.** The task page, the briefing and the review read show the basis as its own line apart from the summary ("Allowed by: coordinator agent of the same person as the delivering agent (project setting: by agent, set by X on D)"), taken from the field and never parsed from the summary. The summary then shows only what the approver wrote, so a caller can no longer pass off text in it as the server's. For an old-form record the same line is shown from the audit entry when there is one, else not shown.
+
+**Residual until then.** Cross-script homoglyphs (a Cyrillic "а" for a Latin "a" in the forged sentence) still pass the text gate, because the comparison does not map confusables. The audit entry (`same_person_coordinator`, written by the server) remains the authority in the meantime. Only the field closes this, since it removes the comparison.
+
+**Not in this note.** Any code, the token's final spelling, and the release dates; it is filed as its own task.
