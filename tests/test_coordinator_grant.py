@@ -118,8 +118,8 @@ class GrantTests(Grants):
             for setting in (False, True):
                 self.service.approval_by_another_party = setting
                 for label, token, sentence in (
-                        ('the agent itself', self.agent, api.SAME_AGENT[0] + api.BY_AGENT_NEXT),
-                        ('its owner', self.tokens['cora'], api.OWN_PARTY_AGENT[0] + api.BY_AGENT_NEXT),
+                        ('the agent itself', self.agent, api.SAME_AGENT[0] + api.SAME_AGENT_NEXT + api.BY_AGENT_NEXT),
+                        ('its owner', self.tokens['cora'], api.ACCOUNT_ID_AUTHOR + api.BY_AGENT_NEXT),
                         ('another agent of its account', self.agent_with_id('cora', 'Egret-%s-%s' % (mode, setting))[0],
                          None)):
                     if mode == 'by-person':
@@ -515,10 +515,12 @@ class GrantTests(Grants):
         self.assertEqual(200, self.grant().status)
         worker, _ = self.worker_of('cora', 'lane-c')
         task, contribution = self.deliver(worker)
+        # A worker credential is not another agent (kittrial-5bb.438): under the strict setting it is still the
+        # agent's party. By default (kittrial-5bb.519) a NAMED credential of its person is approvable.
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/agent-approval' % self.project,
+                                           {'agent_approval': 'by-person'}, token=self.tokens['olive']).status)
         answer = self.approve(self.agent, task, contribution)
-        # A worker credential is not another agent (kittrial-5bb.438): still the agent's party, by default too.
-        self.assertEqual((answer.status, answer.data['error']['message']),
-                         (403, http_service.ApiHandler.OWN_PARTY_AGENT[0] + http_service.ApiHandler.BY_AGENT_NEXT))
+        self.assertEqual((answer.status, answer.data['error']['message']), (403, OWN_PARTY_AGENT))
         self.assertIs(self.service.approval_by_another_party, False)
         # The person, with the setting off, still may: that is slice 1a's setting, and it is off.
         self.assertEqual(201, self.approve(self.tokens['cora'], task, contribution).status)
@@ -548,15 +550,26 @@ class GrantTests(Grants):
         self.assertIn('You hold the coordinator grant in this project: review it, then approve it or request changes.', after[task]['reason'])
         self.assertNotIn(own, after)                                              # never its own party's
         # Work under a worker credential its account issued is nobody's by person (the setting is off), so
-        # only the party rule keeps it from the agent that would be refused the approval.
+        # only the party rule decides. Under the default by-agent a NAMED credential of its person is offered,
+        # as the approve route lets it through (kittrial-5bb.519); under by-person it is kept out.
         swift, swift_id = self.agent_with_id('olive', 'Swift')
         self.assertEqual(200, self.grant(swift_id).status)
         worker, _ = self.worker_of('olive', 'lane-a')
         under, _ = self.deliver(worker)
-        shown = {item['task']: item for item in self.request('GET', '/v1/agents/me/next', token=swift).data['next_actions']
-                 if item.get('kind') in ('to-review', 'review-recommended')}
+
+        def shown_to_swift():
+            return {item['task']: item for item in self.request('GET', '/v1/agents/me/next', token=swift).data['next_actions']
+                    if item.get('kind') in ('to-review', 'review-recommended')}
+        shown = shown_to_swift()
         self.assertIn(task, shown)
         self.assertIn('You hold the coordinator grant', shown[task]['reason'])
+        self.assertIn(under, shown)
+        self.assertTrue(shown[under]['reason'].startswith(
+            'A contribution under a worker credential of your person awaits review.'), shown[under]['reason'])
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/agent-approval' % self.project,
+                                           {'agent_approval': 'by-person'}, token=self.tokens['olive']).status)
+        shown = shown_to_swift()
+        self.assertIn(task, shown)
         self.assertNotIn(under, shown)
 
 

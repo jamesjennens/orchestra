@@ -2460,8 +2460,9 @@ credential approved anything; this is the one place where that is lifted.
   grant itself stay refused, and so does the triage of requirement proposals (no
   credential records a disposition; the proposal reads keep answering `can_triage:
   false` to a granted agent).
-- **A granted agent never approves its own work, its account's own work, or work under a
-  worker credential of its account, whatever the setting of the section above says.**
+- **A granted agent never approves its own work or its account's own work, whatever the
+  setting of the section above says, and under `by-person` it never approves work under a
+  worker credential of its account either.**
 - **By default it MAY approve the work of ANOTHER personal agent of the same account**
   (kittrial-5bb.438, at James's direction: "the coordinator is different from the worker").
   - That is the project's setting `agent_approval: by-agent`.
@@ -2472,16 +2473,35 @@ credential approved anything; this is the one place where that is lifted.
   - `403`, by default: "This contribution was delivered by this agent itself." (or "This task
     is assigned to this agent itself.", or the own-party sentences below for its account or a
     worker credential), followed by: "On this project a coordinator agent may approve the work
-    of another agent of the same person (agent approvals: by agent), but never its own work,
-    its person's own work, or work under a worker credential of that person: somebody of
-    another party who may approve here must approve it (another coordinator or owner of this
-    project, or a superuser)."
+    of another agent of the same person, or of a worker credential of that person issued with a
+    name no other account has held (agent approvals: by agent), but never its own work (its own
+    sub-workers count as its own work) or its person's own work: somebody of another party who
+    may approve here must approve it (another coordinator or owner of this project, or a
+    superuser)."
   - `403`, under `by-person`, the sentences of that section said of the agent: "This
     contribution was delivered by this agent's own party: its account, one of that account's
     agents, or a name that a worker credential of that account holds or has held. An agent
     never approves work of its own party, whatever this server's setting for people says:
     somebody of another party who may approve here must approve it (another coordinator or
     owner of this project, or a superuser)."
+- **Work under a worker credential of the same person (kittrial-5bb.519).** Under `by-agent`
+  the agent also approves work whose name the record proves is a worker credential's of its
+  own account, and it is told which case a refusal is.
+  - Approved: a name of a worker credential that only this account has ever held in the project
+    (working, revoked or expired; a name this account revokes and issues again stays one
+    issuer), and `ACCOUNT/label` below the account's own id (only that account's credential
+    issued with no name can write it: a session writes exactly its account id, an agent only its
+    own id, and another account's credential is bound to its own namespace). The task's assignee
+    is judged the same way.
+  - Refused, each with its own sentence: a name another account has also held ("Issue a credential
+    with a name no other account has held, or set the worker up from My agents."), the bare
+    account id, which the account's own session also writes ("Issue the worker's credential with
+    a name, or set the worker up from My agents."), and the agent itself, as when another worker
+    uses a copy of its credential ("set it up as a new agent from My agents.").
+  - The approval then ends with "Approved by a coordinator agent of the same person as the worker
+    credential that delivered it (project setting agent_approval: by-agent).", the web route
+    refuses a caller who writes either sentence (`422`), and the audit event of the write carries
+    `basis`: `worker-credential` or `agent`. `by-person` and a damaged setting are unchanged.
 - **People are not affected:** a person's approval follows the installation's setting as
   before.
 - **The setting:** `PUT /v1/projects/{id}/agent-approval` with
@@ -2588,7 +2608,11 @@ another account "You hold the coordinator grant in this project: review it, then
 it or request changes". It never lists its own party's work for approval, except the work of
 another agent of its account under the project's default `agent_approval: by-agent`
 (kittrial-5bb.438), which it lists as "A contribution by another agent of your person awaits
-review.".
+review.", and the work of a worker credential of its person that the approve route lets through
+(kittrial-5bb.519), listed as "A contribution under a worker credential of your person awaits
+review.". It decides both with the same functions as the approve route, so it never lists work
+the route would refuse: not the agent's own work or a sub-label of it, not the bare account id,
+and not a name another account has held.
 
 Like the setting above, this is the web route's: an approval on the host route
 (`endpoint.py` over SSH, or run on the server) knows no accounts and no grants.

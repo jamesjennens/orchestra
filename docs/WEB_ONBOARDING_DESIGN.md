@@ -79,9 +79,11 @@ Everything under "What is true today" was read in the code of `main` at
   - **(b) Separate worker agents (own agent record, own VS Code window):**
     each person has **one account and several agents** (never a second "worker
     account"). Separate worker agents are mandatory for coordinators (separation
-    of duties is about approval: a coordinator must not approve work delivered by
-    their own agent or sub-labels, `kittrial-5bb.323`, which their separate
-    worker agents also fall under) and recommended for long-running tasks. One
+    of duties is about approval: a coordinator agent never approves work delivered
+    by itself or its own sub-labels, `kittrial-5bb.323`; under the project setting
+    `agent_approval: by-agent`, the default since `kittrial-5bb.438`, it MAY approve
+    work of its person's separate worker agents, which `by-person` still refuses)
+    and recommended for long-running tasks. One
     VS Code window holds one Orchestra identity; running two Orchestra identities
     in two chats of one VS Code window is not required.
 - **Confirmations, site jobs, and untrusted inputs (`01a1495f` item 5, `01a1496d`, `01a149d9`, `kittrial-5bb.320`):**
@@ -657,11 +659,14 @@ a second "worker account"):
 - **Option (b): Separate worker agents (own agent identity, own VS Code window, under the person's same account) — mandatory for coordinators (`kittrial-5bb.323`), recommended for long tasks:**
   - **Separation of duties for coordinators (`01a1496e`, `kittrial-5bb.323`):**
     People have one account and several agents. Separation of duties is about
-    **approval**: a coordinator (and their coordinator helper agent) **must not
-    approve work delivered by their own agent or sub-labels** (`kittrial-5bb.323`),
-    which a coordinator's separate worker agents **also** fall under (work
-    delivered by any of a coordinator's own agents must be reviewed and approved
-    by another coordinator or owner). Running a coordinator's workers as separate
+    **approval**: a coordinator helper agent **never approves work delivered by
+    itself or its own sub-labels** (`kittrial-5bb.323`; work by `<helper>/<label>`
+    counts as the helper's own and stays refused). Under the project setting
+    `agent_approval: by-agent` (the default since `kittrial-5bb.438`) it **may**
+    approve work delivered by its person's separate worker agents, and under
+    `by-agent` also by a named worker credential of its person
+    (`kittrial-5bb.519`); under `by-person` all of these are the coordinator's own
+    party's work and need another coordinator or owner. Running a coordinator's workers as separate
     worker agents in their own VS Code window (rather than in-process under the
     coordinator's helper) keeps the coordinator's helper free to coordinate and
     review others' work, and enforces a clean operational boundary between the
