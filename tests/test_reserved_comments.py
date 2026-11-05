@@ -1418,5 +1418,221 @@ class ReservedLabelMutationGuardTests(unittest.TestCase):
         self.assertEqual(len(calls), 5)
 
 
+class NoteValueAttachmentAndParityTests(unittest.TestCase):
+    """kittrial-5bb.517: `--append-notes` and `--notes` take a `--file`/`-f`
+    attachment as their inline value across every guard and the argv handed to
+    native `bd`; any other value flag followed by a file attachment is refused
+    with one clear sentence naming `--append-notes` and `--notes`.
+    """
+
+    def _scans_across_guards_and_bd(self, args, attachments):
+        import tempfile
+        from unittest import mock
+        import raw_lifecycle
+        import reserved_comments as rc
+        try:
+            import endpoint as ep
+        except ImportError:
+            ep = None
+
+        command = args[0]
+        seen = {}
+        real_scan = rc._bd_scan
+
+        def capture(name, fn):
+            recorded = []
+            def spy(scan_args, scan_command):
+                result = real_scan(scan_args, scan_command)
+                recorded.append(result)
+                return result
+            with mock.patch.object(rc, '_bd_scan', side_effect=spy), \
+                 mock.patch.object(raw_lifecycle, '_bd_scan', side_effect=spy):
+                try:
+                    fn()
+                except Exception:
+                    pass
+            self.assertTrue(recorded, f'{name} did not run _bd_scan for {args!r}')
+            seen[name] = recorded[0]
+
+        row = {'id': 'task-1', 'title': 'ordinary', 'issue_type': 'task',
+               'description': '', 'labels': []}
+        capture('write_targets', lambda: rc.write_targets(args, attachments))
+        capture('unresolved_bd_flags', lambda: rc.unresolved_bd_flags(args, attachments))
+        capture('label_guard_request', lambda: rc.label_guard_request(args, attachments))
+        capture('raw_lifecycle.guard',
+                lambda: raw_lifecycle.guard(args, attachments, lambda tokens: [row]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            if ep is not None:
+                bd_argv = ep._expand_bd_argv(args, attachments, tmp)
+            else:
+                paths = {}
+                for idx, tok in enumerate(args):
+                    if isinstance(tok, str) and tok.startswith('@attachment:'):
+                        key = tok.partition(':')[2]
+                        dest = Path(tmp) / f'{idx}.txt'
+                        dest.write_text(attachments[key]['text'], encoding='utf-8')
+                        paths[key] = str(dest)
+                bd_argv = rc.expand_bd_attachments(args, attachments, paths=paths)
+            resolved_argv = [
+                Path(tok).read_text(encoding='utf-8')
+                if isinstance(tok, str) and tok.startswith(tmp) and Path(tok).is_file()
+                else tok
+                for tok in bd_argv
+            ]
+            seen['bd_argv'] = real_scan(resolved_argv, command)
+        return seen
+
+    def test_parity_across_write_targets_unresolved_flags_label_guard_lifecycle_and_bd_argv(self):
+        import reserved_comments as rc
+        note_text = 'Quoted kittrial-5bb.510-c01a1a35f and kittrial-5bb.513 in note'
+        body_text = 'Body referencing kittrial-5bb.510 and --set-labels=plain'
+        shapes = [
+            (
+                'note-flag-update-append-notes-file',
+                ['update', 'task-1', '--append-notes', '@attachment:0'],
+                {'0': {'flag': '--file', 'text': note_text}},
+                ([('--append-notes', note_text)], ['task-1'], []),
+            ),
+            (
+                'note-flag-update-notes-short-f',
+                ['update', 'task-1', '--notes', '@attachment:0'],
+                {'0': {'flag': '-f', 'text': note_text}},
+                ([('--notes', note_text)], ['task-1'], []),
+            ),
+            (
+                'note-flag-create-notes-file',
+                ['create', 'Title', '--notes', '@attachment:0'],
+                {'0': {'flag': '--file', 'text': note_text}},
+                ([('--notes', note_text)], ['Title'], []),
+            ),
+            (
+                'other-value-flag-description-file',
+                ['update', 'task-1', '--description', '@attachment:0'],
+                {'0': {'flag': '--file', 'text': note_text}},
+                ([('--description', None)], ['task-1'], ['--description']),
+            ),
+            (
+                'other-value-flag-title-short-f',
+                ['update', 'task-1', '--title', '@attachment:0'],
+                {'0': {'flag': '-f', 'text': note_text}},
+                ([('--title', None)], ['task-1'], ['--title']),
+            ),
+            (
+                'other-value-flag-short-d-file',
+                ['create', 'Title', '-d', '@attachment:0'],
+                {'0': {'flag': '--file', 'text': note_text}},
+                ([('-d', None)], ['Title'], ['-d']),
+            ),
+            (
+                'path-flag-update-body-file',
+                ['update', 'task-1', '@attachment:0'],
+                {'0': {'flag': '--body-file', 'text': body_text}},
+                ([('--body-file', body_text)], ['task-1'], []),
+            ),
+            (
+                'path-flag-update-design-file',
+                ['update', 'task-1', '@attachment:0'],
+                {'0': {'flag': '--design-file', 'text': body_text}},
+                ([('--design-file', body_text)], ['task-1'], []),
+            ),
+            (
+                'path-flag-create-file',
+                ['create', 'Title', '@attachment:0'],
+                {'0': {'flag': '--file', 'text': body_text}},
+                ([('--file', body_text)], ['Title'], []),
+            ),
+            (
+                'bare-operand-update-file',
+                ['update', 'task-1', '@attachment:0'],
+                {'0': {'flag': '--file', 'text': note_text}},
+                ([], ['task-1', note_text], ['--file']),
+            ),
+            (
+                'bare-operand-after-double-dash',
+                ['update', 'task-1', '--', '@attachment:0'],
+                {'0': {'flag': '--file', 'text': note_text}},
+                ([], ['task-1', '--file', note_text], []),
+            ),
+        ]
+        consumers = ('write_targets', 'unresolved_bd_flags', 'label_guard_request',
+                     'raw_lifecycle.guard', 'bd_argv')
+        for label, args, attachments, expected in shapes:
+            with self.subTest(shape=label):
+                seen = self._scans_across_guards_and_bd(args, attachments)
+                self.assertEqual(set(seen.keys()), set(consumers))
+                for name in consumers:
+                    self.assertEqual(
+                        seen[name], expected,
+                        f'{name} diverged on {label}: got {seen[name]!r}, expected {expected!r}')
+        # Verify the note-flag shape leaves write_targets with only task-1, no unknown flags,
+        # and no label-guard ambiguity, while create TITLE --notes --file is not mistaken for
+        # batch creation (`create --file`).
+        wt = rc.write_targets(
+            ['update', 'task-1', '--append-notes', '@attachment:0'],
+            {'0': {'flag': '--file', 'text': note_text}})
+        self.assertEqual(wt, {'command': 'update', 'targets': ['task-1'],
+                              'new_id': None, 'refusal': None})
+        wt_create = rc.write_targets(
+            ['create', 'Title', '--notes', '@attachment:0'],
+            {'0': {'flag': '--file', 'text': note_text}})
+        self.assertEqual(wt_create, {'command': 'create', 'targets': [],
+                                     'new_id': None, 'refusal': None})
+        # Verify the parity check fails if any consumer expands differently (e.g. legacy
+        # unexpanded `@attachment:0` or legacy `['--file', text]` after `--append-notes`).
+        note_args = ['update', 'task-1', '--append-notes', '@attachment:0']
+        note_att = {'0': {'flag': '--file', 'text': note_text}}
+        expected_note_scan = ([('--append-notes', note_text)], ['task-1'], [])
+        for bad_expanded in (
+            note_args,
+            ['update', 'task-1', '--append-notes', '--file', note_text],
+        ):
+            self.assertNotEqual(rc._bd_scan(bad_expanded, 'update'), expected_note_scan)
+
+    def test_other_value_flags_followed_by_attachment_are_refused_with_clear_sentence(self):
+        import reserved_comments as rc
+        for args, att_flag, bad_flag in (
+            (['update', 'task-1', '--description', '@attachment:0'], '--file', '--description'),
+            (['update', 'task-1', '--title', '@attachment:0'], '-f', '--title'),
+            (['update', 'task-1', '-d', '@attachment:0'], '--file', '-d'),
+            (['update', 'task-1', '-qd', '@attachment:0'], '-f', '-d'),
+            (['create', 'Title', '--acceptance', '@attachment:0'], '--file', '--acceptance'),
+            (['close', 'task-1', '-r', '@attachment:0'], '--file', '-r'),
+        ):
+            attachments = {'0': {'flag': att_flag, 'text': 'text'}}
+            with self.subTest(args=args, att_flag=att_flag):
+                refusal = rc.attachment_value_refusal(args, attachments)
+                self.assertIsNotNone(refusal)
+                self.assertIn('--append-notes', refusal)
+                self.assertIn('--notes', refusal)
+                self.assertIn(bad_flag, refusal)
+                self.assertIn(att_flag, refusal)
+                wt = rc.write_targets(args, attachments)
+                self.assertEqual(wt['refusal'], refusal)
+        # Note flags with --file or -f are allowed; note flags with --body-file are refused.
+        for note_flag in ('--append-notes', '--notes'):
+            for att_flag in ('--file', '-f'):
+                self.assertIsNone(rc.attachment_value_refusal(
+                    ['update', 'task-1', note_flag, '@attachment:0'],
+                    {'0': {'flag': att_flag, 'text': 'note'}}))
+            refusal = rc.attachment_value_refusal(
+                ['update', 'task-1', note_flag, '@attachment:0'],
+                {'0': {'flag': '--body-file', 'text': 'note'}})
+            self.assertIsNotNone(refusal)
+            self.assertIn('--append-notes', refusal)
+            self.assertIn('--notes', refusal)
+        # Standalone path flags keep their existing behaviour (no value-flag refusal).
+        for args, att_flag in (
+            (['update', 'task-1', '@attachment:0'], '--body-file'),
+            (['update', 'task-1', '@attachment:0'], '--design-file'),
+            (['create', 'Title', '@attachment:0'], '--file'),
+            (['comments', 'add', 'task-1', '@attachment:0'], '--file'),
+            (['dep', 'add', '@attachment:0'], '--file'),
+        ):
+            with self.subTest(args=args, att_flag=att_flag):
+                self.assertIsNone(rc.attachment_value_refusal(
+                    args, {'0': {'flag': att_flag, 'text': 'body'}}))
+
+
 if __name__ == '__main__':
     unittest.main()

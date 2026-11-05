@@ -2222,6 +2222,7 @@ lists the read-only rounds view's display bounds separately in `rounds_limits`.
 | `checkpoint` | `source_commit` / `branch` | <= 128 / <= 200 characters |
 | `checkpoint` | `open_items` / `resolved` | <= 100 each, within the 80,000-byte record; group them (one open item per theme with an id prefix, resolved ones folded) and link a longer text in a repository document through an item `source` |
 | `create` / `update` | `--description`, `--body-file` | <= 20,000 characters on the native route and on HTTP alike, answered with `Task description is too long`; keep a long text in a repository document and link it from the description |
+| `create` / `update` | `--notes`, `--append-notes` (including `--file` / `-f` attached to either) | <= 20,000 characters, answered with `Task note is too long`; keep a long text in a repository document and link it from the note |
 | `checkpoint` | item `text`/`reason` | <= 400 characters |
 | `checkpoint` | item `source`/`evidence` | <= 240 characters |
 | `checkpoint` | whole payload | <= 80 KB canonical bytes |

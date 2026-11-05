@@ -1205,6 +1205,156 @@ def _parse_go_bool(value):
     return None
 
 
+NOTE_VALUE_ATTACHMENT_FLAGS = frozenset(('--append-notes', '--notes'))
+NOTE_ATTACHMENT_FILE_FLAGS = frozenset(('--file', '-f'))
+
+
+def _command_value_inventory(args):
+    """(command, value_long, short_table) for an argv list."""
+    command = args[0] if args and isinstance(args[0], str) else None
+    if command in ('create', 'update', 'close', 'reopen'):
+        return command, BD_LONG_VALUE_FLAGS.get(command, set()) | BD_GLOBAL_VALUE_FLAGS, _short_flag_table(command)
+    if command == 'comments':
+        _, subcommand = _bd_command_context(args)
+        return command, BD_COMMENT_ADD_VALUE_FLAGS | BD_GLOBAL_VALUE_FLAGS, _short_flag_table('comments', subcommand)
+    if command == 'dep':
+        subcommand = _dep_subcommand(args)
+        return command, BD_DEP_VALUE_LONG_FLAGS | BD_GLOBAL_VALUE_FLAGS, _short_flag_table('dep', subcommand)
+    return command, READ_VALUE_FLAGS.get(command, frozenset()) | BD_GLOBAL_VALUE_FLAGS, _short_flag_table(command)
+
+
+def _value_flag_taking_next(token, value_long, table):
+    """The flag spelling when ``token`` consumes the next argv token as its value, else None."""
+    if not isinstance(token, str) or len(token) <= 1 or not token.startswith('-'):
+        return None
+    if token.startswith('--'):
+        name, sep, _ = token.partition('=')
+        return name if not sep and name in value_long else None
+    body = token[1:]
+    end = body.find('=')
+    chars = body[:end] if end != -1 else body
+    attached = body[end + 1:] if end != -1 else None
+    for position, ch in enumerate(chars):
+        spec = table.get(ch) if table else None
+        if spec is None:
+            return None
+        if spec == 'value':
+            return '-' + ch if attached is None and position == len(chars) - 1 else None
+    return None
+
+
+def attachment_value_refusal(args, attachments=None):
+    """Sentence refusing a value-taking flag directly followed by a file attachment, or None.
+
+    Only ``--append-notes`` and ``--notes`` on ``create``/``update`` take a ``--file``/``-f``
+    attachment as their inline text value (kittrial-5bb.517). Any other value flag followed by
+    an ``@attachment:`` token is refused before bd runs so a literal ``--file`` is never passed
+    as the flag's value and the file text is never read as a positional task id.
+    """
+    if not isinstance(args, list) or not args or not isinstance(args[0], str):
+        return None
+    command, value_long, table = _command_value_inventory(args)
+    index = 1
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            index += 1
+            continue
+        if token == '--':
+            break
+        flag_name = _value_flag_taking_next(token, value_long, table)
+        if flag_name is not None:
+            if index + 1 < len(args):
+                next_token = args[index + 1]
+                if isinstance(next_token, str) and next_token.startswith('@attachment:'):
+                    item = ((attachments or {}).get(next_token.partition(':')[2])
+                            if isinstance(attachments, dict) else None)
+                    att_flag = (item.get('flag')
+                                if isinstance(item, dict) and isinstance(item.get('flag'), str)
+                                else '--file')
+                    if not (command in ('create', 'update')
+                            and flag_name in NOTE_VALUE_ATTACHMENT_FLAGS
+                            and isinstance(item, dict)
+                            and att_flag in NOTE_ATTACHMENT_FILE_FLAGS
+                            and isinstance(item.get('text'), str)):
+                        return ('%s does not take %s as its value; only --append-notes and --notes '
+                                'take a file attachment (--file or -f)'
+                                % (shown_token(flag_name), shown_token(att_flag)))
+            index += 2
+            continue
+        index += 1
+    return None
+
+
+def expand_bd_attachments(args, attachments=None, paths=None):
+    """Expand ``@attachment:`` tokens in ``args`` with one shared rule across every guard and bd.
+
+    On ``create``/``update``, ``--append-notes`` or ``--notes`` directly followed by a ``--file``
+    or ``-f`` attachment expands that attachment in place to the single inline note text token.
+    Any other value-taking flag directly followed by an ``@attachment:`` token receives ``None``
+    as its value (never a literal ``--file`` flag or a leaked positional operand). Every other
+    ``@attachment:`` token expands to ``[flag, paths[key] if paths is given else text]``.
+    """
+    if not isinstance(args, list) or not args:
+        return []
+    if attachments is None:
+        return list(args)
+    command, value_long, table = _command_value_inventory(args)
+    expanded = [args[0]]
+    index = 1
+    end_of_flags = False
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            expanded.append(token)
+            index += 1
+            continue
+        if token == '--':
+            end_of_flags = True
+            expanded.append(token)
+            index += 1
+            continue
+        if not end_of_flags:
+            flag_name = _value_flag_taking_next(token, value_long, table)
+            if flag_name is not None:
+                if index + 1 >= len(args):
+                    expanded.append(token)
+                    index += 1
+                    continue
+                next_token = args[index + 1]
+                if isinstance(next_token, str) and next_token.startswith('@attachment:'):
+                    key = next_token.partition(':')[2]
+                    item = attachments.get(key) if isinstance(attachments, dict) else None
+                    if (command in ('create', 'update')
+                            and flag_name in NOTE_VALUE_ATTACHMENT_FLAGS
+                            and isinstance(item, dict)
+                            and item.get('flag') in NOTE_ATTACHMENT_FILE_FLAGS
+                            and isinstance(item.get('text'), str)):
+                        expanded.extend([token, item['text']])
+                    else:
+                        expanded.extend([token, None])
+                    index += 2
+                    continue
+                expanded.extend([token, next_token])
+                index += 2
+                continue
+        if token.startswith('@attachment:'):
+            key = token.partition(':')[2]
+            item = attachments.get(key) if isinstance(attachments, dict) else None
+            if (not isinstance(item, dict)
+                    or not isinstance(item.get('flag'), str)
+                    or not isinstance(item.get('text'), str)):
+                expanded.append(None)
+            else:
+                value = str(paths[key]) if (paths is not None and key in paths) else item['text']
+                expanded.extend([item['flag'], value])
+            index += 1
+            continue
+        expanded.append(token)
+        index += 1
+    return expanded
+
+
 def _bd_scan(args, command):
     """Structurally scan a create/update argv list.
 
@@ -1240,9 +1390,11 @@ def _bd_scan(args, command):
             name, sep, value = token.partition('=')
             if name in value_long:
                 if not sep:
+                    has_next = index + 1 < len(args)
                     value = (args[index + 1]
-                             if index + 1 < len(args)
-                             and isinstance(args[index + 1], str) else None)
+                             if has_next and isinstance(args[index + 1], str) else None)
+                    if has_next and value is None:
+                        unknown.append(name)
                     index += 1
                 flags.append((name, value))
             elif name in bool_long:
@@ -1269,9 +1421,11 @@ def _bd_scan(args, command):
                     elif position < len(chars) - 1:
                         value = chars[position + 1:]
                     else:
+                        has_next = index + 1 < len(args)
                         value = (args[index + 1]
-                                 if index + 1 < len(args)
-                                 and isinstance(args[index + 1], str) else None)
+                                 if has_next and isinstance(args[index + 1], str) else None)
+                        if has_next and value is None:
+                            unknown.append('-' + ch)
                         index += 1
                     flags.append(('-' + ch, value))
                     break
@@ -1284,7 +1438,7 @@ def _bd_scan(args, command):
     return flags, operands, unknown
 
 
-def bd_flag_values(args):
+def bd_flag_values(args, attachments=None):
     """(name, value) for every flag of a `create`/`update` argv, as pflag parses it.
 
     The ONE shorthand-aware reader the claiming guards share (kittrial-5bb.352 review
@@ -1304,11 +1458,12 @@ def bd_flag_values(args):
     command = args[0] if isinstance(args[0], str) else None
     if command not in ('create', 'update'):
         return []
-    flags, _, _ = _bd_scan(args, command)
+    expanded = expand_bd_attachments(args, attachments) if attachments is not None else args
+    flags, _, _ = _bd_scan(expanded, command)
     return flags
 
 
-def unresolved_bd_flags(args):
+def unresolved_bd_flags(args, attachments=None):
     """Unresolvable create/update flags; a non-empty list must fail the guard.
 
     The raw create/update path resolves its flag surface from the pinned bd
@@ -1323,11 +1478,12 @@ def unresolved_bd_flags(args):
     command = args[0] if isinstance(args[0], str) else None
     if command not in ('create', 'update'):
         return []
-    _, _, unknown = _bd_scan(args, command)
+    expanded = expand_bd_attachments(args, attachments) if attachments is not None else args
+    _, _, unknown = _bd_scan(expanded, command)
     return list(unknown)
 
 
-def label_guard_request(args):
+def label_guard_request(args, attachments=None):
     """Describe the read-before-write reserved-label check an argv list needs.
 
     Returns None when the invocation cannot move a reserved label, else a dict:
@@ -1351,7 +1507,8 @@ def label_guard_request(args):
     command = args[0] if isinstance(args[0], str) else None
     if command not in ('create', 'update'):
         return None
-    flags, operands, unknown = _bd_scan(args, command)
+    expanded = expand_bd_attachments(args, attachments) if attachments is not None else args
+    flags, operands, unknown = _bd_scan(expanded, command)
     ambiguous = bool(unknown)
     if command == 'create':
         parents = [value for name, value in flags if name == '--parent']
@@ -1434,7 +1591,7 @@ def _moves_status_or_assignee(flags):
     return move or claim
 
 
-def status_change_targets(args):
+def status_change_targets(args, attachments=None):
     """The ids a status/assignee-moving invocation names, for the guard.
 
     Covers `close`, `reopen`, and `update` with any flag that changes status or
@@ -1454,7 +1611,8 @@ def status_change_targets(args):
     command = args[0] if isinstance(args[0], str) else None
     if command not in ('close', 'reopen', 'update'):
         return None
-    flags, operands, unknown = _bd_scan(args, command)
+    expanded = expand_bd_attachments(args, attachments) if attachments is not None else args
+    flags, operands, unknown = _bd_scan(expanded, command)
     if command == 'update' and not _moves_status_or_assignee(flags):
         return None
     if unknown:
@@ -1463,7 +1621,7 @@ def status_change_targets(args):
     return (command, targets or None)
 
 
-def title_change_targets(args):
+def title_change_targets(args, attachments=None):
     """The ids an `update` that changes a title names, for the record-anchor guard (kittrial-5bb.97).
 
     ``None`` when the invocation is not an `update` with `--title` (bd 1.2.2 has no short
@@ -1473,7 +1631,8 @@ def title_change_targets(args):
     """
     if not isinstance(args, list) or not args or args[0] != 'update':
         return None
-    flags, operands, unknown = _bd_scan(args, 'update')
+    expanded = expand_bd_attachments(args, attachments) if attachments is not None else args
+    flags, operands, unknown = _bd_scan(expanded, 'update')
     if not any(name == '--title' for name, _ in flags):
         return None
     targets = [token for token in operands if not token.startswith('@attachment:')]
@@ -1918,12 +2077,12 @@ def write_targets(args, attachments=None):
         refusal = _read_writes(args, read)
         return None if refusal is None else {'command': read, 'targets': [], 'new_id': None,
                                              'refusal': refusal}
-    label, targets, new_id, refusal = command, [], None, None
+    label, targets, new_id, refusal = command, [], None, attachment_value_refusal(args, attachments)
     if command in ('create', 'update', 'close', 'reopen'):
-        flags, operands, unknown = _bd_scan(args, command)
+        expanded = expand_bd_attachments(args, attachments) if attachments is not None else args
+        flags, operands, unknown = _bd_scan(expanded, command)
         operands = [token for token in operands if not token.startswith('@attachment:')]
-        files = [token for token in args[1:] if isinstance(token, str) and token.startswith('@attachment:')]
-        if unknown:
+        if unknown and refusal is None:
             refusal = 'the flag %s is not one this interface can resolve to tasks' % shown_token(unknown[0])
         for name, value in flags:
             if name in _ID_VALUE_FLAGS and isinstance(value, str) and value.strip():
@@ -1935,9 +2094,7 @@ def write_targets(args, attachments=None):
             elif ids:
                 new_id = ids[0]
             named = {name for name, _ in flags}
-            batch = named & {'--file', '-f', '--graph'} or any(
-                (attachments or {}).get(token.partition(':')[2], {}).get('flag') in ('--file', '-f') for token in files)
-            if batch:
+            if named & {'--file', '-f', '--graph'}:
                 refusal = refusal or ('creating several tasks from a file names no task here; create them one by one')
         else:
             targets = operands + targets
