@@ -1626,7 +1626,7 @@ CONTRIBUTOR_COMMANDS = (
      'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
     ('trace --verify [--repo DIR] [--record | --payloads FILE]',
      "check each accepted design document against git at its pinned commit (verified, design-drift)"),
-    ('trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]',
+    ('trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N] [--interfaces-offset N]',
      "the program view of a program project: its areas, interfaces and requirements' coverage"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),

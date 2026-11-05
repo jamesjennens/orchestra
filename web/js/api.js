@@ -506,7 +506,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
       replyTo ? { to_project: toProject, text, reply_to: replyTo } : { to_project: toProject, text }),
     noteNoted: (pid, nid) => mutate('POST', `/v1/projects/${pid}/notes/${nid}/noted`, {}),
     // kittrial-5bb.453: the program view (the Program page).
-    programView: (pid, cursor) => call('GET', `/v1/projects/${pid}/program`, { params: cursor ? { cursor } : {} }),
+    programView: (pid, cursor, interfaces_offset) => call('GET', `/v1/projects/${pid}/program`,
+      { params: Object.assign(cursor ? { cursor } : {}, interfaces_offset ? { interfaces_offset } : {}) }),
     mergeSlot: (pid) => call('GET', `/v1/projects/${pid}/merge-slot`),
     acquireMergeSlot: (pid, task_id, target) => mutate('POST', `/v1/projects/${pid}/merge-slot/acquire`, { task_id, target }),
     releaseMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/release`, {}),

@@ -160,14 +160,35 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual({'state': 'not-available', 'note': program_view.INTERFACES_NOT_AVAILABLE}, answer['interfaces'])
         self.assertEqual((program_view.DECISIONS_SCOPE, [], []),
                          (answer['decisions']['scope'], answer['decisions']['items'], answer['suggestions']['items']))
-        self.assertIn('kittrial-5bb.450', program_view.INTERFACES_NOT_AVAILABLE)
+
+    def test_the_interfaces_section_pages_names_readable_areas_only_and_counts_none(self):
+        def view(n, **more):
+            return dict({'key': 'iface.k%03d.v1' % n, 'record': {'name': 'K%d' % n, 'revision': 2}, 'lifecycle': 'accepted',
+                         'replacement': None}, **more)
+        usage = [{'key': 'iface.k001.v1', 'role': 'provides', 'project': 'north', 'minimum': 2},
+                 {'key': 'iface.k001.v1', 'role': 'consumes', 'project': 'north', 'minimum': 1}]
+        views = [view(n) for n in range(60)] + [{'key': 'iface.draft.v1', 'proposed': {'name': 'D', 'revision': 1},
+                                                  'lifecycle': 'draft', 'replacement': None}]
+        first = program_view.interfaces_section(views, usage, False, lambda record: ['compatibility-unverified'], 0)
+        self.assertEqual((50, 61, 50, 'ok'), (len(first['items']), first['total'], first['next_offset'], first['state']))
+        self.assertEqual([{'area': 'north', 'minimum': 2}], [r for r in first['items'] if r['key'] == 'iface.k001.v1'][0]['providers'])
+        self.assertEqual([{'area': 'north', 'minimum': 1}], [r for r in first['items'] if r['key'] == 'iface.k001.v1'][0]['consumers'])
+        second = program_view.interfaces_section(views, usage, False, lambda record: [], 50)
+        self.assertEqual((11, None), (len(second['items']), second['next_offset']))
+        draft = [row for row in first['items'] if row['key'] == 'iface.draft.v1'][0]
+        self.assertEqual(('draft', ['compatibility-unverified']), (draft['lifecycle'], draft['flags']))
+        program_isolation.assert_interfaces_section_hidden(self, first, {'south', 'ghost'})
+        self.assertFalse(first['complete'])
+        unsettled = program_view.interfaces_unsettled()
+        self.assertEqual(([], 'unsettled'), (unsettled['items'], unsettled['state']))
+        program_isolation.assert_interfaces_section_hidden(self, unsettled, set())
 
     def test_the_arguments(self):
         self.assertEqual({'offset': 0, 'limit': 50, 'idle_minutes': 15, 'requirements_offset': 0, 'decisions_offset': 0,
-                          'suggestions_offset': 0},
+                          'suggestions_offset': 0, 'interfaces_offset': 0},
                          program_view.parse_args([]))
         for bad in (['--limit', '51'], ['--limit', '0'], ['--offset', '-1'], ['--idle-minutes', '0'],
-                    ['--requirements-offset', '-1'], ['--view', 'x']):
+                    ['--requirements-offset', '-1'], ['--interfaces-offset', '-1'], ['--view', 'x']):
             with self.assertRaises(ValueError, msg=bad):
                 program_view.parse_args(bad)
 
@@ -350,6 +371,19 @@ class WebTests(LinkCase):
             self, self.request, 'north', 'nowhere',
             {'program member': self.tokens['carl'], 'nobody': self.tokens['otto'],
              'agent without the grant': self.tokens['wren']})
+
+    def test_the_harness_shows_no_area_in_the_interfaces_section(self):
+        program_isolation.assert_interfaces_hidden(
+            self, self.request, 'prog', {'south', 'ghost'},
+            {'program contributor': self.tokens['carl'], 'program owner': self.tokens['pat'],
+             'reader of another area': self.tokens['vera'], 'agent without the area': self.tokens['wren']})
+        # In-process backend only: its program() never supplies interfaces (http_service.py InProcessBackend), so this
+        # checks the not-available path and the 422, NOT the may_read gate. The real gate is pinned by
+        # tests/test_interfaces_native.py NativeProgramViewInterfacesGateTests (fails with allowed() forced True).
+        data = self.view(self.tokens['vera'], '?interfaces_offset=0')
+        self.assertEqual('not-available', data['interfaces']['state'])
+        self.assertEqual(422, self.request('GET', '/v1/projects/prog/program?interfaces_offset=x',
+                                           token=self.tokens['vera']).status)
 
     def test_the_sections_coverage_and_bounds(self):
         data = self.view(self.tokens['vera'])
@@ -582,6 +616,70 @@ console.log(JSON.stringify({text:host.textContent,
                       program_view.DECISIONS_SCOPE, 'no-area-cites'):
             self.assertIn(words, out['text'])
         self.assertEqual([True, False, False, False], out['flags'])
+
+    def test_the_interfaces_table_shows_the_server_rows_as_text(self):
+        import shutil
+        import test_http_web
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        code = """await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const read=JSON.parse(process.argv[3]);
+const host=document.createElement('div');
+host.appendChild(view.interfacesTable(read.ok));
+const empty=document.createElement('div');
+empty.appendChild(view.interfacesTable(read.empty));
+const note=document.createElement('div');
+note.appendChild(view.interfacesTable(read.unsettled));
+const rows=Array.from(host.querySelectorAll('tr')).map((row)=>row.textContent);
+const made=['img','script','b','svg'].map((tag)=>Array.from(host.querySelectorAll(tag)).length).reduce((a,b)=>a+b,0);
+console.log(JSON.stringify({rows,made,text:host.textContent,empty:empty.textContent,note:note.textContent}));"""
+        hostile = '<img src=x onerror=1>\u202eQuotes'
+        ok = {'state': 'ok', 'scope': program_view.INTERFACES_SCOPE, 'complete': False, 'total': 1, 'next_offset': None,
+              'items': [{'key': 'iface.quotes.v1', 'name': hostile, 'lifecycle': 'accepted', 'revision': 2,
+                         'replacement': None, 'flags': ['compatibility-unverified'],
+                         'providers': [{'area': 'north', 'minimum': 2}],
+                         'consumers': [{'area': 'east', 'minimum': 1}, {'area': 'west', 'minimum': 2}]}]}
+        read = {'ok': ok, 'empty': dict(ok, items=[], total=0), 'unsettled': program_view.interfaces_unsettled()}
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/program.js').as_uri(), json.dumps(read))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(0, out['made'])
+        self.assertIn(hostile, out['text'])
+        self.assertIn('iface.quotes.v1' + hostile + 'accepted r2north@2east@1, west@2compatibility-unverified',
+                      out['rows'])
+        self.assertIn(program_view.INTERFACES_SCOPE, out['text'])
+        self.assertIn('The register holds no interface.', out['empty'])
+        self.assertIn(program_view.INTERFACES_UNSETTLED, out['note'])
+
+    def test_next_interfaces_does_not_send_an_areas_cursor_bound_to_another_offset(self):
+        # kittrial-5bb.467 r3 (review of r2, item 2): an areas cursor is bound to the whole query, interfaces_offset
+        # included, so "Next interfaces" after "Next areas" must start the areas again rather than send a cursor the
+        # server refuses with 409. Needs node.
+        import shutil
+        import test_http_web
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        code = """await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const calls=[];
+const answer={schema:'program-view-v1',program:'pp',areas:{items:[],total:120,next_cursor:'C1'},
+  interfaces:{state:'ok',scope:'s',complete:false,total:120,next_offset:50,items:[]},
+  requirements:{items:[],total:0},decisions:{items:[],total:0},suggestions:{items:[],total:0},coverage:{}};
+const ctx={href:(p)=>'#'+p,api:{programView:async(pid,cursor,offset)=>{calls.push([cursor===undefined?null:cursor,offset===undefined?null:offset]);return answer;}}};
+const host=await view.page(ctx,{pid:'pp'});
+const button=(label)=>Array.from(host.querySelectorAll('button')).find((b)=>b.textContent===label);
+await button('Next areas').dispatch('click');
+await button('Next interfaces').dispatch('click');
+console.log(JSON.stringify(calls));"""
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/program.js').as_uri())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        calls = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual([[None, None], ['C1', None], [None, 50]], calls)
 
     def test_a_superseded_decision_still_shows_its_area_states(self):
         # Review of .454 r2, b1: it still binds in the data, so the page must not show only the word superseded.

@@ -21,7 +21,11 @@ OPEN_STATUSES = ('open', 'in_progress', 'blocked')
 NOT_WORK_TYPES = ('epic', 'event', 'gate')
 
 NOT_VISIBLE = 'not visible to you'
-INTERFACES_NOT_AVAILABLE = 'The interface register (kittrial-5bb.450, slice 3) is not in this build yet.'
+INTERFACES_NOT_AVAILABLE = 'The interface register is not read by this build.'
+INTERFACES_SCOPE = ('Providers and consumers are read from the readable areas of this read only. When any area is not '
+                    'visible to you, or not on a page read, the flags that need every area are not shown.')
+INTERFACES_UNSETTLED = ('Rights changed while this page was read, so the interfaces are not shown: '
+                        'read the page again.')
 DECISIONS_SCOPE = ('Adoptions are read from the readable areas of this read only: an area that is not visible to '
                    'you reads not-visible, and one not on this page of areas reads not-checked.')
 COORDINATORS_ON_THE_WEB = 'Coordinators are shown on the web Program page.'
@@ -45,19 +49,21 @@ def parse_args(args):
     parser.add_argument('--limit', type=int, default=AREAS_MAX)
     parser.add_argument('--idle-minutes', type=int, default=lanes.DEFAULT_IDLE_MINUTES, dest='idle_minutes')
     parser.add_argument('--requirements-offset', type=int, default=0, dest='requirements_offset')
+    parser.add_argument('--interfaces-offset', type=int, default=0, dest='interfaces_offset')
     parser.add_argument('--decisions-offset', type=int, default=0, dest='decisions_offset')
     parser.add_argument('--suggestions-offset', type=int, default=0, dest='suggestions_offset')
     parser.add_argument('--json', action='store_true')       # the answer is always JSON
     parsed = parser.parse_args(list(args))
     if not 1 <= parsed.limit <= AREAS_MAX or min(parsed.offset, parsed.requirements_offset, parsed.decisions_offset,
-                                                 parsed.suggestions_offset) < 0:
+                                                 parsed.suggestions_offset, parsed.interfaces_offset) < 0:
         raise ValueError('Invalid program read: --limit must be 1..%d, and the offsets must be >= 0' % AREAS_MAX)
     if not lanes.IDLE_MINUTES_MIN <= parsed.idle_minutes <= lanes.IDLE_MINUTES_MAX:
         raise ValueError('Invalid program read: --idle-minutes must be %d..%d'
                          % (lanes.IDLE_MINUTES_MIN, lanes.IDLE_MINUTES_MAX))
     return {'offset': parsed.offset, 'limit': parsed.limit, 'idle_minutes': parsed.idle_minutes,
             'requirements_offset': parsed.requirements_offset, 'decisions_offset': parsed.decisions_offset,
-            'suggestions_offset': parsed.suggestions_offset}
+            'suggestions_offset': parsed.suggestions_offset,
+            'interfaces_offset': parsed.interfaces_offset}
 
 
 def area_keys(items):
@@ -204,17 +210,52 @@ def coverage(areas, total_areas, offset, requirements):
             'areas_total': total_areas, 'rows_read': rows_read, 'cut': cut}
 
 
+def interfaces_unsettled():
+    """The interfaces section when rights kept changing while the page was read: no row at all."""
+    return {'state': 'unsettled', 'items': [], 'total': 0, 'next_offset': None, 'complete': False,
+            'scope': INTERFACES_SCOPE, 'note': INTERFACES_UNSETTLED}
+
+
+def interfaces_section(views, usage, complete, flags, offset):
+    """The register as the program view shows it (kittrial-5bb.467): the entries of ``interface list`` (a draft too,
+    for a reader of the program, as there), by key, pages of 50. Providers and consumers come from ``usage``, which
+    holds the readable areas only, so a row never names an area the caller may not read. There is no count of the
+    areas left out: with one other area a count would name it. ``flags`` is interface_records.flags over the usage
+    and ``complete``, which withholds the flags that need every area when any was not read."""
+    rows = []
+    for view in sorted(views, key=lambda v: v.get('key') or ''):
+        record = view.get('record') or view.get('proposed')
+        if not isinstance(record, dict):
+            continue
+        key = view.get('key')
+        found = [u for u in usage if u.get('key') == key]
+        rows.append({'key': key, 'name': record.get('name'), 'lifecycle': view.get('lifecycle'),
+                     'revision': record.get('revision'), 'replacement': view.get('replacement'),
+                     'flags': flags(view['record']) if view.get('record') else ['compatibility-unverified'],
+                     'providers': sorted(({'area': u['project'], 'minimum': u['minimum']}
+                                          for u in found if u.get('role') == 'provides'),
+                                         key=lambda u: (u['area'], u['minimum'])),
+                     'consumers': sorted(({'area': u['project'], 'minimum': u['minimum']}
+                                          for u in found if u.get('role') == 'consumes'),
+                                         key=lambda u: (u['area'], u['minimum']))})
+    page = rows[offset:offset + ROWS_MAX]
+    following = offset + ROWS_MAX
+    return {'state': 'ok', 'items': page, 'total': len(rows), 'next_offset': following if following < len(rows) else None,
+            'complete': bool(complete), 'scope': INTERFACES_SCOPE}
+
+
 def empty_section():
     return {'items': [], 'total': 0, 'next_offset': None}
 
 
-def answer(program, areas, total_areas, offset, limit, requirements, decisions=None, suggestions=None):
+def answer(program, areas, total_areas, offset, limit, requirements, decisions=None, suggestions=None,
+           interfaces=None):
     """The whole answer, from what the endpoint read (no I/O)."""
     following = offset + limit
     return {'schema': 'program-view-v1', 'program': program,
             'areas': {'items': areas, 'total': total_areas,
                       'next_offset': following if following < total_areas else None},
-            'interfaces': {'state': 'not-available', 'note': INTERFACES_NOT_AVAILABLE},
+            'interfaces': interfaces or {'state': 'not-available', 'note': INTERFACES_NOT_AVAILABLE},
             'requirements': requirements,
             'decisions': dict(decisions or empty_section(), scope=DECISIONS_SCOPE),
             'suggestions': dict(suggestions or empty_section()),

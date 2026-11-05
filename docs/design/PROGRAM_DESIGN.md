@@ -371,7 +371,7 @@ for the caller, then reports:
     becomes the hidden one, and the page is read again without that area, so none of its citations stay in the
     requirements section (review of .453, B2). After three reads that each lose a right, the requirements section
     is `unsettled`, with no row.
-- **Interfaces** read `not-available` until slice 3 (kittrial-5bb.450) is merged forward. **Decisions** and
+- **Interfaces** (kittrial-5bb.467) are the register's entries with providers and consumers from the readable areas only. **Decisions** and
   **suggestions** are slice 5's (kittrial-5bb.454, as built under section 6).
 - **Requirements:** each accepted program requirement that no readable area of this read cites (`no-area-cites`),
   and each area design section pinning a superseded program revision (`cites-superseded-revision`), 50 rows a page.
