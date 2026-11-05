@@ -4203,6 +4203,8 @@ class EndpointBackend:
                           'open_items_shown': shown,
                           'open_items_total': total,
                           **({'open_items_note': note} if note else {})}
+            if isinstance(point.get('author'), str):
+                checkpoint['author_name'] = self._actor_names([point['author']], project_id).get(point['author'])
             from briefing import bound_context_pointer_display
             checkpoint['pointer_items'],checkpoint['resolved_pointer_items']=bound_context_pointer_display(
                 [checkpoint['pointer_items'],checkpoint['resolved_pointer_items']])
@@ -14034,7 +14036,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             text=APPROVAL_WAIT
         review['waiting_for_approval']=text
         actors = [brief['task'].get('assignee')]
-        actors += [checkpoint.get('author')] if checkpoint else []
+        actors += [checkpoint.get('author', {}).get('text') if checkpoint and isinstance(checkpoint.get('author'), dict)
+                   else checkpoint.get('author')] if checkpoint else []
         actors += [contribution.get('author')] if contribution else []
         actors += [r.get('author') for r in review.get('requests') or []]
         # Only a recommendation by a different person from the contribution's author is
@@ -14063,7 +14066,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         task = dict(brief['task'], review_state=review.get('state') or 'none')
         brief['task'] = self._task_view(task, names, project_id=ctx.params['pid'])
         if checkpoint:
-            checkpoint['author_name'] = names.get(checkpoint.get('author'))
+            author = checkpoint.get('author')
+            author_id = author.get('text') if isinstance(author, dict) else author
+            checkpoint['author_name'] = checkpoint.get('author_name') or names.get(author_id)
         if contribution:
             contribution['author_name'] = names.get(contribution.get('author'))
         for request in review.get('requests') or []:

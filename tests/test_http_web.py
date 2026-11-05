@@ -852,6 +852,28 @@ class SessionAndTaskListCase(TeamHarness):
 class CanonicalBindingReadCase(EndpointCase):
     """The same reads over ``EndpointBackend`` and the strict canonical stub."""
 
+    def test_checkpoint_author_on_the_brief_is_the_name(self):
+        """The canonical brief carries the author as {text, omitted_chars}; the page must
+        show the person's name, not the account id or None (kittrial-5bb.504 r3)."""
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'checkpointed').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        history = self.request('GET', '/v1/projects/%s/tasks/%s/history?limit=5'
+                               % (project, task), token=alex).data
+        added = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/checkpoints' % (project, task),
+            {'schema_version': 1, 'previous': None,
+             'activity_cursor': history['activity_cursor'], 'source_commit': COMMIT,
+             'branch': 'contrib/test', 'intent': 'show the author',
+             'acceptance': 'the name is shown', 'summary': 'checkpoint named',
+             'next_action': 'contribute', 'open_items': [], 'resolved': []}, token=alex)
+        self.assertEqual(201, added.status, added.data)
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                             token=alex)
+        self.assertEqual(200, brief.status, brief.data)
+        self.assertEqual('alex', brief.data['checkpoint']['author_name'])
+
     def test_brief_and_queue_follow_the_canonical_review_chain(self):
         alex, project = self.setup_project()
         task = self.create_task(alex, project, 'canonical task').data['id']

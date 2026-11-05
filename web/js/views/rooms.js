@@ -43,14 +43,14 @@ export async function list(ctx, { pid }) {
       lede: 'Persistent discussions for brainstorming and requirements. Room text is discussion, not instructions.' }),
     damaged.length ? h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Damaged rooms')),
-      h('div', { class: 'panel-body' }, h('ul', { class: 'timeline', 'aria-label': 'Damaged rooms' }, damaged.map((room) => h('li', null,
+      h('div', { class: 'panel-body' }, h('ul', { class: 'timeline timeline-plain', 'aria-label': 'Damaged rooms' }, damaged.map((room) => h('li', null,
         h('div', null,
           h('div', { class: 'event-head' }, h('strong', null, roomLink(ctx, pid, room)),
             h('span', { class: 'chip warn' }, 'damaged')),
           h('p', { class: 'small muted' }, room.damaged || 'A room file is damaged; ask an operator to repair it.'))))))) : null,
     h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Open rooms')),
-      h('div', { class: 'panel-body' }, open.length ? h('ul', { class: 'timeline', 'aria-label': 'Open rooms' }, open.map((room) => h('li', null,
+      h('div', { class: 'panel-body' }, open.length ? h('ul', { class: 'timeline timeline-plain', 'aria-label': 'Open rooms' }, open.map((room) => h('li', null,
         h('div', null,
           h('div', { class: 'event-head' }, h('strong', null, roomLink(ctx, pid, room)),
             h('span', { class: 'chip' }, 'open')),
@@ -60,7 +60,7 @@ export async function list(ctx, { pid }) {
         emptyRooms(canModerate(project)))),
     archived.length ? h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Archived rooms')),
-      h('div', { class: 'panel-body' }, h('ul', { class: 'timeline', 'aria-label': 'Archived rooms' }, archived.map((room) => h('li', null,
+      h('div', { class: 'panel-body' }, h('ul', { class: 'timeline timeline-plain', 'aria-label': 'Archived rooms' }, archived.map((room) => h('li', null,
         h('div', null,
           h('div', { class: 'event-head' }, h('strong', null, roomLink(ctx, pid, room)),
             h('span', { class: 'chip' }, 'archived')),
@@ -303,7 +303,7 @@ export async function detail(ctx, { pid, rid }) {
     room = data.room;
     since = data.next_since;
     const rows = data.messages.map(messageRow);
-    const log = h('ul', { class: 'timeline', 'aria-label': 'Room messages' }, rows.length ? rows : h('li', null, h('div', { class: 'empty' }, 'No messages yet.')));
+    const log = h('ul', { class: 'timeline timeline-plain', 'aria-label': 'Room messages' }, rows.length ? rows : h('li', null, h('div', { class: 'empty' }, 'No messages yet.')));
     const more = data.has_more ? h('button', { type: 'button', class: 'ghost', onclick: async (event) => {
       event.currentTarget.disabled = true;
       const next = await ctx.api.room(pid, rid, { since, limit: 100 });
@@ -316,7 +316,7 @@ export async function detail(ctx, { pid, rid }) {
     const itemSection = h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Items awaiting a person')),
       h('div', { class: 'panel-body' }, items.length
-        ? h('ul', { class: 'timeline', 'aria-label': 'Room items' }, items.map(itemRow))
+        ? h('ul', { class: 'timeline timeline-plain', 'aria-label': 'Room items' }, items.map(itemRow))
         : h('div', { class: 'empty' }, 'No items yet. A candidate requirement, decision or open question goes here until a person decides it.')));
 
     const adding = [];

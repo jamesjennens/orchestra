@@ -2,7 +2,7 @@
 import { h, mount, brandMark, initials, confirmDialog, toast } from './dom.js';
 import { createApi, fetchTransport } from './api.js';
 import { describe } from './ui.js';
-import { matchRoute, projectOf, RECORD_ROUTES } from './routes.js';
+import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage } from './routes.js';
 import * as auth from './views/auth.js';
 import * as work from './views/work.js';
 import * as project from './views/project.js';
@@ -81,6 +81,43 @@ export async function start(root, options = {}) {
   }
 
   let shell;
+  function projectSections(proj) {
+    return [
+      ['', 'Tasks'],
+      ['reviews', 'Reviews'],
+      ['releases', 'Releases'],
+      ctx.features.requirements && ['requirements', 'Requirements'],
+      ['records', 'Records'],
+      ctx.features.records && ['decisions', 'Decisions'],
+      ['rooms', 'Rooms'],
+      ['lanes', 'Lanes'],
+      // kittrial-5bb.453: only on a project with an accepted program.area side (the server's cached flag).
+      program.showsProgram(proj) && ['program', 'Program'],
+      ['feedback', 'Orchestra feedback'],
+      ['settings', 'Members & settings'],
+      ['owner', 'superuser'].includes(proj.role) && ['setup', 'Set up'],
+      ['how', 'How work is found'],
+    ].filter(Boolean);
+  }
+
+  // Switching project keeps the page when the target has it; otherwise the target's Tasks
+  // list opens and a toast says why (the toast layer leaves the page layout alone).
+  function switchProject(targetPid) {
+    // Read the current route and its project's sections before ctx.go changes location.hash.
+    const route = currentRoute();
+    const here = ctx.projects.find((p) => p.id === projectOf(route));
+    const hereSections = here ? projectSections(here) : [];
+    const target = ctx.projects.find((p) => p.id === targetPid);
+    const sections = target ? projectSections(target) : [];
+    const t = switchTarget(route, targetPid, sections.map(([seg]) => seg));
+    ctx.go(t.path);
+    if (t.fellBack) {
+      const name = target ? target.name : 'that project';
+      const label = t.section && (hereSections.find(([seg]) => seg === t.section) || [])[1];
+      toast(fallbackMessage(name, label));
+    }
+  }
+
   function buildShell(route) {
     route = route.split('?')[0];
     const pid = projectOf(route);
@@ -89,7 +126,7 @@ export async function start(root, options = {}) {
     const link = (href, label, count) => h('a', { class: 'nav-link', href: ctx.href(href), 'aria-current': route === href ? 'page' : null },
       h('span', null, label), count ? h('span', { class: 'nav-count' }, count) : null);
 
-    const switcher = h('select', { id: 'project-switch', class: 'project-switch', 'aria-label': 'Current project', onchange: (e) => e.target.value && ctx.go('/p/' + e.target.value) },
+    const switcher = h('select', { id: 'project-switch', class: 'project-switch', 'aria-label': 'Current project', onchange: (e) => e.target.value && switchProject(e.target.value) },
       h('option', { value: '' }, active.length ? 'Choose a project…' : 'No projects yet'),
       active.map((p) => h('option', { value: p.id, selected: p.id === pid }, p.name)));
 
@@ -105,22 +142,7 @@ export async function start(root, options = {}) {
         h('div', { class: 'rail-section' },
           h('label', { class: 'rail-label', for: 'project-switch' }, 'Project'),
           switcher,
-          current ? [
-            link('/p/' + pid, 'Tasks'),
-            link('/p/' + pid + '/reviews', 'Reviews'),
-            link('/p/' + pid + '/releases', 'Releases'),
-            ctx.features.requirements ? link('/p/' + pid + '/requirements', 'Requirements') : null,
-            link('/p/' + pid + '/records', 'Records'),
-            ctx.features.records ? link('/p/' + pid + '/decisions', 'Decisions') : null,
-            link('/p/' + pid + '/rooms', 'Rooms'),
-            link('/p/' + pid + '/lanes', 'Lanes'),
-            // kittrial-5bb.453: only on a project with an accepted program.area side (the server's cached flag).
-            program.showsProgram(current) ? link('/p/' + pid + '/program', 'Program') : null,
-            link('/p/' + pid + '/feedback', 'Orchestra feedback'),
-            link('/p/' + pid + '/settings', 'Members & settings'),
-            ['owner', 'superuser'].includes(current.role) ? link('/p/' + pid + '/setup', 'Set up') : null,
-            link('/p/' + pid + '/how', 'How work is found'),
-          ] : null),
+          current ? projectSections(current).map(([seg, label]) => link('/p/' + pid + (seg ? '/' + seg : ''), label)) : null),
         ctx.me.superuser ? h('div', { class: 'rail-section' },
           h('span', { class: 'rail-label' }, 'Administration'),
           link('/admin/users', 'People & access')) : null,
