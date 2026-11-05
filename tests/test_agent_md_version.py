@@ -19,7 +19,7 @@ import test_coordinator_agent_md as md
 
 #: AGENT.md version -> sha256 of the four texts the page writes for the fixed payload below, in order
 #: (worker, worker with certificate, coordinator, coordinator with certificate), each ended by a NUL.
-PINS = {2: 'PIN-2'}
+PINS = {2: '01c340cc064af2134d2aa9128e6be666dbeead832ebef2a8a36a5a6807de3878'}
 
 
 class VersionTests(md.CoordinatorGuideTests):

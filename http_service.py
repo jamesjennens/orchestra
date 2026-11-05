@@ -7095,44 +7095,47 @@ class ApiHandler(BaseHTTPRequestHandler):
             if refusal and by_agent:
                 refusal, setting = self._agent_approval_refusal(principal, names, assignee, author, pid, setting)
         agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        # The case is a LABEL, read with the service functions the route reads, in the route's order. It decides
+        # nothing: may_approve and the refusal above come from the route's functions alone.
         cases = []
         for target in (author, assignee):
             if not isinstance(target, str) or not target or self._independent_all(names, [target], pid, True):
                 continue
-            kind = self.service.actor_kind(target)
-            if kind == 'name':
-                cases.append('own-worker-credential')
-            elif kind == 'account':
+            if not by_agent:
                 cases.append('own-person')
-            elif by_agent and agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
-                cases.append('own-work')
-            elif by_agent and self.service.other_agent_of_same_person(agent_id, target):
+            elif self.service.other_agent_of_same_person(agent_id, target):
                 cases.append('another-agent')
-            else:
+            elif self.service.worker_credential_of_same_person(agent_id, target, pid):
+                # Refused under by-person and damaged, where it is a name of the party like any other.
+                cases.append('worker-credential' if setting['mode'] == 'by-agent' else 'own-worker-credential')
+            elif agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
+                cases.append('own-work')
+            elif self._bare_account_id_of(agent_id, target):
                 cases.append('own-person')
+            else:
+                cases.append('own-worker-credential')
+        allowed = ('another-agent', 'worker-credential') if by_agent and setting['mode'] == 'by-agent' else ()
         if refusal:
-            case = next((c for c in cases if c != 'another-agent' or setting['mode'] != 'by-agent'),
-                        cases[0] if cases else 'own-person')
+            case = next((c for c in cases if c not in allowed), cases[0] if cases else 'own-person')
         else:
-            case = 'another-agent' if 'another-agent' in cases else cases[0] if cases else 'independent'
+            case = cases[0] if cases else 'independent'
         shown = {'mode': setting['mode'], 'set_by': setting.get('set_by'),
                  'set_by_display_name': setting.get('set_by_display_name'), 'set_at': setting.get('set_at'),
                  'damaged': setting.get('damaged') is True}
         may = bool(can_approve) and not refusal
+        who = ('set by %s at %s' % (shown['set_by_display_name'] or shown['set_by'], shown['set_at'])
+               if shown['set_by'] else 'the default; nobody has set it')
         if not can_approve:
             reason = 'You do not hold the approval capability in this project, so you cannot approve this.'
-        elif case == 'another-agent' and by_agent:
-            who = ('set by %s at %s' % (shown['set_by_display_name'] or shown['set_by'], shown['set_at'])
-                   if shown['set_by'] else 'the default; nobody has set it')
-            if may:
-                reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
-                          '(%s), so a coordinator agent may approve another agent of its own person.' % who)
-            else:
-                reason = ('Another party must approve this: the project\'s setting Approvals by coordinator agents '
-                          'is by-person (%s)%s.' % (who, '; the stored value is damaged, so it is read as by-person'
-                                                    if shown['damaged'] else ''))
         elif refusal:
-            reason = refusal
+            reason = refusal                  # the route's own 403 sentence, word for word
+        elif case == 'another-agent':
+            reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
+                      '(%s), so a coordinator agent may approve another agent of its own person.' % who)
+        elif case == 'worker-credential':
+            reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
+                      '(%s), so a coordinator agent may approve a worker credential of its own person issued with '
+                      'a name no other account has held.' % who)
         elif case == 'independent':
             reason = 'You may approve this: it was delivered by another party.'
         else:

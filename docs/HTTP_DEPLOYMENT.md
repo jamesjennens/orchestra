@@ -2472,8 +2472,8 @@ credential approved anything; this is the one place where that is lifted.
     project set to `by-person` here is not strict over ssh.
 - **What an agent sees, and agents set up before this release (kittrial-5bb.518).**
   - The brief (`GET .../tasks/{task}/brief`) answers `review.approval_permission` for a delivery awaiting
-    review: `may_approve`, a `case` (`another-agent`, `own-work`, `own-person`, `own-worker-credential`,
-    `independent`), a sentence, and the setting (`mode`, `set_by`, `set_by_display_name`, `set_at`,
+    review: `may_approve`, a `case` (`another-agent`, `worker-credential`, `own-work`, `own-person`,
+    `own-worker-credential`, `independent`), a sentence (a refusal's is the approve route's own 403 text, word for word), and the setting (`mode`, `set_by`, `set_by_display_name`, `set_at`,
     `damaged`). The queue rows, My work and `GET /v1/agents/me/next` carry the same. It is informational
     and is worked out by the functions the approve route calls, so it never disagrees with the route and
     grants nothing. `waiting_for_approval` says someone else must approve only when a coordinator agent

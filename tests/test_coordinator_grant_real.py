@@ -121,6 +121,27 @@ class RealStackTests(held.RealStackTests):
         self.assertEqual((403, OWN_PARTY_AGENT), (refused.status, held.message(refused)), refused.data)
         self.assertEqual(before, self.comments(task))
 
+    def test_the_brief_says_what_the_approve_does_through_the_real_stack(self):
+        """kittrial-5bb.518: approval_permission in the brief agrees with the approve, with the real endpoint and bd."""
+        self.assertEqual(200, self.grant().status)
+        made = self.request('POST', '/v1/agents', {'name': 'Egret', 'working_directory': '/home/x/egret', 'projects': ['pp']},
+                            token=self.tokens['cora'])
+        self.assertEqual(201, made.status, made.data)
+        self.tokens['egret'] = made.data['credential']['secret']
+        task, contribution = self.deliver('egret')
+        seen = self.request('GET', '%s/%s/brief' % (self.tasks, task), token=self.agent).data['review']
+        permission = seen['approval_permission']
+        self.assertEqual((True, 'another-agent', 'by-agent'),
+                         (permission['may_approve'], permission['case'], permission['setting']['mode']))
+        self.assertNotEqual('Waiting for somebody else\'s approval of the current contribution.', seen['waiting_for_approval'])
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/pp/agent-approval', {'agent_approval': 'by-person'},
+                                           token=self.tokens['alex']).status)
+        task, contribution = self.deliver('egret')
+        permission = self.request('GET', '%s/%s/brief' % (self.tasks, task), token=self.agent).data['review']['approval_permission']
+        refused = self.approve(self.agent, task, contribution)
+        self.assertEqual((False, 403, held.message(refused)), (permission['may_approve'], refused.status, permission['reason']))
+
     def test_its_own_accounts_work_and_the_grant_removed(self):
         self.assertEqual(200, self.grant().status)
         # cora's own contribution: her agent is refused though the installation's setting is off.

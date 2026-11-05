@@ -4054,22 +4054,6 @@ class Service:
             return (head.casefold() != agent_id.casefold() and isinstance(mine, dict) and isinstance(other, dict)
                     and isinstance(mine.get('owner'), str) and other.get('owner') == mine['owner'])
 
-    def actor_kind(self, name):
-        """What the first segment of the task actor ``name`` is: ``'agent'``, ``'account'`` or ``'name'``.
-
-        The same order ``actor_parties`` reads it in (a personal agent, then an account, then a name written
-        under a worker credential). Read-only: it says which kind of name a refusal is about
-        (kittrial-5bb.518) and decides nothing.
-        """
-        if not isinstance(name, str) or not name:
-            return 'name'
-        head = name.split('/', 1)[0]
-        with self.store.lock:
-            agent = self.state['agents'].get(head)
-            if isinstance(agent, dict) and agent.get('owner'):
-                return 'agent'
-            return 'account' if head in self.state['users'] else 'name'
-
     def worker_credential_of_same_person(self, agent_id, name, project_id):
         """Whether ``name`` was written under a WORKER CREDENTIAL of the account that owns ``agent_id`` (kittrial-5bb.519).
 

@@ -2,8 +2,9 @@
 
 ``approval_permission`` is informational and grants nothing: it is worked out by the functions the approve route
 calls, so the two cannot disagree. Who may approve is UNCHANGED by this task: the matrix below stores the answers
-of c01d067 (the approve POST of a granted coordinator agent, five cases x three settings x the installation's
-setting on and off) as literal expectations, and checks in every cell that ``may_approve`` equals the POST.
+of the tree it was built on, .516 + .519 (the approve POST of a granted coordinator agent, six cases x three
+settings x the installation's setting on and off = 36 cells) as literal expectations, and checks in every cell that
+``may_approve`` equals the POST and that the reason is the route's own sentence.
 
 Through the real routes of the web service (the in-process backend); one real-bd path is in
 tests/test_coordinator_grant_real.py.
@@ -22,64 +23,92 @@ import work
 
 API = http_service.ApiHandler
 
-#: The approve POST of the granted coordinator agent on c01d067 (recorded by running tests/approval_matrix.py on a
-#: detached c01d067 worktree), as ``case|setting|installation setting`` -> (status, message of a refusal).
-BASE_STRICT = ("This contribution was delivered by this agent's own party: its account, one of that account's agents, "
-               "or a name that a worker credential of that account holds or has held. An agent never approves work of "
-               "its own party, whatever this server's setting for people says: somebody of another party who may "
-               "approve here must approve it (another coordinator or owner of this project, or a superuser).")
-BASE_BY_AGENT_NEXT = (" On this project a coordinator agent may approve the work of another agent of the same person "
-                      "(agent approvals: by agent), but never its own work, its person's own work, or work under a "
-                      "worker credential of that person: somebody of another party who may approve here must approve "
-                      "it (another coordinator or owner of this project, or a superuser).")
-BASE_PERSONS = ("This contribution was delivered by this agent's own party: its account, one of that account's agents, "
-                "or a name that a worker credential of that account holds or has held." + BASE_BY_AGENT_NEXT)
-BASE_ITSELF = "This contribution was delivered by this agent itself." + BASE_BY_AGENT_NEXT
-BASE_RESULTS = {
+import test_agent_approval_credentials as credentials
+
+# The approve POST of the granted coordinator agent on .516 + .519 (the tree .518 was built on; .518 does not touch
+# the route), recorded by running tests/approval_matrix.py there: ``case|setting|installation setting`` -> (status,
+# the message of a refusal). By-person and damaged cells are .519's literals B1/B3, which are c01d067's.
+M1 = ("This contribution was delivered under your person's own account id, which their own "
+    "session also writes, so it cannot be told from your person's work. Issue the worker's "
+    'credential with a name, or set the worker up from My agents. On this project a coordinator'
+    ' agent may approve the work of another agent of the same person, or of a worker credential'
+    ' of that person issued with a name no other account has held (agent approvals: by agent), '
+    "but never its own work (its own sub-workers count as its own work) or its person's own "
+    'work: somebody of another party who may approve here must approve it (another coordinator '
+    'or owner of this project, or a superuser).')
+
+M2 = ('This contribution was delivered under lane-s, a name that worker credentials of more than '
+    "one account have held. One of those accounts is this agent's, and nothing on the record "
+    'says which credential wrote it, so it counts as the work of each of them. Issue a '
+    'credential with a name no other account has held, or set the worker up from My agents. On '
+    'this project a coordinator agent may approve the work of another agent of the same person,'
+    ' or of a worker credential of that person issued with a name no other account has held '
+    '(agent approvals: by agent), but never its own work (its own sub-workers count as its own '
+    "work) or its person's own work: somebody of another party who may approve here must "
+    'approve it (another coordinator or owner of this project, or a superuser).')
+
+M3 = ('This contribution was delivered by this agent itself. If another worker uses a copy of '
+    "this agent's credential, set it up as a new agent from My agents. On this project a "
+    'coordinator agent may approve the work of another agent of the same person, or of a worker'
+    ' credential of that person issued with a name no other account has held (agent approvals: '
+    'by agent), but never its own work (its own sub-workers count as its own work) or its '
+    "person's own work: somebody of another party who may approve here must approve it (another"
+    ' coordinator or owner of this project, or a superuser).')
+
+BEFORE = {
     'another-agent|by-agent|off': (201, None),
     'another-agent|by-agent|on': (201, None),
-    'another-agent|by-person|off': (403, BASE_STRICT),
-    'another-agent|by-person|on': (403, BASE_STRICT),
-    'another-agent|damaged|off': (403, BASE_STRICT),
-    'another-agent|damaged|on': (403, BASE_STRICT),
+    'another-agent|by-person|off': (403, credentials.B1),
+    'another-agent|by-person|on': (403, credentials.B1),
+    'another-agent|damaged|off': (403, credentials.B1),
+    'another-agent|damaged|on': (403, credentials.B1),
     'independent|by-agent|off': (201, None),
     'independent|by-agent|on': (201, None),
     'independent|by-person|off': (201, None),
     'independent|by-person|on': (201, None),
     'independent|damaged|off': (201, None),
     'independent|damaged|on': (201, None),
-    'own-person|by-agent|off': (403, BASE_PERSONS),
-    'own-person|by-agent|on': (403, BASE_PERSONS),
-    'own-person|by-person|off': (403, BASE_STRICT),
-    'own-person|by-person|on': (403, BASE_STRICT),
-    'own-person|damaged|off': (403, BASE_STRICT),
-    'own-person|damaged|on': (403, BASE_STRICT),
-    'own-worker-credential|by-agent|off': (403, BASE_PERSONS),
-    'own-worker-credential|by-agent|on': (403, BASE_PERSONS),
-    'own-worker-credential|by-person|off': (403, BASE_STRICT),
-    'own-worker-credential|by-person|on': (403, BASE_STRICT),
-    'own-worker-credential|damaged|off': (403, BASE_STRICT),
-    'own-worker-credential|damaged|on': (403, BASE_STRICT),
-    'own-work|by-agent|off': (403, BASE_ITSELF),
-    'own-work|by-agent|on': (403, BASE_ITSELF),
-    'own-work|by-person|off': (403, BASE_STRICT),
-    'own-work|by-person|on': (403, BASE_STRICT),
-    'own-work|damaged|off': (403, BASE_STRICT),
-    'own-work|damaged|on': (403, BASE_STRICT),
+    'own-person|by-agent|off': (403, M1),
+    'own-person|by-agent|on': (403, M1),
+    'own-person|by-person|off': (403, credentials.B1),
+    'own-person|by-person|on': (403, credentials.B1),
+    'own-person|damaged|off': (403, credentials.B1),
+    'own-person|damaged|on': (403, credentials.B1),
+    'own-worker-credential|by-agent|off': (403, M2),
+    'own-worker-credential|by-agent|on': (403, M2),
+    'own-worker-credential|by-person|off': (403, credentials.B3),
+    'own-worker-credential|by-person|on': (403, credentials.B3),
+    'own-worker-credential|damaged|off': (403, credentials.B3),
+    'own-worker-credential|damaged|on': (403, credentials.B3),
+    'own-work|by-agent|off': (403, M3),
+    'own-work|by-agent|on': (403, M3),
+    'own-work|by-person|off': (403, credentials.B1),
+    'own-work|by-person|on': (403, credentials.B1),
+    'own-work|damaged|off': (403, credentials.B1),
+    'own-work|damaged|on': (403, credentials.B1),
+    'worker-credential|by-agent|off': (201, None),
+    'worker-credential|by-agent|on': (201, None),
+    'worker-credential|by-person|off': (403, credentials.B1),
+    'worker-credential|by-person|on': (403, credentials.B1),
+    'worker-credential|damaged|off': (403, credentials.B1),
+    'worker-credential|damaged|on': (403, credentials.B1),
 }
+
+
+ALLOWED_BY = {'another-agent': 'another agent of its own person',
+              'worker-credential': 'a worker credential of its own person issued with a name no other account has held'}
 
 
 class Matrix(approval_matrix.MatrixFixture):
 
-    def brief(self, task, token=None):
-        return self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (self.project, task),
-                            token=token or self.agent).data['review']
+    def brief(self, task):
+        return self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (self.project, task), token=self.agent).data['review']
 
-    def queue_row(self, task, token=None):
-        items = self.request('GET', '/v1/projects/%s/queue' % self.project, token=token or self.agent).data['items']
+    def queue_row(self, task):
+        items = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.agent).data['items']
         return next(item for item in items if item['id'] == task)
 
-    def test_who_may_approve_is_what_it_was_at_c01d067_and_may_approve_equals_the_post(self):
+    def test_who_may_approve_is_unchanged_and_may_approve_and_the_reason_are_the_routes(self):
         seen = 0
         for case, mode, installation, task, contribution in self.cells():
             key = '%s|%s|%s' % (case, mode, 'on' if installation else 'off')
@@ -87,35 +116,56 @@ class Matrix(approval_matrix.MatrixFixture):
                 permission = self.brief(task)['approval_permission']
                 row = self.queue_row(task)['approval_permission']
                 posted = self.approve(self.agent, task, contribution)
-                status, message = BASE_RESULTS[key]
-                # Who may approve: the same answer as c01d067's.
-                self.assertEqual(status, posted.status, posted.data)
-                if status == 403:
-                    sentence = posted.data['error']['message']
-                    if case == 'own-worker-credential':
-                        # The same refusal, now naming its case (kittrial-5bb.518 condition 6).
-                        self.assertEqual(API.OWN_WORKER_CREDENTIAL % 'lane-c', sentence)
-                    else:
-                        self.assertEqual(message, sentence)
-                # may_approve is the POST, in the brief and in the queue row; and the case is the cell's.
+                status, message = BEFORE[key]
+                self.assertEqual(status, posted.status, posted.data)                 # the route is unchanged
                 self.assertEqual(status == 201, permission['may_approve'])
                 self.assertEqual(permission, row)
-                self.assertEqual(case, permission['case'])
-                self.assertEqual(mode, permission['setting']['mode'] if mode != 'damaged' else 'damaged')
-                if mode == 'damaged':
-                    self.assertEqual(('by-person', True), (permission['setting']['mode'], permission['setting']['damaged']))
-                if status == 403 and case != 'another-agent':
-                    self.assertEqual(sentence, permission['reason'])      # the refusal's own words
+                # A worker credential refused under by-person and damaged is a name of the party like any other.
+                label = 'own-worker-credential' if case == 'worker-credential' and mode != 'by-agent' else case
+                self.assertEqual(label, permission['case'])
+                self.assertEqual(('by-person', True) if mode == 'damaged' else (mode, False),
+                                 (permission['setting']['mode'], permission['setting']['damaged']))
+                if status == 403:
+                    self.assertEqual(message, posted.data['error']['message'])
+                    self.assertEqual(message, permission['reason'])            # the route's own sentence
+                else:
+                    self.assertEqual(201, posted.status)
+                    if case == 'independent':
+                        expected = 'You may approve this: it was delivered by another party.'
+                    else:
+                        setting = permission['setting']
+                        self.assertEqual(self.ids['olive'], setting['set_by'])
+                        expected = ("You may approve this: the project's setting Approvals by coordinator agents is "
+                                    "by-agent (set by %s at %s), so a coordinator agent may approve %s."
+                                    % (setting['set_by_display_name'], setting['set_at'], ALLOWED_BY[case]))
+                    self.assertEqual(expected, permission['reason'])
                 seen += 1
-        self.assertEqual(30, seen)
-        self.assertEqual(30, len(BASE_RESULTS))
+        self.assertEqual(36, seen)
+        self.assertEqual(36, len(BEFORE))
+
+    def test_by_person_and_damaged_cells_are_byte_identical_to_c01d067(self):
+        """.519's literals B1, B3 and B7 are c01d067's answers; every refused by-person/damaged cell is one of them."""
+        for key, (status, message) in BEFORE.items():
+            case, mode, _ = key.split('|')
+            if mode == 'by-agent' or status == 201:
+                continue
+            with self.subTest(cell=key):
+                self.assertEqual(credentials.B3 if case == 'own-worker-credential' else credentials.B1, message)
+        for mode in ('by-person', 'damaged'):
+            self.set_project_setting(mode)
+            for installation in (False, True):
+                self.service.approval_by_another_party = installation
+                task, contribution = self.deliver(self.tokens['carl'])
+                self.backend._task(self.project, task)['assignee'] = 'lane-c'
+                refused = self.approve(self.agent, task, contribution)
+                self.assertEqual((403, credentials.B7), (refused.status, refused.data['error']['message']), (mode, installation))
+                self.assertEqual(credentials.B7, self.brief(task)['approval_permission']['reason'])
+
+
 
 
 class Reads(approval_matrix.MatrixFixture):
     """What each read says, with no approve tried."""
-
-    def put_mode(self, mode):
-        self.set_mode(mode)
 
     def brief(self, task, token=None):
         return self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (self.project, task),
@@ -155,58 +205,71 @@ class Reads(approval_matrix.MatrixFixture):
 
     def test_by_person_the_brief_says_another_party_must_approve(self):
         self.service.approval_by_another_party = True
-        self.set_mode('by-person')
+        self.set_project_setting('by-person')
         task, _ = self.deliver(self.other)
         review = self.brief(task)
         self.assertEqual(work.APPROVAL_WAIT, review['waiting_for_approval'])
         permission = review['approval_permission']
         self.assertEqual((False, 'another-agent'), (permission['may_approve'], permission['case']))
-        self.assertTrue(permission['reason'].startswith(
-            "Another party must approve this: the project's setting Approvals by coordinator agents is by-person ("))
+        refused = self.approve(self.agent, task, _)
+        self.assertEqual((403, refused.data['error']['message']), (403, permission['reason']))
         self.assertEqual([], self.next_reason(task))               # and it is not offered
 
     def test_a_damaged_stored_value_reads_as_by_person_with_damaged_true(self):
-        self.set_mode('damaged')
+        self.set_project_setting('damaged')
         task, _ = self.deliver(self.other)
         permission = self.brief(task)['approval_permission']
         self.assertEqual((False, 'by-person', True), (permission['may_approve'], permission['setting']['mode'],
                                                        permission['setting']['damaged']))
-        self.assertIn('the stored value is damaged, so it is read as by-person', permission['reason'])
 
     def test_its_own_delivery_is_never_approvable_under_either_setting(self):
         for mode in ('by-agent', 'by-person'):
             with self.subTest(mode=mode):
-                self.set_mode(mode)
+                self.set_project_setting(mode)
                 task, _ = self.deliver(self.agent)
                 permission = self.brief(task)['approval_permission']
                 self.assertEqual((False, 'own-work'), (permission['may_approve'], permission['case']))
-                # c01d067's own sentences, unchanged: by-agent names the agent itself, by-person the party.
-                self.assertTrue(permission['reason'].startswith(
-                    API.SAME_AGENT[0] if mode == 'by-agent' else API.OWN_PARTY_AGENT[0]), permission['reason'])
+                refused = self.approve(self.agent, task, _)
+                self.assertEqual(refused.data['error']['message'], permission['reason'])
 
-    def test_the_worker_credential_case_is_named_plainly(self):
+    def test_the_worker_credential_cases_are_named_and_use_the_routes_words(self):
+        # lane-c: a name only cora has held. Approvable under by-agent; a name of the party under by-person.
+        self.set_project_setting('by-agent')
+        task, contribution = self.deliver(self.lane_c)
+        permission = self.brief(task)['approval_permission']
+        self.assertEqual((True, 'worker-credential'), (permission['may_approve'], permission['case']))
+        setting = permission['setting']
+        self.assertEqual("You may approve this: the project's setting Approvals by coordinator agents is by-agent "
+                         "(set by %s at %s), so a coordinator agent may approve a worker credential of its own "
+                         "person issued with a name no other account has held."
+                         % (setting['set_by_display_name'], setting['set_at']), permission['reason'])
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        for mode in ('by-person', 'damaged'):
+            self.set_project_setting(mode)
+            task, contribution = self.deliver(self.lane_c)
+            permission = self.brief(task)['approval_permission']
+            refused = self.approve(self.agent, task, contribution)
+            self.assertEqual((False, 'own-worker-credential', 403), (permission['may_approve'], permission['case'], refused.status))
+            self.assertEqual(refused.data['error']['message'], permission['reason'])
+        # lane-s: a name another account held first, refused under every setting.
         for mode in ('by-agent', 'by-person'):
-            with self.subTest(mode=mode):
-                self.set_mode(mode)
-                task, contribution = self.deliver(self.worker)
-                permission = self.brief(task)['approval_permission']
-                expected = ('This was delivered under lane-c, a worker credential of your own person. A coordinator '
-                            'agent never approves that, whatever the agent-approval setting says: another party must '
-                            'approve it.')
-                self.assertEqual((False, 'own-worker-credential', expected),
-                                 (permission['may_approve'], permission['case'], permission['reason']))
-                refused = self.approve(self.agent, task, contribution)
-                self.assertEqual((403, expected), (refused.status, refused.data['error']['message']))
+            self.set_project_setting(mode)
+            task, contribution = self.deliver(self.lane_s)
+            permission = self.brief(task)['approval_permission']
+            refused = self.approve(self.agent, task, contribution)
+            self.assertEqual((False, 'own-worker-credential', 403), (permission['may_approve'], permission['case'], refused.status))
+            self.assertEqual(refused.data['error']['message'], permission['reason'])
 
     def test_the_other_cases_have_their_sentences(self):
         task, _ = self.deliver(self.tokens['carl'])
         permission = self.brief(task)['approval_permission']
         self.assertEqual((True, 'independent', 'You may approve this: it was delivered by another party.'),
                          (permission['may_approve'], permission['case'], permission['reason']))
-        task, _ = self.deliver(self.tokens['cora'])
+        task, contribution = self.deliver(self.tokens['cora'])
         permission = self.brief(task)['approval_permission']
-        self.assertEqual((False, 'own-person'), (permission['may_approve'], permission['case']))
-        self.assertTrue(permission['reason'].startswith(API.OWN_PARTY_AGENT[0]))
+        refused = self.approve(self.agent, task, contribution)
+        self.assertEqual((False, 'own-person', 403), (permission['may_approve'], permission['case'], refused.status))
+        self.assertEqual(refused.data['error']['message'], permission['reason'])
 
     def test_a_person_coordinator_under_the_installations_setting_still_sees_the_wait(self):
         """Condition 3: the brief fix hides nothing from a PERSON, whatever the project's agent setting says."""
@@ -214,7 +277,7 @@ class Reads(approval_matrix.MatrixFixture):
         self.assertEqual(200, self.member('cora', 'coordinator', token=self.admin).status)         # a PERSON who is a coordinator
         for mode in ('by-agent', 'by-person'):
             with self.subTest(mode=mode):
-                self.set_mode(mode)
+                self.set_project_setting(mode)
                 for deliverer, case, waits in ((self.other, 'own-person', True), (self.tokens['cora'], 'own-person', True),
                                                (self.tokens['carl'], 'independent', False)):
                     task, contribution = self.deliver(deliverer)
@@ -233,7 +296,7 @@ class Reads(approval_matrix.MatrixFixture):
                          (listed['approval_permission']['may_approve'], listed['approval_permission']['case'],
                           listed['approval_permission']['setting']['mode']))
         self.assertEqual('awaiting-review', self.brief(task)['state'])          # nothing was tried
-        self.set_mode('by-person')
+        self.set_project_setting('by-person')
         listed = next(item for item in self.request('GET', '/v1/projects/%s/queue' % self.project,
                                                     token=self.agent).data['items'] if item['id'] == task)
         self.assertFalse(listed['approval_permission']['may_approve'])
@@ -307,7 +370,7 @@ class Reads(approval_matrix.MatrixFixture):
         line = next(l for l in text.split('\n') if task in l)
         self.assertIn('; you may approve this (another-agent)', line)
         self.assertIn('; you may NOT approve this (own-work): another party must', next(l for l in text.split('\n') if own in l))
-        self.set_mode('by-person')
+        self.set_project_setting('by-person')
         line = next(l for l in self.agent_prompt().split('\n') if task in l)
         self.assertIn('; you may NOT approve this (another-agent): another party must', line)
 
