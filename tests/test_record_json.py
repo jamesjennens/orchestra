@@ -282,7 +282,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The fourteenth (kittrial-5bb.426) reads deployment.private.json from the same
             # checked descriptor, with a damaged or nested document reading as a configuration fault.
             # The fifteenth (kittrial-5bb.454 r2) reads a `.decision-attests` journal entry for a backup.
-            'admin.py': 15,
+            # The sixteenth (kittrial-5bb.500) reads the backed-up web service state document before
+            # `restore-new --restore-http-state` creates anything: a damaged or nested one is a refusal.
+            # The seventeenth (kittrial-5bb.500 r2) reads the LIVE state to name what the restore changes;
+            # an unreadable one is said so, and the copy kept aside still holds it.
+            'admin.py': 17,
             # D2: bounded native history, review VOID and preserved target payload.
             'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
