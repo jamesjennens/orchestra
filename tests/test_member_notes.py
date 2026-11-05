@@ -444,5 +444,62 @@ class PinTests(unittest.TestCase):
         self.assertIn('not an instruction', agent_prompts.MEMBER_NOTE_NOT_AN_INSTRUCTION)
 
 
+
+class _HostNotesManagerStub:
+    """Stands in for an enrolled host-notes manager: host_notes.enroll sets ``service.host_notes_manager``, and
+    http_auth._note_identity only tests that it is set. No socket and no durable effect."""
+    def __init__(self):
+        import threading
+        self.local = threading.local()
+        self.root = None
+
+    def preflight(self):
+        pass
+
+    def active(self, project):
+        return False
+
+
+class SettleUnderHostNotesTests(MemberCase):
+    """Candidate 1105a: with host notes enrolled, a member still settles a coordinator's reply to it (.508), and
+    every other note keeps the coordinator identity first (found by the review of the 1105a merges)."""
+
+    def setUp(self):
+        super().setUp()
+        note = self.member(self.tokens['carl'])
+        self.assertEqual(201, note.status, note.data)
+        self.to_coordinators = note.data['id']
+        reply = self.reply(self.tokens['cleo'], note.data['id'])
+        self.assertEqual(201, reply.status, reply.data)
+        self.reply_id = reply.data['id']
+        self.service.host_notes_manager = _HostNotesManagerStub()
+        self.addCleanup(setattr, self.service, 'host_notes_manager', None)
+
+    def test_the_member_marks_its_reply_noted_with_host_notes_enrolled(self):
+        answer = self.noted(self.tokens['carl'], 'prog', self.reply_id)
+        self.assertEqual(200, answer.status, answer.data)
+        self.assertEqual('noted', answer.data['settled']['how'])
+
+    def test_another_member_gets_the_missing_note_answer(self):
+        other = self.noted(self.tokens['vera'], 'prog', self.reply_id)
+        missing = self.noted(self.tokens['vera'], 'prog', 'cnote-' + '0' * 24)
+        self.assertNotEqual(200, other.status, other.data)
+        self.assertEqual((other.status, (other.data.get('error') or {}).get('message')),
+                         (missing.status, (missing.data.get('error') or {}).get('message')))
+
+    def test_a_non_coordinator_learns_nothing_about_which_notes_exist(self):
+        existing = self.noted(self.tokens['carl'], 'prog', self.to_coordinators)
+        missing = self.noted(self.tokens['carl'], 'prog', 'cnote-' + '0' * 24)
+        self.assertNotEqual(200, existing.status, existing.data)
+        self.assertEqual((existing.status, (existing.data.get('error') or {}).get('message')),
+                         (missing.status, (missing.data.get('error') or {}).get('message')))
+
+    def test_the_coordinator_still_settles_a_note_to_the_coordinators(self):
+        fresh = self.member(self.tokens['carl'], text='A second question for the coordinators.')
+        self.assertEqual(201, fresh.status, fresh.data)
+        answer = self.noted(self.tokens['cleo'], 'prog', fresh.data['id'])
+        self.assertEqual(200, answer.status, answer.data)
+
+
 if __name__ == '__main__':
     unittest.main()

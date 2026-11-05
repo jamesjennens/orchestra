@@ -4334,17 +4334,23 @@ class Service:
         """Mark a note to ``project_id`` noted: nothing is owed. A settled one is 409 with how it was settled."""
         from host_notes import state_change, HostIdentity
         with self.store.lock, state_change(self, web=not isinstance(principal, HostIdentity)):
-            self._note_identity(principal, project_id)
-            self._note_store(write=True)
+            # Each kind of note keeps its own rule (merge of .508 with the host notes, review of candidate 1105a):
+            # a coordinator's reply to a member is settled by that member under .508's rule; every other note,
+            # and a missing one, first needs the coordinator identity, so the answer tells a non-coordinator
+            # nothing about which notes exist.
             note = next((n for n in self._notes() if n['id'] == note_id and n['to']['project'] == project_id), None)
-            if note is None:
-                raise not_found('Note not found')
-            if note['to'].get('role') == 'member':
+            if note is not None and note['to'].get('role') == 'member' and not isinstance(principal, HostIdentity):
+                self._refresh_authority(principal)
                 # A coordinator's reply to a member is read, and marked so, by that member alone, in a person's
                 # session (kittrial-5bb.508); to anyone else it is the same 404 as a missing note.
                 if (note['to'].get('user_id') != principal.user_id or not self._is_person_session(principal)
                         or self._project_role(project_id, principal.user_id) not in self.MEMBER_NOTE_ROLES):
                     raise not_found('Note not found')
+            else:
+                self._note_identity(principal, project_id)
+                if note is None or note['to'].get('role') == 'member':
+                    raise not_found('Note not found')
+            self._note_store(write=True)
             if note['settled'] is not None:
                 raise conflict('This note is already settled (%s)' % note['settled']['how'],
                                {'settled': dict(note['settled'])})
