@@ -128,7 +128,7 @@ class RealStackTests(held.RealStackTests):
         own, mine = self.deliver('cora')
         refused = self.approve(self.agent, own, mine)
         # kittrial-5bb.438: the person's own work stays the agent's party under the default setting too.
-        self.assertEqual((403, http_service.ApiHandler.OWN_PARTY_AGENT[0] + http_service.ApiHandler.BY_AGENT_NEXT),
+        self.assertEqual((403, http_service.ApiHandler.ACCOUNT_ID_AUTHOR + http_service.ApiHandler.BY_AGENT_NEXT),
                          (refused.status, held.message(refused)), refused.data)
         self.assertEqual('awaiting-review', self.review(own)['state'])
         # cora herself, signed in, approves it as before: the setting is off.

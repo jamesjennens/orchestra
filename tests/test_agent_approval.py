@@ -24,9 +24,9 @@ import test_coordinator_grant
 
 API = http_service.ApiHandler
 STRICT = API.OWN_PARTY_AGENT[0] + API.OWN_PARTY_AGENT[3]
-OWN_WORK = API.SAME_AGENT[0] + API.BY_AGENT_NEXT
-OWN_TASK = API.SAME_AGENT[1] + API.BY_AGENT_NEXT
-PERSONS_WORK = API.OWN_PARTY_AGENT[0] + API.BY_AGENT_NEXT
+OWN_WORK = API.SAME_AGENT[0] + API.SAME_AGENT_NEXT + API.BY_AGENT_NEXT        # kittrial-5bb.519: says what to do
+OWN_TASK = API.SAME_AGENT[1] + API.SAME_AGENT_NEXT + API.BY_AGENT_NEXT
+PERSONS_WORK = API.ACCOUNT_ID_AUTHOR + API.BY_AGENT_NEXT                      # kittrial-5bb.519: the bare account id
 PERSONS_TASK = API.OWN_PARTY_AGENT[2] + API.BY_AGENT_NEXT
 
 
@@ -127,11 +127,16 @@ class DefaultTests(SamePerson):
                 else:
                     self.refused(answer, sentence)
 
-    def test_a_worker_credential_of_its_person_is_refused(self):
+    def test_a_named_worker_credential_of_its_person_is_approved_by_default_and_refused_when_strict(self):
+        # kittrial-5bb.519: it was refused (PERSONS_WORK) before; the matrix is in test_agent_approval_credentials.
         self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)
         worker, _ = self.worker_of('cora', 'lane-c')
         task, contribution = self.deliver(worker)
-        self.refused(self.approve(self.agent, task, contribution), PERSONS_WORK)
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        self.assertEqual(self.approval_summary(task), 'accepted ' + API.WORKER_CREDENTIAL_APPROVAL)
+        self.assertEqual(200, self.set_mode('by-person').status)
+        task, contribution = self.deliver(worker)
+        self.refused(self.approve(self.agent, task, contribution), STRICT)
 
     def test_without_an_effective_grant_it_cannot_approve(self):
         task, contribution = self.deliver(self.other)
