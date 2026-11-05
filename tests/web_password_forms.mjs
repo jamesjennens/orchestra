@@ -54,6 +54,45 @@ async function accountPage(minimum) {
 }
 
 const out = {};
+
+// -- the cursor: each form opens in its first empty field (kittrial-5bb.503) -------
+// The views schedule the focus after the form is in the page, so each case waits one tick.
+// These run first: a timer left by a form earlier in this script would fire inside a later case.
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+const focusedId = () => {
+  const active = document.activeElement;
+  return active && active !== document.body ? (active.attributes.id || null) : null;
+};
+const elementWithId = (id) => { const el = document.createElement('input'); el.setAttribute('id', id); return el; };
+{
+  // The sign-in box, as app.js shows it: the title is focused first, then the box renders.
+  const title = document.createElement('h1');
+  title.setAttribute('id', 'page-title');
+  title.focus();
+  auth.login(context(null));
+  await settle();
+  out.signInFocus = focusedId();
+}
+{
+  // Someone who has already moved into another field keeps the cursor there.
+  const typed = elementWithId('typed-elsewhere');
+  typed.focus();
+  auth.login(context(null));
+  await settle();
+  out.signInFocusKeptWhenTyping = focusedId();
+}
+{
+  document.activeElement = document.body;
+  auth.redeem(context(8));
+  await settle();
+  out.redeemFocus = focusedId();
+}
+{
+  document.activeElement = document.body;
+  await admin.account(context(8));
+  await settle();
+  out.accountFocus = focusedId();
+}
 {
   const { form, before } = await accountPage(1);
   out.accountHintDefault = hintOf(form, 'next');

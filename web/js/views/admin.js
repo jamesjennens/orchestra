@@ -1,5 +1,5 @@
 import { h, time, confirmDialog, secretDialog, initials } from '../dom.js';
-import { pageHead, empty, field, setFieldError, formValues, act, errorState,
+import { pageHead, empty, field, setFieldError, formValues, act, errorState, focusFirstEmpty,
          passwordHint, passwordAdvice, passwordTooShort, PASSWORD_MISMATCH } from '../ui.js';
 
 export async function users(ctx) {
@@ -135,6 +135,8 @@ export async function account(ctx) {
     }).catch(() => null);
     if (done) { form.reset(); status.textContent = 'Password changed. Other sessions stay signed in until they expire.'; status.hidden = false; }
   });
+  // Once the form is in the page (kittrial-5bb.503).
+  setTimeout(() => focusFirstEmpty(form));
   return h('div', { class: 'stack' },
     pageHead({ title: 'Account', lede: `Signed in as @${ctx.me.username || ctx.me.id}${ctx.me.superuser ? ' · superuser' : ''}.` }),
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Change password')), h('div', { class: 'panel-body' }, form)));

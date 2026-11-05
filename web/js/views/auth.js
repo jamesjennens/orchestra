@@ -1,5 +1,5 @@
 import { h, brandMark } from '../dom.js';
-import { field, setFieldError, formValues, describe,
+import { field, setFieldError, formValues, describe, focusFirstEmpty,
          passwordHint, passwordTooShort, PASSWORD_MISMATCH } from '../ui.js';
 
 export function login(ctx, message) {
@@ -42,6 +42,8 @@ export function login(ctx, message) {
       h('button', { type: 'button', class: 'link', onclick: () => ctx.root.replaceChildren(redeem(ctx)) }, 'Set a new password'),
       '. No account yet? Ask your Orchestra administrator to create one.'),
     ctx.options.loginHint ? ctx.options.loginHint() : null);
+  // Once the card is in the page (kittrial-5bb.503).
+  setTimeout(() => focusFirstEmpty(form));
   return h('div', { class: 'auth' }, card);
 }
 
@@ -69,6 +71,8 @@ export function redeem(ctx) {
       status.hidden = false;
     }
   });
+  // Once the card is in the page (kittrial-5bb.503).
+  setTimeout(() => focusFirstEmpty(form));
   return h('div', { class: 'auth' }, h('div', { class: 'auth-card' },
     h('div', { class: 'brand' }, brandMark(), h('span', null, 'Orchestra')),
     h('h1', { id: 'page-title', tabindex: '-1' }, 'Set a new password'),
