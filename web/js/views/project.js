@@ -92,6 +92,92 @@ const LANE_FLAGS = [
   ['holder_retired', 'Holder retired'],
 ];
 
+// Lane nudge slice 3 (kittrial-5bb.513; docs/design/LANE_NUDGE_DESIGN.md sec. 1.4, 5, 6):
+// closed message and reason lists (nudges.py:21-23), server-computed can_nudge, and
+// per-row carrier_seen from the carrier registry.
+export const NUDGE_MESSAGES = [
+  ['resume', 'Resume (wake and run work --mine)'],
+  ['restart', 'Restart (start a fresh turn and run work --mine)'],
+];
+export const NUDGE_REASONS = [
+  ['stalled-at-prompt', 'Stalled at prompt'],
+  ['api-error', 'API error'],
+  ['lost-wake', 'Lost wake'],
+  ['no-answer', 'No answer'],
+  ['other', 'Other'],
+];
+export const NUDGE_NOTE_MAX = 200;
+export const NUDGE_WAIT_STATES = ['waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user'];
+export const NO_CARRIER_SENTENCE = 'No supervisor is running for this lane\u2019s owner, so a nudge cannot be delivered.';
+
+const NUDGE_DETAIL_WORDS = {
+  'not-at-prompt': 'not at prompt',
+  'no-session': 'no session',
+  'start-failed': 'start failed',
+  'no-carrier': 'no carrier seen',
+  'unclaimed': 'unclaimed',
+  'unanswered': 'unanswered',
+  'requester-lost-authority': 'requester lost authority',
+};
+
+// The server computes can_nudge on GET /v1/projects/<pid>/lanes from the same live
+// CAP_COORDINATE check that POST /v1/projects/<pid>/nudges enforces; never guessed here.
+export function canNudge(data) {
+  return Boolean(data && data.can_nudge === true);
+}
+
+// Whether a carrier for this lane's account sent a heartbeat within the freshness window.
+export function hasCarrier(lane) {
+  return Boolean(lane && lane.carrier_seen === true);
+}
+
+// The lane's own declared wait on a lanes row, matching nudges.declared_wait (nudges.py:101-118):
+// only a declared waiting-on-* state counts (never an inferred/guessed wait or working).
+export function declaredWait(lane) {
+  const found = ((lane && lane.held) || []).filter((entry) =>
+    entry && entry.declared === true && NUDGE_WAIT_STATES.includes(entry.state));
+  if (!found.length) return null;
+  found.sort((a, b) => {
+    const sa = String(a.state_since || ''), sb = String(b.state_since || '');
+    if (sa !== sb) return sa < sb ? -1 : 1;
+    const ta = String(a.task || ''), tb = String(b.task || '');
+    return ta < tb ? -1 : ta > tb ? 1 : 0;
+  });
+  const entry = found[0];
+  return {
+    task: String(entry.task || '').slice(0, 120),
+    state: entry.state,
+    waiting_on: entry.waiting_on ? String(entry.waiting_on).slice(0, 40) : null,
+    waiting_on_name: entry.waiting_on_name || null,
+    since: typeof entry.state_since === 'string' ? entry.state_since : null,
+  };
+}
+
+function nudgeOutcomeNodes(nudge) {
+  const detail = nudge.outcome_detail ? (NUDGE_DETAIL_WORDS[nudge.outcome_detail] || nudge.outcome_detail) : null;
+  const stamp = nudge.outcome_at ? [' ', time(nudge.outcome_at)] : null;
+  if (nudge.state === 'not-deliverable') {
+    return ['not deliverable (', detail || 'no carrier seen', ')', stamp];
+  }
+  if (nudge.state === 'delivered' || nudge.state === 'restarted' || nudge.state === 'coalesced') {
+    return [nudge.state, stamp];
+  }
+  if (nudge.state === 'failed' || nudge.state === 'expired' || nudge.state === 'cancelled') {
+    return [nudge.state, detail ? `: ${detail}` : null, stamp];
+  }
+  return [nudge.state || 'pending', detail ? ` (${detail})` : null, stamp];
+}
+
+export function nudgeLine(lane) {
+  const nudge = lane && lane.nudge;
+  if (!nudge || typeof nudge !== 'object') return null;
+  return h('div', { class: 'small muted', 'data-nudge': 'true', 'data-nudge-state': nudge.state || '' },
+    'Nudged ', nudge.requested_at ? [time(nudge.requested_at), ' '] : null,
+    'by ', nudge.requested_by_display || 'a coordinator',
+    ' (', nudge.message || 'resume', '): ',
+    nudgeOutcomeNodes(nudge));
+}
+
 // The server's ages are whole seconds; said as a rough span, never re-derived from a clock.
 export function ageText(seconds) {
   if (seconds === null || seconds === undefined) return 'unknown';
@@ -200,7 +286,100 @@ export function lanesPanel(ctx, project) {
         h('span', { class: 'chip warn', 'data-flag': key }, label))) : null);
   }
 
-function laneBlock(ctx, project, lane) {
+  function nudgeControls(lane, data) {
+    if (!hasCarrier(lane)) {
+      return h('div', { class: 'small muted', 'data-no-carrier': 'true' }, NO_CARRIER_SENTENCE);
+    }
+    if (!canNudge(data)) return null;
+    const target = lane.actor || lane.lane;
+    const formHost = h('div', { 'data-nudge-host': target });
+    const openBtn = h('button', {
+      type: 'button',
+      'data-nudge-button': target,
+      onclick: () => {
+        if (formHost.childElementCount) {
+          formHost.replaceChildren();
+          return;
+        }
+        let wait = declaredWait(lane);
+        let conflictText = null;
+        const messageSel = h('select', { 'data-nudge-message': target, 'aria-label': 'Nudge message' },
+          NUDGE_MESSAGES.map(([value, label]) => h('option', { value }, label)));
+        const reasonSel = h('select', { 'data-nudge-reason': target, 'aria-label': 'Nudge reason' },
+          NUDGE_REASONS.map(([value, label]) => h('option', { value }, label)));
+        const noteInput = h('input', {
+          type: 'text',
+          'data-nudge-note': target,
+          maxlength: String(NUDGE_NOTE_MAX),
+          placeholder: 'For the audit log only — not sent to the lane',
+          'aria-label': 'Audit note (optional, at most 200 characters, not sent to the lane)',
+        });
+        const ackBox = h('input', { type: 'checkbox', 'data-nudge-ack-wait': target });
+        const waitHost = h('div');
+        const status = h('span', { class: 'small muted', role: 'status', 'data-nudge-status': target });
+        function renderWait() {
+          if (!wait && !conflictText) {
+            waitHost.replaceChildren();
+            return;
+          }
+          const sentence = conflictText
+            ? [conflictText]
+            : ['This lane says it is waiting on ', wait.waiting_on_name || wait.waiting_on || wait.state,
+               wait.since ? [' since ', time(wait.since)] : null, '. Nudge it anyway?'];
+          waitHost.replaceChildren(
+            h('div', { class: 'small', 'data-nudge-wait-warning': 'true' }, ...sentence),
+            h('label', { class: 'check small' }, ackBox, 'I have read what this lane says it is waiting on; nudge it anyway'));
+        }
+        renderWait();
+        async function sendNudge() {
+          const msg = messageSel.value;
+          const rsn = reasonSel.value;
+          if (!NUDGE_MESSAGES.some(([k]) => k === msg) || !NUDGE_REASONS.some(([k]) => k === rsn)) {
+            status.textContent = 'Choose a message and a reason from the list.';
+            return;
+          }
+          const rawNote = noteInput.value || '';
+          if (rawNote.length > NUDGE_NOTE_MAX || /[\x00-\x1f\x7f]/.test(rawNote)) {
+            status.textContent = `Audit note must be at most ${NUDGE_NOTE_MAX} characters with no control character.`;
+            return;
+          }
+          if ((wait || conflictText) && !ackBox.checked) {
+            status.textContent = 'Confirm that you have read what this lane says it is waiting on before sending.';
+            return;
+          }
+          status.textContent = '';
+          const body = { lane: target, message: msg, reason: rsn };
+          const trimmed = rawNote.trim();
+          if (trimmed) body.note = trimmed;
+          if (wait || conflictText) body.acknowledge_declared_wait = true;
+          try {
+            await ctx.api.nudgeLane(project.id, body);
+            await draw();
+          } catch (error) {
+            if (error && error.status === 409 && !conflictText) {
+              conflictText = error.message || 'This lane declared a wait. Confirm before nudging it.';
+              renderWait();
+              status.textContent = conflictText;
+              return;
+            }
+            status.textContent = (error && error.message) || 'Nudge request failed.';
+          }
+        }
+        const sendBtn = h('button', { type: 'button', 'data-nudge-submit': target, onclick: sendNudge }, 'Send nudge');
+        const cancelBtn = h('button', { type: 'button', 'data-nudge-cancel': target, onclick: () => formHost.replaceChildren() }, 'Cancel');
+        formHost.replaceChildren(
+          h('div', { class: 'stack small', 'data-nudge-form': target },
+            waitHost,
+            h('label', { class: 'small' }, 'Message ', messageSel),
+            h('label', { class: 'small' }, 'Reason ', reasonSel),
+            h('label', { class: 'small' }, 'For the audit log only — not sent to the lane ', noteInput),
+            h('div', { class: 'toolbar' }, sendBtn, cancelBtn, status)));
+      },
+    }, 'Nudge');
+    return h('div', { class: 'small', 'data-nudge-actions': target }, openBtn, formHost);
+  }
+
+  function laneBlock(ctx, project, lane, data) {
     const held = lane.held || [];
     const raised = LANE_FLAGS.filter(([key]) => lane[key]);
     return h('div', { class: 'lane', 'data-lane': lane.lane, 'data-actor': lane.actor,
@@ -231,7 +410,9 @@ function laneBlock(ctx, project, lane) {
       held.length ? h('ul', { class: 'lane-tasks' }, held.map((entry) => taskLine(entry))) : null,
       // A free lane says WHAT it holds (nothing) and WHEN it last wrote, in local
       // time: the mock-up's empty line (lanes.html:74 'Free: portal-agent ...').
-      lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last wrote ', lane.last_write ? time(lane.last_write) : h('span', { class: 'muted' }, 'never'), ' (', ageText(lane.last_write_age_seconds), ' ago).') : null);
+      lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last wrote ', lane.last_write ? time(lane.last_write) : h('span', { class: 'muted' }, 'never'), ' (', ageText(lane.last_write_age_seconds), ' ago).') : null,
+      nudgeLine(lane),
+      nudgeControls(lane, data));
   }
 
   function pager(data) {
@@ -262,7 +443,7 @@ function laneBlock(ctx, project, lane) {
         'Reading with ', String(data.idle_minutes), ' idle minutes: ',
         LANE_FLAGS.map(([key, label]) => `${counts[key] || 0} ${label.toLowerCase()}`).join(' · '),
         '. ', scopeSentence(data)),
-      lanes.length ? h('div', { class: 'stack' }, lanes.map((lane) => laneBlock(ctx, project, lane)))
+      lanes.length ? h('div', { class: 'stack' }, lanes.map((lane) => laneBlock(ctx, project, lane, data)))
         : empty('No lanes to show', 'No session holds work in this project right now.'),
       pager(data));
   }

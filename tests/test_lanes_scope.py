@@ -289,10 +289,10 @@ class ParityTests(ScopeCase):
         self.assertEqual('all', every['scope'])
         # the route adds only display fields to the canonical rows: display_name
         # and waiting_on_name (kittrial-5bb.416, http_service.py project_lanes) and
-        # the board's nudge field (kittrial-5bb.413). Strip them before comparing,
-        # keeping every canonical field in the comparison.
+        # the board's nudge and carrier_seen fields (kittrial-5bb.413, .513). Strip them
+        # before comparing, keeping every canonical field in the comparison.
         route_rows = [{key: value for key, value in row.items()
-                       if key not in ('display_name', 'waiting_on_name', 'nudge')}
+                       if key not in ('display_name', 'waiting_on_name', 'nudge', 'carrier_seen')}
                       for row in every['items']]
         for row in route_rows:
             for entry in row.get('held') or []:
@@ -303,8 +303,8 @@ class ParityTests(ScopeCase):
         names = {row['actor']: row.get('display_name') for row in every['items']}
         self.assertEqual('carl', names[self.ids['carl']])
         self.assertEqual('dave', names[self.ids['dave']])
-        # ... and the 413 one too: every row carries its nudge view.
-        self.assertTrue(all('nudge' in row for row in every['items']))
+        # ... and the 413 / 513 ones too: every row carries its nudge and carrier_seen views.
+        self.assertTrue(all('nudge' in row and 'carrier_seen' in row for row in every['items']))
         self.assertEqual(self.both(), {row['actor'] for row in self.rows('all')['items']})
 
     def test_the_bound_key_endpoint_rule_stays_operator_only(self):

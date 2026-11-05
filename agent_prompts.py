@@ -101,6 +101,20 @@ COORDINATOR_NOTES = (
     'more often, keep its notes_marker as your baseline, and act on each new note. Do not end your turn '
     'while a note to you is unsettled: reply with reply_to set to its id, or mark it noted with POST '
     '/v1/projects/PROJECT/notes/NOTE/noted.')
+#: The coordinator-only paragraph on nudging a stalled lane (kittrial-5bb.513; LANE_NUDGE_DESIGN.md sections 1, 4, 5, 6).
+#: Word for word with web/js/agentSetup.js LANE_NUDGE (pinned by tests/test_web_lanes.py).
+LANE_NUDGE = (
+    'Nudging a stalled lane: read GET /v1/projects/PROJECT/lanes before nudging. Nudge with '
+    'POST /v1/projects/PROJECT/nudges (lane, message resume or restart, reason stalled-at-prompt, '
+    'api-error, lost-wake, no-answer or other, optional audit-only note of at most 200 characters, '
+    'and an Idempotency-Key); never nudge your own lane or a lane of your own account. Never nudge a '
+    'lane whose declared state is waiting-on-coordinator, waiting-on-review or waiting-on-user unless '
+    'its wait has already been answered or you know its wait has died, and then only with '
+    'acknowledge_declared_wait: true. An automatic nudge is allowed only when a lane has your_move_idle '
+    'on a task whose declared state is not waiting-on-*, no nudge is pending or claimed, and no nudge '
+    "was sent since the lane's last_write (one resume with reason lost-wake per idle episode; if "
+    'nudge.state is not-deliverable or the nudge does not wake the lane, do not repeat it — tell your '
+    'owner).')
 #: Every quote-like character (ASCII, typographic, guillemets, low-9, primes,
 #: fullwidth, CJK corner brackets) becomes a plain apostrophe, so a title can never
 #: close or imitate the label's own double quotes.
@@ -441,7 +455,7 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
     else:
         # Only a project where this person coordinates gets the paragraph (kittrial-5bb.357);
         # a contributor or owner is not told how to direct a web worker.
-        coordinator_tools = ['', WEB_WORKER_TOOLS, WORKER_ON_ANOTHER_MACHINE, PROGRAM_LINKS, COORDINATOR_NOTES] if any(
+        coordinator_tools = ['', WEB_WORKER_TOOLS, WORKER_ON_ANOTHER_MACHINE, PROGRAM_LINKS, COORDINATOR_NOTES, LANE_NUDGE] if any(
             p.get('role') == 'coordinator' for p in acting) else []
         head = intro + coordinator_tools + [
             '',

@@ -15262,11 +15262,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())
                                if type(continuation) is int and continuation > state['o'] else None)
-        # kittrial-5bb.413: each row also carries the lane's newest nudge request in THIS project
-        # (read-only; never the note). Only rows the viewer's scope already put on the page.
+        # kittrial-5bb.513: whether POST /v1/projects/{pid}/nudges accepts this caller (the exact
+        # live CAP_COORDINATE check that project_nudge_request runs), and whether a carrier for each
+        # lane's account sent a heartbeat within nudges.CARRIER_WINDOW (90 s).
+        try:
+            self.service.check_authority(ctx.principal, ctx.params['pid'], CAP_COORDINATE)
+            body['can_nudge'] = True
+        except HttpError:
+            body['can_nudge'] = False
+        # kittrial-5bb.413 / .513: each row also carries the lane's newest nudge request in THIS project
+        # (read-only; never the note) and carrier_seen. Only rows the viewer's scope already put on the page.
         items = [row for row in body.get('items') or [] if isinstance(row, dict)]
-        shown = self.service.nudge_views(ctx.params['pid'], [row.get('actor') for row in items])
-        body['items'] = [dict(row, nudge=shown.get(row.get('actor'))) if isinstance(row, dict) else row
+        actors = [row.get('actor') for row in items]
+        shown = self.service.nudge_views(ctx.params['pid'], actors)
+        carried = self.service.carrier_seen_views(ctx.params['pid'], actors)
+        body['items'] = [dict(row, nudge=shown.get(row.get('actor')),
+                              carrier_seen=bool(carried.get(row.get('actor'))))
+                         if isinstance(row, dict) else row
                          for row in body.get('items') or []]
         return 200, body
 
