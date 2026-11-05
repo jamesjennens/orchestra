@@ -18,6 +18,7 @@ Two properties are pinned here, and both are mutation-checked:
 
 Every loop here is driven by a fake clock: nothing in this file sleeps.
 """
+import datetime
 import json
 import os
 import re
@@ -79,6 +80,16 @@ WORKER_CORPUS = [
                              {'task': 'a', 'whose_move': 'you', 'blocking_items': True},
                              {'task': 'c', 'whose_move': 'them'}]),
     ('not a dict and missing fields', [{'whose_move': 'you'}, 'nonsense', None]),
+    # kittrial-5bb.509: far-future is a listed timer, far-past is one due move row, both
+    # spellings (top level and the attention block) lifted the same way. The instants are
+    # far from any real clock, so the two copies agree whatever moment they read.
+    ('a pending timer and a due one', [
+        {'task': 't7', 'whose_move': 'them', 'lane_not_before': '2099-01-01T00:00:00Z'},
+        {'task': 't8', 'whose_move': 'them',
+         'attention': {'lane_not_before': '2000-01-01T00:00:00Z'}}]),
+    ('a value that does not parse is no timer', [
+        {'task': 't9', 'whose_move': 'them', 'lane_not_before': 'tomorrow at noon'},
+        {'whose_move': 'them', 'lane_not_before': '2099-01-01T00:00:00Z'}]),
 ]
 
 #: One lane board per coordinator case: each trigger, a declared wait, and a quiet lane.
@@ -93,6 +104,14 @@ LANES_CORPUS = [
     ('quiet lane', {'schema': 'lanes-v1', 'items': [
         {'lane': 'lane-c', 'actor': A, 'held': [{'task': 't6', 'state': 'working',
                                                  'flags': []}]}]}),
+    # kittrial-5bb.509: the board's own timer_due flag is the trigger; a set wake time
+    # that has not come due (or a lane that wrote after it) is no row.
+    ('a due timer and a not-yet-due one', {'schema': 'lanes-v1', 'items': [
+        {'lane': 'lane-d', 'actor': A, 'held': [
+            {'task': 't7', 'state': 'waiting-on-coordinator', 'waiting_on': 'coordinator',
+             'not_before': '2026-10-17T19:00:00Z', 'timer_due': True, 'flags': []},
+            {'task': 't8', 'state': 'working', 'not_before': '2099-01-01T00:00:00Z',
+             'timer_due': False, 'flags': []}]}]}),
     ('not a payload', 'nonsense'),
 ]
 
@@ -185,6 +204,9 @@ class InlineAgreementTests(unittest.TestCase):
         self.assertEqual(client._InlineWait.MOVE_FIELDS, waiting.MOVE_FIELDS)
         self.assertEqual(client._InlineWait.WORKER_MOVE_FIELDS, waiting.WORKER_MOVE_FIELDS)
         self.assertEqual(client._InlineWait.COORDINATOR_TRIGGERS, waiting.COORDINATOR_TRIGGERS)
+        self.assertEqual(client._InlineWait.OPTIONAL_TRIGGERS, waiting.OPTIONAL_TRIGGERS)
+        self.assertEqual(client._InlineWait.TIMER_WAKE_EPSILON, waiting.TIMER_WAKE_EPSILON)
+        self.assertEqual(client._InlineWait.TIMER_REPOLL_SECONDS, waiting.TIMER_REPOLL_SECONDS)
         self.assertEqual(client._InlineWait.LANE_FLAGS, waiting.LANE_FLAGS)
         self.assertEqual(client._InlineWait.FINGERPRINT, waiting.FINGERPRINT)
 
@@ -261,6 +283,15 @@ class InlineAgreementTests(unittest.TestCase):
             empty = waiting.worker_view([])
             work = waiting.worker_view([{'task': 't1', 'whose_move': 'you'}])
             later = waiting.worker_view([{'task': 't2', 'whose_move': 'you'}])
+            # kittrial-5bb.509: a pending timer caps the nap at the time remaining, and
+            # the due read the cap buys IS the wake. Same injected clock on both copies.
+            fixed = datetime.datetime(2026, 11, 4, 12, 0, 0, tzinfo=datetime.timezone.utc)
+            timer = {'task': 't9', 'whose_move': 'them', 'lane_not_before': '2026-11-04T12:01:30Z'}
+            pending = module.worker_view([timer], now=fixed)
+            pending_next = module.worker_view([timer], now=fixed + datetime.timedelta(seconds=60))
+            due = module.worker_view([timer], now=fixed + datetime.timedelta(seconds=91))
+            timer_kwargs = dict(base, since=pending['fingerprint'],
+                                now=waiting.parse_instant('2026-11-04T12:00:00Z'))
             return [
                 ([empty, work], base),
                 ([work], base),
@@ -276,6 +307,9 @@ class InlineAgreementTests(unittest.TestCase):
                 ([empty], dict(give_up, since=empty['fingerprint'])),
                 ([work], reset),
                 ([later], dict(reset, since=empty['fingerprint'])),
+                ([pending, pending_next, due], timer_kwargs),
+                ([pending, due], timer_kwargs),
+                ([due, due], dict(timer_kwargs, since=due['fingerprint'], timeout=60)),
             ]
 
         for index, (views, kwargs) in enumerate(scripts(waiting)):

@@ -1160,9 +1160,19 @@ class InProcessBackend:
             import lane_state
             declared = dict(payload['lane_state']) if isinstance(payload['lane_state'], dict) else payload['lane_state']
             try:
-                lane_state.validate(declared, task['id'])
+                # The write-time clock for not_before (kittrial-5bb.509) is the service's
+                # own injectable clock (an epoch; parse_moment compares datetimes, so it
+                # is read as one), and a wake time is the HOLDER's only: the same two
+                # rules the native checkpoint writer (briefing.save_checkpoint) enforces.
+                from datetime import datetime as _dt, timezone as _tz
+                lane_state.validate(declared, task['id'],
+                                    now=_dt.fromtimestamp(self.service._now(), _tz.utc))
             except ValueError as error:
                 raise invalid(str(error)) from None
+            if (isinstance(declared, dict) and 'not_before' in declared
+                    and record['actor'] != task.get('assignee')):
+                raise invalid('Invalid lane state: not_before is set only by the task\'s holder; '
+                              'a coordinator asks the holder in a comment')
             record['lane_state'] = dict(declared, checkpoint=record['id'])
         checkpoints.append(record)
         task['version'] += 1
@@ -4789,6 +4799,10 @@ class EndpointBackend:
                 # wait fingerprints this, so its own checkpoint does not wake it.
                 'wait_newer_activity_marker': row.get('wait_newer_activity_marker')
                 if isinstance(row.get('wait_newer_activity_marker'), str) else None,
+                # The holder's own wake time (kittrial-5bb.509): the wait's timer reads it
+                # from the same row, so the CLI and HTTP forms print the same timer fact.
+                'lane_not_before': row.get('lane_not_before')
+                if isinstance(row.get('lane_not_before'), str) else None,
                 'newer_activity_by_others': row.get('newer_activity_by_others')
                 if type(row.get('newer_activity_by_others')) is int and row.get('newer_activity_by_others') >= 0 else None,
                 'newer_activity_own': row.get('newer_activity_own')
@@ -9981,7 +9995,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                            newer_activity_by_others=attention_field(task, 'newer_activity_by_others'),
                            newer_activity_own=attention_field(task, 'newer_activity_own'),
                            newer_activity_coverage=attention_field(task, 'newer_activity_coverage'),
-                           unresolved_directions=attention_field(task, 'unresolved_directions'))
+                           unresolved_directions=attention_field(task, 'unresolved_directions'),
+                           # The holder's wake time rides the row (kittrial-5bb.509) so the
+                           # wait's worker_view reads the same timer the CLI read does.
+                           lane_not_before=attention_field(task, 'lane_not_before'))
                 project_rows.append(row)
                 if move == 'you':
                     project_move_rows.append(row)

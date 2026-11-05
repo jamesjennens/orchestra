@@ -143,12 +143,25 @@ WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner
 #: (kittrial-5bb.398) is a lane-raised fault that stays until a coordinator clears it. ``empty-wake``
 #: (kittrial-5bb.397) is the lane board's count of worker wakes that changed nothing the
 #: caller could act on: three DIFFERENT fingerprints in 24 hours on one lane.
+#: ``timer-due`` (kittrial-5bb.509) is a lane's ``not_before`` wake time that came due and
+#: the lane has not acted since -- a desktop session that stopped, for example.
 COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                        'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation')
+                        'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation',
+                        'timer-due')
 #: Triggers whose EMPTY group stays out of the fingerprint, so a quiet answer keeps the
-#: fingerprint it had before they were added (coordinator rule for .397 and .398).
-OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation')
+#: fingerprint it had before they were added (coordinator rule for .397, .398 and .509).
+OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation', 'timer-due')
 EMPTY_WAKE_TRIGGER = 3
+
+#: A pending timer's sleep cap (kittrial-5bb.509). A lane state's ``not_before`` is a wake
+#: time: the worker view lists the not-yet-due ones under ``timers`` (additive, NOT
+#: fingerprinted, so setting one never wakes its own holder), and the poll's sleep is
+#: capped at the time remaining plus ``TIMER_WAKE_EPSILON``, so the wait re-reads at the
+#: due instant and the due row -- which IS fingerprinted -- is the wake. While the
+#: reader's clock has not caught up with the caller's, the re-poll runs no faster than
+#: ``TIMER_REPOLL_SECONDS``: bounded, never a tight loop.
+TIMER_WAKE_EPSILON = 1.0
+TIMER_REPOLL_SECONDS = 5.0
 
 #: The lane board flags a coordinator acts on: a lane quiet on its own move, or past a
 #: declared wait. ``waiting_too_long`` and ``expect_by_passed`` are the declared waits;
@@ -484,6 +497,28 @@ def parse_instant(text):
     return (moment - _EPOCH).total_seconds()
 
 
+def _earliest_timer_epoch(view):
+    """The earliest pending ``not_before`` of one wait read, as epoch seconds, or ``None``.
+
+    The pending timers are the read's own ``timers`` list (worker form only); a value
+    that does not parse is skipped, never a failed wait.
+    """
+    earliest = None
+    for timer in view.get('timers') or []:
+        if not isinstance(timer, dict):
+            continue
+        value = timer.get('not_before')
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            epoch = parse_instant(value)
+        except ValueError:
+            continue
+        if earliest is None or epoch < earliest:
+            earliest = epoch
+    return earliest
+
+
 def format_instant(epoch):
     """The ISO-8601 UTC spelling of an epoch (``2026-10-17T19:55:21Z``).
 
@@ -588,17 +623,76 @@ def movement(items):
                          if isinstance(item, dict) and item.get('whose_move') == 'you'])
 
 
-def worker_view(items, claiming=None, empty_message=None):
+def _lane_not_before(item):
+    """One item's lane ``not_before`` -- at the top level or in its attention block."""
+    if not isinstance(item, dict):
+        return None
+    value = item.get('lane_not_before')
+    if value is None:
+        attention = item.get('attention')
+        if isinstance(attention, dict):
+            value = attention.get('lane_not_before')
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _timer_rows(items, now_epoch):
+    """The pending and the due timers of one worker read (kittrial-5bb.509).
+
+    Each held task's lane-state ``not_before`` is one timer, read from the item the SAME
+    read already carries (the producer resolves it, holder-authored records only). A
+    not-yet-due timer changes nothing the fingerprint sees; a DUE timer becomes a move
+    row of stable fields -- no age, no seconds left -- so it joins the items and the
+    fingerprint exactly when due, once, and only the holder's next record (with or
+    without a new ``not_before``) ends it. The clock is injected as epoch seconds
+    (``parse_instant``'s unit, so the inlined client copy parses identically), and a
+    value that does not parse -- the writer's own rule asks for seconds and an offset
+    -- is skipped, never a failed wait.
+    """
+    pending, due = [], []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        task = item.get('task')
+        value = _lane_not_before(item)
+        if task is None or not value:
+            continue
+        try:
+            moment = parse_instant(value)
+        except ValueError:
+            continue
+        if moment > now_epoch:
+            pending.append({'task': _scalar(task), 'not_before': _scalar(value)})
+        else:
+            due.append({'task': _scalar(task), 'whose_move': 'you', 'trigger': 'timer-due',
+                        'not_before': _scalar(value)})
+    pending.sort(key=lambda row: (str(row.get('not_before') or ''), str(row.get('task') or '')))
+    due.sort(key=lambda row: str(row.get('task') or ''))
+    return pending, due
+
+
+def worker_view(items, claiming=None, empty_message=None, now=None):
     """The worker form's answer: the rows whose move is the caller's plus a fingerprint.
 
     ``claiming`` is the project's claiming setting this read used, and
     ``empty_message`` the sentence an empty listing carries under ``assigned``
     (kittrial-5bb.352). Both are additive: a reader that does not know them ignores
     them, and a project with no project directory keeps exactly the old answer.
+
+    ``now`` is the read's clock for ``not_before`` timers (kittrial-5bb.509); the
+    endpoint read injects nothing (the real clock) and tests inject theirs. The
+    not-yet-due timers are listed under ``timers`` -- additive and NOT fingerprinted, so
+    setting a timer never wakes its own holder -- and a DUE timer enters ``items`` and
+    the fingerprint as a move row, so a waiting lane wakes at its own set time.
     """
     rows = movement(items)
+    moment = datetime.datetime.now(datetime.timezone.utc) if now is None else now
+    pending, due = _timer_rows(items, (moment - _EPOCH).total_seconds())
+    if due:
+        rows = _sorted_rows(list(rows) + due)
     view = {'schema': WAIT_SCHEMA, 'form': 'worker', 'items': rows,
             'fingerprint': digest(_sorted_rows([_worker_fingerprinted(row) for row in rows]))}
+    if pending:
+        view['timers'] = pending
     if claiming:
         view['claiming'] = claiming
     if not rows and empty_message:
@@ -630,6 +724,18 @@ def _empty_wake_row(lane):
             'trigger': _scalar(lane.get('empty_wake_trigger')),
             'empty_wakes_24h': lane.get('empty_wakes_24h') if isinstance(lane.get('empty_wakes_24h'), int) else 0,
             'at': _scalar(lane.get('empty_wake_at'))}
+
+
+def _timer_row(lane, entry):
+    """One due timer a coordinator must look at, reduced to stable fields (no age).
+
+    The lane board computed the rule (due, past the read's grace, and no write by the
+    lane since the due instant); the row carries who and when, never how long ago.
+    """
+    return {'lane': _scalar(lane.get('lane')), 'actor': _scalar(lane.get('actor')),
+            'task': _scalar(entry.get('task')), 'state': _scalar(entry.get('state')),
+            'waiting_on': _scalar(entry.get('waiting_on')),
+            'not_before': _scalar(entry.get('not_before'))}
 
 
 def _fault_row(lane, fault):
@@ -745,6 +851,11 @@ def coordinator_view(queue_items, lanes_payload, comment_pointers=None):
         count = lane.get('empty_wakes_24h')
         if isinstance(count, int) and count >= EMPTY_WAKE_TRIGGER:
             triggers['empty-wake'].append(_empty_wake_row(lane))
+        for entry in lane.get('held') or []:
+            # A due timer the lane has not acted on (kittrial-5bb.509): the board's
+            # timer_due flag already carries the rule; the row is its stable identity.
+            if isinstance(entry, dict) and entry.get('timer_due'):
+                triggers['timer-due'].append(_timer_row(lane, entry))
     grouped = {name: _sorted_rows(rows) for name, rows in triggers.items()}
     flat = [dict(row, trigger=name) for name in COORDINATOR_TRIGGERS for row in grouped[name]]
     # An empty group of a trigger added after the fingerprint existed (OPTIONAL_TRIGGERS) never
@@ -990,6 +1101,17 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
             remember(answer)
             return EXIT_TIMEOUT, answer
         nap = interval if timeout is None else min(interval, max(0.0, timeout - elapsed))
+        # A pending timer caps the sleep at the time remaining (kittrial-5bb.509): the
+        # wait re-reads at the due instant, and the due row that read returns IS the wake,
+        # so a lane that must act at a set time wakes then and not at the next interval.
+        # The wall clock walks with the caller's monotonic clock (tests drive both), and a
+        # re-poll while the reader's clock has not caught up never runs faster than
+        # TIMER_REPOLL_SECONDS.
+        earliest = _earliest_timer_epoch(view)
+        if earliest is not None:
+            wall_now = (time.time() if now is None else now) + (clock() - started)
+            remaining = earliest - wall_now
+            nap = min(nap, remaining + TIMER_WAKE_EPSILON if remaining > 0 else TIMER_REPOLL_SECONDS)
         if nap <= 0:
             answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
                                    reset=False)

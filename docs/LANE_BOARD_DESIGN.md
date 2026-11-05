@@ -189,6 +189,19 @@ and a log error is swallowed into an answer `warnings` entry. The coordinator fo
 `empty-wake` trigger: one row per lane whose `empty_wakes_24h` is 3 or more. That group is part of the
 coordinator fingerprint only when it has a row, so an unchanged quiet answer keeps its old fingerprint.
 
+### Timed wake-ups (kittrial-5bb.509)
+
+A lane that must act at a set time declares it with the `not_before` field of its lane-state record
+(set only by the task's holder; strictly future, at most 14 days ahead; a later record without it
+clears it). The worker wait wakes on its own at that time — a not-yet-due timer is listed under the
+answer's `timers` and never enters the fingerprint, and the due timer becomes one fingerprinted move
+row — so a coordinator does not watch the clock for a lane that is merely waiting. The coordinator
+form gains a `timer-due` trigger for the failure the worker cannot fix itself: a lane whose
+`not_before` came due, the read's idle threshold has passed since, and the lane's newest write
+anywhere is still older than the due instant — a desktop session that has stopped, for example. One
+row per such held task (`lane`, `actor`, `task`, `state`, `waiting_on`, `not_before`; no ages), part
+of the coordinator fingerprint only when it has a row, and cleared the moment the lane writes.
+
 ## 4. The web: the Lanes panel
 
 The panel belongs on the **project page of the web service, for owners and coordinators**

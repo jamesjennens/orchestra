@@ -84,12 +84,23 @@ being woken to find nothing is visible instead of silent. The log is additive, n
 written to the tracker, and a log error only adds a `warnings` entry - it can never fail
 or change a wait. The coordinator has the same thing over the things it wakes for - a
 delivery awaiting review, approved work awaiting integration, a checkpoint addressed to
-the coordinator, a lane quiet on its own move or past a declared wait, and a lane with
-repeated empty wakes - as `wait --coordinator`: run `wait --coordinator`; act on what it
+the coordinator, a lane quiet on its own move or past a declared wait, a lane with
+repeated empty wakes, and a lane whose set wake time came due without the lane acting -
+as `wait --coordinator`: run `wait --coordinator`; act on what it
 returns; run `wait --coordinator` again. Add `--comments` to also wake on a plain comment
 another actor wrote on a task (the coordinator form only; the printed next command keeps it).
 An agent with a web credential reads the same worker form,
 one read, at `GET /v1/agents/me/wait`, and blocks in the loop of whatever runs it.
+
+A lane that must act at a set time does not need anybody to watch the clock for it
+(kittrial-5bb.509): it sets the `not_before` wake time on its own lane-state record
+(the holder only; strictly future, at most 14 days ahead; a later record without it
+clears it) and ends its turn inside the kit wait, not at the prompt - the wait lists the
+not-yet-due timers and caps its sleep at the time remaining, so the due moment is the
+lane's own wake. The coordinator's `timer-due` trigger covers the failure the lane
+cannot fix itself: a wake time that came due, the idle threshold has passed since, and
+the lane has written nothing since the due instant - a desktop session that has stopped,
+for example.
 
 An agent should not invent the next wait after an empty timeout. Pass `--idle-since TIME`
 (when the current idle spell began) and `--max-timeout SECONDS` (the longest single

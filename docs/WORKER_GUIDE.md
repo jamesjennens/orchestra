@@ -39,6 +39,8 @@ A worker that runs again and again keeps what it needs to continue in three plac
 
 If your prompt has grown, write its state into checkpoints now and replace it with the served short form. If you wait for a person, say so in a blocked checkpoint on the task and tell that person in one line at every run. Declare the wait with the sibling `lane_state` key of the same checkpoint payload (`state`; `waiting_on`, a role or an actor id, required with a waiting state; and an optional `expect_by`, ISO-8601 with an offset, where a past value is accepted and flagged), set at claim, at every checkpoint and whenever a wait begins, so `work lanes` shows the lane board and flags a wait that has run too long.
 
+A lane that must act at a set time declares it with the same record's optional `not_before` (kittrial-5bb.509): a full ISO-8601 time with seconds and an offset, strictly in the future and at most 14 days ahead. Only the holder sets it - a coordinator asks you in a comment - and a later checkpoint whose `lane_state` has no `not_before` clears it. The blocking wait wakes at that time: it lists the not-yet-due timers in its answer and caps its sleep at the time remaining, so end your turn inside the kit wait (`wait --since FINGERPRINT ...`), never at the prompt, and the due moment is your wake. The Lanes page shows the time as `due <local time>` and `Overdue` once past, and a coordinator watches the `timer-due` trigger for lanes that do not wake.
+
 The same text is in the repository under `docs/` and `templates/`, where a clone lets you search it. A kit document is never returned in part: if `docs NAME` is refused, nothing was returned, and the refusal says what is wrong with the installation.
 
 ## A path on somebody else's machine

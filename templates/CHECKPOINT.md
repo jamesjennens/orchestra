@@ -94,7 +94,10 @@ The required fields are `schema_version` (1), `task` and `state`. `state` is one
 A waiting state also requires `waiting_on` (a role `coordinator`/`reviewer`/`user`, or an
 actor id, at most 96 characters; refused without one). `expect_by` is an optional
 ISO-8601 time with an offset; a past value is accepted and flagged, and only an
-unparseable one is refused.
+unparseable one is refused. `not_before` (kittrial-5bb.509) is an optional full ISO-8601
+time with seconds and an offset, strictly in the future and at most 14 days ahead, set
+only by the task's holder - a coordinator asks the holder in a comment; the blocking
+wait wakes the lane at it, and a later record without it clears it.
 
 ```json
 {"schema_version": 1, "task": "example-task", "state": "working"}

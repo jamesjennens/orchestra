@@ -22,10 +22,18 @@ Two properties follow from the separate form and are both tested:
 Every rule refuses rather than coerces: no person is inferred, no actor is turned into a
 role, and a past ``expect_by`` is accepted (and flagged on read, ``expect_by_passed``)
 while only an unparseable one is refused.
+
+``not_before`` (kittrial-5bb.509) is the holder's own wake time: a strictly future
+moment, at most :data:`NOT_BEFORE_MAX_AHEAD` ahead, set only by the task's holder (a
+coordinator asks the holder in a comment; the checkpoint writer refuses anybody else's).
+Both rules are WRITE-time rules, taken against an injected clock, so a READ stays
+time-independent: the moment ``not_before`` has passed the record is still usable, and
+only an unparseable value is refused on read exactly as ``expect_by`` is. A later record
+without the field clears the timer.
 """
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import record_json
 from requirements import canonical_bytes
@@ -59,9 +67,19 @@ REQUIRED_FIELDS = ('schema_version', 'task', 'state')
 #: publishes, which is the only way the record can be guaranteed to name the task's
 #: newest checkpoint at write time. ``waiting_on`` and ``expect_by`` are optional by
 #: rule. ``reason`` and ``about_task`` belong to ``needs-investigation`` only. The written
-#: record's field set is exactly these eight.
-OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by', 'reason', 'about_task')
+#: record's field set is exactly these nine.
+OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by', 'not_before', 'reason', 'about_task')
 FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
+
+#: A ``not_before`` may be set at most this far ahead (kittrial-5bb.509): a wake time is
+#: a short commitment, not a calendar. The bound is named in the refusal.
+NOT_BEFORE_MAX_AHEAD = timedelta(days=14)
+#: The shape a ``not_before`` must have at WRITE: a full ISO-8601 time with seconds and
+#: an offset. The blocking wait parses the value back to the second to cap its sleep, so
+#: a value without seconds is a date-and-minute, not a wake time. Read stays structural
+#: (``parse_moment`` only), so an older foreign record without seconds stays usable.
+NOT_BEFORE_SHAPE = re.compile(
+    r'\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:[Zz]|[+-]\d{2}:?\d{2})\Z')
 
 
 def parse_moment(value, label='expect_by'):
@@ -119,7 +137,7 @@ def _reason_problems(value):
     return []
 
 
-def problems(payload, task, checkpoint=None):
+def problems(payload, task, checkpoint=None, now=None):
     """Every problem with one lane-state payload, in order, so one refusal names them all.
 
     ``checkpoint`` is the comment id of the checkpoint this record is written with. When
@@ -127,6 +145,11 @@ def problems(payload, task, checkpoint=None):
     yet), so the field may be absent or present; the writer compares a supplied value to
     the id it publishes and refuses a mismatch, which is the "it is not the task's newest
     at write time" rule. When ``checkpoint`` is given, the field must be present and equal.
+
+    ``now`` is the WRITE-time clock (kittrial-5bb.509). ``None`` -- the read path, and
+    ``newest`` with it -- checks ``not_before`` structurally only, so a record whose wake
+    time has passed stays usable; the writer passes a clock and the future-and-bounded
+    rules apply. Tests inject ``now``; only the writers supply the real clock.
     """
     if not isinstance(payload, dict):
         return ['Invalid lane state: expected a JSON object']
@@ -180,6 +203,11 @@ def problems(payload, task, checkpoint=None):
         if 'about_task' in payload and (not isinstance(payload['about_task'], str)
                                         or not TASK_ID.fullmatch(payload['about_task'])):
             found.append('Invalid lane state: about_task must be a task id')
+        if 'not_before' in payload:
+            # A fault is not a wait (kittrial-5bb.398); a wake time belongs to a lane that
+            # waits, and a raised fault is cleared by a coordinator, not by a timer.
+            found.append('Invalid lane state: not_before is refused when state is %r; a fault '
+                         'is not a wait' % state)
     else:
         for name in ('reason', 'about_task'):
             if name in payload:
@@ -190,12 +218,29 @@ def problems(payload, task, checkpoint=None):
             parse_moment(payload['expect_by'])
         except ValueError as error:
             found.append('Invalid lane state: ' + str(error))
+    if 'not_before' in payload:
+        try:
+            moment = parse_moment(payload['not_before'], 'not_before')
+        except ValueError as error:
+            found.append('Invalid lane state: ' + str(error))
+        else:
+            if now is not None and not NOT_BEFORE_SHAPE.fullmatch(str(payload['not_before']).strip()):
+                found.append('Invalid lane state: not_before must be a full ISO-8601 time with '
+                             'seconds and an offset, such as 2026-11-05T17:30:00Z')
+            elif now is not None:
+                if moment <= now:
+                    found.append('Invalid lane state: not_before must be strictly in the future, '
+                                 'so the lane has something to wake for')
+                elif moment - now > NOT_BEFORE_MAX_AHEAD:
+                    found.append('Invalid lane state: not_before is more than %d days ahead; a '
+                                 'wake time is set at most %d days out'
+                                 % (NOT_BEFORE_MAX_AHEAD.days, NOT_BEFORE_MAX_AHEAD.days))
     return found
 
 
-def validate(payload, task, checkpoint=None):
+def validate(payload, task, checkpoint=None, now=None):
     """Return ``payload`` when it is a valid lane-state record for ``task``, else raise."""
-    found = problems(payload, task, checkpoint)
+    found = problems(payload, task, checkpoint, now=now)
     if found:
         raise ValueError('; '.join(found))
     return payload
@@ -268,20 +313,20 @@ def newest(comments, task):
     return comment, payload, checkpoint
 
 
-def record(payload, task, checkpoint):
+def record(payload, task, checkpoint, now=None):
     """The validated record dict that is written, with ``checkpoint`` set to the id."""
     written = dict(payload)
     written['checkpoint'] = checkpoint
-    validate(written, task, checkpoint)
+    validate(written, task, checkpoint, now=now)
     return written
 
 
-def body(payload, task, checkpoint):
+def body(payload, task, checkpoint, now=None):
     """The exact comment body the checkpoint writer posts for one lane-state record."""
-    return PREFIX + canonical_bytes(record(payload, task, checkpoint)).decode()
+    return PREFIX + canonical_bytes(record(payload, task, checkpoint, now=now)).decode()
 
 
-def ensure(run, comments, actor, task, payload, checkpoint):
+def ensure(run, comments, actor, task, payload, checkpoint, now=None):
     """The lane-state record for this checkpoint, written now if it is not already there.
 
     A retry of a checkpoint request that was already recorded (``save_checkpoint``'s
@@ -289,9 +334,10 @@ def ensure(run, comments, actor, task, payload, checkpoint):
     two writes leaves none: this completes it. Exact identity is the writing actor, the
     checkpoint it names and the same fields; a retry that would REVISE the state of an
     already-published checkpoint is refused, because a record is written only with its own
-    checkpoint and names the newest checkpoint at that moment.
+    checkpoint and names the newest checkpoint at that moment. ``now`` is the write-time
+    clock for ``not_before`` (kittrial-5bb.509); the writer supplies it.
     """
-    wanted = record(payload, task, checkpoint)
+    wanted = record(payload, task, checkpoint, now=now)
     for comment in comments or []:
         if not isinstance(comment, dict) or comment.get('author') != actor:
             continue

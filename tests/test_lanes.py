@@ -236,6 +236,56 @@ class FlagTests(unittest.TestCase):
         self.assertEqual(row_b['flag_tasks'], {'your_move_idle': ['t2']})
 
 
+class TimerDueTests(unittest.TestCase):
+    """kittrial-5bb.509: the board shows a holder's set wake time and computes the
+    coordinator's timer-due rule -- due, past the idle grace, and no write by the lane
+    since the due instant. The clock is the read's own ``now``, never the real one."""
+
+    def timer_row(self, not_before, record_stamp='2026-09-15T09:30:00Z', author=None):
+        row = task('t1', A, [comment('c0', 'hello', A, '2026-09-15T08:00:00Z')])
+        add_checkpoint(row, 'cp1', record_stamp)
+        payload = dict(schema_version=1, task='t1', checkpoint='cp1', state='working')
+        if not_before is not None:
+            payload['not_before'] = not_before
+        row['comments'].append(comment('ls1', lane_state.PREFIX + canonical_bytes(payload).decode(),
+                                       author or A, record_stamp))
+        return row
+
+    def test_a_future_wake_time_is_shown_and_is_not_a_flag(self):
+        _lane, entry = entry_of(board([self.timer_row('2026-09-15T13:00:00Z')]), 't1')
+        self.assertEqual(entry['not_before'], '2026-09-15T13:00:00Z')
+        self.assertFalse(entry['not_before_due'])
+        self.assertFalse(entry['timer_due'])
+        self.assertNotIn('timer_due', entry['flags'])    # a trigger, never a lane flag
+
+    def test_a_due_wake_time_passes_the_grace_and_the_no_write_rule(self):
+        _lane, entry = entry_of(board([self.timer_row('2026-09-15T11:00:00Z')]), 't1')
+        self.assertTrue(entry['not_before_due'])
+        self.assertTrue(entry['timer_due'])
+
+    def test_a_due_wake_time_inside_the_grace_is_not_yet_the_coordinators(self):
+        # One idle threshold for the lane to wake itself: NOW - 11:55 is 300s, under 900.
+        _lane, entry = entry_of(board([self.timer_row('2026-09-15T11:55:00Z')]), 't1')
+        self.assertTrue(entry['not_before_due'])
+        self.assertFalse(entry['timer_due'])
+
+    def test_a_write_by_the_lane_after_the_due_instant_means_it_woke(self):
+        row = self.timer_row('2026-09-15T11:00:00Z')
+        row['comments'].append(comment('c9', 'awake and working', A, '2026-09-15T11:30:00Z'))
+        _lane, entry = entry_of(board([row]), 't1')
+        self.assertTrue(entry['not_before_due'])
+        self.assertFalse(entry['timer_due'])
+
+    def test_only_the_holders_own_record_sets_a_wake_time(self):
+        # The state itself is declared by any author's record (no author rule on the
+        # reader); the wake time is the holder's own, so this entry carries none.
+        _lane, entry = entry_of(board([self.timer_row('2026-09-15T11:00:00Z', author=B)]), 't1')
+        self.assertEqual(entry['state'], 'working')
+        self.assertIsNone(entry['not_before'])
+        self.assertFalse(entry['not_before_due'])
+        self.assertFalse(entry['timer_due'])
+
+
 class IdleLaneTests(unittest.TestCase):
     def test_a_registered_lane_that_holds_nothing_and_wrote_recently_is_idle(self):
         holder = task('t1', A)

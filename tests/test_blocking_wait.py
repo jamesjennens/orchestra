@@ -8,6 +8,7 @@ safe; the interval's floor is 60 and its default 300; ``--timeout`` bounds the w
 cheap read happens per poll; the coordinator's four triggers each work; and the worker
 and coordinator texts say run-wait-act-run-wait.
 """
+import datetime
 import io
 import json
 import sys
@@ -141,6 +142,105 @@ class WorkerFormTests(unittest.TestCase):
         self.assertEqual(code, waiting.EXIT_USAGE)
 
 
+class TimerWakeTests(unittest.TestCase):
+    """kittrial-5bb.509: a lane state's ``not_before`` wakes its lane at that time.
+
+    Every due-ness read runs against an injected clock. A not-yet-due timer is listed
+    but fingerprint-invisible (setting a timer never wakes its own holder); a due timer
+    becomes one stable move row; the wait sleeps no longer than the time remaining.
+    """
+
+    START = datetime.datetime(2026, 11, 4, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    DUE = '2026-11-04T12:01:30Z'                    # 90 seconds after START
+
+    def timer_item(self, task='t1', value=DUE, **extra):
+        row = {'task': task, 'whose_move': 'coordinator', 'review_state': 'in-progress',
+               'lane_not_before': value}
+        row.update(extra)
+        return row
+
+    def moment(self, **change):
+        return self.START.replace(**change)
+
+    def test_no_wake_before_the_timer_time(self):
+        view = waiting.worker_view([self.timer_item()], now=self.START)
+        quiet = waiting.worker_view([], now=self.START)
+        self.assertEqual(view['fingerprint'], quiet['fingerprint'])
+        self.assertEqual(view['items'], [])
+        self.assertEqual(view['timers'], [{'task': 't1', 'not_before': self.DUE}])
+        # The attention block spells the timer the same way: the web transport's row and
+        # the native one fingerprint the same task the same way.
+        nested = waiting.worker_view([dict(self.timer_item(), lane_not_before=None,
+                                           attention={'lane_not_before': self.DUE})],
+                                     now=self.START)
+        self.assertEqual(nested['fingerprint'], view['fingerprint'])
+        self.assertEqual(nested['timers'], view['timers'])
+
+    def test_exactly_one_wake_once_the_timer_is_due(self):
+        item = self.timer_item()
+        before = waiting.worker_view([item], now=self.START)
+        due = waiting.worker_view([item], now=self.moment(minute=1, second=30))
+        self.assertNotEqual(due['fingerprint'], before['fingerprint'])
+        self.assertEqual(due['items'], [{'task': 't1', 'whose_move': 'you',
+                                         'trigger': 'timer-due', 'not_before': self.DUE}])
+        # The row is stable: a later read of the same due state is the SAME wake, so the
+        # fingerprint does not move again with the clock.
+        later = waiting.worker_view([item], now=self.moment(minute=5))
+        self.assertEqual(later['fingerprint'], due['fingerprint'])
+        # And through the wait: holding the due fingerprint blocks, it is not re-served.
+        clock = FakeClock()
+        read = scripted([due, due])
+        code, _view = waiting.run_wait(read, since=due['fingerprint'], interval=60, timeout=60,
+                                       clock=clock.clock, sleep=clock.sleep)
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+
+    def test_a_cleared_timer_wakes_nobody(self):
+        item = self.timer_item()
+        never_set = dict(item, lane_not_before=None)
+        quiet = waiting.worker_view([never_set], now=self.START)['fingerprint']
+        # While set but not due the fingerprint is already quiet; once the holder's newer
+        # record carries no not_before the timer is gone outright, even past the old time.
+        self.assertEqual(waiting.worker_view([item], now=self.START)['fingerprint'], quiet)
+        cleared = waiting.worker_view([never_set], now=self.moment(minute=5))
+        self.assertEqual(cleared['items'], [])
+        self.assertNotIn('timers', cleared)
+        self.assertEqual(cleared['fingerprint'], quiet)
+
+    def test_the_wait_sleeps_no_longer_than_the_timer(self):
+        item = self.timer_item()
+        pending_first = waiting.worker_view([item], now=self.START)
+        pending_next = waiting.worker_view([item], now=self.moment(minute=1))
+        due = waiting.worker_view([item], now=self.moment(minute=1, second=30))
+        self.assertEqual(pending_first['fingerprint'], pending_next['fingerprint'])
+        clock = FakeClock()
+        read = scripted([pending_first, pending_next, due])
+        code, view = waiting.run_wait(read, since=pending_first['fingerprint'], interval=60,
+                                      timeout=600, clock=clock.clock, sleep=clock.sleep,
+                                      now=waiting.parse_instant('2026-11-04T12:00:00Z'))
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(view['items'][0]['trigger'], 'timer-due')
+        # One full interval, then the 30 seconds remaining plus the 1-second epsilon: the
+        # wait re-reads at the due instant instead of sleeping to the next interval.
+        self.assertEqual(clock.naps, [60, 31])
+
+    def test_a_value_that_does_not_parse_never_caps_the_sleep(self):
+        # A minutes-only spelling is no timer at all to the wait: the writer's own rule
+        # asks for seconds and an offset, so such a value can only be hand-planted. It
+        # wakes nobody and caps nothing -- degraded, never a tight loop and never a
+        # failed wait.
+        view = waiting.worker_view([self.timer_item(value='2026-11-04T12:01Z')], now=self.START)
+        self.assertNotIn('timers', view)
+        self.assertEqual(view['items'], [])
+        self.assertEqual(view['fingerprint'], waiting.worker_view([], now=self.START)['fingerprint'])
+        clock = FakeClock()
+        read = scripted([view, view, view])
+        code, _view = waiting.run_wait(read, since=view['fingerprint'], interval=60, timeout=120,
+                                       clock=clock.clock, sleep=clock.sleep,
+                                       now=waiting.parse_instant('2026-11-04T12:00:00Z'))
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+        self.assertEqual(clock.naps, [60, 60])
+
+
 class CoordinatorFormTests(unittest.TestCase):
     """The coordinator form uses the same loop over the four triggers (kittrial-5bb.263)."""
 
@@ -216,13 +316,37 @@ class CoordinatorFormTests(unittest.TestCase):
                 self.assertEqual([row['lane'] for row in view['triggers']['lane-quiet']], ['lane-a'])
                 self.assertIn(flag, view['triggers']['lane-quiet'][0]['flags'])
 
+    def test_trigger_a_due_timer_the_lane_has_not_acted_on(self):
+        lanes = lanes_page(lane('lane-a', A, held=[
+            {'task': 't5', 'state': 'waiting-on-coordinator', 'waiting_on': 'coordinator',
+             'whose_move': 'coordinator', 'flags': [], 'not_before': '2026-11-04T11:00:00Z',
+             'timer_due': True}]))
+        view = self.coordinator(lanes=lanes)
+        rows = view['triggers']['timer-due']
+        self.assertEqual([row['task'] for row in rows], ['t5'])
+        self.assertEqual(rows[0]['lane'], 'lane-a')
+        self.assertEqual(rows[0]['not_before'], '2026-11-04T11:00:00Z')
+        # The rule is the board's, and the row is stable fields only: the same board
+        # answers the same fingerprint, so the clock alone never re-wakes a coordinator.
+        again = self.coordinator(lanes=lanes)
+        self.assertEqual(again['fingerprint'], view['fingerprint'])
+
+    def test_a_not_yet_due_timer_is_no_trigger(self):
+        view = self.coordinator(lanes=lanes_page(lane('lane-a', A, held=[
+            {'task': 't5', 'state': 'working', 'flags': [], 'not_before': '2099-01-01T00:00:00Z'}])))
+        self.assertEqual(view['triggers']['timer-due'], [])
+        self.assertEqual(view['items'], [])
+
     def test_a_quiet_project_triggers_nothing(self):
         view = self.coordinator(queue=[{'task': 't1', 'review_state': 'none'}],
                                 lanes=lanes_page(lane('lane-a', A, held=[
                                     {'task': 't1', 'state': 'working', 'flags': []}])))
         # kittrial-5bb.397/.398: empty `needs-investigation` and `empty-wake` groups are kept OUT
         # of the fingerprint, so a quiet answer keeps the fingerprint it had before those triggers.
-        stable = {name: [] for name in waiting.COORDINATOR_TRIGGERS if name not in ('needs-investigation', 'empty-wake')}
+        # kittrial-5bb.509: `timer-due` joins them (OPTIONAL_TRIGGERS), so a project whose
+        # lanes set wake times still fingerprints as quiet until one is due.
+        stable = {name: [] for name in waiting.COORDINATOR_TRIGGERS
+                  if name not in waiting.OPTIONAL_TRIGGERS}
         self.assertEqual(view['fingerprint'], waiting.digest(stable))
         self.assertEqual(view['items'], [])
 

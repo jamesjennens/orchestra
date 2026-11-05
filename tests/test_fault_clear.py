@@ -481,7 +481,7 @@ class WaitTests(unittest.TestCase):
         return lanes.read(list(rows), A, tl.registry(('lane-a', A), ('lane-b', B)), [], now=NOW, journal=None)
 
     def test_the_coordinator_wait_has_a_needs_investigation_trigger(self):
-        self.assertEqual('needs-investigation', waiting.COORDINATOR_TRIGGERS[-1])
+        self.assertIn('needs-investigation', waiting.COORDINATOR_TRIGGERS)
         row = tl.task('t1', A)
         raise_fault(row, about_task='t9')
         view = waiting.coordinator_view([], self.lanes_payload(row))
@@ -504,7 +504,9 @@ class WaitTests(unittest.TestCase):
         self.assertEqual([], before['triggers']['needs-investigation'])
         tl.add_lane_state(row, 'f1', 'cp-f1', RAISED, state='needs-investigation', reason='the merge slot is stuck')
         after = waiting.coordinator_view([], self.lanes_payload(quiet, row))
-        for name in waiting.COORDINATOR_TRIGGERS[:-1]:
+        for name in waiting.COORDINATOR_TRIGGERS:
+            if name == 'needs-investigation':
+                continue
             self.assertEqual(before['triggers'][name], after['triggers'][name], name)
         self.assertNotEqual(before['fingerprint'], after['fingerprint'])
 
