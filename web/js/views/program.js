@@ -21,13 +21,47 @@ function coordinatorsText(found) {
 export function areaRow(row) {
   if (!row.visible) {
     return h('tr', { 'data-area': row.area },
-      h('td', null, row.area), h('td', null, row.state), h('td', { colspan: '4', class: 'muted' }, row.note));
+      h('td', null, row.area), h('td', null, row.state), h('td', { colspan: '5', class: 'muted' }, row.note));
   }
   const lanes = row.lanes || {};
   return h('tr', { 'data-area': row.area },
     h('td', null, row.area), h('td', null, row.state), h('td', null, String(row.open_tasks)),
     h('td', null, String(lanes.waiting_too_long)), h('td', null, String(lanes.expect_by_passed)),
+    h('td', null, String(lanes.your_move_idle ?? 0)),
     h('td', null, coordinatorsText(row.coordinators)));
+}
+
+// kittrial-5bb.507: the lane rows behind an area's counts, in a collapsed details under its row, as the server
+// wrote them (the holder's display name, the task, its state, who it waits on, expect-by, flags). The link goes
+// to the area's own Lanes page. A row the reader may not see has no details element at all.
+export function laneRowsRow(row) {
+  if (!row.visible) return null;
+  const lanes = row.lanes_rows || [];
+  const held = [];
+  for (const lane of lanes) {
+    const holder = lane.display_name || lane.lane || '';
+    const flags = (entry) => (entry.flags || []).join(', ');
+    if (!(lane.held || []).length) {
+      held.push(h('tr', { 'data-lane': holder }, h('td', null, holder), h('td', { colspan: '5', class: 'muted' },
+        lane.idle ? 'idle' : 'holds nothing')));
+    }
+    for (const entry of lane.held || []) {
+      held.push(h('tr', { 'data-lane': holder, 'data-task': entry.task },
+        h('td', null, holder), h('td', null, `${entry.task} ${entry.title || ''}`.trim()),
+        h('td', null, entry.state || ''), h('td', null, entry.waiting_on_name || entry.waiting_on || ''),
+        h('td', null, entry.expect_by || ''), h('td', null, flags(entry))));
+    }
+  }
+  const summary = `Lanes (${row.lanes_total ?? lanes.length})`;
+  return h('tr', { 'data-area-lanes': row.area },
+    h('td', { colspan: '7' },
+      h('details', null, h('summary', null, summary),
+        lanes.length ? h('table', { class: 'table', 'data-table': 'area-lanes' },
+          h('thead', null, h('tr', null, ...['Holder', 'Task', 'State', 'Waiting on', 'Expect by', 'Flags']
+            .map((label) => h('th', null, label)))),
+          h('tbody', null, ...held)) : h('p', { class: 'muted' }, 'No lane to show.'),
+        row.lanes_more ? h('p', { class: 'small muted' }, row.lanes_more) : null,
+        h('a', { href: '#/p/' + encodeURIComponent(row.area) + '/lanes' }, 'Open the area\'s Lanes page'))));
 }
 
 export function areasTable(areas) {
@@ -35,8 +69,8 @@ export function areasTable(areas) {
   if (!items.length) return h('p', { class: 'muted', 'data-empty': 'areas' }, 'This project lists no areas.');
   return h('table', { class: 'table', 'data-table': 'areas' },
     h('thead', null, h('tr', null, ...['Area', 'Link', 'Open tasks', 'Lanes waiting long', 'Lanes past expect-by',
-      'Coordinators'].map((label) => h('th', null, label)))),
-    h('tbody', null, ...items.map(areaRow)));
+      'Lanes with an idle move', 'Coordinators'].map((label) => h('th', null, label)))),
+    h('tbody', null, ...items.flatMap((row) => [areaRow(row), laneRowsRow(row)])));
 }
 
 export function requirementsTable(requirements) {
