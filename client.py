@@ -867,10 +867,12 @@ class _InlineWait:
     def wait_command(prefix, fingerprint, idle_since, timeout,
                      interval=DEFAULT_INTERVAL, form='worker',
                      idle_minutes=DEFAULT_IDLE_MINUTES, max_timeout=None,
-                     give_up_after=DEFAULT_GIVE_UP_AFTER):
+                     give_up_after=DEFAULT_GIVE_UP_AFTER, comments=False):
         parts = [prefix, 'wait']
         if form == 'coordinator':
             parts += ['--coordinator', '--idle-minutes', str(idle_minutes)]
+            if comments:
+                parts += ['--comments']
         parts += ['--interval', str(_InlineWait._seconds(interval))]
         if fingerprint:
             parts += ['--since', fingerprint]
@@ -1022,6 +1024,8 @@ class _InlineWait:
         if parsed.since is not None and not _InlineWait.is_fingerprint(parsed.since):
             raise ValueError('Invalid wait: --since takes a fingerprint this kit printed '
                              '(wait1:<64 hex>)')
+        if parsed.comments and not parsed.coordinator:
+            raise ValueError('Invalid wait: --comments belongs to --coordinator')
         if parsed.idle_since is not None:
             _InlineWait.parse_instant(parsed.idle_since)
         if parsed.max_timeout is not None and parsed.max_timeout <= 0:
@@ -1038,6 +1042,8 @@ class _InlineWait:
         args = []
         if options.coordinator:
             args += ['--coordinator', '--idle-minutes', str(options.idle_minutes)]
+            if options.comments:
+                args += ['--comments-others']
         if since is not None:
             args += ['--since', since]
         return args
@@ -1046,7 +1052,8 @@ class _InlineWait:
     def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
                  clock=None, sleep=None, form=None, idle_since=None, max_timeout=None,
                  give_up_after=DEFAULT_GIVE_UP_AFTER, command_prefix='client.py',
-                 idle_minutes=DEFAULT_IDLE_MINUTES, now=None, state_file=None, fresh=False):
+                 idle_minutes=DEFAULT_IDLE_MINUTES, now=None, state_file=None, fresh=False,
+                 comments=False):
         clock = time.monotonic if clock is None else clock
         sleep = time.sleep if sleep is None else sleep
         form = form or 'worker'
@@ -1072,7 +1079,8 @@ class _InlineWait:
                     'next_timeout': _InlineWait._seconds(timeout),
                     'next_command': _InlineWait.wait_command(
                         command_prefix, fingerprint, _InlineWait.format_instant(wall_now + elapsed),
-                        timeout, interval, form, idle_minutes, max_timeout, give_up_after),
+                        timeout, interval, form, idle_minutes, max_timeout, give_up_after,
+                        comments),
                     'give_up': False,
                 }
                 return dict(view, **fields)
@@ -1084,7 +1092,7 @@ class _InlineWait:
                 'next_timeout': _InlineWait._seconds(upcoming),
                 'next_command': _InlineWait.wait_command(
                     command_prefix, fingerprint, idle_since, upcoming, interval, form,
-                    idle_minutes, max_timeout, give_up_after),
+                    idle_minutes, max_timeout, give_up_after, comments),
                 'give_up': give_up,
             }
             if give_up:
@@ -1188,6 +1196,7 @@ def _wait_parser(add_help=False):
     parser.add_argument('--timeout', type=float, default=None)
     parser.add_argument('--since')
     parser.add_argument('--fresh', action='store_true')
+    parser.add_argument('--comments', action='store_true')
     parser.add_argument('--idle-since')
     parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
     parser.add_argument('--give-up-after', type=float,
@@ -1270,7 +1279,8 @@ def _wait_command(args,config,project,actor,out,config_path=None):
                               command_prefix=_wait_client_prefix(config_path,project,actor),
                               idle_minutes=options.idle_minutes,
                               state_file=state_file,
-                              fresh=options.fresh)
+                              fresh=options.fresh,
+                              comments=options.comments)
     text = json.dumps(view,ensure_ascii=True,indent=2)+'\n'
     if out:
         # The wait result is a result at every exit code, so --out writes it too; a

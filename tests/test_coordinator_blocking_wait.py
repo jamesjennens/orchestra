@@ -75,6 +75,35 @@ class BlockingWaitTests(grants.Grants):
         self.comment(self.tokens['carl'], task, 'a worker')
         self.assertEqual(2, len(self.baseline()['comments']))
 
+    def test_the_client_comments_flag_wakes_the_live_route_only_for_a_plain_comment_by_another(self):
+        """kittrial-5bb.506: the query is the one the CLIENT's own argv produces, sent for real."""
+        import lane_state
+        import client
+        def query_for(argv):
+            flags = waiting.read_args(waiting.parse_client_args(argv))
+            return '&comments=others' if '--comments-others' in flags else ''
+        def fingerprint(query):
+            answer = self.wait(None, query)
+            self.assertEqual(200, answer.status, answer.data)
+            return answer.data['fingerprint']
+        with_flag = query_for(['--coordinator', '--comments'])
+        without_flag = query_for(['--coordinator'])
+        self.assertEqual('&comments=others', with_flag)
+        self.assertEqual('', without_flag)
+        task = self.new_task()
+        start = fingerprint(with_flag)
+        self.comment(self.agent, task, 'my own')
+        self.assertEqual(start, fingerprint(with_flag))
+        refused = self.request('POST', self.base(task) + '/comments',
+                               {'text': lane_state.PREFIX + '{}'}, token=self.tokens['carl'])
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(start, fingerprint(with_flag))
+        self.comment(self.tokens['carl'], task, 'a plain comment')
+        self.assertNotEqual(start, fingerprint(with_flag))
+        plain_start = fingerprint(without_flag)
+        self.comment(self.tokens['carl'], task, 'another plain comment')
+        self.assertEqual(plain_start, fingerprint(without_flag))
+
     def test_newest_twenty_pointers_and_machine_records_do_not_wake(self):
         task = self.new_task()
         for number in range(23):

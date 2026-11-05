@@ -557,7 +557,7 @@ def empty_returns(elapsed, base, cap):
 
 def wait_command(prefix, fingerprint, idle_since, timeout, interval=DEFAULT_INTERVAL,
                  form='worker', idle_minutes=DEFAULT_IDLE_MINUTES, max_timeout=None,
-                 give_up_after=DEFAULT_GIVE_UP_AFTER):
+                 give_up_after=DEFAULT_GIVE_UP_AFTER, comments=False):
     """The exact ``wait`` command to run next, as one line the caller can copy.
 
     ``prefix`` is how the caller invokes the client (its config/project/actor part when
@@ -569,6 +569,8 @@ def wait_command(prefix, fingerprint, idle_since, timeout, interval=DEFAULT_INTE
     parts = [prefix, 'wait']
     if form == 'coordinator':
         parts += ['--coordinator', '--idle-minutes', str(idle_minutes)]
+        if comments:
+            parts += ['--comments']
     parts += ['--interval', str(_seconds(interval))]
     if fingerprint:
         parts += ['--since', fingerprint]
@@ -801,6 +803,7 @@ def parse_client_args(args):
     parser.add_argument('--timeout', type=float, default=None)
     parser.add_argument('--since')
     parser.add_argument('--fresh', action='store_true')
+    parser.add_argument('--comments', action='store_true')
     parser.add_argument('--idle-since')
     parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
     parser.add_argument('--give-up-after', type=float, default=DEFAULT_GIVE_UP_AFTER,
@@ -815,6 +818,8 @@ def parse_client_args(args):
     if parsed.since is not None and not is_fingerprint(parsed.since):
         raise ValueError('Invalid wait: --since takes a fingerprint this kit printed '
                          '(wait1:<64 hex>)')
+    if parsed.comments and not parsed.coordinator:
+        raise ValueError('Invalid wait: --comments belongs to --coordinator')
     if parsed.idle_since is not None:
         parse_instant(parsed.idle_since)  # refuse a bad TIME before any read happens
     if parsed.max_timeout is not None and parsed.max_timeout <= 0:
@@ -840,6 +845,8 @@ def read_args(options, since=None):
     args = []
     if options.coordinator:
         args += ['--coordinator', '--idle-minutes', str(options.idle_minutes)]
+        if options.comments:
+            args += ['--comments-others']
     if since is not None:
         args += ['--since', since]
     return args
@@ -848,7 +855,8 @@ def read_args(options, since=None):
 def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
              clock=None, sleep=None, form=None, idle_since=None, max_timeout=None,
              give_up_after=DEFAULT_GIVE_UP_AFTER, command_prefix='client.py',
-             idle_minutes=DEFAULT_IDLE_MINUTES, now=None, state_file=None, fresh=False):
+             idle_minutes=DEFAULT_IDLE_MINUTES, now=None, state_file=None, fresh=False,
+             comments=False):
     """Block, polling ``read`` every ``interval`` seconds, until something is the move.
 
     ``read`` is called once per poll and returns one view (the payload of
@@ -912,7 +920,7 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
                 'next_command': wait_command(command_prefix, fingerprint,
                                              format_instant(wall_now + elapsed), timeout,
                                              interval, form, idle_minutes,
-                                             max_timeout, give_up_after),
+                                             max_timeout, give_up_after, comments),
                 'give_up': False,
             }
             return dict(view, **fields)
@@ -924,7 +932,7 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
             'next_timeout': _seconds(upcoming),
             'next_command': wait_command(command_prefix, fingerprint, idle_since, upcoming,
                                          interval, form, idle_minutes, max_timeout,
-                                         give_up_after),
+                                         give_up_after, comments),
             'give_up': give_up,
         }
         if give_up:

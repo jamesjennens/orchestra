@@ -313,6 +313,30 @@ class InlineAgreementTests(unittest.TestCase):
             self.assertEqual(waiting.timeout_cap(base, cap),
                              client._InlineWait.timeout_cap(base, cap))
 
+    def test_the_comments_flag_agrees_and_belongs_to_the_coordinator_form(self):
+        kit = waiting.parse_client_args(['--coordinator', '--comments'])
+        inline = client._InlineWait.parse_client_args(['--coordinator', '--comments'])
+        read = waiting.read_args(kit)
+        self.assertEqual(read, ['--coordinator', '--idle-minutes', str(kit.idle_minutes),
+                                '--comments-others'])
+        self.assertEqual(read, client._InlineWait.read_args(inline))
+        self.assertEqual(waiting.wait_command('p', None, IDLE, 60, form='coordinator',
+                                              comments=True),
+                         client._InlineWait.wait_command('p', None, IDLE, 60, form='coordinator',
+                                                         comments=True))
+        self.assertIn('--comments', waiting.wait_command('p', None, IDLE, 60,
+                                                         form='coordinator', comments=True))
+        self.assertNotIn('--comments', waiting.wait_command('p', None, IDLE, 60,
+                                                            form='worker', comments=True))
+        self.assertNotIn('--comments-others', waiting.read_args(
+            waiting.parse_client_args(['--coordinator'])))
+        for argv in (['--comments'], ['--comments', '--interval', '60']):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError):
+                    waiting.parse_client_args(argv)
+                with self.assertRaises(ValueError):
+                    client._InlineWait.parse_client_args(argv)
+
     def test_the_state_path_agrees(self):
         """Review items 6 and 7: the cache is derived from --config, on any path style."""
         for config in ('/home/someone/.orchestra/client.json', 'client.json',

@@ -4,7 +4,7 @@
 
 `GET /v1/agents/me/wait?form=coordinator` exposes the existing CLI
 `wait --coordinator` projection to an agent with a current project coordinator
-grant. A worker credential, an ordinary agent without that grant, or an agent
+grant (`comments=others` adds the plain comments, as `wait --coordinator --comments` does). A worker credential, an ordinary agent without that grant, or an agent
 whose last effective grant was revoked gets `403`. Authority is checked on each
 call, including the owner's current role. Only projects where the grant is
 effective are read; membership or an agent project assignment alone grants no
