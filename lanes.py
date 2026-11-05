@@ -273,6 +273,23 @@ def inferred_wait(checkpoint_payload):
     return None
 
 
+def holder_last_write(row, actor):
+    """The timestamp text of the holder's newest comment on the task, or the task's own write time."""
+    stamps = [comment.get('created_at') for comment in row.get('comments') or []
+              if isinstance(comment, dict) and comment.get('author') == actor]
+    newest = None
+    best = None
+    for text in stamps:
+        parsed = moment(text)
+        if parsed is not None and (newest is None or parsed > newest):
+            newest = parsed
+            best = text
+    if best is not None:
+        return best
+    fallback = row.get('updated_at') or row.get('created_at')
+    return fallback if isinstance(fallback, str) else None
+
+
 def holder_idle_seconds(row, actor, now):
     """How long this lane has written nothing on a task.
 
@@ -386,6 +403,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         'state_age_seconds': age,
         'no_checkpoint': checkpoint is None,
         'held_age_seconds': seconds_since(row.get('updated_at') or row.get('created_at'), now),
+        'holder_last_write_at': holder_last_write(row, actor),
         'holder_last_write_seconds': idle_seconds,
         'flags': flags,
         'pending_review_items': pending_items,

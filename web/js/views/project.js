@@ -818,6 +818,44 @@ export function agentApprovalPanel(ctx, project) {
   return host;
 }
 
+// Whether the project sends an automatic resume nudge to a lane idle past twice the threshold
+// (kittrial-5bb.514). Off by default; only a project owner or superuser by session may change it.
+export function autoNudgePanel(ctx, project) {
+  const host = h('section', { class: 'panel', 'data-panel': 'auto-nudge' });
+  const block = Object.assign({ enabled: false, set_by: null, set_at: null, set_by_display_name: null },
+    project.auto_nudge || {});
+  const canSet = Boolean(project.can_set_auto_nudge) && !project.archived && project.usable !== false;
+  function draw() {
+    const enabled = block.enabled === true;
+    const select = h('select', { id: 'auto-nudge-value', 'aria-label': 'Automatic lane nudges' },
+      h('option', { value: 'off', selected: !enabled }, 'Off — nudges are sent only when a coordinator asks'),
+      h('option', { value: 'on', selected: enabled }, 'On — nudge a lane once per idle episode after twice the threshold'));
+    const save = h('button', { type: 'button', class: 'primary', onclick: async (e) => {
+      try {
+        const result = await act(e.currentTarget, () => ctx.api.setAutoNudge(project.id, select.value === 'on'),
+          { success: 'Automatic lane nudge setting saved' });
+        if (result && typeof result.enabled === 'boolean') Object.assign(block, result, { damaged: false });
+        draw();
+      } catch { /* the refusal is shown beside the control */ }
+    } }, 'Save');
+    host.replaceChildren(
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Automatic lane nudges')),
+      h('div', { class: 'panel-body' },
+        h('p', { class: 'muted' }, enabled
+          ? 'A lane whose move is its own, with no declared wait and not retired, receives at most one automatic resume nudge per idle episode after twice the idle threshold (at least 30 minutes), at most once per 6 hours and twice per 24 hours.'
+          : 'Automatic lane nudges are off. A lane is nudged only when a coordinator requests it. That is the default.'),
+        canSet ? h('div', { class: 'toolbar' }, h('label', { class: 'check', for: 'auto-nudge-value' }, 'Automatic nudges'), select, save) : null,
+        h('p', { class: 'small muted' },
+          enabled ? 'Set to on' : 'Set to off',
+          block.set_by ? [' by ', h('span', { class: 'mono' }, block.set_by_display_name || block.set_by)] : null,
+          block.set_at ? [' ', time(block.set_at)] : null,
+          block.set_by ? '.' : ' — the default; nobody has changed it.'),
+        block.damaged ? h('p', { class: 'small', role: 'status' }, 'The stored setting could not be read, so automatic nudges stay off until an owner saves it again.') : null));
+  }
+  draw();
+  return host;
+}
+
 export async function settings(ctx, { pid }) {
   const project = await load(ctx, pid);
   const owner = isOwner(project);
@@ -994,7 +1032,7 @@ export async function settings(ctx, { pid }) {
     // kittrial-5bb.447: notes between the coordinators of linked projects, in the same line (no new panel).
     h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator'),
       ' · ', h('a', { href: ctx.href(`/p/${pid}/notes`), 'data-link': 'notes' }, 'Notes between coordinators')),
-    membersHost, claimingPanel(ctx, project), agentApprovalPanel(ctx, project), coordination.node,
+    membersHost, claimingPanel(ctx, project), agentApprovalPanel(ctx, project), autoNudgePanel(ctx, project), coordination.node,
     // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
     switchesPanel(ctx, project),
     delegated.node, agentsHost, credsHost, auditHost, danger);

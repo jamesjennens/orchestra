@@ -662,10 +662,18 @@ def still_coordinates(state, requested_by, project_id):
     that is a superuser or holds ``coordinate`` in the project. An agent: it is enabled and still
     granted the project, its account is enabled and holds ``coordinate`` there, and its coordinator
     grant is effective (:func:`grant_issuer_holds`) -- the rule ``decide`` applies to its credential.
-    Anything unreadable is no.
+    An automatic nudge (``kind == 'auto'``, kittrial-5bb.514): the project's ``auto_nudge`` setting
+    is still enabled. Anything unreadable is no.
     """
     if not isinstance(state, dict) or not isinstance(requested_by, dict):
         return False
+    if requested_by.get('kind') == 'auto':
+        projects = state.get('projects') if isinstance(state.get('projects'), dict) else {}
+        if project_id not in projects:
+            return False
+        settings = state.get('auto_nudge') if isinstance(state.get('auto_nudge'), dict) else {}
+        entry = settings.get(project_id)
+        return isinstance(entry, dict) and entry.get('enabled') is True
     users = state.get('users') if isinstance(state.get('users'), dict) else {}
     user = users.get(requested_by.get('user_id'))
     if not isinstance(user, dict) or user.get('disabled'):

@@ -2080,6 +2080,7 @@ class InProcessBackend:
         read treats a task that has no registered lane -- and an actor's lane therefore
         carries the same name and id.
         """
+        from datetime import datetime, timezone
         from lanes import read as lanes_read
         from sessions import read_registry
         rows = [dict(task, issue_type=task.get('issue_type') or 'task',
@@ -2114,6 +2115,7 @@ class InProcessBackend:
             except Exception:
                 pass
         return lanes_read(rows, actor, registry, list(args),
+                          now=datetime.fromtimestamp(self.service._now(), tz=timezone.utc),
                           operators=operators, journal=None, scope=scope,
                           project=project_id, authority_state=self.service.state,
                           extra_live_sessions=extra_live_sessions)
@@ -2135,11 +2137,26 @@ class InProcessBackend:
                     comment_pending=attention_field(item, 'assignee_comment_pending') is True)
                 rows.append(row)
             pointers = waiting.comment_pointers(self._project_rows(project_id), actor) if comments else None
-            return waiting.coordinator_view(
-                rows,
-                self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
-                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'),
-                pointers)
+            board = self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
+                                    '--limit', str(LANES_LIMIT_MAX)], actor, scope='all')
+            filtered = self.service.filter_coordinator_wait_lanes(project_id, board)
+            view = waiting.coordinator_view(rows, filtered, pointers)
+            nudge_by_actor = {
+                (row.get('actor') or row.get('lane')): row['nudge']
+                for row in (filtered.get('items') if isinstance(filtered, dict) else None) or []
+                if isinstance(row, dict) and isinstance(row.get('nudge'), dict)
+            }
+            if nudge_by_actor:
+                for row in view.get('triggers', {}).get('lane-quiet') or []:
+                    key = row.get('actor') or row.get('lane')
+                    if key in nudge_by_actor:
+                        row['nudge'] = dict(nudge_by_actor[key])
+                for row in view.get('items') or []:
+                    if row.get('trigger') == 'lane-quiet':
+                        key = row.get('actor') or row.get('lane')
+                        if key in nudge_by_actor:
+                            row['nudge'] = dict(nudge_by_actor[key])
+            return view
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -3695,10 +3712,11 @@ class EndpointBackend:
         ``'own'`` instead. The endpoint honours only that narrowing, and its own routes keep
         computing their scope themselves.
         """
+        authority = (authority_request(principal, project_id, CAP_READ, now=self.service._expiry_now())
+                     if principal is not None else None)
         reply = self._endpoint('work', project_id, actor, ['lanes'] + list(args),
-                               authority=authority_request(principal, project_id, CAP_READ,
-                                                           now=self.service._expiry_now()),
-                               require_authority=True, extra={'lanes_scope': scope})
+                               authority=authority,
+                               require_authority=principal is not None, extra={'lanes_scope': scope})
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical lanes read returned an unexpected shape')
@@ -9256,6 +9274,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         # caller may change it: the same live CAP_PROJECT_ADMIN check the PUT route makes.
         result['agent_approval'] = self.service.agent_approval(ctx.params['pid'])
         result['can_set_agent_approval'] = self._may_set_agent_approval(ctx)
+        result['auto_nudge'] = self.service.auto_nudge(ctx.params['pid'])
+        result['can_set_auto_nudge'] = self._may_set_agent_approval(ctx)
         return 200, result
 
     def _may_set_agent_approval(self, ctx):
@@ -9288,6 +9308,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'projects.agent_approval', ctx.params['pid'], update,
                             capability=CAP_PROJECT_ADMIN, audit_metadata={'agent_approval': value})
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/auto-nudge')
+    def project_auto_nudge(self, ctx):
+        """Set whether the project sends automatic ``resume`` nudges to idle lanes (kittrial-5bb.514).
+
+        An owner of the project or a superuser, by session: never a credential, so no agent turns
+        automatic nudging on. The write records who set it and when, and is audited.
+        """
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'auto_nudge'}:
+            raise invalid('Send exactly the field to change: auto_nudge')
+        value = payload['auto_nudge']
+        if type(value) is not bool:
+            raise invalid('auto_nudge must be true or false')
+
+        def update():
+            result = self.service.set_auto_nudge(ctx.principal, ctx.params['pid'], value)
+            return result, result
+        return self._mutate(ctx, 'projects.auto_nudge', ctx.params['pid'], update,
+                            capability=CAP_PROJECT_ADMIN, audit_metadata={'auto_nudge': value})
 
     @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/claiming')
     def project_claiming(self, ctx):
@@ -15430,10 +15470,42 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _carrier_gate(self, ctx):
         self.service.check_authority(ctx.principal, None, CAP_NUDGE_CARRY)
 
+    def _all_project_lanes(self, project_id):
+        """Read all pages of ``project_id``'s lanes board as the service (scope ``'all'``)."""
+        from lanes import DEFAULT_IDLE_MINUTES, LANES_LIMIT_MAX
+        items = []
+        offset = 0
+        first = None
+        for _page in range(50):
+            page = self.backend.lanes_read(
+                project_id, None,
+                ['--idle-minutes', str(DEFAULT_IDLE_MINUTES), '--limit', str(LANES_LIMIT_MAX),
+                 '--offset', str(offset)],
+                'service/lanes', 'all')
+            if first is None:
+                first = dict(page) if isinstance(page, dict) else {'items': []}
+            for row in (page.get('items') if isinstance(page, dict) else None) or []:
+                if isinstance(row, dict):
+                    items.append(row)
+            offset = page.get('next_offset') if isinstance(page, dict) else None
+            if type(offset) is not int:
+                break
+        if first is None:
+            return {'items': [], 'idle_threshold_minutes': DEFAULT_IDLE_MINUTES}
+        first['items'] = items
+        return first
+
+    def _evaluate_carrier_auto_nudges(self, ctx):
+        """Evaluate automatic nudges in the carrier path only, reading each project's lanes as the service."""
+        for project_id in self.service.carrier_auto_nudge_projects(ctx.principal):
+            board = self._all_project_lanes(project_id)
+            self.service.evaluate_auto_nudges(ctx.principal, project_id, board, request_id=ctx.request_id)
+
     @route('GET', r'/v1/me/nudges', carrier=True)
     def me_nudges(self, ctx):
         """The carrier's own open requests: id, project, lane, message key and message set (no reason, no note)."""
         self._carrier_gate(ctx)
+        self._evaluate_carrier_auto_nudges(ctx)
         return 200, dict(self.service.carrier_nudges(ctx.principal), generated_at=now_iso(self.service._now()))
 
     @route('POST', r'/v1/me/carrier', carrier=True)
@@ -15444,6 +15516,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_unknown_fields(payload, self.CARRIER_FIELDS, 'A carrier heartbeat')
         answer, wrote = self.service.carrier_heartbeat(ctx.principal, payload)
         if wrote:
+            self._evaluate_carrier_auto_nudges(ctx)
             self.service.store.save_soon()
         return 200, answer
 
