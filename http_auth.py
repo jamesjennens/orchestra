@@ -4348,6 +4348,7 @@ class Service:
                     raise not_found('Note not found')
             else:
                 self._note_identity(principal, project_id)
+                self._note_store(write=True)        # a damaged record answers 503 here, before any 404
                 if note is None or note['to'].get('role') == 'member':
                     raise not_found('Note not found')
             self._note_store(write=True)

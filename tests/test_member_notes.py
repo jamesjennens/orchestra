@@ -494,6 +494,11 @@ class SettleUnderHostNotesTests(MemberCase):
         self.assertEqual((existing.status, (existing.data.get('error') or {}).get('message')),
                          (missing.status, (missing.data.get('error') or {}).get('message')))
 
+    def test_a_damaged_notes_record_still_answers_503_not_404(self):
+        self.service.state['coordinator_notes'] = 'damaged'
+        answer = self.noted(self.tokens['cleo'], 'prog', self.to_coordinators)
+        self.assertEqual(503, answer.status, answer.data)
+
     def test_the_coordinator_still_settles_a_note_to_the_coordinators(self):
         fresh = self.member(self.tokens['carl'], text='A second question for the coordinators.')
         self.assertEqual(201, fresh.status, fresh.data)
