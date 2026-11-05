@@ -601,14 +601,28 @@ class SentenceTests(PinBase):
         self.assertEqual('accepted ' + WORKER_CREDENTIAL_BASIS, self.approval_summary(by_credential))
         self.assertEqual('accepted ' + AGENT_BASIS, self.approval_summary(by_agent))
 
-    def test_a_task_delivered_by_both_kinds_says_worker_credential(self):
-        """Author another agent of the person and assignee a worker credential's name: the stronger statement."""
+    def test_an_agent_delivers_and_the_task_goes_to_a_worker_credential_the_basis_is_the_delivering_agents(self):
+        """kittrial-5bb.515 r2 (S1): the delivering author decides the basis whenever it is of the approver's party."""
         task, contribution = self.deliver(self.other)
         self.backend._task(self.project, task)['assignee'] = 'lane-c'
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        self.assertEqual('accepted ' + AGENT_BASIS, self.approval_summary(task))
+        event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
+        self.assertEqual('agent', event['basis'])
+
+    def test_a_worker_credential_delivers_and_the_task_goes_to_an_agent_the_basis_stays_the_credentials(self):
+        task, contribution = self.deliver(self.lane_c)
+        self.backend._task(self.project, task)['assignee'] = self.other_id
         self.assertEqual(201, self.approve(self.agent, task, contribution).status)
         self.assertEqual('accepted ' + WORKER_CREDENTIAL_BASIS, self.approval_summary(task))
         event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
         self.assertEqual('worker-credential', event['basis'])
+
+    def test_an_independent_author_and_a_worker_credential_assignee_the_assignee_decides(self):
+        task, contribution = self.deliver(self.tokens['carl'])
+        self.backend._task(self.project, task)['assignee'] = 'lane-c'
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        self.assertEqual('accepted ' + WORKER_CREDENTIAL_BASIS, self.approval_summary(task))
 
     def test_the_people_are_judged_as_before_on_credential_work(self):
         """cora's own session is not the agent: with the installation's setting on she is still refused her own party's work."""

@@ -57,6 +57,10 @@ from review_workflow import TEXT_LIMITS, limited
 #: The approval_basis field value for each basis the approve route names (kittrial-5bb.515 B, with the
 #: worker-credential basis of kittrial-5bb.519). Both values are in review_workflow.APPROVAL_BASES.
 APPROVAL_BASIS_OF = {'agent': 'same-person-agent', 'worker-credential': 'same-person-worker-credential'}
+#: Where the approve route puts the basis it decided, for the backends to write as ``approval_basis``
+#: (kittrial-5bb.515 r2). A tuple key: a JSON request body only has string keys, so no caller can spell it, and
+#: ``approval_basis`` itself is not a field a caller may send (a body naming it is refused).
+SERVER_APPROVAL_BASIS = ('server', 'approval_basis')
 import claim_limit
 import handover_steps
 import project_setup
@@ -1324,13 +1328,14 @@ class InProcessBackend:
                   'items': items,
                   'actor': actor,
                   'created_at': now_iso(self.service._now())}
-        if operation == 'approve' and payload.get('approval_basis') is not None:
-            # kittrial-5bb.515: the server's own statement, from the route; the canonical vocabulary.
+        if operation == 'approve' and payload.get(SERVER_APPROVAL_BASIS) is not None:
+            # kittrial-5bb.515: the server's own statement, from the route (never a caller's key); the canonical
+            # vocabulary.
             from review_workflow import APPROVAL_BASES
-            if payload['approval_basis'] not in APPROVAL_BASES:
+            if payload[SERVER_APPROVAL_BASIS] not in APPROVAL_BASES:
                 raise invalid('Canonical command rejected the request',
                               'ValueError: Invalid approval basis; expected one of: ' + ', '.join(sorted(APPROVAL_BASES)))
-            record['approval_basis'] = payload['approval_basis']
+            record['approval_basis'] = payload[SERVER_APPROVAL_BASIS]
         if operation == 'request-changes':
             # Marks the request as following the canonical respond rule. Requests
             # recorded before the respond step existed carry no flag and keep the old
@@ -3283,8 +3288,8 @@ class EndpointBackend:
         'request-review': ('summary',),
         'withdraw': ('disposition',),
         'resolve-item': ('disposition',),
-        # kittrial-5bb.515: set by the route alone (it refuses a caller's), and only when the endpoint lists it.
-        'approve': ('approval_basis',),
+        # kittrial-5bb.515: approval_basis is NOT here. The route alone decides it and hands it over under
+        # SERVER_APPROVAL_BASIS; a body naming it is refused (the dedicated 422, and the unknown-field check).
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -3505,6 +3510,9 @@ class EndpointBackend:
                 # keep their null, because their ABSENCE is an invalid field set.
                 if payload.get(field) is not None:
                     body[field] = payload.get(field)
+            if operation == 'approve' and payload.get(SERVER_APPROVAL_BASIS) is not None:
+                # kittrial-5bb.515: the route's own value, never a caller's key.
+                body['approval_basis'] = payload[SERVER_APPROVAL_BASIS]
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
             if not body['operation_id']:
@@ -3599,7 +3607,7 @@ class EndpointBackend:
         try:
             reply = self._endpoint('review', project_id, self.actor_namespace + '/read', ['--help'])
             payload = self._checked(reply, 'review', reading=True)
-        except HttpError:
+        except Exception:                     # noqa: BLE001 -- any failure to read the help: not advertised, the sentence
             return False
         return approval_basis_listed(payload)
 
@@ -7115,11 +7123,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         for target, is_author in ((author, True), (assignee, False)):
             if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
                 continue
+            # The basis is the DELIVERING author's whenever the author is of the approver's party; the assignee
+            # decides it only when the author is independent (kittrial-5bb.515 r2: the author comes first, so the
+            # first basis found stands).
             if self.service.other_agent_of_same_person(agent_id, target):
                 basis = basis or 'agent'
                 continue
             if self.service.worker_credential_of_same_person(agent_id, target, project):
-                basis = 'worker-credential'
+                basis = basis or 'worker-credential'
                 continue
             head = target.split('/', 1)[0]
             if agent_id and head.casefold() == agent_id.casefold():
@@ -7141,6 +7152,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             agents = self.service.state.get('agents')
             mine = agents.get(agent_id) if isinstance(agents, dict) else None
             return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
+
+    @staticmethod
+    def _refuse_caller_approval_basis(payload):
+        """The first of two barriers (kittrial-5bb.515): the basis of an approval is the server's statement.
+
+        A body naming ``approval_basis`` gets this 422 on every operation. The second barrier holds without it:
+        ``approval_basis`` is not a field a caller may send, so the unknown-field check refuses it too, and the
+        backends only ever write the value the route put under :data:`SERVER_APPROVAL_BASIS`.
+        """
+        if 'approval_basis' in payload:
+            raise invalid('approval_basis is set by the server')
 
     def _approval_permission(self, principal, pid, author, assignee, setting=None, can_approve=None):
         """Whether ``principal`` may approve a delivery now, and why (kittrial-5bb.518). Informational: it grants nothing.
@@ -14567,9 +14589,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (kittrial-5bb.209), and is then judged by party below whatever the setting says.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
-        if 'approval_basis' in payload:
-            # kittrial-5bb.515: the basis of an approval is the server's statement; nobody names it in a body.
-            raise invalid('approval_basis is set by the server')
+        self._refuse_caller_approval_basis(payload)
         recommending = payload.get('operation') == 'recommend'
         # With the installation's setting on, an approval is judged by whose work it is, which
         # needs the same read a recommendation makes (kittrial-5bb.199). Off: no read, no rule.
@@ -14652,11 +14672,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     # kittrial-5bb.515: the endpoint's review help lists the field, so the basis is a field of
                     # the record and the approver's summary stays the approver's own words. The value is the
                     # one the route's basis names (kittrial-5bb.519: an agent, or a worker credential).
-                    payload['approval_basis'] = APPROVAL_BASIS_OF[setting_basis]
+                    payload[SERVER_APPROVAL_BASIS] = APPROVAL_BASIS_OF[setting_basis]
                 if setting is not None:
                     sentence = (self.WORKER_CREDENTIAL_APPROVAL if setting_basis == 'worker-credential'
                                 else self.SAME_PERSON_APPROVAL)
-                    if isinstance(summary, str) and 'approval_basis' not in payload:
+                    if isinstance(summary, str) and SERVER_APPROVAL_BASIS not in payload:
                         joined = (summary.rstrip() + ' ' if summary.strip() else '') + sentence
                         over = len(joined) - self.SUMMARY_MAX
                         if over > 0:

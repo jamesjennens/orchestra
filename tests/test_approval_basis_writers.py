@@ -7,6 +7,7 @@ reading of the advertisement, and the real endpoint with a real bd (skipped wher
 """
 import json
 import sys
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -94,6 +95,36 @@ class Gate(base.SamePerson):
         self.assertNotIn('approval_basis', record)
         self.assertEqual('accepted ' + API.WORKER_CREDENTIAL_APPROVAL, record['summary'])
 
+    def test_an_agent_delivers_then_the_task_goes_to_a_worker_credential_and_the_field_names_the_agent(self):
+        # kittrial-5bb.515 r2 (S1): the delivering author decides the basis whenever it is of the approver's party.
+        self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)
+        self.worker_of('cora', 'lane-c')
+        task, contribution = self.deliver(self.other)
+        self.backend._task(self.project, task)['assignee'] = 'lane-c'
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        self.assertEqual('same-person-agent', self.stored(task)['approval_basis'])
+        event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
+        self.assertEqual(('agent', self.other_id, 'lane-c'), (event['basis'], event['author'], event['assignee']))
+
+    def test_a_worker_credential_delivers_then_the_task_goes_to_an_agent_and_the_field_stays_the_credentials(self):
+        task, contribution = self.credential_delivery()
+        self.backend._task(self.project, task)['assignee'] = self.other_id
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        self.assertEqual('same-person-worker-credential', self.stored(task)['approval_basis'])
+        event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
+        self.assertEqual('worker-credential', event['basis'])
+
+    def test_the_brief_shows_the_basis_only_while_the_approval_stands(self):
+        # N4: the in-process reader's own guard (InProcessBackend's review view reads the basis only while the
+        # task's review state is approved), with the record itself left as it is.
+        task, contribution = self.deliver(self.other)
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        brief = lambda: self.request('GET', self.base(task) + '/brief', token=self.tokens['olive']).data['review']
+        self.assertEqual('same-person-agent', brief()['approval_basis']['basis'])
+        self.backend._task(self.project, task)['review_state'] = 'awaiting-review'
+        self.assertEqual('same-person-agent', self.stored(task)['approval_basis'])     # the record is unchanged
+        self.assertNotIn('approval_basis', brief())
+
     def test_every_route_basis_has_a_field_value_in_the_vocabulary(self):
         self.assertEqual({'agent': 'same-person-agent', 'worker-credential': 'same-person-worker-credential'},
                          http_service.APPROVAL_BASIS_OF)
@@ -141,6 +172,65 @@ class CallersCannotWriteIt(base.SamePerson):
         self.assertEqual('awaiting-review', self.state_of(task))                  # nothing was written
 
 
+    def test_the_field_is_not_one_a_caller_may_send(self):
+        # S2: approval_basis is not in the caller-allowed set; the route hands its value over under a key no
+        # JSON body can spell.
+        self.assertNotIn('approval_basis', http_service.EndpointBackend.REVIEW_OPTIONAL_FIELDS.get('approve', ()))
+        self.assertIsInstance(http_service.SERVER_APPROVAL_BASIS, tuple)
+
+    def test_without_the_dedicated_check_a_body_naming_the_field_is_refused_as_unknown_and_writes_nothing(self):
+        # S2: the reviewer's mutant M3 (the dedicated 422 removed); the second barrier still refuses it.
+        task, contribution = self.deliver(self.other)
+        with unittest.mock.patch.object(API, '_refuse_caller_approval_basis', staticmethod(lambda payload: None)):
+            answer = self.request('POST', self.base(task) + '/reviews', {
+                'operation': 'approve', 'contribution': contribution, 'summary': 'ok',
+                'approval_basis': 'same-person-agent'}, token=self.agent)
+        self.assertEqual(422, answer.status, answer.data)
+        self.assertTrue(answer.data['error']['message'].startswith('Unsupported review payload field'), answer.data)
+        self.assertEqual('awaiting-review', self.state_of(task))
+        self.assertEqual([], [r for r in self.backend.state['contributions'][task] if r['kind'] == 'approve'])
+
+
+class BackendsWriteOnlyTheRoutesKey(base.SamePerson):
+    """S2's third barrier: below the route, each backend writes only the value under SERVER_APPROVAL_BASIS, never a
+    string key ``approval_basis`` (which the route refuses twice before any backend could see it)."""
+
+    def principal(self):
+        return types.SimpleNamespace(actor=self.agent_id, user_id=self.ids['cora'], agent_id=self.agent_id,
+                                     via='credential')
+
+    def approve_payload(self, task, contribution, **extra):
+        return dict({'task_id': task, 'operation': 'approve', 'contribution': contribution, 'summary': 'ok'}, **extra)
+
+    def test_the_in_process_backend_ignores_a_string_key_and_writes_the_routes(self):
+        task, contribution = self.deliver(self.other)
+        self.backend._review_add(self.principal(), self.project,
+                                 self.approve_payload(task, contribution, approval_basis='same-person-agent'))
+        record = [r for r in self.backend.state['contributions'][task] if r['kind'] == 'approve'][-1]
+        self.assertNotIn('approval_basis', record)
+        task, contribution = self.deliver(self.other)
+        payload = self.approve_payload(task, contribution)
+        payload[http_service.SERVER_APPROVAL_BASIS] = 'same-person-agent'
+        self.backend._review_add(self.principal(), self.project, payload)
+        record = [r for r in self.backend.state['contributions'][task] if r['kind'] == 'approve'][-1]
+        self.assertEqual('same-person-agent', record['approval_basis'])
+
+    def test_the_endpoint_command_carries_only_the_routes_key(self):
+        backend = object.__new__(http_service.EndpointBackend)
+        backend.actor_namespace = 'http'
+        payload = {'task_id': 'pp-1', 'operation': 'approve', 'schema_version': 1, 'operation_id': 'op-1',
+                   'previous': '1', 'contribution': '1', 'summary': 'ok'}
+
+        def sent(extra):
+            action, _, _, attachments = backend._command('reviews.add', self.principal(), 'pp', {**payload, **extra},
+                                                         'op-1')
+            self.assertEqual('review', action)
+            return json.loads(attachments['0']['text'])
+        self.assertNotIn('approval_basis', sent({'approval_basis': 'same-person-agent'}))
+        self.assertEqual('same-person-agent',
+                         sent({http_service.SERVER_APPROVAL_BASIS: 'same-person-agent'})['approval_basis'])
+
+
 class EndpointBackendReadsTheAdvertisement(unittest.TestCase):
     def backend(self, reply):
         backend = object.__new__(http_service.EndpointBackend)
@@ -169,6 +259,14 @@ class EndpointBackendReadsTheAdvertisement(unittest.TestCase):
     def test_an_endpoint_that_cannot_be_read_does_not_advertise(self):
         backend = self.backend(lambda action, args: {'returncode': 2, 'stdout': '', 'stderr': 'boom'})
         self.assertFalse(backend.approval_basis_advertised('pp'))
+
+    def test_any_exception_from_the_help_read_does_not_advertise(self):
+        # N3: not only an HttpError: an OSError (or any other failure) of the help read falls back to the sentence.
+        for error in (OSError('no such endpoint'), RuntimeError('boom'), ValueError('bad')):
+            with self.subTest(error=type(error).__name__):
+                def raises(action, args, error=error):
+                    raise error
+                self.assertFalse(self.backend(raises).approval_basis_advertised('pp'))
 
 
 def only_its_own_tests(cls):
@@ -230,6 +328,34 @@ class RealWriterTests(real.RealStackTests):
         self.assertNotIn('approval_basis', record)
         self.assertEqual('Accepted ' + SENTENCE, record['summary'])
         self.assertNotIn('approval_basis', self.review(task))
+
+    def test_an_agent_delivers_then_reassigned_to_a_worker_credential_and_bd_holds_same_person_agent(self):
+        # S1 through the real endpoint and bd: the task is reassigned in bd itself, as an operator would.
+        task, contribution = self.egret_task()
+        self.assertEqual(200, self.request('PUT', '/v1/projects/pp/members/%s' % self.ids['cora'], {'role': 'owner'},
+                                           token=self.admin_token()).status)
+        made = self.request('POST', '/v1/projects/pp/worker-credentials', {'label': 'worker', 'actor': 'lane-c'},
+                            token=self.tokens['cora'])
+        self.assertEqual(201, made.status, made.data)
+        self.bd('update', task, '--assignee', 'lane-c')
+        before = self.comments(task)
+        approved = self.approve(self.agent, task, contribution)
+        self.assertEqual(201, approved.status, approved.data)
+        record = self.written(task, before)
+        self.assertEqual('same-person-agent', record['approval_basis'])
+        self.assertEqual('same-person-agent', self.review(task)['approval_basis']['basis'])
+
+    def test_without_the_dedicated_check_a_caller_naming_the_field_writes_nothing(self):
+        # S2 through the real endpoint and bd, with the dedicated 422 removed (the reviewer's M3).
+        task, contribution = self.egret_task()
+        before = self.comments(task)
+        with unittest.mock.patch.object(API, '_refuse_caller_approval_basis', staticmethod(lambda payload: None)):
+            refused = self.request('POST', '%s/%s/reviews' % (self.tasks, task), dict(
+                operation='approve', schema_version=1, operation_id='op-forged-2', previous=contribution,
+                contribution=contribution, summary='Accepted', approval_basis='same-person-agent'), token=self.agent)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(before, self.comments(task))
+        self.assertEqual('awaiting-review', self.review(task)['state'])
 
     def test_a_caller_naming_the_field_writes_nothing(self):
         task, contribution = self.egret_task()

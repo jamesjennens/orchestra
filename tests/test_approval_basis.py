@@ -133,7 +133,15 @@ class Advertised(unittest.TestCase):
         self.assertEqual(['follows'], fields['contribute'])
 
     def test_a_kit_without_the_field_does_not_list_it(self):
-        self.assertNotIn('approve', {op for op in w.help_optional_fields() if op not in w.OPTIONAL})
+        # kittrial-5bb.515 r2 (N5): the help is derived from OPTIONAL, so a kit whose approve allows no
+        # approval_basis lists none, and a writer reading that help does not see it advertised.
+        import unittest.mock
+        import http_service
+        self.assertTrue(http_service.approval_basis_listed({'optional_fields': w.help_optional_fields()}))
+        with unittest.mock.patch.dict(w.OPTIONAL, {'approve': set()}):
+            listed = w.help_optional_fields()
+            self.assertNotIn('approval_basis', listed.get('approve', []))
+            self.assertFalse(http_service.approval_basis_listed({'optional_fields': listed}))
 
 
 class NobodyElseWrites(unittest.TestCase):
