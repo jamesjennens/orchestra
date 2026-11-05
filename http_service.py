@@ -6250,8 +6250,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             # must not turn it into "cannot say". The entry is written with the next save.
             self.service.store.save_soon('the audit entry of a refusal')
             raise
-        except Exception:
+        except Exception as error:
             self.service.idempotency_release(digest)
+            if getattr(error, 'kept_narrowing', False):
+                # A narrowing (revoke, demote, remove, disable) whose save failed keeps its effect in memory
+                # (kittrial-5bb.487, http_auth.Service._save_narrowing). Its audit event says so; it is
+                # written with the next save that succeeds, together with the narrowing itself.
+                event = self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed-unsaved',
+                                           project_id=project_id, reason=reason)
+                if audit_metadata:
+                    event.update(audit_metadata)
             raise
         # The server's time of the write, at the top level of the answer and of what is kept for
         # a retry, so that the same request sent again is answered with the time the write was
@@ -8206,8 +8214,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload or {}
         # Anonymous but reset-value-authorized. The token lookup is uniform, so a
         # missing account and a wrong value are indistinguishable to the caller.
-        result = self.service.redeem_reset(ctx.params['uid'], payload.get('reset_value'),
-                                           payload.get('new_password'))
+        try:
+            result = self.service.redeem_reset(ctx.params['uid'], payload.get('reset_value'),
+                                               payload.get('new_password'))
+        except Exception as error:
+            if getattr(error, 'kept_narrowing', False):
+                # kittrial-5bb.487: the new password was taken back, the sessions and credentials it
+                # ended stay ended; this route is not a _mutate route, so it says so here itself.
+                self.service.audit(ctx.request_id, None, 'accounts.reset.redeem', 'committed-unsaved',
+                                   reason='account=%s' % ctx.params['uid'])
+            raise
         # Redemption is anonymous but token-authorized: record the account, never the
         # reset value or the new password.
         self.service.audit(ctx.request_id, None, 'accounts.reset.redeem', 'committed',
