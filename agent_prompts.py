@@ -286,14 +286,25 @@ def _recommended(item):
 
 
 #: class -> (heading, line builder, waiting-since field)
+def _permission(item):
+    """What the agent itself may do with this delivery, when the service worked it out (kittrial-5bb.518)."""
+    permission = item.get('approval_permission')
+    if not isinstance(permission, dict):
+        return ''
+    case = token(permission.get('case'))
+    if permission.get('may_approve') is True:
+        return '; you may approve this (%s)' % case
+    return '; you may NOT approve this (%s): another party must' % case
+
+
 CLASSES = [
     ('changes', 'Changes requested on your tasks: address every pending item, then deliver a new revision',
      lambda i: 'state changes-requested; %s; %s' % (_requests(i), _revision(i)), 'waiting_since'),
     ('review', 'Contributions awaiting your review: approve, or request changes with item ids',
-     lambda i: 'state %s; %s%s; delivered by%s%s' % (
+     lambda i: 'state %s; %s%s; delivered by%s%s%s' % (
          token(i.get('review_state')), 'RE-REVIEW of ' if int(
              (i.get('contribution') or {}).get('revision') or 1) > 1 else '', _revision(i),
-         _deliverer(i), _recommended(i)),
+         _deliverer(i), _recommended(i), _permission(i)),
      'waiting_since'),
     ('recommend', 'Contributions you could review: read the work, then record a recommendation or request '
                   'changes (you cannot approve; an owner or a coordinator decides)',
@@ -456,8 +467,9 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
             'macOS/Linux) and curl reads it with -K.' % (secret_file['windows'], secret_file['posix']),
             '5. Items assigned to your owner are not assigned to you. If one needs you to '
             'deliver, tell your owner it must be handed over to you first instead of working '
-            'around it. Approvals and integration stay your owner\'s decision unless they tell '
-            'you otherwise.',
+            'around it. Approvals and integration stay your owner\'s decision unless your '
+            'coordinator grant and the project\'s agent-approval setting allow them; the task '
+            'brief\'s approval_permission says which, for each delivery.',
             '6. A path on someone else\'s machine is not reachable: do not search for it; '
             'ask in the task for the content or a repository path.',
             '7. When you need a decision or information, ask in the task (a comment, or an '

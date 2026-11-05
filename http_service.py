@@ -63,7 +63,7 @@ import rooms
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
-from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+from http_auth import (Principal, AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_NUDGE_CARRY, NUDGES_SCOPE,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
@@ -6926,6 +6926,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                      '(agent approvals: by agent), but never its own work, its person\'s own work, or work under a '
                      'worker credential of that person: somebody of another party who may approve here must approve '
                      'it (another coordinator or owner of this project, or a superuser).')
+    #: A name a worker credential of the agent's own person wrote (kittrial-5bb.518). The agent-approval setting
+    #: never lets an agent approve it; the refusal and the brief's approval_permission say this, word for word.
+    OWN_WORKER_CREDENTIAL = ('This was delivered under %s, a worker credential of your own person. A coordinator '
+                             'agent never approves that, whatever the agent-approval setting says: another party '
+                             'must approve it.')
+    #: The cases approval_permission names (kittrial-5bb.518).
+    APPROVAL_CASES = ('another-agent', 'own-work', 'own-person', 'own-worker-credential', 'independent')
     #: Added to the summary of an approval that only this setting let through, so the record says so.
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
@@ -6983,7 +6990,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return False
         return True
 
-    def _agent_approval_refusal(self, principal, names, assignee, author, project):
+    def _agent_approval_refusal(self, principal, names, assignee, author, project, setting=None):
         """``(refusal or None, setting)`` for an agent approver the party rule refused (kittrial-5bb.438).
 
         Only asked once :meth:`_own_party_refusal` has refused an AGENT, which holds an effective
@@ -6991,10 +6998,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         ``by-person`` setting that refusal stands. Under ``by-agent``, the default, each of the author and
         the assignee that is of the agent's party is let through only when it is ANOTHER personal agent of
         the same person; the agent itself, its person and its person's worker credentials still refuse.
+
+        A name written under a worker credential of the agent's person is refused in the sentence of
+        :attr:`OWN_WORKER_CREDENTIAL` under either setting (kittrial-5bb.518). ``setting`` is the project's
+        setting when the caller already holds it (a list of rows reads it once); the approve route passes none
+        and reads it here, inside the mutation, every time.
         """
-        setting = self.service.agent_approval(project)
+        if setting is None:
+            setting = self.service.agent_approval(project)
         if setting['mode'] != 'by-agent':
-            return self._own_party_refusal(names, assignee, author, project, True), setting
+            refusal = self._own_party_refusal(names, assignee, author, project, True)
+            if refusal:
+                target = self._refused_target(names, assignee, author, project)
+                if self.service.actor_kind(target) == 'name':
+                    refusal = self.OWN_WORKER_CREDENTIAL % target
+            return refusal, setting
         own, shared_name, held, _ = self.OWN_PARTY_AGENT
         agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
         for target, is_author in ((author, True), (assignee, False)):
@@ -7004,12 +7022,88 @@ class ApiHandler(BaseHTTPRequestHandler):
                 continue
             if agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
                 first = self.SAME_AGENT[0 if is_author else 1]
+            elif self.service.actor_kind(target) == 'name':
+                return self.OWN_WORKER_CREDENTIAL % target, setting
             elif is_author:
                 first = shared_name % target if len(self.service.actor_parties(target, project, True)) > 1 else own
             else:
                 first = held
             return first + self.BY_AGENT_NEXT, setting
         return None, setting
+
+    def _refused_target(self, names, assignee, author, project):
+        """The author, or else the assignee, that makes :meth:`_own_party_refusal` refuse an agent: its order."""
+        for target in (author, assignee):
+            if isinstance(target, str) and target and not self._independent_all(names, [target], project, True):
+                return target
+        return None
+
+    def _approval_permission(self, principal, pid, author, assignee, setting=None, can_approve=None):
+        """Whether ``principal`` may approve a delivery now, and why (kittrial-5bb.518). Informational: it grants nothing.
+
+        The answer is the approve route's own, because it asks the functions the route asks and decides
+        nothing itself: :meth:`_own_party_refusal`, then, for an agent it refused, :meth:`_agent_approval_refusal`
+        (the project's agent-approval setting), and the installation's ``approval_by_another_party`` through
+        the same independence check. ``setting`` and ``can_approve`` are given by a caller that answers many rows
+        and reads them once; absent, they are read here. The case is a label for the sentence and is derived
+        from who delivered, never used to decide.
+        """
+        by_agent = principal.via == 'credential'
+        if setting is None:
+            setting = self.service.agent_approval(pid)
+        if can_approve is None:
+            can_approve = CAP_APPROVE in self.service.capabilities_for(principal, pid)
+        names = [principal.actor or principal.user_id, principal.user_id]
+        refusal = None
+        if by_agent or self.service.approval_by_another_party:
+            refusal = self._own_party_refusal(names, assignee, author, pid, by_agent)
+            if refusal and by_agent:
+                refusal, setting = self._agent_approval_refusal(principal, names, assignee, author, pid, setting)
+        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        cases = []
+        for target in (author, assignee):
+            if not isinstance(target, str) or not target or self._independent_all(names, [target], pid, True):
+                continue
+            kind = self.service.actor_kind(target)
+            if kind == 'name':
+                cases.append('own-worker-credential')
+            elif kind == 'account':
+                cases.append('own-person')
+            elif by_agent and agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
+                cases.append('own-work')
+            elif by_agent and self.service.other_agent_of_same_person(agent_id, target):
+                cases.append('another-agent')
+            else:
+                cases.append('own-person')
+        if refusal:
+            case = next((c for c in cases if c != 'another-agent' or setting['mode'] != 'by-agent'),
+                        cases[0] if cases else 'own-person')
+        else:
+            case = 'another-agent' if 'another-agent' in cases else cases[0] if cases else 'independent'
+        shown = {'mode': setting['mode'], 'set_by': setting.get('set_by'),
+                 'set_by_display_name': setting.get('set_by_display_name'), 'set_at': setting.get('set_at'),
+                 'damaged': setting.get('damaged') is True}
+        may = bool(can_approve) and not refusal
+        if not can_approve:
+            reason = 'You do not hold the approval capability in this project, so you cannot approve this.'
+        elif case == 'another-agent' and by_agent:
+            who = ('set by %s at %s' % (shown['set_by_display_name'] or shown['set_by'], shown['set_at'])
+                   if shown['set_by'] else 'the default; nobody has set it')
+            if may:
+                reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
+                          '(%s), so a coordinator agent may approve another agent of its own person.' % who)
+            else:
+                reason = ('Another party must approve this: the project\'s setting Approvals by coordinator agents '
+                          'is by-person (%s)%s.' % (who, '; the stored value is damaged, so it is read as by-person'
+                                                    if shown['damaged'] else ''))
+        elif refusal:
+            reason = refusal
+        elif case == 'independent':
+            reason = 'You may approve this: it was delivered by another party.'
+        else:
+            reason = ('You may approve this: this installation does not ask for another party to approve work '
+                      'for people.')
+        return {'may_approve': may, 'case': case, 'reason': reason, 'setting': shown}
 
     def _own_party_refusal(self, names, assignee, author, project, agent=False):
         """The sentence for an approver whose party the work is, or None when it is not.
@@ -9714,6 +9808,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     # The agent's own API is registered before ``/v1/agents/{aid}`` so the literal
     # ``me`` path always wins. Every route here returns stable JSON; the browser
     # screens are the separate task kittrial-5bb.20 and are not built here.
+    #: The version of the AGENT.md text the set-up page writes (web/js/agentSetup.js; its first line says it too),
+    #: and what an agent with an older copy is told (kittrial-5bb.518). The server never touches the agent's file.
+    AGENT_MD_VERSION = 2
+    AGENT_MD_NOTE = ('If your .orchestra/AGENT.md has no version line or an older one, it predates current guidance. '
+                     'The server\'s reads are authoritative over it: the brief\'s approval_permission decides whether '
+                     'you may approve. Ask your owner to re-run set-up from My agents to refresh the file.')
+
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
@@ -9728,6 +9829,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'agent': agent,
                 'setup': self.service.agent_setup(agent, None),
                 'claim_limit': self._agent_claim_limit_record_view(agent),
+                'agent_md': {'version': self.AGENT_MD_VERSION, 'note': self.AGENT_MD_NOTE},
                 'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
                 'generated_at': now_iso(self.service._now())}
         # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
@@ -10932,7 +11034,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             return []
         # kittrial-5bb.438: under the project's default agent-approval setting a granted agent may approve the
         # work of ANOTHER agent of its person, so that work is offered to it too (and only to it, for approval).
-        by_agent = approves and self.service.agent_approval(project_id)['mode'] == 'by-agent'
+        setting = self.service.agent_approval(project_id) if approves else None
+        by_agent = approves and setting['mode'] == 'by-agent'
+        # kittrial-5bb.518: the reason names the setting and the case, from the approve route's own answer.
+        asker = Principal(principal.user_id, principal.display_name, False, 'credential', actor,
+                          agent_id=agent_id) if approves else None
         actions = []
         for row in rows:
             if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
@@ -10955,6 +11061,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'A contribution by another account awaits review. ')
                           + 'You hold the coordinator grant in this project: review it, then approve it or request '
                             'changes.')
+                permission = self._approval_permission(asker, project_id, row.get('contribution_author'),
+                                                       row.get('assignee'), setting, True)
+                reason += ' %s (agent_approval: %s; case: %s)' % (permission['reason'], permission['setting']['mode'],
+                                                                  permission['case'])
             elif recommended_by and owner_approves:
                 kind, count, who = 'review-recommended', 'review_recommended', 'owner'
                 reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
@@ -14064,9 +14174,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         required=bool(review.get('approval_requires_other_party') or self.service.approval_by_another_party)
         named=any(r.get('reviewer')==caller for r in review.get('pending_review_requests') or [])
         text=approval_wait(review.get('state'),tid,caller,assignee,author,required,named_reviewer=named)
+        # kittrial-5bb.518: the same answer the approve route would give this caller, for an awaiting delivery.
+        permission = (self._approval_permission(ctx.principal, pid, author, assignee)
+                      if review.get('state') == 'awaiting-review' and author else None)
+        review['approval_permission'] = permission
         if (required and review.get('state')=='awaiting-review' and author
                 and not self._independent_all([caller],[author,assignee],pid)):
-            text=APPROVAL_WAIT
+            # Waiting for somebody else, unless the approve route itself would let THIS caller through: only an
+            # agent can be (a coordinator agent under the project's by-agent setting, for another agent of its
+            # person). A person is never told otherwise than before, under either setting.
+            if not (ctx.principal.via == 'credential' and permission and permission['may_approve']):
+                text=APPROVAL_WAIT
         review['waiting_for_approval']=text
         actors = [brief['task'].get('assignee')]
         actors += [checkpoint.get('author')] if checkpoint else []
@@ -15017,8 +15135,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                      item['review_state'] in ACTIVE_REVIEW_STATES)]
         body = self._paged(ctx, items, limit, state, complete=bool(read.get('complete')),
                            generated_at=now_iso(self.service._now()))
-        body['items'] = self._task_views(body['items'], ctx.params['pid'])
+        rows = body['items']
+        views = self._task_views(rows, ctx.params['pid'])
+        self._add_approval_permissions(ctx.principal, ctx.params['pid'], rows, views)
+        body['items'] = views
         return 200, body
+
+    def _add_approval_permissions(self, principal, pid, rows, views, setting=None, can_approve=None):
+        """Put ``approval_permission`` on each awaiting-review row of ``views`` (kittrial-5bb.518).
+
+        ``rows`` are the queue rows the views were made from, in the same order. The project's setting and the
+        caller's capability are read ONCE for the request, not once per row, and only when a row awaits review.
+        """
+        for row, view in zip(rows, views):
+            if row.get('review_state') != 'awaiting-review' or not row.get('contribution_author'):
+                continue
+            if setting is None:
+                setting = self.service.agent_approval(pid)
+            if can_approve is None:
+                can_approve = CAP_APPROVE in self.service.capabilities_for(principal, pid)
+            view['approval_permission'] = self._approval_permission(
+                principal, pid, row.get('contribution_author'), row.get('assignee'), setting, can_approve)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/lanes')
     def project_lanes(self, ctx):
@@ -15357,6 +15494,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             truncated = truncated or not read.get('complete')
             reads.append((project, capabilities, read))
         details = self._me_work_details(reads, actor)
+        settings = {}                      # each project's agent-approval setting, read at most once a request
         for project, capabilities, read in reads:
             items = [dict(item, **details[(project['id'], item.get('id'))])
                      if (project['id'], item.get('id')) in details else item
@@ -15397,6 +15535,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                             [actor, principal.user_id],
                             [item.get('assignee'), item.get('contribution_author')],
                             project['id']):
+                        if item['review_state'] == 'awaiting-review' and item.get('contribution_author'):
+                            # kittrial-5bb.518: what the approve route would answer this person, per row; the
+                            # project's setting and the capability are read once for the project, not per row.
+                            if project['id'] not in settings:
+                                settings[project['id']] = self.service.agent_approval(project['id'])
+                            row['approval_permission'] = self._approval_permission(
+                                principal, project['id'], item.get('contribution_author'), item.get('assignee'),
+                                settings[project['id']], True)
                         to_review.append(row)
         if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
             truncated = True
@@ -15413,7 +15559,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Each agent's prompt covers only the projects that agent is granted.
         prompts = [agent_prompts.build_prompt(
             agent, owner_name,
-            [p for p in classified if p['id'] in set(agent.get('projects') or [])],
+            self._agent_prompt_projects(agent, principal, classified, settings),
             generated_at, server)
             for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
@@ -15423,6 +15569,37 @@ class ApiHandler(BaseHTTPRequestHandler):
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}
+
+    def _agent_prompt_projects(self, agent, owner, classified, settings):
+        """The projects of one agent's prompt, its review rows carrying what THE AGENT may do (kittrial-5bb.518).
+
+        ``classified`` is the owner's own sort of each project's queue. An agent that holds the coordinator
+        grant in a project is judged as the approve route judges it (``_approval_permission``): a sibling agent's
+        delivery is a row it may approve under by-agent and one it may not under by-person. An agent with no
+        grant is judged by nothing here and its rows stay as they were. ``settings`` is the request's per-project
+        cache of the agent-approval setting.
+        """
+        mine = set(agent.get('projects') or [])
+        agent_id = agent.get('id')
+        out = []
+        for entry in classified:
+            if entry['id'] not in mine:
+                continue
+            rows = entry['classes'].get('review') or []
+            if not rows or not self.service.agent_approves(agent_id, entry['id']):
+                out.append(entry)
+                continue
+            if entry['id'] not in settings:
+                settings[entry['id']] = self.service.agent_approval(entry['id'])
+            agent_principal = Principal(owner.user_id, owner.display_name, False, 'credential',
+                                        agent.get('actor') or agent_id, agent_id=agent_id)
+            marked = [dict(row, approval_permission=self._approval_permission(
+                          agent_principal, entry['id'], row.get('contribution_author'), row.get('assignee'),
+                          settings[entry['id']], True))
+                      if row.get('review_state') == 'awaiting-review' and row.get('contribution_author') else row
+                      for row in rows]
+            out.append(dict(entry, classes=dict(entry['classes'], review=marked)))
+        return out
 
     def _me_work_details(self, reads, actor):
         """Fill the canonical queue's gaps for the rows that matter most, within a bound.
