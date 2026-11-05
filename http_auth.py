@@ -4054,6 +4054,41 @@ class Service:
             return (head.casefold() != agent_id.casefold() and isinstance(mine, dict) and isinstance(other, dict)
                     and isinstance(mine.get('owner'), str) and other.get('owner') == mine['owner'])
 
+    def worker_credential_of_same_person(self, agent_id, name, project_id):
+        """Whether ``name`` was written under a WORKER CREDENTIAL of the account that owns ``agent_id`` (kittrial-5bb.519).
+
+        True only when the record shows the name is a worker credential's of that one account O, and
+        nothing else could have written it:
+
+        * a name whose head is neither an account nor an agent id: the issuers of the project's worker
+          credentials whose namespace holds the name are exactly {O}. The set is the one
+          :meth:`actor_parties` computes (``full_actor_parties``), working, revoked or expired
+          credentials alike, so a name O revoked and issued again stays one issuer, and a name another
+          account held once stays shared (False);
+        * ``O/label`` with a non-empty label: a session writes exactly its account id, an agent only
+          its own id, and a worker credential only inside its namespace, so only O's own credential
+          issued with no name can write below O's account id.
+
+        False for everything else: the bare account id (O's own session writes it too), a shared name,
+        the agent itself or any agent id, another account's names, and a name no credential record holds
+        (a name of the host route).
+        """
+        if not all(isinstance(value, str) and value for value in (agent_id, name, project_id)):
+            return False
+        head, _, label = name.partition('/')
+        with self.store.lock:
+            agents = self.state.get('agents') if isinstance(self.state.get('agents'), dict) else {}
+            users = self.state.get('users') if isinstance(self.state.get('users'), dict) else {}
+            mine = agents.get(agent_id)
+            owner = mine.get('owner') if isinstance(mine, dict) else None
+            if not isinstance(owner, str) or not owner or head in agents or head.casefold() == agent_id.casefold():
+                return False
+            if head == owner:
+                return bool(label)
+            if head in users:
+                return False
+            return full_actor_parties(self.state, name, project_id) == {owner}
+
     def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
         """Delete the agent's coordinator AND release grants in each of ``project_ids``.
 

@@ -6908,13 +6908,27 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: another agent of its person, never itself, its person or its person's worker credentials.
     SAME_AGENT = ('This contribution was delivered by this agent itself.',
                   'This task is assigned to this agent itself.')
-    BY_AGENT_NEXT = (' On this project a coordinator agent may approve the work of another agent of the same person '
-                     '(agent approvals: by agent), but never its own work, its person\'s own work, or work under a '
-                     'worker credential of that person: somebody of another party who may approve here must approve '
-                     'it (another coordinator or owner of this project, or a superuser).')
+    BY_AGENT_NEXT = (' On this project a coordinator agent may approve the work of another agent of the same person, '
+                     'or of a worker credential of that person issued with a name no other account has held (agent '
+                     'approvals: by agent), but never its own work (its own sub-workers count as its own work) or its '
+                     'person\'s own work: somebody of another party who may approve here must approve it (another '
+                     'coordinator or owner of this project, or a superuser).')
     #: Added to the summary of an approval that only this setting let through, so the record says so.
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
+    #: The same, for work under a worker credential of the approving agent's person (kittrial-5bb.519).
+    WORKER_CREDENTIAL_APPROVAL = ('Approved by a coordinator agent of the same person as the worker credential that '
+                                  'delivered it (project setting agent_approval: by-agent).')
+    #: Said under by-agent about the three own-party cases that stay refused (kittrial-5bb.519).
+    SHARED_NAME_NEXT = (' Issue a credential with a name no other account has held, or set the worker up from My '
+                        'agents.')
+    ACCOUNT_ID_AUTHOR = ('This contribution was delivered under your person\'s own account id, which their own session '
+                         'also writes, so it cannot be told from your person\'s work. Issue the worker\'s credential '
+                         'with a name, or set the worker up from My agents.')
+    SUB_WORKER_NEXT = (' Work by a sub-worker of this agent counts as this agent\'s own. Run the worker as a separate '
+                       'agent from My agents, in its own VS Code window, and this agent may approve it.')
+    SAME_AGENT_NEXT = (' If another worker uses a copy of this agent\'s credential, set it up as a new agent from My '
+                       'agents.')
     SUMMARY_MAX = TEXT_LIMITS['summary']
 
     @staticmethod
@@ -6928,24 +6942,42 @@ class ApiHandler(BaseHTTPRequestHandler):
         )
         return ' '.join(stripped.split())
 
-    def _contains_same_person_approval(self, summary):
+    def _basis_sentence_in(self, summary):
+        """The fixed approval sentence a caller's text contains (either one), or None."""
         if not isinstance(summary, str):
-            return False
-        target = self._normalize_basis_text(self.SAME_PERSON_APPROVAL)
-        return bool(target) and target in self._normalize_basis_text(summary)
+            return None
+        text = self._normalize_basis_text(summary)
+        for sentence in (self.SAME_PERSON_APPROVAL, self.WORKER_CREDENTIAL_APPROVAL):
+            target = self._normalize_basis_text(sentence)
+            if target and target in text:
+                return sentence
+        return None
+
+    def _contains_same_person_approval(self, summary):
+        return self._basis_sentence_in(summary) is not None
 
     def _another_agent_only(self, agent_id, names, parties, project):
         """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
 
-        True when nothing of its party is there at all, or only other personal agents of the same account;
-        False as soon as one is the agent itself, its account, or a worker credential's name of that account.
+        True when nothing of its party is there at all, or only other personal agents of the same account or
+        worker credentials of that account that the approve route lets through (kittrial-5bb.519: the same two
+        functions :meth:`_agent_approval_refusal` calls, so the list and the route have one source); False as
+        soon as one is the agent itself or a sub-label of it, the bare account id, or a shared name.
         """
         for target in parties:
             if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
                 continue
-            if not self.service.other_agent_of_same_person(agent_id, target):
+            if not (self.service.other_agent_of_same_person(agent_id, target)
+                    or self.service.worker_credential_of_same_person(agent_id, target, project)):
                 return False
         return True
+
+    def _credential_work_in(self, agent_id, names, parties, project):
+        """Whether one of ``parties`` of the approver's party is a worker credential of its person (kittrial-5bb.519)."""
+        return any(isinstance(target, str) and target
+                   and not self._independent_all(names, [target], project, True)
+                   and self.service.worker_credential_of_same_person(agent_id, target, project)
+                   for target in parties)
 
     def _agent_approval_refusal(self, principal, names, assignee, author, project):
         """``(refusal or None, setting)`` for an agent approver the party rule refused (kittrial-5bb.438).
@@ -6954,26 +6986,45 @@ class ApiHandler(BaseHTTPRequestHandler):
         coordinator grant (a credential has ``approve`` through nothing else). Under the project's
         ``by-person`` setting that refusal stands. Under ``by-agent``, the default, each of the author and
         the assignee that is of the agent's party is let through only when it is ANOTHER personal agent of
-        the same person; the agent itself, its person and its person's worker credentials still refuse.
+        the same person, or a worker credential of that person that the record shows is that person's alone
+        (:meth:`Service.worker_credential_of_same_person`, kittrial-5bb.519); the agent itself and its sub-labels,
+        its person's bare account id and a name shared with another account still refuse.
         """
         setting = self.service.agent_approval(project)
         if setting['mode'] != 'by-agent':
             return self._own_party_refusal(names, assignee, author, project, True), setting
         own, shared_name, held, _ = self.OWN_PARTY_AGENT
         agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        basis = None
         for target, is_author in ((author, True), (assignee, False)):
             if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
                 continue
             if self.service.other_agent_of_same_person(agent_id, target):
+                basis = basis or 'agent'
                 continue
-            if agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
-                first = self.SAME_AGENT[0 if is_author else 1]
-            elif is_author:
-                first = shared_name % target if len(self.service.actor_parties(target, project, True)) > 1 else own
-            else:
-                first = held
-            return first + self.BY_AGENT_NEXT, setting
-        return None, setting
+            if self.service.worker_credential_of_same_person(agent_id, target, project):
+                basis = 'worker-credential'
+                continue
+            head = target.split('/', 1)[0]
+            if agent_id and head.casefold() == agent_id.casefold():
+                return (self.SAME_AGENT[0 if is_author else 1]
+                        + (self.SUB_WORKER_NEXT if '/' in target else self.SAME_AGENT_NEXT)
+                        + self.BY_AGENT_NEXT), setting
+            if not is_author:
+                return held + self.BY_AGENT_NEXT, setting
+            if len(self.service.actor_parties(target, project, True)) > 1:
+                return shared_name % target + self.SHARED_NAME_NEXT + self.BY_AGENT_NEXT, setting
+            if self._bare_account_id_of(agent_id, target):
+                return self.ACCOUNT_ID_AUTHOR + self.BY_AGENT_NEXT, setting
+            return own + self.BY_AGENT_NEXT, setting
+        return None, dict(setting, basis=basis)
+
+    def _bare_account_id_of(self, agent_id, name):
+        """Whether ``name`` is exactly the account id of the person who owns ``agent_id``."""
+        with self.service.store.lock:
+            agents = self.service.state.get('agents')
+            mine = agents.get(agent_id) if isinstance(agents, dict) else None
+            return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
 
     def _own_party_refusal(self, names, assignee, author, project, agent=False):
         """The sentence for an approver whose party the work is, or None when it is not.
@@ -10914,6 +10965,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                     continue
                 kind, count, who = 'to-review', 'to_review', 'agent'
                 reason = (('A reviewer recommends approving this contribution. ' if recommended_by else
+                           'A contribution under a worker credential of your person awaits review. ' if same_person
+                           and self._credential_work_in(agent_id, [actor], parties, project_id) else
                            'A contribution by another agent of your person awaits review. ' if same_person and
                            not self._independent([actor], parties, project_id, True) else
                            'A contribution by another account awaits review. ')
@@ -14376,21 +14429,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise forbidden(refusal)
             if payload.get('operation') == 'approve':
                 summary = payload.get('summary')
-                if self._contains_same_person_approval(summary):
+                typed = self._basis_sentence_in(summary)
+                if typed is not None:
                     raise invalid('The approval summary may not contain %r; the server adds that sentence itself'
-                                  % self.SAME_PERSON_APPROVAL)
+                                  % typed)
                 if setting is not None:
+                    basis = setting.get('basis') or 'agent'
+                    sentence = (self.WORKER_CREDENTIAL_APPROVAL if basis == 'worker-credential'
+                                else self.SAME_PERSON_APPROVAL)
                     if isinstance(summary, str):
-                        joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
+                        joined = (summary.rstrip() + ' ' if summary.strip() else '') + sentence
                         over = len(joined) - self.SUMMARY_MAX
                         if over > 0:
                             raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
                                           'its summary must then say so in a sentence of %d characters; shorten '
                                           'the summary by %d characters and send it again'
-                                          % (len(self.SAME_PERSON_APPROVAL), over))
+                                          % (len(sentence), over))
                         payload['summary'] = joined
                     same_person.update(same_person_coordinator=True, author=delivered.get('author'),
                                        assignee=(current.get('task') or {}).get('assignee'),
+                                       basis=basis,
                                        agent_approval=setting['mode'],
                                        agent_approval_set_by=setting.get('set_by') or 'default',
                                        agent_approval_set_at=setting.get('set_at'))
@@ -14402,9 +14460,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
                     raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
                                     else self.NOT_INDEPENDENT)
-                if self._contains_same_person_approval(payload.get('summary')):
+                typed = self._basis_sentence_in(payload.get('summary'))
+                if typed is not None:
                     raise invalid('The recommendation summary may not contain %r; the server adds that sentence itself'
-                                  % self.SAME_PERSON_APPROVAL)
+                                  % typed)
                 # One standing recommendation for a contribution from each PERSON
                 # (kittrial-5bb.154): a second one, by the same actor or by another agent of
                 # the same person, is refused and nothing is stored. Read from EVERY standing
