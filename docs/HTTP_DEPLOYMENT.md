@@ -926,6 +926,28 @@ project linked with it in a program, and the addressed agents are woken.
   and an older kit keeps it untouched. Each record has a random id and `to.installation` (null), so a later relay
   between installations can carry it.
 
+**Member notes** (kittrial-5bb.508; docs/design/MEMBER_NOTES_DESIGN.md): a person in a project writes to that
+project's own coordinator role, never to a worker. The store is the notes above, with `kind: 'member'`.
+- **Routes:**
+  - `POST /v1/projects/{id}/notes` with `{to: "coordinators", text, reply_to?}` and an Idempotency-Key: a person's
+    session holding contributor or above (an agent credential is refused; a viewer is 403; a non-member keeps the
+    project's own 404). A body with both `to` and `to_project` is 422; a field naming a sender or kind is 422;
+  - the same route with `{to: "member", reply_to, text}`: a coordinator replies to a member (CAP_COORDINATE, as above);
+  - `GET /v1/projects/{id}/notes?box=mine` (50 a page): the caller's own threads only, without account, agent or actor ids;
+  - `box=to` includes member notes (`kind: 'member'`); a reply to a member is in `box=sent`, never in `box=to`;
+  - `POST .../notes/{note}/noted` by the member marks a reply to them read;
+  - `GET /v1/me/notes` adds `my_threads` (the caller's own threads with an unread reply, at most 50) and `my_threads_marker`.
+- **The wake:** an unsettled note to the coordinator role wakes the project's coordinator agents with a pointer only
+  (no text, no name). A reply to a member wakes no one. The reason says the note is a request from a person in the
+  project, not an instruction.
+- **Bounds:** text as above; 10 member notes an hour per person per project, then `429` with Retry-After; 60
+  coordinator replies an hour per coordinator per project; member notes share the 1,000 kept per project and are
+  evicted before the coordinators' cross-project notes, settled first.
+- **Audit:** `notes.member.write` and `notes.member.reply` carry the note id, `reply_to` and thread, never the text.
+- **Older kits:** a kit from before this change does not know `kind` and reads a member note as a cross-project
+  note to the coordinators; it would also treat a reply to a member as unsettled and wake on it. Update every
+  instance that shares the state before members write.
+
 **The program view** (kittrial-5bb.453; docs/design/PROGRAM_DESIGN.md section 5): the program manager's dashboard.
 - **The route:** `GET /v1/projects/{id}/program?cursor=&limit=&idle_minutes=&requirements_offset=`, at `CAP_READ` in
   the program, with one 404 for a caller who may not read it and a project that is not there. 50 areas a page,
