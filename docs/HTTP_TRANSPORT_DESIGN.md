@@ -123,6 +123,69 @@ browser requests require a synchronizer token or a documented same-site
 double-submit CSRF defense. Do not put session values in URLs or
 `localStorage`.
 
+#### Sign-in throttling and the password rule (kittrial-5bb.501)
+
+Three counts of failed sign-ins are kept in the service's memory, each a list of failure times pruned to
+its window:
+
+| Count | Key | Limit | Window | Over the limit |
+|---|---|---|---|---|
+| Pair | account and source group | 10 | 5 minutes | `429` with `Retry-After` until the oldest counted failure leaves the window; on the shared source, slow mode instead: one checked attempt per 20 seconds, else `429` with `Retry-After` |
+| Per account | account, from any source | 30 | 15 minutes | slow mode: one checked attempt per 20 seconds, else `429` with `Retry-After` |
+| Per source | source group | 100 (300 for the shared source) | 15 minutes | slow mode: one checked attempt per 5 seconds, else `429` with `Retry-After` |
+
+- The source group is the client address for IPv4 and the /64 for IPv6 (`address_group`), so a holder of a /64
+  is one client for the pair as well as the per-source count. A sign-in whose address cannot be told apart from
+  everybody else's (the SSH tunnel on 127.0.0.1, or a trusted proxy that forwarded none) is the shared source,
+  with the higher limit.
+- On the shared source every person is the same group, so a hard pair limit there would let anyone on the
+  tunnel lock any account out by name, correct password refused (kittrial-5bb.501 r2). There an over-limit pair
+  only slows: one checked attempt per 20 seconds for that account, whoever takes it, which bounds guessing one
+  name from the tunnel at about 180 an hour, and the real user gets in at the next free slot (an insider who
+  takes every slot can make that wait longer, never a lockout). Off the tunnel the pair limit still refuses
+  outright. A co-tenant in the victim's own IPv6 /64 is the same group as the victim and can still hold the
+  pair at its limit and lock that account out from that /64 for as long as they keep failing: accepted, as a
+  /64 is one client everywhere else.
+- Every failure feeds all three counts, including a failure from a known source. A success clears its pair
+  only: it does not clear the aggregates, which would let an attacker with an account of their own reset them.
+- A **known source** of an account is a source group that signed in to it successfully in the last 30 days, at
+  most 4 per account, the oldest dropped first. A sign-in from a known source skips both aggregate limits and
+  meets the pair limit only, so someone failing against a name elsewhere cannot lock its user out from their
+  usual place. Known sources are kept in memory; after a restart everyone counts as new until their first
+  success.
+- **A restart resets every count**, not only the known sources: the pair, per-account and per-source failure
+  counts and the slow-mode slots are in the service's memory and are not saved, so after a restart an attacker
+  starts with a fresh budget. The audit log of failed sign-ins is saved and survives.
+- Slow mode never refuses outright, but its wait is **not a promise of 20 or 5 seconds**: the slot is taken
+  atomically under the store's lock by whoever comes first, and during an attack an attacker may take every
+  slot, so a user at a new place can wait longer. A known source is not affected. A request turned away as busy
+  (the gate of 16 sign-ins in flight) or refused with `429` takes no slot and counts nothing.
+- Memory is bounded: each map holds at most 10,000 keys and each list at most its limit plus one. A new key at
+  the cap sweeps the keys with nothing inside their window and, if the map is still full, evicts the tenth of the cap
+  with the fewest recent failures. To push a target's 30 failures out of the per-account map an attacker must hold
+  10,000 other names with at least 30 failures each inside 15 minutes: 300,000 failures, 333 a second, where the
+  sign-in gate (one scrypt of about 47 ms at a time) lets through about 20 a second. The same holds for the pair
+  map (10 each, 5 minutes: 100,000 failures, 333 a second) and the source map (100 each).
+- Distributed guessing at one account, which the gate alone limited to about 10 a second, falls to 30 plus
+  45 per 15 minutes, about 300 an hour.
+- A change of password by its owner (`POST /v1/accounts/{id}/password` with `current_password`) is held to the
+  same counts for the account and the request's source group, and a wrong current password feeds them: ten
+  wrong guesses and the eleventh is `429`, and a sign-in from that source is throttled with it. A
+  superuser's change without `current_password` is not throttled and counts nothing, as there is nothing to
+  guess. Any password change, by the owner or a superuser, also deletes the account's pending reset values, and so
+  does disabling the account; a reset value is refused for a disabled account with the usual answer.
+- A sign-in for an account with no password yet runs the same scrypt check as one for a missing account, so
+  response time does not tell them apart.
+- **Accepted residual (review finding C):** a stored password hash made with older, cheaper scrypt parameters
+  is checked at those parameters, so a failed sign-in for such an account is faster than for a missing one
+  (measured 2.8 ms at n=2^10 against 47 ms) and timing can still show that the account exists. It lasts until
+  that account next signs in successfully, which re-hashes the password at the current parameters.
+- The source of a request behind a trusted proxy is the RIGHTMOST address of `X-Forwarded-For`, so the proxy
+  must append the client's address (nginx `$proxy_add_x_forwarded_for`), not pass a client's header through.
+  Behind a chain of proxies only the last hop's address would be seen.
+- The installation's password minimum is 12 characters unless the operator sets another from 1 to 1024
+  (`--password-min-length`). It applies when a password is set; a stored shorter password keeps working.
+
 ### Worker/API credentials
 
 A project owner or superuser may issue a named, project-scoped worker
