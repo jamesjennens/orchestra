@@ -10490,6 +10490,10 @@ def _main():
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('fault-clear',help='clear a lane\'s needs-investigation flag (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('host-notes',help='local operator enrollment for private host coordinator notes')
+    a.add_argument('operation',choices=('enroll','revoke'));a.add_argument('project')
+    a.add_argument('--principal',required=True);a.add_argument('--actor',required=True)
+    a.add_argument('--approved-by');a.add_argument('--approval')
     a=sub.add_parser('delegation-record',help='grant, narrow or revoke a delegation of a decision right (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('decision-attest',help="attest a decision's exact text (operator allowlist, host journal)")
@@ -11177,6 +11181,10 @@ def _main():
             authority=operators(root,strict=True)
             require_configured_operator(args.actor,authority,'clear a needs-investigation flag')
             print(json.dumps(fault_clear.apply(payload,args.actor,run,path,operators=authority),ensure_ascii=False))
+    elif args.command=='host-notes':
+        from host_notes import enroll
+        print(json.dumps(enroll(root,args.project,args.principal,args.actor,approved_by=args.approved_by,
+                                approval=args.approval,revoke=args.operation=='revoke')))
     elif args.command=='delegation-record':
         # The installation operator's host route for a delegation (kittrial-5bb.407); the
         # SAME delegations.apply the web route and `coordinator delegation-record` call, under

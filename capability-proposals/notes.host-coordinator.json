@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb.459-host-notes-r1",
+  "key": "notes.host-coordinator",
+  "revision": 1,
+  "name": "Coordinator notes through a confined SSH key",
+  "aliases": [
+    "host coordinator notes",
+    "SSH coordinator inbox",
+    "private notes adapter"
+  ],
+  "summary": "Opt-in Linux private adapter to the running .447 notes service: operator-enrolled host principals with recorded owner approval send/read/reply/mark noted/wait through the confined client without a site agent. HMAC challenge-response authenticates the trusted endpoint, and project scope, registry actor ownership and live enrollment are checked before every effect/pass. Text and receipts remain in the existing service store and are limited to the two coordinator projects. Default worker waits are unchanged.",
+  "requirements": [],
+  "anchors": [
+    "docs/HOST_NOTES.md#coordinator-notes-over-confined-ssh"
+  ],
+  "code": [
+    "host_notes.py::start",
+    "host_notes.py::authorize",
+    "host_notes.py::Manager.execute",
+    "host_notes.py::Manager.wait",
+    "http_auth.py::Service.mark_notes_fetched"
+  ],
+  "tests": [
+    "tests/test_host_coordinator_notes.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "coordinator",
+    "notes",
+    "ssh",
+    "wait"
+  ]
+}

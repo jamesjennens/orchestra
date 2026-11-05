@@ -52,6 +52,15 @@ import os
 import re
 import time
 
+
+def bounded_pause(deadline, cost, interval):
+    """Shared .457 read budget: no next pass starts unless its observed cost fits.
+
+    A slower-than-observed pass can overrun this soft bound. Sleep holds no caller lock.
+    Worker wait projection and polling are independent of this helper.
+    """
+    return min(max(interval, 4 * cost), deadline - time.monotonic() - cost)
+
 #: The output schema. Additive fields may be added to it; a reader that does not know
 #: one ignores it, the way the rest of the kit's JSON is read.
 WAIT_SCHEMA = 'wait-v1'

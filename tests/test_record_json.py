@@ -227,7 +227,7 @@ class NoUnguardedParseTests(unittest.TestCase):
     GUARDED_ONLY = ('artifacts.py', 'capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py',
                     'keyed_entries.py', 'project_creation.py', 'recovery.py', 'requirement_baseline_records.py',
                     'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py',
-                    'decision_attest.py', 'delegations.py', 'work.py')
+                    'decision_attest.py', 'delegations.py', 'host_notes.py', 'work.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -345,6 +345,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # .462 also reads an unhonoured comment's time through the guard;
             # that untrusted data can only remove authority, never grant it.
             'delegations.py': 5,
+            'host_notes.py': 4,  # enrollment, private frames, durable-store preflight and save reconciliation
             # kittrial-5bb.454 r2: a comment's record, a journal entry and the comment-write receipt.
             # endpoint.py's seventeenth is the same action's request body. r6: the time a comment no journal
             # honours states, which is text nobody has validated.
