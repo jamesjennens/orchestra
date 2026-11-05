@@ -200,6 +200,7 @@ export async function list(ctx) {
   let unconfirmedOnly = false;
   let cursor = null;
   const previous = [];
+  const pendingReleases = new Map();
   const filter = ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
     h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
       unconfirmedOnly = event.target.checked;
@@ -213,15 +214,108 @@ export async function list(ctx) {
     const items = data.items;
     host.removeAttribute('aria-busy');
     host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
-      h('details', { class: 'agent-details', 'data-agent-details': a.id, open: needsDetails(a) ? true : null },
+      h('details', { class: 'agent-details', 'data-agent-details': a.id, open: needsDetails(a) || pendingReleases.has(a.id) ? true : null },
         h('summary', null, 'Details and settings'),
         h('div', { class: 'stack' }, ...agentCardMore(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
+          ownedBy(ctx, a) ? disableAndReleaseBlock(a) : null,
           manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
       h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
       previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
       data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
+  }
+  // Disabling an agent and optionally releasing its held, undelivered claims (kittrial-5bb.510).
+  // Owner-only: the disable completes first; the dry run shows what it would release, and the
+  // release is a separate, optional second step narrowed to the exact tasks shown by the dry run.
+  function disableAndReleaseBlock(agent) {
+    const box = h('div', { class: 'stack', 'data-agent-retire': agent.id });
+    async function inspectClaims(btn) {
+      const dry = await act(btn, () => ctx.api.releaseAgentClaims(agent.id, { dry_run: true })).catch(() => null);
+      const claims = [];
+      const tasks = [];
+      for (const entry of (dry && Array.isArray(dry.planned) ? dry.planned : [])) {
+        const pid = entry.project;
+        const list = Array.isArray(entry.items) && entry.items.length
+          ? entry.items
+          : (Array.isArray(entry.tasks) ? entry.tasks.map((id) => ({ id, title: null })) : []);
+        for (const item of list) {
+          if (item && item.id) {
+            claims.push({ project: pid, id: item.id, title: item.title || null });
+            if (!tasks.includes(item.id)) tasks.push(item.id);
+          }
+        }
+      }
+      pendingReleases.set(agent.id, { claims, tasks, released: null });
+      await load();
+    }
+    const pending = pendingReleases.get(agent.id);
+    if (agent.enabled !== false) {
+      box.append(h('div', { class: 'copy-row' },
+        h('button', { type: 'button', class: 'danger', 'data-action': 'disable-agent', onclick: async (event) => {
+          const btn = event.currentTarget;
+          const disabled = await act(btn, () => ctx.api.disableAgent(agent.id), { success: 'Agent disabled' }).catch(() => null);
+          if (!disabled) return;
+          await inspectClaims(btn);
+        } }, 'Disable agent')));
+      return box;
+    }
+    const enableBtn = h('button', { type: 'button', class: 'ghost', 'data-action': 'enable-agent', onclick: async (event) => {
+      const enabled = await act(event.currentTarget, () => ctx.api.enableAgent(agent.id), { success: 'Agent enabled' }).catch(() => null);
+      if (!enabled) return;
+      pendingReleases.delete(agent.id);
+      await load();
+    } }, 'Enable agent');
+    if (pending && Array.isArray(pending.released)) {
+      const count = pending.released.length;
+      box.append(
+        h('p', { class: 'small', role: 'status', 'data-claims-released': String(count) },
+          count === 1 ? 'Released 1 claim (' + pending.released[0].task + ').'
+                      : `Released ${count} claims (${pending.released.map((r) => r.task).join(', ')}).`),
+        h('div', { class: 'copy-row' }, enableBtn));
+      return box;
+    }
+    if (pending && Array.isArray(pending.claims)) {
+      if (!pending.claims.length) {
+        box.append(
+          h('p', { class: 'small muted', 'data-open-claims': 'none' }, 'Disabled. Holds no open claims.'),
+          h('div', { class: 'copy-row' }, enableBtn));
+        return box;
+      }
+      const shownTasks = pending.tasks.slice();
+      box.append(
+        h('div', { class: 'stack', 'data-open-claims': 'true' },
+          h('p', { class: 'small' },
+            pending.claims.length === 1
+              ? 'Disabled. This agent still holds 1 open claim:'
+              : `Disabled. This agent still holds ${pending.claims.length} open claims:`),
+          h('ul', { class: 'open-items' },
+            pending.claims.map((c) => h('li', { 'data-claim-task': c.id },
+              h('span', { class: 'mono' }, c.id),
+              c.title ? [' — ', c.title] : null,
+              c.project ? h('span', { class: 'small muted' }, ` (${c.project})`) : null))),
+          h('div', { class: 'copy-row' },
+            h('button', { type: 'button', 'data-action': 'release-claims', onclick: async (event) => {
+              const res = await act(event.currentTarget,
+                () => ctx.api.releaseAgentClaims(agent.id, { dry_run: false, tasks: shownTasks }),
+                { success: 'Claims released' }).catch(() => null);
+              if (!res) return;
+              pendingReleases.set(agent.id, { claims: [], tasks: [], released: Array.isArray(res.released) ? res.released : [] });
+              await load();
+            } }, 'Release its claims'),
+            h('button', { type: 'button', class: 'ghost', 'data-action': 'decline-release', onclick: async () => {
+              pendingReleases.delete(agent.id);
+              await load();
+            } }, 'Keep claims'),
+            enableBtn)));
+      return box;
+    }
+    box.append(
+      h('p', { class: 'small muted' }, 'This agent is disabled.'),
+      h('div', { class: 'copy-row' },
+        h('button', { type: 'button', 'data-action': 'check-claims', onclick: (event) => inspectClaims(event.currentTarget) }, 'Check open claims'),
+        enableBtn));
+    return box;
   }
   // The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276). The server
   // refuses a claim past it, so this is where an owner raises it; leaving the box empty

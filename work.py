@@ -1442,7 +1442,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
             independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
-            lanes_scope='all',provenance_writes=True,identity_names=None,comment_authority=None):
+            lanes_scope='all',provenance_writes=True,identity_names=None,comment_authority=None,
+            authority_state=None):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
@@ -1492,7 +1493,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                 lanes_payload=lanes_read(rows,actor,read_registry(path),
                                          ['--idle-minutes',str(parsed.idle_minutes),
                                           '--limit',str(LANES_LIMIT_MAX)],
-                                         operators=operators,journal=path,scope=lanes_scope,comment_authority=comment_authority)
+                                         operators=operators,journal=path,scope=lanes_scope,comment_authority=comment_authority,
+                                         project=path.name,authority_state=authority_state)
                 queue_payload=queue(rows,actor,['--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                     operators=operators,journal=path,reference_attention=False,
                                     verifiers=verifiers,independent_approval=independent_approval,
@@ -1534,7 +1536,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             from lanes import read as lanes_read
             from sessions import read_registry
             return lanes_read(rows,actor,read_registry(path),args[1:],operators=operators,
-                              journal=path,scope=lanes_scope,comment_authority=comment_authority)
+                              journal=path,scope=lanes_scope,comment_authority=comment_authority,
+                              project=path.name,authority_state=authority_state)
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners,

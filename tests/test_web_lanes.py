@@ -464,7 +464,7 @@ class LanesPageTests(unittest.TestCase):
         # Plain state words per the state map, never a bare slug in a row.
         for task in seen['tasks']:
             for slug in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user',
-                         'waiting_too_long', 'expect_by_passed', 'your_move_idle'):
+                         'waiting_too_long', 'expect_by_passed', 'your_move_idle', 'holder_retired'):
                 self.assertNotIn(slug, task, task)
         self.assertNotIn('2026-10-12T00:00:00Z', text)
         self.assertNotIn('2026-10-12T00:00:00+00:00', text)
@@ -495,6 +495,7 @@ class LanesPageTests(unittest.TestCase):
         self.assertNotIn('2026-10-18T09:30:00Z', text)
         self.assertNotIn('2026-10-17T19:00:00Z', text)
         self.assertEqual(['timer: Overdue'], [f for f in flags if f.startswith('timer:')], flags)
+        self.assertTrue(any(f == 'holder_retired: Holder retired: alpha-3' for f in flags), flags)
         self.assertTrue(seen['freeText'], seen['text'])
         self.assertIn('Holds nothing', seen['freeText'][0])
         self.assertIn('5 min', seen['freeText'][0])
@@ -507,10 +508,11 @@ class LanesPageTests(unittest.TestCase):
         self.assertEqual([None, 'true'], seen['inferredTasks'])
         self.assertEqual(1, len(seen['guessedChips']), seen['guessedChips'])
         self.assertIn('guessed', seen['guessedChips'][0].lower())
-        # The counts line names all three flags and the threshold that was used.
+        # The counts line names all flags and the threshold that was used.
         self.assertTrue(seen['countsLine'], seen['text'])
         self.assertIn('15 idle minutes', seen['countsLine'][0])
         self.assertIn('1 waiting too long', seen['countsLine'][0])
+        self.assertIn('1 holder retired', seen['countsLine'][0])
         # The sentence about what this viewer sees comes from the server's scope and basis.
         said = {name: ' '.join(lines) for name, lines in seen['scopeSentences'].items()}
         self.assertIn('you are an installation operator', said['operator'])

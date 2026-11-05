@@ -30,7 +30,7 @@ const WAITING_LANE = {
   }],
   state: null, waiting_on: null, expect_by: null, inferred: false, state_since: null,
   state_age_seconds: null, last_write: '2026-10-15T10:00:00Z', last_write_age_seconds: 7200,
-  waiting_too_long: true, expect_by_passed: true, your_move_idle: false,
+  waiting_too_long: true, expect_by_passed: true, your_move_idle: false, holder_retired: false,
   flag_tasks: { waiting_too_long: ['alpha-1'], expect_by_passed: ['alpha-1'] },
 };
 const GUESSED_LANE = {
@@ -41,18 +41,18 @@ const GUESSED_LANE = {
     not_before: '2026-10-17T19:00:00Z', not_before_due: true, timer_due: true,
     checkpoint: 'cp-3', state_since: '2026-10-16T00:00:00Z', state_age_seconds: 3600,
     no_checkpoint: false, held_age_seconds: 40000, holder_last_write_seconds: 2000,
-    flags: ['your_move_idle'], pending_review_items: 0,
+    flags: ['your_move_idle', 'holder_retired'], pending_review_items: 0,
   }],
   state: null, waiting_on: null, expect_by: null, inferred: false, state_since: null,
   state_age_seconds: null, last_write: '2026-10-17T19:30:00Z', last_write_age_seconds: 1800,
-  waiting_too_long: false, expect_by_passed: false, your_move_idle: true,
-  flag_tasks: { your_move_idle: ['alpha-3'] },
+  waiting_too_long: false, expect_by_passed: false, your_move_idle: true, holder_retired: true,
+  flag_tasks: { your_move_idle: ['alpha-3'], holder_retired: ['alpha-3'] },
 };
 const FREE_LANE = {
   lane: 'lane-b', actor: 'session-b', display_name: 'Bo', idle: true, held: [], state: 'idle', waiting_on: null,
   expect_by: null, inferred: false, state_since: null, state_age_seconds: null,
   last_write: '2026-10-17T20:00:00Z', last_write_age_seconds: 300,
-  waiting_too_long: false, expect_by_passed: false, your_move_idle: false, flag_tasks: {},
+  waiting_too_long: false, expect_by_passed: false, your_move_idle: false, holder_retired: false, flag_tasks: {},
   needs_investigation: { record: 'c-9', task: 'alpha-4', about_task: 'alpha-5', reason: 'the <b>merge</b> slot is stuck',
     since: '2026-10-17T19:00:00Z', age_seconds: 3900,
     earlier: [{ record: 'c-8', task: 'alpha-4', about_task: null, reason: 'credentials leaked', since: '2026-10-17T18:00:00Z' }], earlier_omitted: 3 },
@@ -71,7 +71,7 @@ function board(idleMinutes, extra) {
     schema: 'lanes-v1', generated_at: '2026-10-17T20:05:00Z', idle_minutes: idleMinutes,
     scope: 'all', total: 3, items: [waiting, GUESSED_LANE, FREE_LANE],
     next_offset: null,
-    flags: { waiting_too_long: flagged ? 1 : 0, expect_by_passed: flagged ? 1 : 0, your_move_idle: 1 },
+    flags: { waiting_too_long: flagged ? 1 : 0, expect_by_passed: flagged ? 1 : 0, your_move_idle: 1, holder_retired: 1 },
     coverage: 'One lane per registered session name; inferred true marks a row whose state is not declared.',
   }, extra);
 }
