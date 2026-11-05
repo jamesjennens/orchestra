@@ -616,8 +616,10 @@ class RealBdRetiredHolderLanesTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        t510 = Path('/home/agyargon/work/t510')
-        t510.mkdir(parents=True, exist_ok=True)
+        # A fresh folder under the run's own TMPDIR: a folder in the builder's home exists on no other host
+        # (release suite 1105a on koopa).
+        t510 = Path(tempfile.mkdtemp(prefix='t510-'))
+        cls._t510 = t510
         cls._env_patch = mock.patch.dict(os.environ, {'HOME': str(t510), 'TMPDIR': str(t510)})
         cls._env_patch.start()
         cls._old_tempdir = tempfile.tempdir
@@ -639,12 +641,13 @@ class RealBdRetiredHolderLanesTests(unittest.TestCase):
         finally:
             tempfile.tempdir = cls._old_tempdir
             cls._env_patch.stop()
+            shutil.rmtree(cls._t510, ignore_errors=True)
 
     def test_live_ssh_lane_registered_only_in_host_session_registry_is_not_flagged_on_real_bd(self):
         """Addition 1 named case: an actor registered only in sessions.read_registry(path)
         (sessions.py:38-60), with no web agent and no worker credential, holding a task,
         is NOT flagged holder_retired on real bd."""
-        t510 = Path('/home/agyargon/work/t510')
+        t510 = self._t510
         self.assertTrue(str(Path(os.environ['HOME'])).startswith(str(t510)))
         self.assertTrue(str(Path(os.environ['TMPDIR'])).startswith(str(t510)))
 
