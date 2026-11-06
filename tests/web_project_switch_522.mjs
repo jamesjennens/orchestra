@@ -167,6 +167,8 @@ location.hash = '#/p/alpha/reviews?review=changes-requested';
 await ctx.signedIn({ id: 'usr_alex', username: 'alex', display_name: 'Alex', superuser: false });
 await settle();
 out.deepLink = location.hash;
+// The page OPENED: its view rendered (the review filter shows the group the link names), not only the hash.
+out.deepLinkOpened = root.querySelector('#reviews-filter') && root.querySelector('#reviews-filter').value;
 // And with no deep link, home as before.
 location.hash = '#/';
 await ctx.signedIn({ id: 'usr_alex', username: 'alex', display_name: 'Alex', superuser: false });

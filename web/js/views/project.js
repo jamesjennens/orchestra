@@ -474,9 +474,12 @@ export async function lanesPage(ctx, { pid }) {
 
 // The Tasks page's review-state filter, and the status filter's URL words (kittrial-5bb.522 slice 1).
 export const TASK_REVIEW_FILTERS = [['', 'Any review state'], ['awaiting-review', 'Awaiting review'], ['changes-requested', 'Changes requested'], ['approved', 'Approved · not integrated'], ['withdrawn', 'Withdrawn'], ['superseded', 'Superseded'], ['none', 'No contribution']];
-const TASK_STATUS_OF = { active: 'active', closed: 'closed', all: '' };
+// A Map, not an object: `?status=constructor` is no status word (an object would answer with its inherited member).
+const TASK_STATUS_OF = new Map([['active', 'active'], ['closed', 'closed'], ['all', '']]);
 
 export async function overview(ctx, { pid }) {
+  // The render that asks for URL writes (ctx.currentView), taken before anything is awaited: see ctx.setQuery.
+  const view = ctx.currentView ? ctx.currentView() : undefined;
   const project = await load(ctx, pid);
   if (project.usable === false) {
     return h('div', { class: 'stack' },
@@ -489,7 +492,7 @@ export async function overview(ctx, { pid }) {
   // change, so a filtered list is shareable, reload-safe and survives a project switch.
   const query = ctx.query && typeof ctx.query.get === 'function' ? ctx.query : new URLSearchParams('');
   const askedReview = query.get('review') || '';
-  const state = { status: TASK_STATUS_OF[query.get('status')] ?? 'active', q: (query.get('q') || '').trim(),
+  const state = { status: TASK_STATUS_OF.has(query.get('status')) ? TASK_STATUS_OF.get(query.get('status')) : 'active', q: (query.get('q') || '').trim(),
     review: TASK_REVIEW_FILTERS.some(([v]) => v === askedReview) ? askedReview : '', cursor: null, stack: [],
     requirements: query.get('requirements') === '1' };
   const writeQuery = () => {
@@ -499,7 +502,7 @@ export async function overview(ctx, { pid }) {
     if (state.q) params.q = state.q;
     if (state.review) params.review = state.review;
     if (state.requirements) params.requirements = '1';
-    ctx.setQuery(params);
+    ctx.setQuery(params, view);
   };
   const tableHost = h('div', { class: 'panel' });
 
@@ -652,6 +655,7 @@ export async function overview(ctx, { pid }) {
 }
 
 export async function reviews(ctx, { pid }) {
+  const view = ctx.currentView ? ctx.currentView() : undefined;
   const project = await load(ctx, pid);
   // One proposal, or the propose form, replaces the lists on the same page
   // (/p/{pid}/reviews?proposal=<key> and ?propose=1): no separate route.
@@ -682,7 +686,7 @@ export async function reviews(ctx, { pid }) {
   const groupsHost = h('div', { class: 'stack', 'data-review-groups': '' });
   const filterSel = h('select', { id: 'reviews-filter', 'aria-label': 'Show', onchange: (e) => {
     shown = e.target.value;
-    if (ctx.setQuery) ctx.setQuery(shown ? { review: shown } : {});
+    if (ctx.setQuery) ctx.setQuery(shown ? { review: shown } : {}, view);
     drawGroups();
   } }, [['', 'All groups']].concat(groups.map(([keys, title]) => [keys[0], title]))
     .map(([v, l]) => h('option', { value: v, selected: v === shown }, l)));
@@ -695,7 +699,7 @@ export async function reviews(ctx, { pid }) {
     return groups.filter(([keys]) => !shown || keys[0] === shown).map(([keys, title, note]) => {
       const key = keys[0];
       const rows = data.items.filter((t) => keys.includes(t.review_state));
-      if (key === 'error' && !rows.length) return null;
+      if (key === 'error' && !rows.length && !shown) return null;   // empty: hidden unless it is the group asked for
       // Slice 5 (kittrial-5bb.427, design 2.7): groups with items first, and an
       // empty contribution group is one line, not a panel.
       const body = rows.length ? h('section', { class: 'panel', 'aria-labelledby': 'g-' + key },

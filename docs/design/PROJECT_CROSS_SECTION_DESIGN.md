@@ -223,7 +223,8 @@ structure" and §5 "Ranked changes"). The coordinator's 02:30Z correction and 03
 .502's change 1 plus 7 (the orthogonal switch).
 
 **What .504 already fixed:**
-- .502 §1.2 measured the switcher always landing on Tasks (app.js:92 at that commit).
+- .502 §1.2 measured the switcher always landing on Tasks (app.js:92 at that commit). .504 had already removed
+  that always-Tasks behaviour before slice 1 began; slice 1 does not touch it.
 - .504 (187b170c, 995e5b31) made it keep the section: `switchProject` (app.js:105-119) with `switchTarget`
   (routes.js:78-92) and the toast `fallbackMessage` (routes.js:96-100).
 - Pins: tests/test_site_defects_504.py:17-43 and :70-84.
@@ -234,24 +235,54 @@ structure" and §5 "Ranked changes"). The coordinator's 02:30Z correction and 03
 - **.502 §1.9:** the Tasks filters live in a closure, `state` (project.js:484 at b08ca8d4), and are not in the URL. Reviews has no
   filter at all (project.js:634-688 at b08ca8d4).
 
-**Slice 1, as VERIFIED.** It fixes .502 §1.2 (the rest of it) and §1.9 for Tasks and Reviews:
+**Slice 1, as VERIFIED.** It fixes the rest of .502 §1.2 (what the switch loses besides the section: the query and
+the project itself; the always-Tasks landing is .504's, above) and §1.9 for Tasks and Reviews:
 - **(a) The query survives a switch.** On `#/p/A/reviews?review=changes-requested`, choosing B opens
   `#/p/B/reviews?review=changes-requested`.
   - **Only view filters cross:** `status`, `q`, `review`, `requirements`.
+  - **Only values that mean the same in every project cross.** `status` crosses as `active`, `closed` or `all`;
+    `review` as one of the review-state words (`awaiting-review`, `legacy-review-ready`, `changes-requested`,
+    `approved`, `awaiting-integration`, `error`, `withdrawn`, `superseded`, `none`); `requirements` as `1`. Any
+    other value is dropped (a task id typed into `status` does not cross).
+  - **The `q` pattern (one):** a search crosses unless a word in it has the shape of an id, that is letters and
+    digits joined by `-`, `_` or `.` at least once (`/^[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)+$/`, routes.js
+    `ID_SHAPED`, after trimming separators at a word's ends and splitting on spaces and punctuation). It covers
+    `task_18cb2f`, `alpha-1`, `alpha-7k2`, `room_7f3a`, `r-9d4487e9c7da`, `REQ-7`, `kittrial-5bb.522`. A search for
+    an id names one record of one project, so it stays behind. Plain words cross. A hyphenated word such as
+    `set-up` has the shape too and stops crossing; that is accepted.
+  - **Records' `state`** is not carried: no page writes it, and only keys a page writes are carried.
   - **A key that names a record of A** (`?proposal=<key>` on Reviews, project.js:638) or a mode of one page is
     dropped, because B has no such record.
 - **(b) Fallback to Tasks.** If the section is not available in B for this person (Set up for a non-owner, Program
   where B has none), B's Tasks list opens and the toast says so once. This is as today; the filters still apply to
-  Tasks.
-- **(c) A task page** (`#/p/A/t/ID`) opens B's Tasks list. The task belongs to A, so its query is not carried.
+  Tasks. Handover and Notes are open to every member, so they keep their section in any project the person can open.
+- **(c) A record page of A** opens B's matching list where B serves it, with nothing of the page's query, and the
+  toast gives the true reason (one sentence each, routes.js `fallbackMessage`):
+  - a task page (`#/p/A/t/ID`) opens B's Tasks: "Task pages belong to one project, so B opened on Tasks.";
+  - `/new` opens B's Tasks: "A new task is written in one project, so B opened on Tasks.";
+  - a room page opens B's Rooms, a requirement page its Requirements, a record page (reference or capability
+    included) its Records, a decision page its Decisions: "A room belongs to one project, so B opened on its Rooms
+    list." (likewise requirement, record, decision);
+  - where B does not serve that list (Decisions on a server without them), B's Tasks opens: "B has no Decisions
+    page, so it opened on Tasks.";
+  - a section B lacks (Set up, Program): "B has no Set up page, so it opened on Tasks." (filters kept);
+  - any other page of A (a design or trace page): "That page belongs to one project, so B opened on Tasks."
 - **(d) The project is remembered.** The last project a person opened is kept in their browser as
-  `orchestra.lastProject.<user id>` and cleared on sign-out.
+  `orchestra.lastProject.<user id>` and cleared on sign-out and when the session is lost (a 401).
   - On a page without a project (My work, My agents, Projects), the rail shows that project in the switcher, with
     its sections, instead of "Choose a project…" (.502 §3).
-  - A remembered project that `GET /v1/projects` no longer lists is forgotten.
+  - A remembered project that a SUCCESSFUL `GET /v1/projects` no longer lists is forgotten. A failed read says
+    nothing about access: the key is kept and nothing is shown from it until a read succeeds.
+  - It is written after the project page's view answered, so a session that has ended writes nothing.
   - The URL always wins on a project page.
-- **(e) Return to a deep link after sign-in** (Q4).
+- **(e) Return to a deep link after sign-in** (Q4), for the person it was opened for: with nobody signed in when it
+  was opened, whoever signs in; after a sign-out or a lost session, only the person who was signed in (the next
+  person, including after Back on the login page, lands on `#/`).
 - **(f) .502 §1.9 for Tasks and Reviews:**
+  - **A write belongs to the render that asked for it.** The search box writes after 250 ms; a view passes the
+    render token it took when it started (`ctx.setQuery(params, ctx.currentView())`), and a write from a render
+    that is no longer current, or while another page's navigation is pending, writes nothing. Sign-out and a lost
+    session end the render too.
   - **Tasks:** the filters (status, search, review state, show requirements) are read from the query on load. Each
     change writes them back with `history.replaceState`, so a filtered list is shareable and reload-safe and
     survives the switch.
