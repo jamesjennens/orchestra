@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tasks · Orchestra (fresh look mock-up)</title>
+<link rel="stylesheet" href="fresh.css">
+<script>(function(){var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t);document.addEventListener("DOMContentLoaded",function(){var c=document.querySelector(".tabs [aria-current]");if(c)c.parentNode.scrollLeft=c.offsetLeft-16;});})();</script>
+</head>
+<body data-page="tasks">
+<div class="shell">
+<nav class="rail" aria-label="Main">
+  <a class="brand" href="my-work.html"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect class="tile" width="24" height="24" rx="6"/><rect class="bar" x="5" y="6" width="8" height="2.6" rx="1.3"/><rect class="bar" x="8.5" y="10.7" width="10.5" height="2.6" rx="1.3"/><rect class="bar" x="12" y="15.4" width="7" height="2.6" rx="1.3"/></svg><span class="wordmark">Orchestra</span></a>
+  <div class="nav">
+    <a href="#"><span>My work</span><span class="n you">5</span></a>
+    <a href="#"><span>People</span></a>
+    <a href="#"><span>Agents</span><span class="n you">1</span></a>
+  </div>
+  <div>
+    <div class="rail-label" id="proj-label">Project</div>
+    <button class="switch" type="button" aria-labelledby="proj-label proj-name" aria-haspopup="listbox"><span id="proj-name">Alpha</span><span class="role">coordinator</span><span class="chev" aria-hidden="true">&#9662;</span></button>
+    <div class="nav sub-nav"><a href="#" aria-current="page"><span>Tasks</span><span class="n">17</span></a><a href="#"><span>Reviews</span><span class="n">3</span></a><a href="#"><span>Releases</span></a><a href="#"><span>Requirements</span></a><a href="#"><span>Records</span></a><a href="#"><span>Rooms</span></a><a href="#"><span>Lanes</span></a><a href="#"><span>People</span></a><a href="#"><span>Agents</span></a><a href="#"><span>Settings</span></a><a href="#"><span>Set up</span></a><a href="#"><span>How</span></a></div>
+  </div>
+  <div class="nav">
+    <a href="#"><span>Programs</span></a>
+    <a href="#"><span>Administration</span></a>
+  </div>
+  <div class="rail-foot"><span class="avatar" aria-hidden="true">CL</span><span class="who"><b>Cora Lee</b><span>Account · Sign out</span></span></div>
+</nav>
+<div class="content">
+<header class="topbar">
+  <a class="brand" href="my-work.html"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect class="tile" width="24" height="24" rx="6"/><rect class="bar" x="5" y="6" width="8" height="2.6" rx="1.3"/><rect class="bar" x="8.5" y="10.7" width="10.5" height="2.6" rx="1.3"/><rect class="bar" x="12" y="15.4" width="7" height="2.6" rx="1.3"/></svg><span class="wordmark">Orchestra</span></a>
+  <span class="where">Alpha · Tasks</span>
+  <button class="menu" type="button" aria-label="Open the menu"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</header>
+<main class="main" id="main"><div class="page">
+<header class="page-head">
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="project.html">Alpha</a><span class="sep" aria-hidden="true">/</span><span>Tasks</span></nav>
+  <div class="ph-title"><h1 id="page-title">Tasks</h1></div>
+  <div class="key"><span class="key-num">17</span><span class="key-label">open · 4 wait on you</span></div>
+  <div class="ph-action"><a class="btn primary add" href="#">New task</a></div>
+</header>
+<section class="section" aria-label="Task list">
+  <div class="toolbar">
+    <input type="search" aria-label="Search tasks" placeholder="Search title, description or id">
+    <div class="seg" role="group" aria-label="Status"><button type="button" aria-pressed="true">Open 17</button><button type="button" aria-pressed="false">Closed 42</button><button type="button" aria-pressed="false">All</button></div>
+    <select aria-label="Who acts next"><option>Anyone acts next</option><option>You act next</option></select>
+  </div>
+  <div class="table-wrap"><table class="stacks">
+    <thead><tr><th>Task</th><th>State</th><th>Who acts next</th><th class="r">Updated</th></tr></thead>
+    <tbody><tr>
+  <td><a class="title" href="task.html">Fix: VAT rounding differs between invoice and cart</a><span class="sub"><span class="pri p0">P0</span> · <span class="mono">alpha-g11</span></span></td>
+  <td><span class="chip crit">Changes requested</span></td>
+  <td class="full"><span class="who-acts">Carl Novak · address the changes</span></td>
+  <td class="r"><span class="when">25 min</span></td>
+</tr><tr class="mine">
+  <td><a class="title" href="task.html">Checkout: show delivery estimate before payment</a><span class="sub"><span class="pri p1">P1</span> · <span class="mono">alpha-7k2</span></span></td>
+  <td><span class="chip warn">Awaiting review</span></td>
+  <td class="full"><span class="who-acts you"><b>You</b> · review the contribution</span></td>
+  <td class="r"><span class="when">2 days</span></td>
+</tr><tr>
+  <td><a class="title" href="task.html">Upgrade payment SDK to 4.x</a><span class="sub"><span class="pri p1">P1</span> · <span class="mono">alpha-gyq</span></span></td>
+  <td><span class="chip ok">Approved</span></td>
+  <td class="full"><span class="who-acts">Ines Duarte · integrate</span></td>
+  <td class="r"><span class="when">1 h</span></td>
+</tr><tr class="mine">
+  <td><a class="title" href="task.html">Cart: warn when an item went out of stock</a><span class="sub"><span class="pri p1">P1</span> · <span class="mono">alpha-p9g</span></span></td>
+  <td><span class="chip info">In progress</span></td>
+  <td class="full"><span class="who-acts you"><b>You</b> · deliver</span></td>
+  <td class="r"><span class="when">3 h</span></td>
+</tr><tr>
+  <td><a class="title" href="task.html">Decision: keep guest checkout?</a><span class="sub"><span class="pri p2">P2</span> · <span class="mono">alpha-6sx</span></span></td>
+  <td><span class="chip ">Open</span></td>
+  <td class="full"><span class="who-acts">Anyone · claim it</span></td>
+  <td class="r"><span class="when">1 day</span></td>
+</tr><tr class="mine">
+  <td><a class="title" href="task.html">Promotions: percentage discount codes</a><span class="sub"><span class="pri p2">P2</span> · <span class="mono">alpha-k4f</span></span></td>
+  <td><span class="chip warn">Awaiting review</span></td>
+  <td class="full"><span class="who-acts you"><b>You</b> · review the contribution</span></td>
+  <td class="r"><span class="when">5 h</span></td>
+</tr><tr>
+  <td><a class="title" href="task.html">Replace the legacy address validator</a><span class="sub"><span class="pri p2">P2</span> · <span class="mono">alpha-wqo</span></span></td>
+  <td><span class="chip info">In progress</span></td>
+  <td class="full"><span class="who-acts">Heron (agent) · deliver</span></td>
+  <td class="r"><span class="when">40 min</span></td>
+</tr><tr>
+  <td><a class="title" href="task.html">Gift cards: redeem at checkout</a><span class="sub"><span class="pri p2">P2</span> · <span class="mono">alpha-97o</span></span></td>
+  <td><span class="chip ">Open</span></td>
+  <td class="full"><span class="who-acts">Anyone · claim it</span></td>
+  <td class="r"><span class="when">2 days</span></td>
+</tr><tr>
+  <td><a class="title" href="task.html">Product page: LCP under 2.5 s on 3G</a><span class="sub"><span class="pri p3">P3</span> · <span class="mono">alpha-wyf</span></span></td>
+  <td><span class="chip ">Open</span></td>
+  <td class="full"><span class="who-acts">Anyone · claim it</span></td>
+  <td class="r"><span class="when">4 days</span></td>
+</tr></tbody></table></div>
+  <div class="pager"><span class="num">1–9 of 17</span><span class="toolbar"><button class="btn sm" type="button" disabled>Previous</button><button class="btn sm" type="button">Next</button></span></div>
+</section>
+</div></main>
+</div>
+</div>
+<span class="mock-note" aria-hidden="true">Mock-up · made-up data</span>
+</body>
+</html>
