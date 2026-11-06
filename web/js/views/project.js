@@ -903,19 +903,14 @@ export function autoNudgePanel(ctx, project) {
   return host;
 }
 
-export async function settings(ctx, { pid }) {
-  const project = await load(ctx, pid);
+// The members panel (moved unchanged from Members & settings to People, kittrial-5bb.522 slice 2).
+// `coordination` is the Who-coordinates panel on the same page, read again after a role change.
+function membersPanel(ctx, project, coordination) {
+  const pid = project.id;
   const owner = isOwner(project);
   // Its own selector: the role options belong to the members list, never to another
   // panel's control (the claiming setting has data-panel="claiming" instead).
   const membersHost = h('div', { class: 'panel', 'data-panel': 'members' });
-  const agentsHost = h('div');
-  const credsHost = h('div');
-  const auditHost = h('div');
-  // Who coordinates (kittrial-5bb.198), read again after an owner changes a role or a grant here.
-  const coordination = coordinationPanel(ctx, project);
-  // Delegated decision rights (kittrial-5bb.407): read by every member; recorded only by a person owner.
-  const delegated = delegationsPanel(ctx, project, { owner: project.role === 'owner' });
 
   async function drawMembers() {
     let data;
@@ -970,6 +965,16 @@ export async function settings(ctx, { pid }) {
     return form;
   }
 
+  drawMembers();
+  return membersHost;
+}
+
+// The agents that work in this project (moved unchanged to the Agents section, kittrial-5bb.522 slice 2).
+function projectAgentsPanel(ctx, project, coordination) {
+  const pid = project.id;
+  const owner = isOwner(project);
+  const agentsHost = h('div');
+
   // The agents that work in this project, and which of them coordinate it (kittrial-5bb.209). An owner
   // gives and removes the grant here; the server says why when a grant cannot be given.
   async function drawAgents() {
@@ -1020,6 +1025,45 @@ export async function settings(ctx, { pid }) {
         })))) : h('div', { class: 'panel-body' }, empty('No agents here yet', 'A member grants their own agent this project on the Agents page.'))));
   }
 
+  drawAgents();
+  return agentsHost;
+}
+
+export async function people(ctx, { pid }) {
+  const project = await load(ctx, pid);
+  const owner = isOwner(project);
+  const coordination = coordinationPanel(ctx, project);
+  return h('div', { class: 'stack' },
+    pageHead({ crumbs: crumbs(ctx, project, 'People'), title: 'People', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
+    archivedBanner(project),
+    unusableBanner(project),
+    membersPanel(ctx, project, coordination),
+    // kittrial-5bb.578: invite links, moved with the members from Members & settings to People.
+    invitePanel(ctx, project),
+    coordination.node);
+}
+
+export async function projectAgents(ctx, { pid }) {
+  const project = await load(ctx, pid);
+  const owner = isOwner(project);
+  const coordination = coordinationPanel(ctx, project);
+  return h('div', { class: 'stack' },
+    pageHead({ crumbs: crumbs(ctx, project, 'Agents'), title: 'Agents', lede: owner ? 'Which agents work here and which of them coordinate.' : null }),
+    archivedBanner(project),
+    unusableBanner(project),
+    owner ? projectAgentsPanel(ctx, project, coordination)
+      : h('p', { 'data-note': 'agents-owner-only' }, 'Only this project’s owners see its agents here. Your own agents are under ', h('a', { href: ctx.href('/agents') }, 'My agents'), '.'),
+    coordination.node);
+}
+
+export async function settings(ctx, { pid }) {
+  const project = await load(ctx, pid);
+  const owner = isOwner(project);
+  const credsHost = h('div');
+  const auditHost = h('div');
+  // Delegated decision rights (kittrial-5bb.407): read by every member; recorded only by a person owner.
+  const delegated = delegationsPanel(ctx, project, { owner: project.role === 'owner' });
+
   async function drawCreds() {
     if (!owner) { credsHost.replaceChildren(); return; }
     let data;
@@ -1059,7 +1103,7 @@ export async function settings(ctx, { pid }) {
         empty('No administrative activity yet', null)));
   }
 
-  drawMembers(); drawAgents(); drawCreds(); drawAudit();
+  drawCreds(); drawAudit();
 
   const danger = owner && !project.archived ? h('section', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Archive project')),
@@ -1072,18 +1116,15 @@ export async function settings(ctx, { pid }) {
       } }, 'Archive project')))) : null;
 
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
+    pageHead({ crumbs: crumbs(ctx, project, 'Settings'), title: 'Settings', lede: owner ? 'How work is claimed and approved, credentials, activity and archiving.' : 'Only project owners can change these.' }),
     archivedBanner(project),
     unusableBanner(project),
     // kittrial-5bb.442: the hand-over walkthrough, checked live (each member reads their own).
     // kittrial-5bb.447: notes between the coordinators of linked projects, in the same line (no new panel).
     h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator'),
       ' · ', h('a', { href: ctx.href(`/p/${pid}/notes`), 'data-link': 'notes' }, 'Notes between coordinators')),
-    membersHost,
-    // kittrial-5bb.578: invite links, shown only while the installation's switch is on (or to list your own).
-    invitePanel(ctx, project),
-    claimingPanel(ctx, project), agentApprovalPanel(ctx, project), autoNudgePanel(ctx, project), coordination.node,
+    claimingPanel(ctx, project), agentApprovalPanel(ctx, project), autoNudgePanel(ctx, project),
     // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
     switchesPanel(ctx, project),
-    delegated.node, agentsHost, credsHost, auditHost, danger);
+    delegated.node, credsHost, auditHost, danger);
 }

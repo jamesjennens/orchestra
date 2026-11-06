@@ -320,7 +320,7 @@ out.bridgeResumeHasNoPromptToPaste = JSON.stringify(commands(d)) === JSON.string
   && attr(d, 'data-bridge-prompt', 'true').length === 1
   && /Orchestra Bridge starts the agent with its own prompt: nothing needs pasting here\./.test(shownText(d));
 out.bridgeResumeSaysWhatWaitingCounts = attr(d, 'data-waiting-count', 'true').length === 1
-  && /own tasks plus open tasks nobody holds, unless the project’s “How work is handed out” setting \(Members & settings\) is “Only coordinators assign work”/.test(shownText(d));
+  && /own tasks plus open tasks nobody holds, unless the project’s “How work is handed out” setting \(the project’s Settings\) is “Only coordinators assign work”/.test(shownText(d));
 out.nextHiddenAndDonePrimaryOnTheLast = button(d, 'wizard-next').hidden === true && button(d, 'wizard-done').className === 'primary';
 texts.resume = shownText(d); sentences.resume = firstSentenceCount(d);
 const back = [];
@@ -523,7 +523,7 @@ await d.wizard.next();
 out.coordinatorRoleScreen = screenOf(d) === 'role' && attr(d, 'data-role-coordinator', 'true').length === 1
   && /Kestrel holds the coordinator grant for Alpha: it is set up as a coordinator\./.test(shownText(d));
 const coordinatorRoleText = d.all(() => true).map((e) => e.textContent).join('\n');
-out.coordinatorRoleKeepsGrantLocation = coordinatorRoleText.includes('The grant is given here or on the project’s Members & settings page, and removed on the project’s Members & settings page.')
+out.coordinatorRoleKeepsGrantLocation = coordinatorRoleText.includes('The grant is given here or on the project’s Agents page, and removed on the project’s Agents page.')
   && coordinatorRoleText.includes('Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.');
 out.coordinatorSetupHintAbsentWithGrant = attr(d, 'data-role-coordinator-help', 'true').length === 0;
 out.coordinatorHasNoRoleChoice = !windowsChoice(d, 'setup-role', 'worker') && !windowsChoice(d, 'setup-role', 'reviewer');
@@ -536,7 +536,7 @@ d = await openWizard();
 await d.wizard.next();
 out.coordinatorSetupHintPresentWithoutGrant = attr(d, 'data-role-coordinator-help', 'true').length === 1
   && attr(d, 'data-role-coordinator-help', 'true')[0].textContent
-    === "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.";
+    === "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Agents page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.";
 // A grant without effect still uses the non-coordinator screen and its grant hint.
 store.clear();
 server.coordinates = [{ project: 'p1', effective: false }];
@@ -687,7 +687,7 @@ out.rereadWithoutEffectiveGrantSaysSoInOneLine = grantError.hidden === false
   && noEffectFiles.screenText.includes('Claim exactly one that nobody holds')
   && !noEffectFiles.screenText.includes('## You coordinate');
 // Note (1) & kittrial-5bb.541 (1, 3): When P is no longer grantable after the re-read, state.coordinatorProject
-// is cleared, the screen re-renders, the error says this set-up cannot tell and directs to Members & settings,
+// is cleared, the screen re-renders, the error says this set-up cannot tell and directs to the Agents page,
 // and the files screen keeps the worker's AGENT.md and setup prompt.
 server.dropFromGrantableOnReread = true;
 await button(d, 'grant-coordinator').dispatch('click');
@@ -695,7 +695,7 @@ await tick(); await tick();
 server.dropFromGrantableOnReread = false;
 server.grantHasNoEffectOnReread = false;
 const errorShownAfterDrop = grantError.hidden === false
-  && grantError.textContent === "This set-up cannot tell whether Kestrel holds a coordinator grant for Alpha. Check the project's Members & settings page.";
+  && grantError.textContent === "This set-up cannot tell whether Kestrel holds a coordinator grant for Alpha. Check the project's Agents page.";
 const choiceRemovedAfterDrop = !windowsChoice(d, 'setup-role', 'coordinator:p1')
   && Boolean(windowsChoice(d, 'setup-role', 'coordinator:p2'))
   && !button(d, 'grant-coordinator')

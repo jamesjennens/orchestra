@@ -1,5 +1,5 @@
 // Invite links (kittrial-5bb.578). Two parts:
-//  * invitePanel: on a project's Members & settings page, for a person who may invite to at least one
+//  * invitePanel: on a project's People page, for a person who may invite to at least one
 //    project (an owner of it, or a superuser) while the installation's switch is on. It makes an
 //    invite, shows its link ONCE, and lists the person's invites with their status and a Withdraw button.
 //  * invitePage: the signed-out page the link opens (#/invite/TOKEN). It shows who invited whom, the
@@ -50,7 +50,7 @@ export function invitePanel(ctx, project) {
           field({ id: 'i-agent-name', label: 'Agent name', placeholder: 'e.g. Lena build bot', maxlength: 64 }),
           h('label', { class: 'small' }, 'Project ', agentProject),
           field({ id: 'i-agent-limit', label: 'Claim limit', value: '1' })),
-        h('p', { class: 'small muted' }, 'A worker only: a coordinator grant is given on Members & settings after they sign in.')),
+        h('p', { class: 'small muted' }, 'A worker only: a coordinator grant is given on the project’s Agents page after they sign in.')),
       h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Make invite link')));
     node.addEventListener('submit', async (event) => {
       event.preventDefault();

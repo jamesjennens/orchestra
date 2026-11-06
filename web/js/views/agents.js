@@ -486,7 +486,7 @@ export async function list(ctx) {
           h('input', { type: 'checkbox', disabled: true, 'aria-label': `${p.name} (not available to ${ownerName})` }),
           h('span', null, `${ownerName} is not a member of ${p.name}: `,
             ctx.me && (ctx.me.superuser || p.role === 'owner')
-              ? h('a', { href: ctx.href(`/p/${p.id}/settings`) }, "add them under the project's Members first")
+              ? h('a', { href: ctx.href(`/p/${p.id}/people`) }, "add them under the project's Members first")
               : "add them under the project's Members first")))),
       h('div', null, h('button', { type: 'submit' }, 'Save projects')));
     form.addEventListener('submit', async (event) => {
@@ -1003,7 +1003,7 @@ function secretNotice(justCreated) {
     h('p', { class: 'small', 'data-secret-save': 'true' }, 'Save this secret now, in the file named below. Never paste it into a chat.'),
     h('p', { class: 'small muted', 'data-secret-once': 'true' }, 'It is shown once and this page does not keep it.'),
     justCreated ? h('p', { class: 'small muted', 'data-secret-later': 'true' },
-      'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Members & settings page first.') : null);
+      'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Agents page first.') : null);
 }
 
 function secretLinesBlock(payload, secretValue, os, noproxy = false) {
@@ -1195,14 +1195,14 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     role: () => setupText.coordinating(payload) ? [
       h('p', { class: 'small', 'data-role-coordinator': 'true' },
         `${payload.name} holds the coordinator grant for ${payload.coordinates.map(projectLabel).join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
-      more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Members & settings page, and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
+      more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Agents page, and removed on the project’s Agents page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
     ] : (() => {
       const grantable = payload.coordinateGrantableProjects || [];
       syncGrantRow();
       return [
         h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
         grantable.length === 0 ? h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
-          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.") : null,
+          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Agents page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.") : null,
         h('div', { class: 'copy-row', 'data-role-choice': 'true' },
           choice('setup-role', 'worker', 'Works on tasks', !state.coordinatorProject && state.role === 'worker', () => selectRole('worker')),
           choice('setup-role', 'reviewer', 'Reviews deliveries', !state.coordinatorProject && state.role === 'reviewer', () => selectRole('reviewer')),
@@ -1409,7 +1409,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       if (!(payload.coordinateGrantableProjects || []).includes(pid)) {
         state.coordinatorProject = null;
         render();
-        wizard.showError(new Error(`This set-up cannot tell whether ${payload.name} holds a coordinator grant for ${projectLabel(pid)}. Check the project's Members & settings page.`));
+        wizard.showError(new Error(`This set-up cannot tell whether ${payload.name} holds a coordinator grant for ${projectLabel(pid)}. Check the project's Agents page.`));
       } else {
         syncGrantRow();
         wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));

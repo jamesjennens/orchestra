@@ -848,7 +848,7 @@ commands of that text.
 ### Handing a project to a coordinator
 
 **The page and the route** (kittrial-5bb.442; docs/design/COORDINATOR_ONBOARDING_DESIGN.md §3): the page
-**Hand this project to a coordinator** (`#/p/NAME/handover`, linked from Members & settings and from Set up)
+**Hand this project to a coordinator** (`#/p/NAME/handover`, linked from the project's People, Agents and Settings pages and from Set up)
 reads `GET /v1/projects/{id}/handover[?person=USER&agent=AGENT]`. It answers the steps for one member, each
 with a state (`done`, `todo`, `waiting`, `failed`, `hidden`), a plain sentence, who does it, and the existing
 page or route that fixes it. It writes nothing, and the page changes nothing itself.
@@ -857,7 +857,7 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
 | --- | --- | --- |
 | Coordinator role | the member's role | an owner (Members) |
 | Their agent has this project (only after the role, so no agent is made first) | the agents that have the project | the member, under My agents |
-| Coordinator grant | the grant and, when it has no effect, why: agent switched off, account disabled, no longer a coordinator, granting owner no longer an owner | an owner (Members & settings) |
+| Coordinator grant | the grant and, when it has no effect, why: agent switched off, account disabled, no longer a coordinator, granting owner no longer an owner | an owner (the project's Agents page) |
 | Installation switches | `GET /v1/projects/{id}/switches`; an endpoint that cannot answer makes only this step say so | the operator, with the command shown |
 | Agent approvals | the project's `agent_approval` setting | an owner |
 | Set up after the grant | the agent has reached the server since the grant (`last_seen_at` later than `granted_at`) | the member, by opening the agent's set-up again |
@@ -2199,7 +2199,7 @@ a child task or a decision under `{task}` through the host's own `coordinate cre
   `web_lifecycle_mark_writes` is `unreadable`; the other two read a malformed value as off.
 - `command` is the operator's `admin.py ... on --actor OPERATOR`.
 - It changes nothing and returns no path, configured value or actor. A contributor or viewer gets 403;
-  a non-member gets 404. Members & settings shows it to a coordinator.
+  a non-member gets 404. The project's Settings page shows it to a coordinator.
 
 **Task create takes a priority too.** `POST /v1/projects/{id}/tasks` takes `title`,
 `description`, `priority` (an integer 0 to 4; bd's default 2 applies when it is absent) and the
@@ -2514,7 +2514,7 @@ credential approved anything; this is the one place where that is lifted.
     `403`, and a credential never may, so no agent sets the rule that judges it.
   - What is recorded: who set it and when, audited as `projects.agent_approval`.
   - Where it shows: `GET /v1/projects/{id}` answers `agent_approval` (`mode`, `set_by`,
-    `set_by_display_name`, `set_at`) and `can_set_agent_approval`, and Members & settings has
+    `set_by_display_name`, `set_at`) and `can_set_agent_approval`, and the project's Settings page has
     an "Approvals by coordinator agents" panel.
   - Damage: a damaged stored value reads as the strict `by-person` (with `damaged: true`), never
     as the default.
@@ -2705,8 +2705,9 @@ role, a superuser, an agent's credential, as the members list does) and changes 
   through the web-service-only `host-coordination` action (below), with the states of
   `host_rules`.
 
-The settings page ("Members & settings") shows it as "Who coordinates" to every member,
-with no control on it, and reads it again after an owner changes a role or a grant there.
+The project's People and Agents pages show it as "Who coordinates" to every member (on
+"Members & settings" before kittrial-5bb.522 slice 2), with no control on it, and read it again
+after an owner changes a role (People) or a grant (Agents) there.
 A superuser of the server may also act as a coordinator in any project; the page says
 so.
 
@@ -3017,7 +3018,7 @@ revoked one that was wider then seeded the next renewal once nothing worked).
 - **Editing another account's agent** (kittrial-5bb.355): the project list offers only the
   projects that agent's OWNER may be granted; every other project the viewer can see is
   listed greyed with "OWNER is not a member of PROJECT: add them under the project's
-  Members first", linking to that project's Members & settings when the viewer may manage
+  Members first", linking to that project's People page when the viewer may manage
   it. The page learns this from `owner_grantable_projects` on the agent read: the owner's
   live memberships (everything when the owner is a superuser), intersected with the
   projects THAT reader can see, so the answer never reveals a project the reader cannot
@@ -3032,7 +3033,7 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   does not already hold an effective grant there, and the caller holds `project.admin`).
   Because both `coordinate_grantable_projects` and `coordinates` require the agent's owner
   to be in the project's memberships, a superuser owner who is not a member of the project
-  grants on the project's Members & settings page only, and the set-up wizard still writes
+  grants on the project's Agents page only, and the set-up wizard still writes
   the worker's files until the owner is added as a member of the project. Only the agent's
   owner, or a superuser, signed in as a person can read `GET /v1/agents/{id}` and
   `GET /v1/agents` (another person receives `404` on `GET /v1/agents/{id}` and sees only
@@ -4392,7 +4393,7 @@ While it is off the create form is hidden and `POST /v1/invites`, `POST /v1/invi
 `Invite links are switched off on this installation. An operator turns them on with "invites_enabled": true in deployment.private.json.`
 Listing and withdrawing stay open, so an invite made while it was on can still be withdrawn. Switching
 off withdraws nothing: a pending link that has not expired works again once the switch is back on. If
-that is not wanted, withdraw the pending invites (Members & settings, or `POST /v1/invites/{id}/revoke`)
+that is not wanted, withdraw the pending invites (the project's People page, or `POST /v1/invites/{id}/revoke`)
 before switching off. A withdrawal whose save fails still holds in memory and is written by the next
 save; a service stopped before that save brings the invite back, so withdraw it again. To turn it
 on, stop nothing: add `"invites_enabled": true` to the top-level object of
@@ -4449,7 +4450,7 @@ status on their list. If the redemption answer is lost the secret is gone with i
 and issues a new one from the agent's card. A restore of the HTTP state withdraws the pending invites in
 the backup, as it spends unused reset values.
 
-**On the page.** Members & settings shows "Invite someone" to a person who may invite to at least one
+**On the page.** The project's People page shows "Invite someone" to a person who may invite to at least one
 project while the switch is on (and the list of their invites at any time). The link opens a signed-out
 page (`#/invite/TOKEN`) that shows the invite, asks for the password twice, and then offers the agent's
 credential file, `.orchestra/agent.json` and `.orchestra/AGENT.md` (and the service certificate, when it
