@@ -125,7 +125,7 @@ The fresh look keeps the bones and changes the voice:
 | **Agents** (`agents.html`, .522 §3.2) | My agents as cards (app.css:299-301; `agents.js:509`) | A table: Agent, Owner, Projects, In Alpha, Last seen (online dot). "Showing: Alpha · change · show all projects". The key "1 needs you". "Add to Alpha" in the row for your agents that are not in it. Other owners' agents are read-only. |
 | **Project › People & Agents** (`project.html`, .522 §3.3) | Members & settings, 2,751 px with forms open (.502 report §2) | The project header with tabs (Tasks … People · Agents · Settings · Set up · How). **People in Alpha** with "+ Add person", a role select and Remove. **Agents in Alpha** with the "Include my agents not in Alpha" switch (shown on: greyed rows with "Add to Alpha") and "+ Add agent". In .522 People and Agents are two tabs; the mock-up shows both sections under the People tab so that one screenshot covers both. |
 
-## 8. Tokens changed or added (today's names)
+## 8. Tokens changed or added (today's names; superseded for the build by §8b)
 
 There are 40 rows: **27 changed, 13 new**. A value of "same" means dark equals light.
 
@@ -172,80 +172,94 @@ Unchanged: `--accent-ink` light, `--surface` light, `--t-xs`…`--t-xl`.
 - `ui.js:21` `'awaiting-review'` → `warn`;
 - `ui.js:32` `in_progress` → `info`.
 
-## 8b. The same tokens on .523's names
+## 8b. The fresh look on .523's frozen names
 
-**Source:** .523 r1, read from `/srv/review-snapshot/k523/r1-design/docs/design/`: `WEB_LOOK_DESIGN.md` (cited below as W, by section and line) and `web-look/proposed.css` (cited as P, by line). .523 renames no token:
-- **Colours:** "Tokens are unchanged except one AA fix" (W §3 l.69). Dark "keeps app.css's token set" (W §8 l.167-169).
-- **Other tokens:** it adds `--t-2xs` and a spacing scale, and changes the values of `--t-2xl` and light `--warn` (W §9 l.175-180).
+**Source and status:**
+- .523's groundwork is approved at c6c8eb3e on b08ca8d4, and its token names are frozen. The frozen list comes from the coordinator's summary of .523 r2.
+- I read .523 r1 (`WEB_LOOK_DESIGN.md` = W, `web-look/proposed.css` = P, at `/srv/review-snapshot/k523/r1-design/`). Neither c6c8eb3e nor `tests/test_site_look_523.py` is readable from this lane, so the build re-reads both first.
+- **This section supersedes §8 for the build.** §8 keeps the original proposal against today's names.
 
-So 33 of the 40 rows land on a name .523 already has. The other 7 are additions. Two of my spacing names collide with .523's, so they move to .523's names.
+**Rule:** every fresh value goes on a frozen name. A size or colour the frozen set lacks is in *Proposed additions* below; nothing is added silently. Values that are on .523's scale are snapped to it (last table).
 
-| today's name | .523's name (cite) | fresh light | fresh dark |
+**On frozen names** (40 names; "=" means the build keeps .523's or today's value):
+
+| frozen name (.523 cite) | fresh light | fresh dark | note |
 |---|---|---|---|
-| `--ground` | `--ground` (W §3 l.69) | #f6f5f2 | #121116 |
-| `--surface` | `--surface` (W §3 l.69) | #ffffff | #1a1920 |
-| `--surface-2` | `--surface-2` (W §3 l.69) | #efede8 | #24232b |
-| `--ink` | `--ink` (W §3 l.69) | #1d1c21 | #ecebf0 |
-| `--ink-2` | `--ink-2` (W §3 l.69) | #3b3942 | #cac7d1 |
-| `--muted` | `--muted` (W §3 l.69) | #605c67 | #a19daa |
-| `--line` | `--line` (W §3 l.69) | #e6e3dd | #2c2a33 |
-| `--line-strong` | `--line-strong` (W §3 l.69; P:108) | #d3cfc7 | #3b3943 |
-| `--accent` | `--accent` (W §3 l.69) | #4b3fc0 | #aaa4ff |
-| `--accent-ink` | `--accent-ink` (W §3 l.69) | #ffffff | #121116 |
-| `--accent-soft` | `--accent-soft` (W §3 l.69) | #ecebfb | #2b2852 |
-| `--focus` | `--focus` (W §8 l.166) | #4b3fc0 | #c4c0ff |
-| `--ok` | `--ok` (W §3 l.69) | #1b6b41 | #6fcf97 |
-| `--ok-soft` | `--ok-soft` (W §3 l.69) | #e2f1e7 | #16301f |
-| `--warn` | `--warn` (W §3 l.84-86; P:44: .523 sets #9a5c00) | **#8a5200** (replaces .523's #9a5c00) | #f0b45a |
-| `--warn-soft` | `--warn-soft` (W §3 l.77) | #fbefd9 | #35270f |
-| `--crit` | `--crit` (W §3 l.69) | #b0251d | #ff8f85 |
-| `--crit-soft` | `--crit-soft` (W §3 l.69) | #fbe7e5 | #3d1b19 |
-| `--idle` | `--idle` (W §3 l.82) | #5f5b66 | #aaa6b2 |
-| `--idle-soft` | `--idle-soft` (W §3 l.80) | #eeece8 | #2a2930 |
-| `--shadow` | `--shadow` (not touched, W §9) | as §8 | as §8 |
-| `--radius` | `--radius` (not touched, W §9) | 8px | same |
-| `--rail` | `--rail` (not touched, W §10 l.187) | 248px | same |
-| `--font` | `--font` (not touched, W §9) | as §8 | same |
-| `--font-display` | `--font-display` (not touched, W §9) | serif stack, §3 | same |
-| `--mono` | `--mono` (not touched, W §9) | as §8 | same |
-| `--t-2xl` | `--t-2xl` (W §1 l.35; P:11: .523 sets 24px) | **28px**; 24px at ≤760 px (so .523's 24 becomes the phone size) | same |
-| `--s-1` | `--s-1` (W §2 l.49; P:22) | 4px | same |
-| `--s-2` | `--s-2` (W §2 l.49) | 8px | same |
-| `--s-3` | `--s-3` (W §2 l.49) | 12px | same |
-| `--s-4` | `--s-4` (W §2 l.49) | 16px | same |
-| my `--s-5` (24px) | **`--s-6`** (W §2 l.49: .523's `--s-5` is 20px) | 24px | same |
-| my `--s-6` (32px) | **`--s-8`** (W §2 l.49) | 32px | same |
-| my `--s-7` (48px) | none: **add `--s-12`**, in .523's 4 × N naming | 48px | same |
-| `--field-line` | none: **add** | #8a8691 | #6f6b79 |
-| `--info` | none: **add** | #0a6178 | #71c7e0 |
-| `--info-soft` | none: **add** | #dff0f5 | #13303a |
-| `--radius-sm` | none: **add** | 6px | same |
-| `--measure` | none: **add** | 1120px | same |
-| `--t-3xl` | none: **add** | 36px; 28px at ≤760 px | same |
+| `--ground` (W §3 l.69) | #f6f5f2 | #121116 | |
+| `--surface` | #ffffff | #1a1920 | |
+| `--surface-2` | #efede8 | #24232b | |
+| `--ink` | #1d1c21 | #ecebf0 | |
+| `--ink-2` | #3b3942 | #cac7d1 | |
+| `--muted` | #605c67 | #a19daa | |
+| `--line` | #e6e3dd | #2c2a33 | |
+| `--line-strong` | #d3cfc7 | #3b3943 | dividers only; control edges use `--field-line` |
+| `--accent` | #4b3fc0 | #aaa4ff | interaction only (§5) |
+| `--accent-ink` | #ffffff | #121116 | |
+| `--accent-soft` | #ecebfb | #2b2852 | |
+| `--focus` (W §8 l.166) | #4b3fc0 | #c4c0ff | |
+| `--ok` | #1b6b41 | #6fcf97 | |
+| `--ok-soft` | #e2f1e7 | #16301f | |
+| `--warn` (W §3 l.84-86; P:44) | **= #9a5c00** (.523's) | #f0b45a | Passes on the fresh backgrounds: 4.72:1 on fresh `--warn-soft` and 4.93:1 on `--ground`; see §9. My #8a5200 is withdrawn. |
+| `--warn-soft` | #fbefd9 | #35270f | |
+| `--crit` | #b0251d | #ff8f85 | |
+| `--crit-soft` | #fbe7e5 | #3d1b19 | |
+| `--idle` | #5f5b66 | #aaa6b2 | |
+| `--idle-soft` | #eeece8 | #2a2930 | |
+| `--shadow` | 0 1px 2px rgba(29,28,33,.05), 0 8px 24px rgba(29,28,33,.06) | 0 1px 2px rgba(0,0,0,.5), 0 8px 24px rgba(0,0,0,.35) | |
+| `--radius` | = 6px | = | Controls, chips and the rail links keep 6. The 8px boxes use a proposed `--radius-lg`. |
+| `--rail` | 248px | = | |
+| `--font` | today's stack + `"Noto Sans", "DejaVu Sans"` | = | |
+| `--font-display` | the serif stack of §3 | = | |
+| `--mono` | today's stack + `"DejaVu Sans Mono"` | = | |
+| `--t-2xs` (P:11) | = 11px | = | No fresh rule uses it: table heads and rail labels move to `--t-xs`, sentence case. |
+| `--t-xs` `--t-sm` `--t-md` `--t-lg` `--t-xl` | = 12 / 13 / 14 / 16 / 20 | = | |
+| `--t-2xl` (W §1 l.35; P:11) | = 24px | = | The h1 on the phone, and the sign-in wordmark |
+| `--s-1` `--s-2` `--s-3` `--s-4` (W §2 l.49; P:22) | = 4 / 8 / 12 / 16 | = | |
+| `--s-5` `--s-6` `--s-8` | = 20 / 24 / 32 | = | There is no `--s-7`. |
 
-**Tokens .523 has and this note does not:**
-- **`--t-2xs`** (11px; W §1 l.31, P:11): the fresh look has no 11 px text (§3), so set it to **12px**. Table heads and rail labels become 12 px sentence case. Remove the token once nothing uses it.
-- **`--s-5`** (20px; W §2 l.49, P:22): keep it at **20px**. No fresh rule uses it, but .523's rules that do (P:27) are replaced by the fresh values below.
+**Proposed additions** (8 names; each needs the coordinator's yes before the build adds it):
 
-**Additions .523 lacks:** `--field-line`, `--info`, `--info-soft`, `--radius-sm`, `--measure`, `--t-3xl`, `--s-12`. That is 7 names.
+| proposed | light | dark | why the frozen set lacks it | where it is used |
+|---|---|---|---|---|
+| `--field-line` | #8a8691 | #6f6b79 | `--line-strong` on white is 1.62:1, so control edges fail WCAG 1.4.11 (3:1); `--line-strong` must stay faint for dividers. | input, select, button, seg and switch borders (app.css:143, :157, :171-173) |
+| `--info` | #0a6178 | #71c7e0 | Today "In progress" borrows `--accent` (ui.js:32), so the accent means both "click" and "a state" (§5). | the In progress chip and dot |
+| `--info-soft` | #dff0f5 | #13303a | the chip background for `--info` | the In progress chip |
+| `--radius-lg` | 8px | = | Boxes that mean something (§4) read softer than controls. | `.state`, the contribution box, the facts strip, dialogs, the sign-in fields |
+| `--measure` | 1120px | = | Main has no maximum width today (app.css:106); lines run 1,000+ px at wide screens. | `.page` max-width |
+| `--s-12` | 48px | = | The scale stops at 32, and the page foot and sign-in panel need more air. Named in .523's 4 × N scheme. | `.main` bottom padding; sign-in panel padding |
+| `--t-3xl` | 28px | = | The desktop h1 of the chosen look is 28. `--t-2xl` is now 24 and stays the phone h1. | h1 ≥761 px; key number ≤760 px |
+| `--t-4xl` | 36px | = | the key number is the page's one large figure | key number ≥761 px; sign-in headline (mock-up 34, snapped to 36) |
 
-**Fixes .523 already makes: "kept from .523", so the build does each once:**
+In §3 and §8 the 36px token was called `--t-3xl`. On the frozen scale it is `--t-4xl`, and 28 is `--t-3xl`.
 
-| fix | .523 (cite) | fresh look |
+**Snapped to .523's scale** (the mock-up used literals; the build uses these, with no new token):
+
+| where | mock-up | build |
 |---|---|---|
-| A chip wraps inside its cell (the defect that started .523) | W §4 l.97-102, §6; P:51-58 | **Kept from .523.** The fresh chip changes only tone, radius and height. The mock-up's `white-space: nowrap` chip is *not* built. |
-| who-acts is plain wrapping text in a cell | W §4 l.103-104; P:60-61 | **Kept from .523.** Fresh adds `.you` (**You** in the accent) and drops the `→ ` prefix (P:61), as the mock-up shows. `test_site_defects_504.py:120` still holds. |
-| Row dividers | No rule of its own: today's `td` border (app.css:186), plus the stacked-row divider (P:91) | **Kept from .523.** Fresh changes only the colour (`--line`), and adds the strong rule above the table and the 3 px "yours" bar. |
-| Sidebar height | Rail gap 18 → 14 (W §2 l.55; P:32). There is no height rule; the sticky 100vh rail with overflow is today's (app.css:84). | **Kept from .523 (14 px).** The mock-up used 22 px; the build takes 14, so the longer .522 rail fits a 700 px window. This is the one place the build differs from the chosen mock-up. |
-| Phone stacking of both task tables | W §5 l.125-130; P:88-102 | **Kept from .523.** Fresh adds only the updated time, right-aligned on the state row. |
-| Table widths fit the room (no 900/1000 px min-width) | W §5 l.117-121; P:70-79 | **Kept from .523.** |
-| Numbers and times right-aligned | W §5 l.123-124; P:84-85 | **Kept from .523.** |
-| A long h1 wraps | W §1 l.40-41; P:17 | **Kept from .523.** |
-| Label classes lose their caps | W §1 l.37-39; P:14-16 | **Kept from .523, and extended** to `th` and `.rail-label` (.523 keeps 11 px caps there). |
-| Light warn passes AA | W §3 l.84-86; P:44 (#9a5c00) | **Replaced** by #8a5200: 5.61:1 on warn-soft, against .523's 4.76. |
-| `.empty` has a dashed border | W §7 l.157-159; P:108 | **Kept from .523.** Fresh adds the `--ground` fill, the icon and an action (§6). |
-| The agent grid never overflows | P:82 | **Kept from .523** until .522's Agents table replaces the cards. |
-| Density values (`.main` padding 20/28, `.stack` gap 16, `td` 8/12) | W §2 l.53-57; P:26-38 | **Not kept.** The fresh values win: `.main` 32/40, sections 36 apart, `td` 12. James chose the calmer density. |
+| sections apart | 36 / 28 phone | `--s-8` 32 / `--s-6` 24 |
+| `.main` padding | 32 40 64 / 20 16 48 phone | `--s-8` `--s-8` `--s-12` / `--s-5` `--s-4` `--s-12` |
+| page head gap / bottom | 8 32 / 24 (18 phone) | `--s-2` `--s-8` / `--s-6` (`--s-4`) |
+| `th` / `td` padding | 10 12 / 12 | `--s-2` `--s-3` / `--s-3` |
+| task-page column gap, side gap | 40, 24 | `--s-8`, `--s-6` |
+| `.state` padding | 18 20 | `--s-4` `--s-5` |
+| sign-in panel / form gap | 48 56 / 22 | `--s-12` / `--s-5` |
+| wordmark rail / sign-in / phone / topbar | 19 / 24 / 22 / 17 | `--t-xl` / `--t-2xl` / `--t-xl` / `--t-lg` |
+| rail gap | 22 | 14, .523's literal (P:32); see open point 1 in plan.md |
+
+**Already done by .523, so kept and not redone:**
+- the chip wraps inside its cell (W §4; P:51-58), with only the fresh tone, radius and height on top;
+- task tables: fixed layout, min-width 0, a 168 px state column, a 96 px right-aligned Updated column with `num` (W §5; P:70-85);
+- both task tables stack at ≤760 px (W §5 l.125-130; P:88-102). Fresh adds only the time, right-aligned on the state row;
+- dashed `.empty` (P:108), with the fresh fill, icon and action on top;
+- `.loading` size (P:109), replaced in slice (e) by the skeleton but on the same class;
+- the `.agent-grid` cap (P:82);
+- scoped `.main` padding (P:26-28), with fresh values under the same `min-width: 761px` scope;
+- `.page-head h1` overflow-wrap (P:17);
+- the rail column painted full height (r2);
+- who-acts as plain text (P:60-61); fresh adds `.you` and drops the `→ ` prefix;
+- the three de-capped label classes (P:14-16); fresh also de-caps `th` and `.rail-label`.
+
+**Not kept from .523:** its denser values (`.main` 20/28, `.stack` 16, `td` 8). The fresh values above win, because James chose the calmer density.
 
 ## 9. WCAG AA: computed contrast for every pair used
 
@@ -269,10 +283,10 @@ The ratios are WCAG 2.x relative luminance, computed by a script from the hex va
 | `idle` / `idle-soft` | chip Open | 5.61 | 6.04 | 4.5 ✓ |
 | `info` / `info-soft` | chip In progress | 5.99 | 7.24 | 4.5 ✓ |
 | `ok` / `ok-soft` | chip Approved | 5.57 | 7.48 | 4.5 ✓ |
-| `warn` / `warn-soft` | chip Awaiting review, Needs setup | 5.61 | 7.86 | 4.5 ✓ |
+| `warn` / `warn-soft` | chip Awaiting review, Needs setup | 4.72 | 7.86 | 4.5 ✓ |
 | `crit` / `crit-soft` | chip Changes requested | 5.65 | 6.95 | 4.5 ✓ |
 | `ok` / `ground` | fact done | 5.97 | 9.89 | 4.5 ✓ |
-| `warn` / `ground` | fact now | 5.86 | 10.18 | 4.5 ✓ |
+| `warn` / `ground` | fact now | 4.93 | 10.18 | 4.5 ✓ |
 | `ok` / `surface` | diff + lines | 6.51 | 9.18 | 4.5 ✓ |
 | `crit` / `surface` | P0, diff − lines | 6.71 | 7.91 | 4.5 ✓ |
 | `ink` / `crit-soft` | error title | 14.24 | 12.93 | 4.5 ✓ |
@@ -283,7 +297,7 @@ The ratios are WCAG 2.x relative luminance, computed by a script from the hex va
 | `crit` / `crit-soft` | error icon and rule | 5.65 | 6.95 | 3 ✓ |
 | `ok` / `surface` | online dot | 6.51 | 9.18 | 3 ✓ |
 
-- **Lowest text pair: 5.57:1.** That is `muted` on `surface-2` (light) and the Approved chip (light).
+- **Lowest text pair: 4.72:1**, the Awaiting review chip in light mode (.523's frozen `--warn` #9a5c00 on fresh `--warn-soft`). It was 5.61 with my withdrawn #8a5200. The next lowest is 5.57, `muted` on `surface-2`.
 - **Lowest pair overall: 3.37:1**, the control edge in dark, against a 3:1 need.
 - **Today, for the same roles:**
   - muted on ground 5.31 / 7.02;
@@ -306,6 +320,8 @@ The ratios are WCAG 2.x relative luminance, computed by a script from the hex va
 - **Only six pages are drawn.** The rest (Reviews, Records, Rooms, Lanes, Settings, Set up, How) would take the same header, table and state patterns. They are not mocked.
 
 ## 11. Build slices
+
+**Superseded by the build plan** (11-06, base .523's c6c8eb3e). That plan uses the frozen names of §8b. It also runs the AA re-measure as a repo test behind .523's `ORCHESTRA_WEB_TEST_BROWSER` switch, so the "no browser harness" remark below is out of date. The table below is kept for its file:line list.
 
 These follow the coordinator's order. Each one needs .523's names landed first (§8b). Line numbers are at b08ca8d4.
 - **Structure is .522's:** the rail, tabs, switcher, the Agents table and the Project › People/Agents sections are built by .522. These slices only style what .522 renders and move nothing.
