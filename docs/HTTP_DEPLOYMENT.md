@@ -2984,13 +2984,18 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   `coordinates: [{project, effective}]`, the agent's coordinator grants in projects its
   owner is a member of and whether each has effect now, and `coordinate_grantable_projects`,
   the sorted list of unarchived granted project IDs where the signed-in caller may newly
-  grant this agent coordination now (`PUT /v1/projects/{project}/agents/{id}/coordinator`:
-  the agent is enabled, the agent's owner is a member of the project with coordinator or
-  owner role — the same owner-member rule as `coordinates`, so a non-member superuser grants
-  on the Members page only — the agent does not already hold an effective grant there, and
-  the caller holds `project.admin`). Only the agent's owner, or a superuser, signed in as a
-  person sees `coordinates` and a populated `coordinate_grantable_projects`; any other
-  caller and any credential read (`/v1/agents/me` and `/v1/agents/me/next`) receives
+  grant this agent coordination in the set-up wizard (`PUT /v1/projects/{project}/agents/{id}/coordinator`:
+  the agent is enabled, the agent's owner is a member of the project with `coordinator` or
+  `owner` role or as a superuser — the same owner-member rule as `coordinates` — the agent
+  does not already hold an effective grant there, and the caller holds `project.admin`).
+  Because both `coordinate_grantable_projects` and `coordinates` require the agent's owner
+  to be in the project's memberships, a superuser owner who is not a member of the project
+  grants on the project's Members & settings page only, and the set-up wizard still writes
+  the worker's files until the owner is added as a member of the project. Only the agent's
+  owner, or a superuser, signed in as a person can read `GET /v1/agents/{id}` and
+  `GET /v1/agents` (another person receives `404` on `GET /v1/agents/{id}` and sees only
+  their own agents on `GET /v1/agents`; a credential receives `403` on both), while
+  credential self-reads (`/v1/agents/me` and `/v1/agents/me/next`) receive
   `coordinate_grantable_projects: []` and no `coordinates` field. In the set-up
   wizard, when `coordinate_grantable_projects` is non-empty and the agent does not yet hold
   an effective coordinator grant, the role screen offers `Coordinator of <project>` choices

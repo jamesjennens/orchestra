@@ -506,7 +506,7 @@ d = await openWizard();
 await d.wizard.next();
 out.coordinatorSetupHintPresentWithoutGrant = attr(d, 'data-role-coordinator-help', 'true').length === 1
   && attr(d, 'data-role-coordinator-help', 'true')[0].textContent
-    === "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again.";
+    === "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.";
 // A grant without effect still uses the non-coordinator screen and its grant hint.
 store.clear();
 server.coordinates = [{ project: 'p1', effective: false }];
@@ -552,7 +552,8 @@ d = await openWizard();
 await d.wizard.next();
 const nonMemberOnlyHasNoChoice = !windowsChoice(d, 'setup-role', 'coordinator:p3')
   && !button(d, 'grant-coordinator')
-  && attr(d, 'data-role-coordinator-help', 'true').length === 1;
+  && attr(d, 'data-role-coordinator-help', 'true').length === 1
+  && attr(d, 'data-role-coordinator-help', 'true')[0].textContent.includes("The agent's owner must also be a member of that project, or this set-up still writes the worker's files.");
 store.clear();
 server.agentProjects = ['p1', 'p2', 'p3'];
 server.coordinateGrantableProjects = ['p1', 'p2', 'p3'];
@@ -655,25 +656,33 @@ out.rereadWithoutEffectiveGrantSaysSoInOneLine = grantError.hidden === false
   && !noEffectFiles.prompt.includes('## You coordinate')
   && noEffectFiles.screenText.includes('Claim exactly one that nobody holds')
   && !noEffectFiles.screenText.includes('## You coordinate');
-// Note (1): When P is no longer grantable after the re-read, state.coordinatorProject is cleared and
-// the screen re-renders so the hold line never names a missing button.
+// Note (1) & kittrial-5bb.541 (1, 3): When P is no longer grantable after the re-read, state.coordinatorProject
+// is cleared, the screen re-renders, the error says this set-up cannot tell and directs to Members & settings,
+// and the files screen keeps the worker's AGENT.md and setup prompt.
 server.dropFromGrantableOnReread = true;
 await button(d, 'grant-coordinator').dispatch('click');
 await tick(); await tick();
 server.dropFromGrantableOnReread = false;
 server.grantHasNoEffectOnReread = false;
 const errorShownAfterDrop = grantError.hidden === false
-  && grantError.textContent === 'Kestrel does not hold an active coordinator grant for Alpha.';
+  && grantError.textContent === "This set-up cannot tell whether Kestrel holds a coordinator grant for Alpha. Check the project's Members & settings page.";
 const choiceRemovedAfterDrop = !windowsChoice(d, 'setup-role', 'coordinator:p1')
   && Boolean(windowsChoice(d, 'setup-role', 'coordinator:p2'))
   && !button(d, 'grant-coordinator')
   && windowsChoice(d, 'setup-role', 'worker').checked === true;
+const droppedFiles = await readFilesGuideAndPrompt(d);
 const advancedAfterDrop = await d.wizard.next();
 out.rereadWithoutGrantableProjectClearsChoiceAndRerenders = errorShownAfterDrop
   && choiceRemovedAfterDrop
   && advancedAfterDrop === true
   && roleStatus.hidden === true
-  && screenOf(d) !== 'role';
+  && screenOf(d) !== 'role'
+  && Boolean(droppedFiles.prompt)
+  && droppedFiles.prompt.includes('role is worker')
+  && droppedFiles.prompt.includes('Claim exactly one that nobody holds')
+  && !droppedFiles.prompt.includes('## You coordinate')
+  && droppedFiles.screenText.includes('Claim exactly one that nobody holds')
+  && !droppedFiles.screenText.includes('## You coordinate');
 for (const open of openDialogs()) await open.close();
 store.clear();
 server.coordinateGrantableProjects = ['p1', 'p2'];
@@ -682,18 +691,25 @@ await d.wizard.next();
 await windowsChoice(d, 'setup-role', 'coordinator:p1').dispatch('change');
 await tick();
 const grantErrorAfterReopen = attr(d, 'data-wizard-error', 'true')[0];
-// Note (3): If the re-read fails after a committed PUT, don't say 'could not confirm whether this was saved';
-// say the grant may be saved and re-read before retrying.
+const roleStatusAfterReopen = attr(d, 'data-wizard-check-status', 'true')[0];
+// Note (3) & kittrial-5bb.541 (4): If the re-read fails after a committed PUT, don't say 'could not confirm
+// whether this was saved'; say the grant may be saved and re-read before retrying, and Next agrees.
 server.grantHasNoEffectOnReread = true;
 server.failAgentReread = true;
 await button(d, 'grant-coordinator').dispatch('click');
 await tick(); await tick();
 server.failAgentReread = false;
 server.grantHasNoEffectOnReread = false;
+const heldAfterFailedReread = await d.wizard.next();
 out.failedRereadAfterCommittedPutSaysMayBeSavedAndRereadBeforeRetrying = grantErrorAfterReopen.hidden === false
   && grantErrorAfterReopen.textContent.includes('The coordinator grant for Alpha may be saved, but re-reading Kestrel failed. Re-open this set-up to re-read before retrying.')
   && grantErrorAfterReopen.textContent.includes('req_reread_500')
-  && !grantErrorAfterReopen.textContent.includes('could not confirm whether this was saved');
+  && !grantErrorAfterReopen.textContent.includes('could not confirm whether this was saved')
+  && heldAfterFailedReread === false
+  && screenOf(d) === 'role'
+  && roleStatusAfterReopen.hidden === false
+  && roleStatusAfterReopen.textContent === 'The coordinator grant for Alpha may be saved, but re-reading Kestrel failed. Re-open this set-up to re-read, or choose another role before continuing.'
+  && !roleStatusAfterReopen.textContent.includes('Click “Make coordinator');
 server.coordinatorGrants.length = 0;
 // Note 1 (r2): Button is disabled while PUT is in flight so a double-click sends only one PUT.
 let seenDisabledDuringFlight = false;

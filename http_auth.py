@@ -3701,9 +3701,11 @@ class Service:
         # has effect now, so the set-up wizard writes a coordinator AGENT.md. Only for the agent's owner
         # (or a superuser) signed in as a person: never for another member, and never for a credential,
         # the agent's own included. Computed live; only projects the owner is a member of.
-        # kittrial-5bb.521: coordinate_grantable_projects lists the agent's projects where THIS caller
-        # may grant coordination now (same live checks as PUT /v1/projects/{pid}/agents/{aid}/coordinator);
-        # empty for anyone who may not grant, and never reveals another project's existence.
+        # kittrial-5bb.521: coordinate_grantable_projects lists the unarchived projects on this agent
+        # where THIS caller may newly grant coordination in the set-up wizard (the PUT authority checks,
+        # plus the agent's owner is a project member so agent_coordinates can report the resulting grant,
+        # and no effective grant is already held); empty on credential reads and whenever nothing is
+        # wizard-grantable, and never reveals another project's existence.
         if principal.credential_id is None and (principal.superuser or principal.user_id == agent['owner']):
             view['coordinates'] = self.agent_coordinates(agent)
             view['coordinate_grantable_projects'] = self.coordinate_grantable_projects(
@@ -3713,7 +3715,7 @@ class Service:
         return view
 
     def coordinate_grantable_projects(self, agent, principal, moment=None):
-        """Unarchived projects on ``agent`` where ``principal`` may newly grant coordination now."""
+        """Unarchived projects on ``agent`` where ``principal`` may newly grant coordination in the set-up wizard (``agent['owner']`` is a project member, no effective grant is already held, and the ``PUT`` coordinator-grant checks pass)."""
         if principal is None or principal.via == 'credential' or principal.credential_id is not None:
             return []
         if not (principal.superuser or principal.user_id == agent.get('owner')):
@@ -3725,6 +3727,10 @@ class Service:
             moment = self._expiry_now() if moment is None else moment
             found = []
             for project_id in sorted({p for p in (agent.get('projects') or ()) if isinstance(p, str)}):
+                # Unlike PUT /v1/projects/{pid}/agents/{aid}/coordinator (which allows a superuser
+                # owner who is not in memberships[project_id]), the wizard only offers projects the
+                # agent's owner is a member of, matching agent_coordinates so a grant given in the
+                # wizard is visible on re-read and produces the coordinator's AGENT.md.
                 if owner_id not in self.state.get('memberships', {}).get(project_id, {}):
                     continue
                 if not self._may_coordinate(project_id, agent):
