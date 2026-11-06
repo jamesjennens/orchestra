@@ -1463,38 +1463,63 @@ class AgentReadCostTests(AgentHarness):
         self.assertEqual(5, len(self.backend.own_calls))
 
     def test_two_requests_either_side_of_expiry_see_different_answers(self):
-        # kittrial-5bb.521 condition 1: a request moment is valid for one request only and
+        # kittrial-5bb.521 condition 1 & S9: a request moment is valid for one request only and
         # is never cached on the Service or across requests. Two requests on either side of
-        # a credential's expiry see different answers.
+        # a credential's expiry see different answers across all five read paths (full list,
+        # bounded page, single agent, /me, /me/next), including after a backward clock step.
         agent_id, secret, created = self.agent_secret(self.alex, projects=list(self.projects))
         cred_id = created['credential']['id']
         now = self.service._expiry_now()
         with self.service.store.lock:
             self.service.state['credentials'][cred_id]['expires_at'] = now + 30
             self.service.store.save()
-        before_list = self.request('GET', '/v1/agents', token=self.alex)
-        self.assertEqual(200, before_list.status, before_list.data)
-        before_item = next(item for item in before_list.data['items'] if item['id'] == agent_id)
-        self.assertTrue(before_item['credentials'][0]['working'])
-        self.assertFalse(before_item['credentials'][0]['revoked'])
-        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=secret).status)
+        for path in ('/v1/agents', '/v1/agents?limit=20'):
+            res = self.request('GET', path, token=self.alex)
+            self.assertEqual(200, res.status, (path, res.data))
+            item = next(a for a in res.data['items'] if a['id'] == agent_id)
+            self.assertTrue(item['credentials'][0]['working'], path)
+            self.assertFalse(item['credentials'][0]['revoked'], path)
+        one_before = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex)
+        self.assertEqual(200, one_before.status, one_before.data)
+        self.assertTrue(one_before.data['credentials'][0]['working'])
+        me_before = self.request('GET', '/v1/agents/me', token=secret)
+        self.assertEqual(200, me_before.status, me_before.data)
+        self.assertTrue(me_before.data['agent']['credentials'][0]['working'])
+        next_before = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, next_before.status, next_before.data)
 
         base_clock = time.time()
         self.service.store.clock = lambda: base_clock + 60
-        after_list = self.request('GET', '/v1/agents', token=self.alex)
-        self.assertEqual(200, after_list.status, after_list.data)
-        after_item = next(item for item in after_list.data['items'] if item['id'] == agent_id)
-        self.assertFalse(after_item['credentials'][0]['working'])
-        self.assertFalse(after_item['credentials'][0]['revoked'])
+        # Advance the monotone floor past expiry, then step the raw wall clock backward:
+        # the monotone half keeps the credential expired across all five read routes.
+        self.assertGreaterEqual(self.service._expiry_now(), now + 60)
+        self.service.store.clock = lambda: base_clock - 3600
+        for path in ('/v1/agents', '/v1/agents?limit=20'):
+            res = self.request('GET', path, token=self.alex)
+            self.assertEqual(200, res.status, (path, res.data))
+            item = next(a for a in res.data['items'] if a['id'] == agent_id)
+            self.assertFalse(item['credentials'][0]['working'], path)
+            self.assertFalse(item['credentials'][0]['revoked'], path)
+        one_after = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex)
+        self.assertEqual(200, one_after.status, one_after.data)
+        self.assertFalse(one_after.data['credentials'][0]['working'])
         self.assertEqual(401, self.request('GET', '/v1/agents/me', token=secret).status)
+        self.assertEqual(401, self.request('GET', '/v1/agents/me/next', token=secret).status)
 
     def test_agent_next_reads_every_granted_project_once(self):
         agent_id, secret, _ = self.agent_secret(self.alex, projects=list(self.projects))
         self.assertTrue(agent_id)
         self.backend.list_calls = []
         self.backend.own_calls = []
-        nxt = self.request('GET', '/v1/agents/me/next', token=secret)
+        expiry_calls = [0]
+        original_expiry_now = self.service._expiry_now
+        def counting_expiry_now():
+            expiry_calls[0] += 1
+            return original_expiry_now()
+        with mock.patch.object(self.service, '_expiry_now', side_effect=counting_expiry_now):
+            nxt = self.request('GET', '/v1/agents/me/next', token=secret)
         self.assertEqual(200, nxt.status, nxt.data)
+        self.assertLessEqual(expiry_calls[0], 2)
         self.assertEqual(5, len(self.backend.list_calls))
         # One owner-filtered own-task read per project, naming this agent's actor.
         actor = nxt.data['agent']['actor']

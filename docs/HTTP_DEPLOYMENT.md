@@ -2980,11 +2980,19 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   live memberships (everything when the owner is a superuser), intersected with the
   projects THAT reader can see, so the answer never reveals a project the reader cannot
   see. Only the agent's owner or a superuser can edit an agent, as before.
-- **A coordinator's AGENT.md** (kittrial-5bb.387): the agent read carries
+- **A coordinator's AGENT.md** (kittrial-5bb.387, kittrial-5bb.521): the agent read carries
   `coordinates: [{project, effective}]`, the agent's coordinator grants in projects its
-  owner is a member of and whether each has effect now. Only the agent's owner, or a
-  superuser, signed in as a person sees it; no other member and no credential (the agent's
-  own on `/v1/agents/me` included) does. The set-up wizard writes the coordinator's
+  owner is a member of and whether each has effect now, and `coordinate_grantable_projects`,
+  the sorted list of unarchived granted project IDs where the signed-in caller may newly
+  grant this agent coordination now (`PUT /v1/projects/{project}/agents/{id}/coordinator`:
+  the agent is enabled, its owner is a coordinator or owner of the project, the agent does
+  not already hold an effective grant there, and the caller holds `project.admin`). Only the
+  agent's owner, or a superuser, signed in as a person sees either field; no other member
+  and no credential (the agent's own on `/v1/agents/me` included) does. In the set-up
+  wizard, when `coordinate_grantable_projects` is non-empty and the agent does not yet hold
+  an effective coordinator grant, the role screen offers `Coordinator of <project>` choices
+  and an explicit `Make coordinator of <project>` button that calls the existing `PUT` route
+  and re-reads `GET /v1/agents/{id}`. The set-up wizard writes the coordinator's
   `.orchestra/AGENT.md` for an agent with an effective grant (guidance first, never claim a
   worker task, then deliveries awaiting review, approved work awaiting integration,
   checkpoints addressed to it, quiet lanes and lanes whose set wake time came due, with

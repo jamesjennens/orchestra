@@ -149,10 +149,10 @@ class AgentScopeFollowupTests(AgentHarness):
         inside = []
         real_scopes = self.service.agent_scopes
 
-        def scopes(agent):
+        def scopes(agent, moment=None):
             inside.append(0)
             try:
-                return real_scopes(agent)
+                return real_scopes(agent, moment=moment)
             finally:
                 inside.pop()
 
@@ -160,7 +160,7 @@ class AgentScopeFollowupTests(AgentHarness):
             if not inside:
                 return 0
             inside[-1] += 1
-            return 0 if inside[-1] == 1 else 100
+            return 100
 
         # Exercise the ordinary agent read, including metadata projection. Raw
         # time is deliberately different from the captured expiry instant.

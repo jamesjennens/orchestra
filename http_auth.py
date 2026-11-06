@@ -2183,7 +2183,10 @@ class Service:
         serializable authorization/revocation boundary: a revocation that commits
         before this call is observed here, so an in-flight mutation can never
         inherit authority the caller has already lost. Derived fields are refreshed
-        from live state rather than trusted from the original request.
+        from live state rather than trusted from the original request. A ``moment``
+        is this request's own :meth:`_expiry_now`; only read routes pass one; it
+        freezes only the monotone half of expiry; the raw half, revocation,
+        disablement and membership stay live.
         """
         if principal is None:
             raise unauthenticated()
@@ -2265,7 +2268,10 @@ class Service:
         it runs while ``store.lock`` is held and before the canonical write, so a
         revocation cannot interleave between the check and the write. The decision
         itself is :func:`http_authority.decide`, the same function the canonical
-        endpoint runs immediately before the effect.
+        endpoint runs immediately before the effect. A ``moment`` is this request's
+        own :meth:`_expiry_now`; only read routes pass one; it freezes only the
+        monotone half of expiry; the raw half, revocation, disablement and
+        membership stay live.
         """
         with self.store.lock:
             return self._check_authority_locked(principal, project_id, capability,
@@ -2289,10 +2295,10 @@ class Service:
             return None, decision['role']
         return self.state.get('projects', {}).get(project_id), decision['role']
 
-    def revalidate_authority(self, principal, moment=None):
+    def revalidate_authority(self, principal):
         """Refresh live authority or raise; used by the backend write boundary."""
         with self.store.lock:
-            return self._refresh_authority(principal, moment=moment)
+            return self._refresh_authority(principal)
 
     def session_expiry_view(self, principal):
         """The caller's own session window and deadlines, or ``None`` (kittrial-5bb.330).
@@ -3430,7 +3436,7 @@ class Service:
             raise invalid('The nudges scope is the nudge carrier\'s alone and is never combined with another scope')
         return tuple(names)
 
-    def agent_scopes(self, agent):
+    def agent_scopes(self, agent, moment=None):
         """What an agent may do, and where that is known from: ``(scopes, source)``.
 
         ``set``: the list on the agent record, written when the agent is made and by a renewal
@@ -3455,9 +3461,9 @@ class Service:
                                                   for scope in stored) or len(stored) != len(set(stored)):
                 return None, 'unknown'
             return tuple(stored), 'inferred' if agent.get('scopes_source') == 'inferred' else 'set'
-        now = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
-                 for credential in self._agent_credentials(agent) if self._credential_live(credential, now)}
+                 for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
         if len(lists) == 1:
             return next(iter(lists)), 'inferred'
         return None, 'unknown'
@@ -3644,7 +3650,7 @@ class Service:
         moment = self._expiry_now() if moment is None else moment
         owner_sees_path = bool(principal.superuser or
                                principal.user_id == agent['owner'])
-        scopes, source = self.agent_scopes(agent)
+        scopes, source = self.agent_scopes(agent, moment=moment)
         view = {
             'id': agent['id'], 'name': agent['name'], 'owner': agent['owner'],
             'owner_display_name': self._owner_name(agent['owner']),
@@ -3706,7 +3712,7 @@ class Service:
         return view
 
     def coordinate_grantable_projects(self, agent, principal, moment=None):
-        """Projects on ``agent`` where ``principal`` may grant coordination now (PUT .../coordinator)."""
+        """Unarchived projects on ``agent`` where ``principal`` may newly grant coordination now."""
         if principal is None or principal.via == 'credential' or principal.credential_id is not None:
             return []
         if not (principal.superuser or principal.user_id == agent.get('owner')):
@@ -3716,12 +3722,17 @@ class Service:
         with self.store.lock:
             moment = self._expiry_now() if moment is None else moment
             found = []
-            for project_id in sorted(set(agent.get('projects') or ())):
+            for project_id in sorted({p for p in (agent.get('projects') or ()) if isinstance(p, str)}):
                 if not self._may_coordinate(project_id, agent):
                     continue
+                held = coordinator_grant(self.state, project_id, agent['id'])
+                if held is not None and grant_issuer_holds(self.state, project_id, held):
+                    continue
                 try:
-                    self._check_authority_locked(principal, project_id, CAP_PROJECT_ADMIN, moment=moment)
+                    project, _ = self._check_authority_locked(principal, project_id, CAP_PROJECT_ADMIN, moment=moment)
                 except HttpError:
+                    continue
+                if isinstance(project, dict) and project.get('archived'):
                     continue
                 found.append(project_id)
             return found
@@ -3741,7 +3752,7 @@ class Service:
                           and grant_issuer_holds(self.state, project_id, grant)})
         return found
 
-    def project_agent_view(self, agent, project_id=None, moment=None):
+    def project_agent_view(self, agent, project_id=None):
         """The *project-owner* view of an agent active in their project.
 
         Deliberately narrower than :meth:`agent_view`. A project owner governs
@@ -3753,7 +3764,7 @@ class Service:
         expose only id, expiry, working/revoked and seven-day warning, so this owner
         can extend a live key without seeing its label, scopes, path, hash or secret.
         """
-        moment = self._expiry_now() if moment is None else moment
+        moment = self._expiry_now()
         view = {
             'id': agent['id'],
             'name': agent['name'],
@@ -5478,7 +5489,7 @@ class Service:
         moment = self._expiry_now() if moment is None else moment
         requested = self._scope_names(scopes)
         label = self._credential_label(label)
-        has, source = self.agent_scopes(agent)
+        has, source = self.agent_scopes(agent, moment=moment)
         if requested is not None and source in ('inferred', 'unknown') and principal.user_id != agent['owner']:
             raise forbidden(self.SCOPES_OWNER_REQUIRED)
         if requested is None:
@@ -5594,7 +5605,7 @@ class Service:
                 change.created(self.state['credentials'], credential['id'])
                 change.created(self.state['credential_tokens'], credential['token_hash'])
                 self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
-                                             self.agent_scopes(agent), request_id)
+                                             self.agent_scopes(agent, moment=moment), request_id)
                 event = self.audit(request_id, principal, 'agents.created', 'committed',
                                    actor=self.agent_actor(agent))
                 event.update(agent_id=agent_id, owner_id=owner_id, created_by=principal.user_id)
@@ -5628,7 +5639,7 @@ class Service:
             agents = [a for a in self.state['agents'].values()
                       if principal.superuser or a['owner'] == principal.user_id]
             if unconfirmed:
-                agents = [a for a in agents if self.agent_scopes(a)[1] != 'set']
+                agents = [a for a in agents if self.agent_scopes(a, moment=moment)[1] != 'set']
             agents.sort(key=lambda a: a['id'])
             return [self.agent_view(a, principal, moment=moment) for a in agents[offset:offset + limit]], len(agents)
 

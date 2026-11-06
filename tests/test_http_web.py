@@ -2426,9 +2426,11 @@ console.log(JSON.stringify({
             'nonOwnerHasNoCoordinatorChoice',
             'ownerSeesCoordinatorChoiceForEachGrantableProject',
             'selectingCoordinatorRadioShowsButtonWithoutGranting',
+            'coordinatorChoiceHoldsNextWithOneLine',
             'switchingCoordinatorProjectUpdatesButtonWithoutWriting',
             'switchingBackToWorkerHidesButtonAndRevokesNothing',
             'refusedCoordinatorGrantShowsErrorAndLeavesWorkerGuide',
+            'rereadWithoutEffectiveGrantSaysSoInOneLine',
             'clickingMakeCoordinatorGrantsAndShowsHeldReadOnly',
             'clickingMakeCoordinatorUpdatesGuideAndPromptFromStart',
         }, set(observed))

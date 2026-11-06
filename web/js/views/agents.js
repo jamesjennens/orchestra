@@ -973,9 +973,37 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     h('div', { class: 'dialog-foot' }, skipBtn, backBtn, nextBtn, doneBtn));
 
   // ---- the screens -------------------------------------------------------------------------
+  const projectsById = new Map(((ctx && ctx.projects) || []).filter((p) => p && typeof p.id === 'string').map((p) => [p.id, p]));
+  const projectLabel = (pid) => {
+    const found = projectsById.get(pid);
+    return (found && typeof found.name === 'string' && found.name.trim()) ? found.name : pid;
+  };
+  const grantRow = h('div', { class: 'copy-row', 'data-coordinator-grant-row': 'true', hidden: true });
+  function syncGrantRow() {
+    const grantable = payload.coordinateGrantableProjects || [];
+    const pid = state.coordinatorProject;
+    if (!pid || !grantable.includes(pid)) {
+      grantRow.hidden = true;
+      grantRow.replaceChildren();
+      return;
+    }
+    const btn = h('button', {
+      type: 'button',
+      class: 'primary',
+      'data-action': 'grant-coordinator',
+      'data-project': pid,
+      disabled: Boolean(state.grantingCoordinator),
+      onclick: () => grantCoordinatorRole(pid, btn),
+    }, 'Make coordinator of ' + projectLabel(pid));
+    grantRow.replaceChildren(btn);
+    grantRow.hidden = false;
+  }
   function choice(name, value, label, checked, onchange) {
-    return h('label', { class: 'small', 'data-choice': name + ':' + value },
-      h('input', { type: 'radio', name, value, checked, onchange }), ' ', label);
+    const input = h('input', { type: 'radio', name, value, checked, onchange: (event) => {
+      if (typeof input.focus === 'function') input.focus();
+      onchange(event);
+    } });
+    return h('label', { class: 'small', 'data-choice': name + ':' + value }, input, ' ', label);
   }
   const screens = {
     system: () => [
@@ -996,9 +1024,10 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     role: () => setupText.coordinating(payload) ? [
       h('p', { class: 'small', 'data-role-coordinator': 'true' },
         `${payload.name} holds the coordinator grant for ${payload.coordinates.join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
-      more(h('p', { class: 'small muted' }, 'The grant is given and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.')),
+      more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Members & settings page, and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
     ] : (() => {
       const grantable = payload.coordinateGrantableProjects || [];
+      syncGrantRow();
       return [
         h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
         grantable.length === 0 ? h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
@@ -1006,12 +1035,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
         h('div', { class: 'copy-row', 'data-role-choice': 'true' },
           choice('setup-role', 'worker', 'Works on tasks', !state.coordinatorProject && state.role === 'worker', () => selectRole('worker')),
           choice('setup-role', 'reviewer', 'Reviews deliveries', !state.coordinatorProject && state.role === 'reviewer', () => selectRole('reviewer')),
-          ...grantable.map((pid) => choice('setup-role', 'coordinator:' + pid, 'Coordinator of ' + pid, state.coordinatorProject === pid, () => selectCoordinatorProject(pid)))),
-        state.coordinatorProject && grantable.includes(state.coordinatorProject)
-          ? h('div', { class: 'copy-row', 'data-coordinator-grant-row': 'true' },
-              h('button', { type: 'button', class: 'primary', 'data-action': 'grant-coordinator', 'data-project': state.coordinatorProject, onclick: () => grantCoordinatorRole(state.coordinatorProject) },
-                'Make coordinator of ' + state.coordinatorProject))
-          : null,
+          ...grantable.map((pid) => choice('setup-role', 'coordinator:' + pid, 'Coordinator of ' + projectLabel(pid), state.coordinatorProject === pid, () => selectCoordinatorProject(pid)))),
+        grantRow,
         more(h('p', { class: 'small muted' }, `This is saved as ${payload.name}’s role on Orchestra. A worker keeps the “Deliver and review” scope, which it needs to deliver its own work; only the reviewer role adds other people’s deliveries to its list.`)),
       ];
     })(),
@@ -1143,40 +1168,53 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   }
 
   async function selectRole(role) {
-    const hadCoordinator = state.coordinatorProject !== null;
     state.coordinatorProject = null;
-    if (hadCoordinator) render();
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    syncGrantRow();
     await saveRole(role);
   }
 
   function selectCoordinatorProject(pid) {
     state.coordinatorProject = pid;
     wizard.clearError();
-    render();
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    syncGrantRow();
   }
 
-  async function grantCoordinatorRole(pid) {
+  async function grantCoordinatorRole(pid, btn) {
+    if (state.grantingCoordinator) return;
     wizard.clearError();
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
     if (!ctx || !ctx.api || typeof ctx.api.grantCoordinator !== 'function' || !payload.agentId) return;
+    state.grantingCoordinator = true;
+    if (btn) btn.disabled = true;
+    let fresh;
     try {
       await ctx.api.grantCoordinator(pid, payload.agentId);
+      fresh = await ctx.api.agent(payload.agentId);
     } catch (error) {
       wizard.showError(error);
       return;
+    } finally {
+      state.grantingCoordinator = false;
+      if (btn) btn.disabled = false;
     }
-    const current = Array.isArray(agent.coordinates) ? agent.coordinates.slice() : [];
-    if (!current.some((c) => c && c.project === pid && c.effective === true)) {
-      current.push({ project: pid, effective: true });
-    }
-    agent.coordinates = current;
-    if (Array.isArray(agent.coordinate_grantable_projects)) {
-      agent.coordinate_grantable_projects = agent.coordinate_grantable_projects.filter((p) => p !== pid);
-    }
+    const freshAgent = (fresh && fresh.agent) || fresh || {};
+    Object.assign(agent, freshAgent);
     payload = setupText.secretlessPayload({ ...(source || {}), agent }, location.origin);
     PAYLOAD_META.set(payload, { certificate, bridgeServer });
+    files[0][1] = setupText.agentJson(payload);
     files[1][1] = setupText.agentGuide(payload, { hasCertificate });
     if (dialog.wizard) {
       dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
+    }
+    if (!payload.coordinates.includes(pid)) {
+      wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));
+      syncGrantRow();
+      return;
     }
     state.coordinatorProject = null;
     render();
@@ -1226,6 +1264,13 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   }
 
   async function next() {
+    if (state.screen === 'role' && state.coordinatorProject && !setupText.coordinating(payload)) {
+      checkStatus.setAttribute('data-check-state', 'failed');
+      checkStatus.textContent = `Click “Make coordinator of ${projectLabel(state.coordinatorProject)}” first, or choose another role before continuing.`;
+      checkStatus.hidden = false;
+      skipBtn.hidden = true;
+      return false;
+    }
     if (CHECKED_SCREENS.includes(state.screen) && !state.checkVerified) {
       if (!(await runCheck())) return false;
     }

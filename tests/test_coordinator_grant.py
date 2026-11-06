@@ -992,6 +992,65 @@ class WizardCoordinatorGrantTests(Grants):
                                            token=self.tokens['olive']).status)
         disabled_read = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=self.tokens['olive'])
         self.assertEqual([], disabled_read.data['coordinate_grantable_projects'])
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/enable' % olive_agent_id, {},
+                                           token=self.tokens['olive']).status)
+
+        # 6. S4: Once the agent holds an effective coordinator grant in Alpha, Alpha is omitted from
+        #    coordinate_grantable_projects (both for a member owner and for a superuser who is not a
+        #    member of the project); a dormant grant whose issuer lost owner/superuser remains grantable.
+        self.assertEqual(200, self.grant(agent_id=olive_agent_id, token=self.tokens['olive']).status)
+        for token in (self.tokens['olive'], self.admin):
+            after_grant = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=token)
+            self.assertEqual(200, after_grant.status, after_grant.data)
+            self.assertEqual([], after_grant.data['coordinate_grantable_projects'])
+        # Superuser-not-member case: admin owns an agent in olive_only (where admin is not in memberships[olive_only]).
+        olive_only = self.create_project(self.tokens['olive'], 'OliveOnly')
+        admin_agent_res = self.request('POST', '/v1/agents',
+                                       {'name': 'AdminHawk', 'projects': [olive_only]},
+                                       token=self.admin)
+        self.assertEqual(201, admin_agent_res.status, admin_agent_res.data)
+        admin_agent_id = admin_agent_res.data['agent']['id']
+        self.assertEqual([olive_only], admin_agent_res.data['agent']['coordinate_grantable_projects'])
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/agents/%s/coordinator' % (olive_only, admin_agent_id),
+                                           {}, token=self.admin).status)
+        admin_after = self.request('GET', '/v1/agents/%s' % admin_agent_id, token=self.admin)
+        self.assertEqual(200, admin_after.status, admin_after.data)
+        self.assertEqual([], admin_after.data['coordinate_grantable_projects'])
+        self.assertEqual([], admin_after.data['coordinates'])
+        # Dormant grant (issuer lost owner authority): Alpha becomes grantable again so a current owner can re-grant.
+        with self.service.store.lock:
+            self.service.state['coordinator_grants'][self.project][olive_agent_id]['granted_by'] = self.ids['cora']
+            self.service.store.save()
+        dormant_read = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=self.tokens['olive'])
+        self.assertEqual([self.project], dormant_read.data['coordinate_grantable_projects'])
+
+        # 7. S5: An archived project is omitted from coordinate_grantable_projects.
+        self.assertEqual(200, self.grant(agent_id=olive_agent_id, method='DELETE', token=self.tokens['olive']).status)
+        with self.service.store.lock:
+            self.service.state['projects'][self.project]['archived'] = True
+            self.service.store.save()
+        archived_read = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=self.tokens['olive'])
+        self.assertEqual(200, archived_read.status, archived_read.data)
+        self.assertEqual([], archived_read.data['coordinate_grantable_projects'])
+        with self.service.store.lock:
+            self.service.state['projects'][self.project]['archived'] = False
+            self.service.store.save()
+
+        # 8. S2: A mixed stored projects list such as [pid, None] does not raise 500 on GET /v1/agents/{aid},
+        #    GET /v1/agents (owner or superuser), or a repair PATCH /v1/agents/{aid}.
+        with self.service.store.lock:
+            self.service.state['agents'][olive_agent_id]['projects'] = [self.project, None]
+            self.service.store.save()
+        for path, token in (('/v1/agents/%s' % olive_agent_id, self.tokens['olive']),
+                            ('/v1/agents', self.tokens['olive']),
+                            ('/v1/agents', self.admin)):
+            res = self.request('GET', path, token=token)
+            self.assertEqual(200, res.status, (path, res.data))
+        repaired = self.request('PATCH', '/v1/agents/%s' % olive_agent_id,
+                                {'projects': [self.project]}, token=self.tokens['olive'])
+        self.assertEqual(200, repaired.status, repaired.data)
+        self.assertEqual([self.project], repaired.data['projects'])
+        self.assertEqual([self.project], repaired.data['coordinate_grantable_projects'])
 
     def test_no_credential_or_outsider_can_see_or_grant_coordinator(self):
         # 1. An agent token (GET /v1/agents/me, GET /v1/agents/{aid}, PUT .../coordinator).
