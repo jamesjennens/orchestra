@@ -64,6 +64,13 @@ That failure is now impossible twice over: the padding override is scoped, and
 the grid floor is capped — `minmax(min(340px, 100%), 1fr)` — so a card can
 never exceed its container at any width.
 
+The rail is sticky at `100vh`, so on a page taller than the viewport its
+background — and the column divider — stopped at the fold (step-2 fix 2;
+already so on main). The shell now paints the full-height column itself: a
+surface → line → transparent gradient exactly `var(--rail)` wide, scoped
+≥761 px. Pixel-verified below the fold on the tall task page: rgb(255, 255,
+255) — the surface — where the ground `#f5f7fa` showed before.
+
 ## 3. Colour
 
 Tokens are unchanged except one AA fix. Every pair below is measured (WCAG
@@ -98,8 +105,12 @@ A chip is tone + text, never a layout device. Rules:
    first, then anywhere. Nothing inside a chip is `nowrap` except its tone dot
    (`flex: none`), which keeps its own line box.
 2. A chip obeys its container: `max-width: 100%`.
-3. Chips in a cell stack vertically (`display: grid; gap: 4px`), never sit
-   beside a neighbour they can run into.
+3. A state cell keeps `table-cell` display in the wide layout. Overriding it
+   to `grid` (the r1 draft) shrank the cell box to its content, so the row's
+   divider drew just under the chip, mid-row — a short line floating beside
+   "Awaiting review" (caught in review, step-2 fix 1). Chips sit in the cell's
+   normal flow; only the phone layout's stacked rows — where the `tr`, not the
+   `td`, carries the border — make a cell a grid.
 4. `who-acts` in a cell is plain wrappable text with a `→ ` prefix, not a
    chip-shaped box — it names a person, the chip names a state.
 5. Long values (`overflow-wrap: anywhere` on h1; wraps everywhere else) mean no
@@ -122,7 +133,12 @@ A chip is tone + text, never a layout device. Rules:
 3. **Long text wraps** in every cell; titles clamp to three lines as today.
 4. **Numbers and times right-align**: `th.num, td.num { text-align: right }`
    plus the updated column.
-5. **Phone (≤760 px): both tables stack to cards.** The project table already
+5. **One divider per row.** Every cell of a row shares one bottom edge, in
+   every table, so the divider always draws on the row line. Measured: bottom
+   edge spread per row ≤ 0.5 px after (the r1 draft's grid override left the
+   state cell 20 px short of its row). The measurement is part of the
+   chip-overlap check in §6 and of the build's test suite.
+6. **Phone (≤760 px): both tables stack to cards.** The project table already
    stacked (`stack-narrow`, app.css:450-456) but put the state chip *beside*
    the title, so a 158 px chip squeezed the title to a few characters a line;
    now title, state and next each take a full row. The My work table
@@ -176,8 +192,9 @@ nothing else animates, pulses or fades in — this proposal adds zero motion.
 `th` 12 px caps, de-cap three label classes, h1 wrap; (2) spacing — the 4 px
 scale, scoped wide `.main`, tighter `.stack`/`.summary`/`td`; (3) colour —
 `--warn: #9a5c00` light only; (4) chips — §4 rules; (5) tables — §5 rules,
-including the `.agent-grid` floor cap; (6) `.empty` dashed border, `.loading`
-size; (7) nothing in dark/motion, by design. Every rule uses app.css's own
+including the `.agent-grid` floor cap; (6) the shell's full-height rail column
+(§2, step-2 fix 2); (7) `.empty` dashed border, `.loading`
+size; (8) nothing in dark/motion, by design. Every rule uses app.css's own
 tokens, adds no external asset and needs no script; the build slice that lands
 it should need `web/css/app.css` plus small class additions in
 `web/js/views/*.js` (a `num` class on numeric columns).

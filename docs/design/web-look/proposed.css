@@ -53,9 +53,12 @@ td { padding: 8px 12px; }                                         /* was 9 */
   border-radius: 8px; padding: 1px 8px; line-height: 18px;
 }
 .chip::before { flex: none; }
-/* A cell's chips stack, never sit beside a neighbour they can run into. */
+/* A cell's chips sit in normal cell flow: the td KEEPS table-cell display in
+   the wide layout. Overriding it to grid once shrank the cell box to its
+   content, so the row's bottom border drew just under the chip, mid-row
+   (James, step-2 fix 1). Stacking is a phone-layout concern only, where the
+   tr -- not the td -- carries the border. */
 td .chip { display: inline-flex; }
-td.task-state-column { display: grid; gap: 4px; justify-items: start; }
 /* who-acts inside a cell wraps as plain text (.502's rule, refined). */
 td .who-acts { display: inline; white-space: normal; line-height: 1.6; padding: 0; border: 0; }
 td .who-acts::before { content: "→ "; }
@@ -109,6 +112,19 @@ td.task-updated-column { text-align: right; }
 .loading { font-size: var(--t-sm); }
 /* Focus stays a 2 px ring at 2 px offset for keyboard users, on every control,
    chip row link and row title; nothing removes it. (No rule added; documented.) */
+
+/* The rail is sticky at 100vh, so on a page taller than the viewport its
+   background -- and the column divider -- stopped at the fold (James, step-2
+   fix 2; already so on main). The shell paints the full-height column itself:
+   surface to the rail's edge, the 1px line, then transparent for the main. */
+@media (min-width: 761px) {
+  .shell {
+    background: linear-gradient(90deg,
+      var(--surface) 0 calc(var(--rail) - 1px),
+      var(--line) calc(var(--rail) - 1px) var(--rail),
+      transparent var(--rail));
+  }
+}
 
 /* ================================================= 7. dark and motion */
 /* Dark tokens are unchanged (all pairs pass AA; measured table in the note).
