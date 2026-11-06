@@ -13,7 +13,7 @@
   --accent-soft: #e6ecfb;
   --ok: #1e7a4b;
   --ok-soft: #e3f3ea;
-  --warn: #a86400;
+  --warn: #9a5c00;  /* was a86400: 4.14:1 on warn-soft at 12px bold; 9a5c00 is 4.76:1 */
   --warn-soft: #fbf0dc;
   --crit: #b42318;
   --crit-soft: #fbe6e4;
@@ -23,15 +23,17 @@
   --shadow: 0 1px 2px rgba(23, 33, 43, .06), 0 4px 16px rgba(23, 33, 43, .06);
   --radius: 6px;
   --rail: 232px;
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-6: 24px; --s-8: 32px;
   --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
   --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
   --mono: "Cascadia Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --t-2xs: 11px;
   --t-xs: 12px;
   --t-sm: 13px;
   --t-md: 14px;
   --t-lg: 16px;
   --t-xl: 20px;
-  --t-2xl: 26px;
+  --t-2xl: 24px;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -78,15 +80,25 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 
 /* ---------- shell ---------- */
 .shell { display: grid; grid-template-columns: var(--rail) minmax(0, 1fr); min-height: 100%; }
+/* the rail is sticky at 100vh, so on a page taller than the viewport its
+   background stopped at the fold; the shell paints the whole column itself */
+@media (min-width: 761px) {
+  .shell {
+    background: linear-gradient(90deg,
+      var(--surface) 0 calc(var(--rail) - 1px),
+      var(--line) calc(var(--rail) - 1px) var(--rail),
+      transparent var(--rail));
+  }
+}
 .rail {
   background: var(--surface); border-right: 1px solid var(--line);
-  display: flex; flex-direction: column; gap: 18px; padding: 16px 12px;
+  display: flex; flex-direction: column; gap: 14px; padding: 16px 12px;
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px; font-weight: 650; font-size: var(--t-lg); color: var(--ink); }
 .brand-mark { width: 22px; height: 22px; flex: none; }
 .rail-section { display: flex; flex-direction: column; gap: 2px; }
-.rail-label { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 0 8px 4px; }
+.rail-label { font-size: var(--t-2xs); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 0 8px 4px; }
 .nav-link {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 6px 8px; border-radius: var(--radius); color: var(--ink-2);
@@ -103,8 +115,9 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   width: 26px; height: 26px; border-radius: 50%; flex: none; display: grid; place-items: center;
   font-size: 11px; font-weight: 700; background: var(--accent-soft); color: var(--accent);
 }
-.main { min-width: 0; padding: 24px 32px 48px; display: flex; flex-direction: column; gap: 20px; }
+.main { min-width: 0; padding: 20px 28px 48px; display: flex; flex-direction: column; gap: var(--s-4); }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.page-head h1, .auth-card h1 { overflow-wrap: anywhere; }
 .page-head .lede { margin-top: 4px; color: var(--muted); }
 .crumbs { font-size: var(--t-sm); color: var(--muted); display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .crumbs a { color: var(--muted); }
@@ -120,8 +133,8 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 
 .content { min-width: 0; display: flex; flex-direction: column; }
 .main-top { display: none; padding: 12px 16px 0; }
-.stack { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
-.detail > .stack { gap: 16px; }
+.stack { display: flex; flex-direction: column; gap: var(--s-4); min-width: 0; }
+.detail > .stack { gap: var(--s-3); }
 .proto-bar {
   display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between;
   padding: 8px 16px; background: var(--ink); color: var(--ground); font-size: var(--t-sm);
@@ -160,10 +173,10 @@ input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; min-hei
 .check { display: inline-flex; align-items: center; gap: 8px; font-weight: 500; color: var(--ink-2); cursor: pointer; }
 textarea { min-height: 96px; resize: vertical; line-height: 1.5; }
 input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--crit); }
-.field { display: flex; flex-direction: column; gap: 5px; }
+.field { display: flex; flex-direction: column; gap: var(--s-1); }
 .field .hint { font-size: var(--t-xs); color: var(--muted); }
 .field .error { font-size: var(--t-xs); color: var(--crit); }
-.form { display: flex; flex-direction: column; gap: 14px; max-width: 560px; }
+.form { display: flex; flex-direction: column; gap: var(--s-3); max-width: 560px; }
 .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .toolbar input[type="search"] { max-width: 280px; }
@@ -180,10 +193,10 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: var(--t-sm); }
 th {
-  text-align: left; font-weight: 600; font-size: 11px; letter-spacing: .05em; text-transform: uppercase;
-  color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--surface);
+  text-align: left; font-weight: 600; font-size: var(--t-xs); letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted); padding: 7px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--surface);
 }
-td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr.row-link { cursor: pointer; }
 tbody tr.row-link:hover td { background: var(--surface-2); }
@@ -193,11 +206,13 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
 
 /* ---------- state chips ---------- */
 .chip {
-  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
-  font-size: var(--t-xs); font-weight: 600; line-height: 20px; padding: 0 8px; border-radius: 10px;
+  /* a chip wraps (at spaces, then anywhere) instead of painting into the next
+     cell of a fixed-width table column */
+  display: inline-flex; align-items: center; gap: 5px; white-space: normal; max-width: 100%; overflow-wrap: anywhere;
+  font-size: var(--t-xs); font-weight: 600; line-height: 18px; padding: 1px 8px; border-radius: 8px;
   background: var(--idle-soft); color: var(--ink-2);
 }
-.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--idle); }
+.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--idle); flex: none; }
 .chip.ok { background: var(--ok-soft); } .chip.ok::before { background: var(--ok); }
 .chip.warn { background: var(--warn-soft); } .chip.warn::before { background: var(--warn); }
 .chip.crit { background: var(--crit-soft); } .chip.crit::before { background: var(--crit); }
@@ -213,7 +228,7 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
 .fact.yes::before { background: var(--ok); }
 .fact.no::before { background: var(--crit); }
 .fact.unknown::before { background: repeating-linear-gradient(90deg, var(--line-strong) 0 6px, transparent 6px 10px); }
-.fact-name { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.fact-name { font-size: var(--t-xs); font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--muted); }
 .fact-value { font-weight: 650; }
 .fact.yes .fact-value { color: var(--ok); }
 .fact.no .fact-value { color: var(--crit); }
@@ -221,7 +236,7 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
 .fact-note { font-size: var(--t-xs); color: var(--muted); overflow-wrap: anywhere; }
 
 /* ---------- task detail ---------- */
-.detail { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; align-items: start; }
+.detail { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--s-4); align-items: start; }
 .side { display: flex; flex-direction: column; gap: 16px; }
 .kv { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px 12px; font-size: var(--t-sm); }
 .kv dt { color: var(--muted); }
@@ -248,9 +263,9 @@ form.respond { border-top: 1px solid var(--line); padding-top: 12px; margin-top:
 .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 
 /* ---------- empty/loading/error ---------- */
-.empty { padding: 32px 16px; text-align: center; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.empty { padding: 32px 16px; text-align: center; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 8px; border: 1px dashed var(--line-strong); border-radius: var(--radius); }
 .empty strong { color: var(--ink); font-size: var(--t-lg); }
-.loading { padding: 32px; color: var(--muted); }
+.loading { padding: 32px; color: var(--muted); font-size: var(--t-sm); }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; color: var(--ink); }
 a.card:hover { border-color: var(--accent); text-decoration: none; }
@@ -283,7 +298,7 @@ dialog::backdrop { background: rgba(15, 20, 26, .45); }
 .md .md-h { font-size: var(--t-md); margin-top: 6px; }
 .req-part { display: flex; flex-direction: column; gap: 6px; }
 .req-part + .req-part { border-top: 1px solid var(--line); padding-top: 12px; }
-.req-part > h3 { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.req-part > h3 { font-size: var(--t-xs); letter-spacing: 0; text-transform: none; color: var(--muted); }
 code.hash { font-size: 11px; overflow-wrap: anywhere; color: var(--muted); }
 .clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .decision-list { list-style: none; margin: 0; padding: 0; }
@@ -296,7 +311,7 @@ code.hash { font-size: 11px; overflow-wrap: anywhere; color: var(--muted); }
 pre.json { font-family: var(--mono); font-size: 12px; background: var(--surface-2); padding: 10px; border-radius: var(--radius); overflow-x: auto; margin: 0; }
 
 /* ---------- agents ---------- */
-.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); gap: 12px; }
 .agent-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .agent-card.needs { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
 .agent-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
@@ -304,7 +319,7 @@ pre.json { font-family: var(--mono); font-size: 12px; background: var(--surface-
 .agent-items { margin: 0; padding-left: 18px; font-size: var(--t-sm); display: flex; flex-direction: column; gap: 4px; }
 .resume { display: flex; flex-direction: column; gap: 6px; background: var(--surface-2); border-radius: var(--radius); padding: 8px 10px; }
 .resume-row { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
-.resume-label { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.resume-label { font-size: var(--t-xs); font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--muted); }
 .resume .path { overflow-wrap: anywhere; }
 .resume .prompt { color: var(--ink-2); }
 .resume button { min-height: 26px; padding: 0 8px; }
@@ -363,7 +378,7 @@ h1[tabindex="-1"]:focus-visible { outline-offset: 4px; }
 /* ---------- page summary: what this is, where it stands, what happens next ---------- */
 .summary {
   display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; align-items: center;
-  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 16px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px;
 }
 .summary .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .summary .next { grid-column: 1 / -1; font-size: var(--t-md); color: var(--ink); }
@@ -379,6 +394,9 @@ h1[tabindex="-1"]:focus-visible { outline-offset: 4px; }
 .who-acts::before { content: "→"; color: var(--muted); font-weight: 400; }
 .who-acts.you { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, transparent); color: var(--ink); }
 .who-acts.agent { background: var(--surface-2); }
+/* in a table cell the who-acts line is plain wrappable text, not a box */
+td .who-acts { display: inline; border: 0; border-radius: 0; padding: 0; line-height: 1.6; }
+td .who-acts::before { content: "→ "; }
 
 /* ---------- on-page navigation for long pages ---------- */
 .on-page { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: var(--t-sm); padding: 0 2px; }
@@ -425,19 +443,23 @@ details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(-
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
 }
 @media (min-width: 761px) {
-  .task-list-project, .task-list-work { table-layout: fixed; }
-  .task-list-project { min-width: 900px; }
-  .task-list-project .task-title-column, .task-list-project .task-title-cell { width: 52%; min-width: 360px; }
-  .task-list-project .task-state-column { width: 120px; }
-  .task-list-project .task-next-column { width: 28%; min-width: 220px; }
-  .task-list-project .task-updated-column { width: 112px; }
-  .task-list-work { min-width: 1000px; }
-  .task-list-work .task-title-column, .task-list-work .task-title-cell { width: 39%; min-width: 340px; }
-  .task-list-work .task-project-column { width: 140px; }
-  .task-list-work .task-state-column { width: 120px; }
-  .task-list-work .task-next-column { width: 27%; min-width: 220px; }
-  .task-list-work .task-updated-column { width: 112px; }
+  /* no min-width: the columns fit the room they get (984px of main at 1280,
+     836 at 900). State column 168px keeps "Awaiting review" (160px at 12px)
+     on one line; composed states fold at the space - wrap, never squeeze.
+     A state cell keeps table-cell display here: a grid cell shrinks to its
+     content and the row divider then draws mid-row, under the chip. */
+  .task-list-project, .task-list-work { table-layout: fixed; min-width: 0; }
+  .task-list-project .task-title-column, .task-list-project .task-title-cell { width: auto; min-width: 300px; }
+  .task-list-project .task-state-column, .task-list-work .task-state-column { width: 168px; }
+  .task-list-project .task-next-column { width: auto; min-width: 200px; }
+  .task-list-project .task-updated-column, .task-list-work .task-updated-column { width: 96px; }
+  .task-list-work .task-title-column, .task-list-work .task-title-cell { width: auto; min-width: 280px; }
+  .task-list-work .task-project-column { width: 110px; }
+  .task-list-work .task-next-column { width: auto; min-width: 200px; }
 }
+/* numbers and times right-aligned, tabular */
+th.num, td.num { text-align: right; }
+th.task-updated-column, td.task-updated-column { text-align: right; }
 
 /* ---------- side column on the task page (wide screens) ---------- */
 .detail .side .panel-body { gap: 10px; }
@@ -452,4 +474,17 @@ details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(-
   table.stack-narrow td { padding: 0; border: 0; }
   table.stack-narrow td.secondary { grid-column: 1 / -1; color: var(--muted); font-size: var(--t-xs); }
   table.stack-narrow td.full-narrow { grid-column: 1 / -1; }
+  /* the My work table stacks the same way (its markup carries no stack-narrow) */
+  .task-list-work thead { display: none; }
+  .task-list-work tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .task-list-work td { padding: 0; border: 0; }
+  .task-list-work td.task-title-cell { grid-column: 1 / -1; }
+  .task-list-work td.task-state-column { display: grid; grid-template-columns: none; justify-items: start; }
+  .task-list-work td.task-next-column { grid-column: 1 / -1; }
+  /* stacked rows give the title, the state and the next step a full row each,
+     so a long chip never squeezes the title to a few characters a line */
+  .task-list-project td.task-title-cell, .task-list-project td.task-state-column,
+  .task-list-project td.task-next-column { grid-column: 1 / -1; }
+  .task-list-project td.task-state-column { display: grid; grid-template-columns: none; justify-items: start; }
 }

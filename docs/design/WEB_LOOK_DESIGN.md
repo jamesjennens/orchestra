@@ -3,8 +3,9 @@
 Base: main `b08ca8d4`. Scope is the look only — type, spacing, colour, density,
 chips, tables, forms, buttons, empty/loading states, focus, dark mode, the
 375 px layout. Navigation, rail, tabs and routes are kittrial-5bb.522's and are
-untouched here. Everything below is a proposal for review: no product code has
-changed.
+untouched here. Everything below is the design's record: step 1 was the
+proposal (mock-ups only), step 2 landed it in `web/css/app.css` with the
+`num` class as the only markup change — see "Landed (step 2)" in §9.
 
 **How to look at it.** `docs/design/web-look/` holds four mock pages with
 made-up data — `my-work.html`, `tasks.html`, `task.html`, `agents.html` — built
@@ -195,9 +196,20 @@ scale, scoped wide `.main`, tighter `.stack`/`.summary`/`td`; (3) colour —
 including the `.agent-grid` floor cap; (6) the shell's full-height rail column
 (§2, step-2 fix 2); (7) `.empty` dashed border, `.loading`
 size; (8) nothing in dark/motion, by design. Every rule uses app.css's own
-tokens, adds no external asset and needs no script; the build slice that lands
-it should need `web/css/app.css` plus small class additions in
-`web/js/views/*.js` (a `num` class on numeric columns).
+tokens, adds no external asset and needs no script.
+
+**Landed (step 2).** The delta now lives in `web/css/app.css` itself, and the
+only markup change it needed was the `num` class on the two Updated columns
+(`web/js/views/project.js`, `web/js/views/work.js`) — everything else,
+including both tables' phone stacking, is CSS on classes the views already
+emit. `tests/test_site_look_523.py` pins the rules as source everywhere and,
+when a headless Chromium is findable (`ORCHESTRA_WEB_TEST_BROWSER` or the
+usual names on PATH), measures them as rendered boxes on a harness page with
+the views' exact markup: chip never into the neighbour, never past the
+wrapper or its cell, one shared bottom edge per row, stacked at 375 with no
+sideways scroll, and the rail column's gradient — at 1280, 900 and 375 px.
+This file and the mock-ups stay as the design's record; the fresh-look task
+builds on the tokens above, whose names are now frozen.
 
 ## 10. Not changed
 

@@ -11,7 +11,7 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
       showProject ? h('th', { scope: 'col', class: 'hide-narrow task-project-column' }, 'Project') : null,
       h('th', { scope: 'col', class: 'task-state-column' }, 'State'),
       h('th', { scope: 'col', class: 'task-next-column' }, 'Next action'),
-      h('th', { scope: 'col', class: 'hide-narrow task-updated-column' }, 'Updated'))),
+      h('th', { scope: 'col', class: 'hide-narrow num task-updated-column' }, 'Updated'))),
     h('tbody', null, rows.map((t) => {
       const href = ctx.href(`/p/${t.project_id}/t/${t.id}`);
       return h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${t.project_id}/t/${t.id}`); } },
@@ -30,7 +30,7 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
           t.recommended ? [' ', h('span', { class: 'chip ok', title: 'A reviewer recommends approving this revision. An owner still decides.' }, 'Recommended')] : null,
           t.pending_request_ids && t.pending_request_ids.length ? h('div', { class: 'sub' }, 'Open requests: ', t.pending_request_ids.join(', ')) : null),
         // Canonical queue rows carry no update time; the review wait start is shown instead.
-        h('td', { class: 'hide-narrow muted task-updated-column' }, t.updated_at ? time(t.updated_at) : t.waiting_since ? time(t.waiting_since) : ''));
+        h('td', { class: 'hide-narrow muted num task-updated-column' }, t.updated_at ? time(t.updated_at) : t.waiting_since ? time(t.waiting_since) : ''));
     }))));
 }
 

@@ -551,7 +551,7 @@ export async function overview(ctx, { pid }) {
         h('thead', null, h('tr', null, h('th', { scope: 'col', class: 'task-title-column' }, 'Task'),
           h('th', { scope: 'col', class: 'task-state-column' }, 'State'),
           h('th', { scope: 'col', class: 'task-next-column' }, 'Who acts next'),
-          h('th', { scope: 'col', class: 'hide-narrow task-updated-column' }, 'Updated'))),
+          h('th', { scope: 'col', class: 'hide-narrow num task-updated-column' }, 'Updated'))),
         h('tbody', null, rows.map((t) => h('tr', { class: 'row-link task-row', 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
           h('td', { class: 'task-title-cell' },
             // A requirement record is marked plainly and points at the Requirements page,
@@ -574,7 +574,7 @@ export async function overview(ctx, { pid }) {
               (t.assignee_name || (t.assignee ? t.assignee : 'anyone')),
               ' · ',
               (t.next_action ? t.next_action.text : '—'))),
-          h('td', { class: 'hide-narrow muted task-updated-column' }, t.updated_at ? time(t.updated_at) : '')))))) :
+          h('td', { class: 'hide-narrow muted num task-updated-column' }, t.updated_at ? time(t.updated_at) : '')))))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
       ...(partial ? [partial] : []),
       h('div', { class: 'pager' },
