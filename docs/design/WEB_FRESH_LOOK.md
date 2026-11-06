@@ -2,7 +2,7 @@
 
 **Status:** design only. No product code changes. The mock-ups are in `docs/design/web-fresh/`, sharing one stylesheet, `fresh.css`. There are 24 screenshots in `web-fresh/shots/`, plus a before/after pair of Tasks, and all of them are on `web-fresh/contact-sheet.html`.
 **Base:** main at b08ca8d4.
-- **Why today's token names:** .523's design note could not be read from this lane, so every token below uses today's names in `web/css/app.css:2-36`.
+- **Why today's token names:** .523's design note could not be read from this lane, so every token below uses today's names in `web/css/app.css:2-36`. Section 8b maps them onto .523's names (r1), now readable.
 - **Mapping to .523:** the token table (section 8) lists today's value next to the proposed light and dark values, so it can be mapped onto .523's names when they arrive.
 - **Navigation:** the rail and tabs follow .522 (PROJECT_CROSS_SECTION_DESIGN.md §3, §3.2, §3.3).
 
@@ -172,6 +172,81 @@ Unchanged: `--accent-ink` light, `--surface` light, `--t-xs`…`--t-xl`.
 - `ui.js:21` `'awaiting-review'` → `warn`;
 - `ui.js:32` `in_progress` → `info`.
 
+## 8b. The same tokens on .523's names
+
+**Source:** .523 r1, read from `/srv/review-snapshot/k523/r1-design/docs/design/`: `WEB_LOOK_DESIGN.md` (cited below as W, by section and line) and `web-look/proposed.css` (cited as P, by line). .523 renames no token:
+- **Colours:** "Tokens are unchanged except one AA fix" (W §3 l.69). Dark "keeps app.css's token set" (W §8 l.167-169).
+- **Other tokens:** it adds `--t-2xs` and a spacing scale, and changes the values of `--t-2xl` and light `--warn` (W §9 l.175-180).
+
+So 33 of the 40 rows land on a name .523 already has. The other 7 are additions. Two of my spacing names collide with .523's, so they move to .523's names.
+
+| today's name | .523's name (cite) | fresh light | fresh dark |
+|---|---|---|---|
+| `--ground` | `--ground` (W §3 l.69) | #f6f5f2 | #121116 |
+| `--surface` | `--surface` (W §3 l.69) | #ffffff | #1a1920 |
+| `--surface-2` | `--surface-2` (W §3 l.69) | #efede8 | #24232b |
+| `--ink` | `--ink` (W §3 l.69) | #1d1c21 | #ecebf0 |
+| `--ink-2` | `--ink-2` (W §3 l.69) | #3b3942 | #cac7d1 |
+| `--muted` | `--muted` (W §3 l.69) | #605c67 | #a19daa |
+| `--line` | `--line` (W §3 l.69) | #e6e3dd | #2c2a33 |
+| `--line-strong` | `--line-strong` (W §3 l.69; P:108) | #d3cfc7 | #3b3943 |
+| `--accent` | `--accent` (W §3 l.69) | #4b3fc0 | #aaa4ff |
+| `--accent-ink` | `--accent-ink` (W §3 l.69) | #ffffff | #121116 |
+| `--accent-soft` | `--accent-soft` (W §3 l.69) | #ecebfb | #2b2852 |
+| `--focus` | `--focus` (W §8 l.166) | #4b3fc0 | #c4c0ff |
+| `--ok` | `--ok` (W §3 l.69) | #1b6b41 | #6fcf97 |
+| `--ok-soft` | `--ok-soft` (W §3 l.69) | #e2f1e7 | #16301f |
+| `--warn` | `--warn` (W §3 l.84-86; P:44: .523 sets #9a5c00) | **#8a5200** (replaces .523's #9a5c00) | #f0b45a |
+| `--warn-soft` | `--warn-soft` (W §3 l.77) | #fbefd9 | #35270f |
+| `--crit` | `--crit` (W §3 l.69) | #b0251d | #ff8f85 |
+| `--crit-soft` | `--crit-soft` (W §3 l.69) | #fbe7e5 | #3d1b19 |
+| `--idle` | `--idle` (W §3 l.82) | #5f5b66 | #aaa6b2 |
+| `--idle-soft` | `--idle-soft` (W §3 l.80) | #eeece8 | #2a2930 |
+| `--shadow` | `--shadow` (not touched, W §9) | as §8 | as §8 |
+| `--radius` | `--radius` (not touched, W §9) | 8px | same |
+| `--rail` | `--rail` (not touched, W §10 l.187) | 248px | same |
+| `--font` | `--font` (not touched, W §9) | as §8 | same |
+| `--font-display` | `--font-display` (not touched, W §9) | serif stack, §3 | same |
+| `--mono` | `--mono` (not touched, W §9) | as §8 | same |
+| `--t-2xl` | `--t-2xl` (W §1 l.35; P:11: .523 sets 24px) | **28px**; 24px at ≤760 px (so .523's 24 becomes the phone size) | same |
+| `--s-1` | `--s-1` (W §2 l.49; P:22) | 4px | same |
+| `--s-2` | `--s-2` (W §2 l.49) | 8px | same |
+| `--s-3` | `--s-3` (W §2 l.49) | 12px | same |
+| `--s-4` | `--s-4` (W §2 l.49) | 16px | same |
+| my `--s-5` (24px) | **`--s-6`** (W §2 l.49: .523's `--s-5` is 20px) | 24px | same |
+| my `--s-6` (32px) | **`--s-8`** (W §2 l.49) | 32px | same |
+| my `--s-7` (48px) | none: **add `--s-12`**, in .523's 4 × N naming | 48px | same |
+| `--field-line` | none: **add** | #8a8691 | #6f6b79 |
+| `--info` | none: **add** | #0a6178 | #71c7e0 |
+| `--info-soft` | none: **add** | #dff0f5 | #13303a |
+| `--radius-sm` | none: **add** | 6px | same |
+| `--measure` | none: **add** | 1120px | same |
+| `--t-3xl` | none: **add** | 36px; 28px at ≤760 px | same |
+
+**Tokens .523 has and this note does not:**
+- **`--t-2xs`** (11px; W §1 l.31, P:11): the fresh look has no 11 px text (§3), so set it to **12px**. Table heads and rail labels become 12 px sentence case. Remove the token once nothing uses it.
+- **`--s-5`** (20px; W §2 l.49, P:22): keep it at **20px**. No fresh rule uses it, but .523's rules that do (P:27) are replaced by the fresh values below.
+
+**Additions .523 lacks:** `--field-line`, `--info`, `--info-soft`, `--radius-sm`, `--measure`, `--t-3xl`, `--s-12`. That is 7 names.
+
+**Fixes .523 already makes: "kept from .523", so the build does each once:**
+
+| fix | .523 (cite) | fresh look |
+|---|---|---|
+| A chip wraps inside its cell (the defect that started .523) | W §4 l.97-102, §6; P:51-58 | **Kept from .523.** The fresh chip changes only tone, radius and height. The mock-up's `white-space: nowrap` chip is *not* built. |
+| who-acts is plain wrapping text in a cell | W §4 l.103-104; P:60-61 | **Kept from .523.** Fresh adds `.you` (**You** in the accent) and drops the `→ ` prefix (P:61), as the mock-up shows. `test_site_defects_504.py:120` still holds. |
+| Row dividers | No rule of its own: today's `td` border (app.css:186), plus the stacked-row divider (P:91) | **Kept from .523.** Fresh changes only the colour (`--line`), and adds the strong rule above the table and the 3 px "yours" bar. |
+| Sidebar height | Rail gap 18 → 14 (W §2 l.55; P:32). There is no height rule; the sticky 100vh rail with overflow is today's (app.css:84). | **Kept from .523 (14 px).** The mock-up used 22 px; the build takes 14, so the longer .522 rail fits a 700 px window. This is the one place the build differs from the chosen mock-up. |
+| Phone stacking of both task tables | W §5 l.125-130; P:88-102 | **Kept from .523.** Fresh adds only the updated time, right-aligned on the state row. |
+| Table widths fit the room (no 900/1000 px min-width) | W §5 l.117-121; P:70-79 | **Kept from .523.** |
+| Numbers and times right-aligned | W §5 l.123-124; P:84-85 | **Kept from .523.** |
+| A long h1 wraps | W §1 l.40-41; P:17 | **Kept from .523.** |
+| Label classes lose their caps | W §1 l.37-39; P:14-16 | **Kept from .523, and extended** to `th` and `.rail-label` (.523 keeps 11 px caps there). |
+| Light warn passes AA | W §3 l.84-86; P:44 (#9a5c00) | **Replaced** by #8a5200: 5.61:1 on warn-soft, against .523's 4.76. |
+| `.empty` has a dashed border | W §7 l.157-159; P:108 | **Kept from .523.** Fresh adds the `--ground` fill, the icon and an action (§6). |
+| The agent grid never overflows | P:82 | **Kept from .523** until .522's Agents table replaces the cards. |
+| Density values (`.main` padding 20/28, `.stack` gap 16, `td` 8/12) | W §2 l.53-57; P:26-38 | **Not kept.** The fresh values win: `.main` 32/40, sections 36 apart, `td` 12. James chose the calmer density. |
+
 ## 9. WCAG AA: computed contrast for every pair used
 
 The ratios are WCAG 2.x relative luminance, computed by a script from the hex values in `fresh.css`. The script is `/home/opusw/work/t525/scratch/contrast.py`, outside the repo. Text needs 4.5:1; control edges, focus and state marks need 3:1. **All 29 pairs pass in both themes.**
@@ -223,9 +298,28 @@ The ratios are WCAG 2.x relative luminance, computed by a script from the hex va
 
 ## 10. Limits, and what I could not do
 
-- **.523's note was unreadable** from this lane, so the mapping to its names is left to whoever has both.
+- **.523's note:** it was unreadable when sections 1-10 were written. It has since been read (r1 snapshot), and section 8b maps the tokens onto its names.
 - **Fonts in the screenshots:** the capture machine has only DejaVu fonts, so the shots show DejaVu Sans, Serif and Mono, which are the last fallbacks. On Windows and macOS the serif is Sitka/Cambria and Charter, narrower and lighter than DejaVu Serif. I could not capture those.
 - **Browsers and devices:** Chromium only (Playwright headless). There was no Firefox or Safari, no real phone, no screen reader and no keyboard-only pass. The dark theme was captured with `?theme=dark` and also emulated with `prefers-color-scheme: dark`.
 - **The mock-ups are static and the data is invented.** The project switcher, menu button, filters and switch are drawn, not wired. The phone menu (the rail as a drawer) is not drawn.
 - **Fixed in the mock-up only:** the current tab is scrolled into view by a three-line inline script. The product would do the same in `app.js`.
 - **Only six pages are drawn.** The rest (Reviews, Records, Rooms, Lanes, Settings, Set up, How) would take the same header, table and state patterns. They are not mocked.
+
+## 11. Build slices
+
+These follow the coordinator's order. Each one needs .523's names landed first (§8b). Line numbers are at b08ca8d4.
+- **Structure is .522's:** the rail, tabs, switcher, the Agents table and the Project › People/Agents sections are built by .522. These slices only style what .522 renders and move nothing.
+- **What every slice's proof includes:** the same **AA re-measure on built pages**, and `python3 -m unittest` plus the `node` shim tests.
+  - **The re-measure:** a Playwright script, run in the lane through `heavy.sh` on `web/prototype.html` (mock data). It visits sign-in, My work, Tasks, a task, Agents and Project › People/Agents at 1280 and 375 px, in light and dark (both `data-theme` and emulated `prefers-color-scheme`).
+  - **For every visible text node** it compares the computed `color` with the first opaque background among its ancestors, and fails below 4.5:1 (3:1 for text ≥24 px, or ≥18.66 px bold).
+  - **For every input, select and button** it fails an edge below 3:1.
+  - It prints a table like §9.
+  - **Why it is not in CI:** the repo has no browser test harness at b08ca8d4 (web tests run on `tests/web_dom_shim.mjs`). So the CI half is the static token test in (a), and the browser half is the lane script, with its output pasted into the slice's note.
+
+| slice | files in web/ (file:line at b08ca8d4) | the test that proves it |
+|---|---|---|
+| **(a) Token values** | `css/app.css:2-36` (light), `:37-54` (dark, both copies); `:26-28` fonts; `:67` h1 uses `--font-display`; `:143`, `:157`, `:171-173` borders → `--field-line`; `:204` add `.chip.info` next to `.chip.accent`; `js/ui.js:21` `'awaiting-review'` → `warn`, `:32` `in_progress` → `info` | A new `tests/test_web_look_tokens.py` (static, runs in CI) parses both token blocks of app.css and asserts every value in §8b, and that the 29 pairs of §9 meet 4.5:1 or 3:1 in light and dark. `test_rooms_http.py:274` (the "Awaiting review" text) still holds. Then the browser AA re-measure. |
+| **(b) Page header** | `js/ui.js:64-72` `pageHead` gains an optional `key: { num, label }`; `css/app.css:107-110` `.page-head` becomes the three-column grid (§6). Callers: `js/views/work.js:61` (My work: the count of rows waiting on you), `js/views/project.js:610` (Tasks: h1 "Tasks"; the key from `page.total`, `project.js:581`; the summary strip at `:600-605` gives way to the key), `js/views/task.js:356` (time waiting, Approve / Send back), `js/views/agents.js:509` (or .522's Agents page), and .522's Project › People/Agents | A new `tests/web_page_head_key.mjs` on the DOM shim: `pageHead` with `key` renders one `h1#page-title`, one `.key-num`, one `.key-label` and at most one `.btn.primary`; without `key` the output is unchanged; each of the six views renders one h1 and a key. `web_how_screen.mjs:41` (first H1) and `web_password_forms.mjs:70` (`#page-title`) still hold. Then the AA re-measure (the key number is large text). **Gap:** "4 wait on you" on Tasks needs a count the list read does not return today. Until the server gives one, the key shows only the total. |
+| **(c) Tables and lists** | `css/app.css:181-191` (table, th, td), `:193-206` chips, `:374-380` who-acts, `:418` `.count`, `:425-440` the task-list widths, `:444-456` `stack-narrow`; `js/views/work.js:8-33` `workTable` (a `mine` row class is not needed on My work), `js/views/project.js:547-573` (a `mine` class when who-acts is you; `num` on Updated); `js/views/agents.js:216` `.agent-grid` (style only) | **Update** `web_task_title_clamp.mjs:60-62`, which pins the 900/1000 px min-widths that .523 drops. **Keep** `test_site_defects_504.py:119-121`. **Add** .523's bounding-box test (W §5 l.110-116): in Chromium at 1280, 900 and 375 px, no state chip extends past its cell and no page scrolls sideways at 375 px (the fresh mock-ups measured no sideways overflow on any of their 12 page-and-width captures; chip bounds were not measured there). Then the AA re-measure (chips, greyed rows, hover). |
+| **(d) Sign-in** | `js/views/auth.js:5-48` (`login`: split layout, brand side, "Have a reset code?" by Password), `:50-81` (`redeem`: the same frame); `js/dom.js:42-56` `brandMark` (the new three-bar tile; also drawn in the rail by `js/app.js:137`, which is styled, not moved); `css/app.css:86-87` `.brand`, `:263-266` `.auth` | `web_password_forms.mjs` (`auth.login`/`redeem` at :72-131) and `test_http_web.py:2489-2500` still pass: field ids `username`/`password` and the `focusFirstEmpty` call (`auth.js:46`) are unchanged. A new shim check: `login` renders one `h1`, a `form` with both fields, the brand with an `aria-hidden` mark of 3 `rect`s, and no external `href`/`src`. AA re-measure on the sign-in page at 1280 and 375 px, light and dark (the brand side is hidden at ≤760 px). |
+| **(e) Empty, loading, error** | `js/ui.js:74-76` `empty` (icon, title, sentence, optional action), `:78-80` `loading` (skeleton plus hidden label, `role="status"`), `:114-120` `errorState` (inline, `role="alert"`, request id, Try again); `css/app.css:251-253`, `:415` `.empty-line` (kept); `js/views/agents.js:199` (the 6 rem "Loading your agents…" box becomes the skeleton). Callers such as `work.js:7` and `project.js:578` keep their calls. | `web_slice5_reviews_page.mjs:35` and `web_slice5_agents_work_page.mjs:17` (the `.empty-line` text) still hold. A new shim test: `empty()` returns `.state` with its title and body; `loading()` returns `role=status` with a hidden label; `errorState()` returns `role=alert` with the request id and a Try again that calls `retry`. A static check that the shimmer stops under `prefers-reduced-motion`. AA re-measure, including `ink-2` on `crit-soft`. |
