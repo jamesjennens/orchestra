@@ -2,7 +2,7 @@
 import { h, mount, brandMark, initials, confirmDialog, toast } from './dom.js';
 import { createApi, fetchTransport } from './api.js';
 import { describe } from './ui.js';
-import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage } from './routes.js';
+import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage, rememberProject, rememberedProject, forgetProject } from './routes.js';
 import * as auth from './views/auth.js';
 import * as work from './views/work.js';
 import * as project from './views/project.js';
@@ -53,6 +53,25 @@ export async function start(root, options = {}) {
     render();
   };
   ctx.href = (route) => '#' + route;
+  // kittrial-5bb.522 slice 1: the browser storage that keeps the last project (options.storage in tests).
+  const storage = (() => {
+    if ('storage' in options) return options.storage;
+    try { return window.localStorage; } catch { return null; }
+  })();
+  // A view writes its filters into the URL's query without a new history entry or a re-render, so a filtered
+  // list is shareable, reload-safe and survives a project switch (kittrial-5bb.522 slice 1, .502 §1.9).
+  ctx.setQuery = (params) => {
+    const path = currentRoute().split('?')[0];
+    const text = new URLSearchParams(params).toString();
+    const route = path + (text ? '?' + text : '');
+    memoryRoute = route;
+    rendered = route;
+    try {
+      history.replaceState(null, '', '#' + route);
+      lastHash = location.hash;
+    } catch { /* hash unavailable: the route stays in memory */ }
+    ctx.query = new URLSearchParams(text);
+  };
   ctx.setDirty = (value) => { ctx.dirty = value; };
 
   ctx.refreshProjects = async () => {
@@ -62,12 +81,18 @@ export async function start(root, options = {}) {
   ctx.signedIn = async (user) => {
     ctx.me = user;
     await ctx.refreshProjects();
-    ctx.go(ctx.projects.length ? '/' : '/welcome');
+    // A deep link opened before signing in is where the person goes once signed in (kittrial-5bb.522 Q4).
+    const wanted = currentRoute();
+    ctx.go(wanted && wanted !== '/' && wanted !== '/welcome' ? wanted : (ctx.projects.length ? '/' : '/welcome'));
   };
   ctx.signOut = async () => {
     try { await api.logout(); } catch { /* the session is gone either way */ }
     agents.clearWizardStorage();
+    forgetProject(storage, ctx.me && ctx.me.id);
     ctx.me = null; ctx.projects = [];
+    // The next person to sign in on this browser starts at home, not on this person's last page.
+    memoryRoute = '/';
+    try { history.replaceState(null, '', '#/'); } catch { /* ignore */ }
     showLogin();
   };
   ctx.sessionLost = () => {
@@ -120,7 +145,9 @@ export async function start(root, options = {}) {
 
   function buildShell(route) {
     route = route.split('?')[0];
-    const pid = projectOf(route);
+    // The project the rail shows: the URL's on a project page (the URL always wins), else the last project this
+    // person opened (kittrial-5bb.522 slice 1), so the switcher is orthogonal to the other menu entries.
+    const pid = projectOf(route) || rememberedProject(storage, ctx.me && ctx.me.id, ctx.projects);
     const active = ctx.projects.filter((p) => !p.archived);
     const current = pid && ctx.projects.find((p) => p.id === pid);
     const link = (href, label, count) => h('a', { class: 'nav-link', href: ctx.href(href), 'aria-current': route === href ? 'page' : null },
@@ -173,6 +200,9 @@ export async function start(root, options = {}) {
     const [path, search] = route.split('?');
     ctx.query = new URLSearchParams(search || '');
     const match = matchRoute(path);
+    // kittrial-5bb.522 slice 1: opening a project page selects that project for the rail's other pages.
+    const opened = projectOf(path);
+    if (opened && ctx.projects.some((p) => p.id === opened && !p.archived)) rememberProject(storage, ctx.me.id, opened);
     const view = match && VIEWS[match.name];
     if (view) {
       try {

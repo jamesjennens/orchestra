@@ -472,6 +472,10 @@ export async function lanesPage(ctx, { pid }) {
     lanesPanel(ctx, project));
 }
 
+// The Tasks page's review-state filter, and the status filter's URL words (kittrial-5bb.522 slice 1).
+export const TASK_REVIEW_FILTERS = [['', 'Any review state'], ['awaiting-review', 'Awaiting review'], ['changes-requested', 'Changes requested'], ['approved', 'Approved · not integrated'], ['withdrawn', 'Withdrawn'], ['superseded', 'Superseded'], ['none', 'No contribution']];
+const TASK_STATUS_OF = { active: 'active', closed: 'closed', all: '' };
+
 export async function overview(ctx, { pid }) {
   const project = await load(ctx, pid);
   if (project.usable === false) {
@@ -481,28 +485,44 @@ export async function overview(ctx, { pid }) {
       unusableBanner(project),
       h('p', null, h('a', { href: ctx.href(`/p/${pid}/settings`) }, 'Members, credentials and archive')));
   }
-  const state = { status: 'active', q: '', review: '', cursor: null, stack: [], requirements: false };
+  // kittrial-5bb.522 slice 1 (.502 §1.9): the filters are the URL's query, read here and written back on each
+  // change, so a filtered list is shareable, reload-safe and survives a project switch.
+  const query = ctx.query && typeof ctx.query.get === 'function' ? ctx.query : new URLSearchParams('');
+  const askedReview = query.get('review') || '';
+  const state = { status: TASK_STATUS_OF[query.get('status')] ?? 'active', q: (query.get('q') || '').trim(),
+    review: TASK_REVIEW_FILTERS.some(([v]) => v === askedReview) ? askedReview : '', cursor: null, stack: [],
+    requirements: query.get('requirements') === '1' };
+  const writeQuery = () => {
+    if (!ctx.setQuery) return;
+    const params = {};
+    if (state.status !== 'active') params.status = state.status || 'all';
+    if (state.q) params.q = state.q;
+    if (state.review) params.review = state.review;
+    if (state.requirements) params.requirements = '1';
+    ctx.setQuery(params);
+  };
   const tableHost = h('div', { class: 'panel' });
 
-  const search = h('input', { type: 'search', id: 'task-search', placeholder: 'Search title, description or ID', 'aria-label': 'Search tasks' });
+  const search = h('input', { type: 'search', id: 'task-search', placeholder: 'Search title, description or ID', 'aria-label': 'Search tasks', value: state.q });
   // A requirement record or BRD section is a visible row the server never calls claimable
   // work (kittrial-5bb.277): it is left out of the default task view, and this filter shows
   // it again marked as a requirement. Off by default, so the Tasks page reads as tasks.
-  const requirementFilter = h('input', { type: 'checkbox', id: 'show-requirements' });
+  const requirementFilter = h('input', { type: 'checkbox', id: 'show-requirements', checked: state.requirements });
   const requirementToggle = h('label', { class: 'check', for: 'show-requirements' }, requirementFilter, 'Show requirements');
   requirementFilter.addEventListener('change', () => {
-    state.requirements = requirementFilter.checked; state.cursor = null; state.stack = []; draw();
+    state.requirements = requirementFilter.checked; state.cursor = null; state.stack = []; writeQuery(); draw();
   });
   const statusSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Status' },
     [['active', 'Active'], ['closed', 'Closed'], ['', 'All']].map(([value, label]) => h('button', { type: 'button', 'aria-pressed': String(state.status === value), onclick: (e) => {
       state.status = value; state.cursor = null; state.stack = [];
       statusSeg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === e.currentTarget)));
+      writeQuery();
       draw();
     } }, label)));
-  const reviewSel = h('select', { id: 'review-filter', 'aria-label': 'Review state', onchange: (e) => { state.review = e.target.value; state.cursor = null; state.stack = []; draw(); } },
-    [['', 'Any review state'], ['awaiting-review', 'Awaiting review'], ['changes-requested', 'Changes requested'], ['approved', 'Approved · not integrated'], ['withdrawn', 'Withdrawn'], ['superseded', 'Superseded'], ['none', 'No contribution']].map(([v, l]) => h('option', { value: v }, l)));
+  const reviewSel = h('select', { id: 'review-filter', 'aria-label': 'Review state', onchange: (e) => { state.review = e.target.value; state.cursor = null; state.stack = []; writeQuery(); draw(); } },
+    TASK_REVIEW_FILTERS.map(([v, l]) => h('option', { value: v, selected: v === state.review }, l)));
   let debounce;
-  search.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(() => { state.q = search.value.trim(); state.cursor = null; state.stack = []; draw(); }, 250); });
+  search.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(() => { state.q = search.value.trim(); state.cursor = null; state.stack = []; writeQuery(); draw(); }, 250); });
 
   async function draw() {
     tableHost.setAttribute('aria-busy', 'true');
@@ -654,11 +674,25 @@ export async function reviews(ctx, { pid }) {
     [['error'], 'Needs operator attention', 'The review record could not be read cleanly; an operator has to repair it.'],
   ];
   const openRequests = (t) => (t.open_requests ?? (t.requests || []).filter((r) => r.status === 'open').length);
-  return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project, 'Reviews'), title: 'Reviews', lede: 'Requirement proposals and every contribution in flight, grouped by who has to act next.' }),
-    proposals,
-    data.complete === false ? h('div', { class: 'banner' }, 'This list is incomplete: the project has more contributions in flight than one read covers.') : null,
-    groups.map(([keys, title, note]) => {
+  // kittrial-5bb.522 slice 1 (.502 §1.9): one group or all, from the URL's `review` and written back to it, so
+  // the filter is shareable, reload-safe and survives a project switch. Any state of a group selects it.
+  const asked = (ctx.query && typeof ctx.query.get === 'function' && ctx.query.get('review')) || '';
+  const groupOf = (state) => (groups.find(([keys]) => keys.includes(state)) || [[]])[0][0] || '';
+  let shown = groupOf(asked);
+  const groupsHost = h('div', { class: 'stack', 'data-review-groups': '' });
+  const filterSel = h('select', { id: 'reviews-filter', 'aria-label': 'Show', onchange: (e) => {
+    shown = e.target.value;
+    if (ctx.setQuery) ctx.setQuery(shown ? { review: shown } : {});
+    drawGroups();
+  } }, [['', 'All groups']].concat(groups.map(([keys, title]) => [keys[0], title]))
+    .map(([v, l]) => h('option', { value: v, selected: v === shown }, l)));
+  const filterLine = h('div', { class: 'filters', 'data-reviews-filter': '' },
+    h('label', { class: 'small', for: 'reviews-filter' }, 'Show '), filterSel);
+  function drawGroups() {
+    groupsHost.replaceChildren(...groupNodes());
+  }
+  function groupNodes() {
+    return groups.filter(([keys]) => !shown || keys[0] === shown).map(([keys, title, note]) => {
       const key = keys[0];
       const rows = data.items.filter((t) => keys.includes(t.review_state));
       if (key === 'error' && !rows.length) return null;
@@ -679,7 +713,15 @@ export async function reviews(ctx, { pid }) {
       // so filter before sorting — sorting first reads .rows of null and the
       // Reviews page crashes in the normal case (no error-state item).
       return { key, rows: rows.length, body };
-    }).filter(Boolean).sort((a, b) => b.rows - a.rows).map(({ body }) => body),
+    }).filter(Boolean).sort((a, b) => b.rows - a.rows).map(({ body }) => body);
+  }
+  drawGroups();
+  return h('div', { class: 'stack' },
+    pageHead({ crumbs: crumbs(ctx, project, 'Reviews'), title: 'Reviews', lede: 'Requirement proposals and every contribution in flight, grouped by who has to act next.' }),
+    proposals,
+    data.complete === false ? h('div', { class: 'banner' }, 'This list is incomplete: the project has more contributions in flight than one read covers.') : null,
+    filterLine,
+    groupsHost,
     proposeSection(ctx, pid, { folded: true }));
 }
 

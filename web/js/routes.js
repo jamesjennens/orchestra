@@ -79,16 +79,58 @@ export const RECORD_ROUTES = new Set(['requirements', 'requirement', 'decisions'
 // when the target project has it (`sections` lists the segments, '' for Tasks); anything
 // else, a task page included, opens the target's Tasks list and says so via fellBack.
 export function switchTarget(route, targetPid, sections) {
-  const path = route.split('?')[0];
+  const [path, search] = route.split('?');
   const pid = projectOf(path);
   if (!pid) return { path: `/p/${targetPid}`, fellBack: false, section: '' };
   const match = new RegExp(`^/p/${ID}(?:/([a-z]+))?$`).exec(path);
+  // A task page (or any record of the old project): the target's Tasks list, and nothing of the old query.
   if (!match) return { path: `/p/${targetPid}`, fellBack: true, section: '' };
   const section = match[1] || '';
+  // kittrial-5bb.522 slice 1: the view's filters survive the switch (they mean the same in every project).
+  const kept = switchQuery(search);
   if (section === '' || sections.includes(section)) {
-    return { path: section ? `/p/${targetPid}/${section}` : `/p/${targetPid}`, fellBack: false, section };
+    return { path: (section ? `/p/${targetPid}/${section}` : `/p/${targetPid}`) + kept, fellBack: false, section };
   }
-  return { path: `/p/${targetPid}`, fellBack: true, section };
+  return { path: `/p/${targetPid}` + kept, fellBack: true, section };
+}
+
+// The query keys that are view filters, the same in every project (kittrial-5bb.522 slice 1). Every other key
+// names something of one project (`proposal=<key>` on Reviews) or a mode of one page, and is not carried.
+export const SWITCH_FILTER_KEYS = ['status', 'q', 'review', 'requirements'];
+export function switchQuery(search) {
+  const from = new URLSearchParams(search || '');
+  const kept = new URLSearchParams();
+  for (const key of SWITCH_FILTER_KEYS) {
+    const value = from.get(key);
+    if (value !== null && value !== '') kept.set(key, value);
+  }
+  const text = kept.toString();
+  return text ? '?' + text : '';
+}
+
+// The last project a person opened, kept in their own browser (kittrial-5bb.522 slice 1). Keyed by the person,
+// so two people signed in on one browser never share it; cleared at sign-out. A view preference only: no
+// route reads it and it decides nothing.
+export const LAST_PROJECT_PREFIX = 'orchestra.lastProject.';
+export function rememberProject(storage, userId, pid) {
+  if (!storage || !userId || !pid) return;
+  try { storage.setItem(LAST_PROJECT_PREFIX + userId, pid); } catch { /* storage unavailable: nothing is remembered */ }
+}
+// The remembered project when the person can still open it (listed and not archived), else null; a project
+// no longer listed is forgotten.
+export function rememberedProject(storage, userId, projects) {
+  if (!storage || !userId) return null;
+  let pid = null;
+  try { pid = storage.getItem(LAST_PROJECT_PREFIX + userId); } catch { return null; }
+  if (!pid) return null;
+  const found = (projects || []).find((p) => p.id === pid && !p.archived);
+  if (found) return pid;
+  try { storage.removeItem(LAST_PROJECT_PREFIX + userId); } catch { /* ignore */ }
+  return null;
+}
+export function forgetProject(storage, userId) {
+  if (!storage || !userId) return;
+  try { storage.removeItem(LAST_PROJECT_PREFIX + userId); } catch { /* ignore */ }
 }
 
 // The sentence the switcher's toast shows after a fallback. `label` is the section's name in
