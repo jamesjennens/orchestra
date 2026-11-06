@@ -3430,7 +3430,7 @@ class Service:
             raise invalid('The nudges scope is the nudge carrier\'s alone and is never combined with another scope')
         return tuple(names)
 
-    def agent_scopes(self, agent, moment=None):
+    def agent_scopes(self, agent):
         """What an agent may do, and where that is known from: ``(scopes, source)``.
 
         ``set``: the list on the agent record, written when the agent is made and by a renewal
@@ -3455,9 +3455,9 @@ class Service:
                                                   for scope in stored) or len(stored) != len(set(stored)):
                 return None, 'unknown'
             return tuple(stored), 'inferred' if agent.get('scopes_source') == 'inferred' else 'set'
-        moment = self._expiry_now() if moment is None else moment
+        now = self._expiry_now()
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
-                 for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
+                 for credential in self._agent_credentials(agent) if self._credential_live(credential, now)}
         if len(lists) == 1:
             return next(iter(lists)), 'inferred'
         return None, 'unknown'
@@ -3644,7 +3644,7 @@ class Service:
         moment = self._expiry_now() if moment is None else moment
         owner_sees_path = bool(principal.superuser or
                                principal.user_id == agent['owner'])
-        scopes, source = self.agent_scopes(agent, moment=moment)
+        scopes, source = self.agent_scopes(agent)
         view = {
             'id': agent['id'], 'name': agent['name'], 'owner': agent['owner'],
             'owner_display_name': self._owner_name(agent['owner']),
@@ -5478,7 +5478,7 @@ class Service:
         moment = self._expiry_now() if moment is None else moment
         requested = self._scope_names(scopes)
         label = self._credential_label(label)
-        has, source = self.agent_scopes(agent, moment=moment)
+        has, source = self.agent_scopes(agent)
         if requested is not None and source in ('inferred', 'unknown') and principal.user_id != agent['owner']:
             raise forbidden(self.SCOPES_OWNER_REQUIRED)
         if requested is None:
@@ -5594,7 +5594,7 @@ class Service:
                 change.created(self.state['credentials'], credential['id'])
                 change.created(self.state['credential_tokens'], credential['token_hash'])
                 self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
-                                             self.agent_scopes(agent, moment=moment), request_id)
+                                             self.agent_scopes(agent), request_id)
                 event = self.audit(request_id, principal, 'agents.created', 'committed',
                                    actor=self.agent_actor(agent))
                 event.update(agent_id=agent_id, owner_id=owner_id, created_by=principal.user_id)
@@ -5628,7 +5628,7 @@ class Service:
             agents = [a for a in self.state['agents'].values()
                       if principal.superuser or a['owner'] == principal.user_id]
             if unconfirmed:
-                agents = [a for a in agents if self.agent_scopes(a, moment=moment)[1] != 'set']
+                agents = [a for a in agents if self.agent_scopes(a)[1] != 'set']
             agents.sort(key=lambda a: a['id'])
             return [self.agent_view(a, principal, moment=moment) for a in agents[offset:offset + limit]], len(agents)
 

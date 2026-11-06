@@ -6724,6 +6724,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def require(self, ctx, capability, *, moment=None):
         """Authorize one read/route capability against live authority."""
+        if moment is None:
+            return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability)
         return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability, moment=moment)
 
     def _project(self, ctx, capability=CAP_READ):
