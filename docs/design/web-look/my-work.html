@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestra mock-up</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<div class="mock-note">Mock-up with made-up data — look only, not the .522 shell</div>
+<div class="shell">
+  <a class="skip" href="#main">Skip to content</a>
+  <nav class="rail" id="rail" aria-label="Main">
+    <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a>
+    <div class="rail-section"><a class="nav-link" href="#" aria-current="page"><span>My work</span><span class="nav-count">3</span></a><a class="nav-link" href="#"><span>My agents</span><span class="nav-count">1</span></a><a class="nav-link" href="#"><span>All projects</span></a></div>
+    <div class="rail-section">
+      <label class="rail-label" for="project-switch">Project</label>
+      <select id="project-switch" class="project-switch" aria-label="Current project">
+        <option value="">Choose a project…</option>
+        <option selected>Order portal</option>
+        <option>Billing</option>
+      </select>
+      <a class="nav-link" href="#"><span>Tasks</span><span class="nav-count">17</span></a><a class="nav-link" href="#"><span>Reviews</span><span class="nav-count">2</span></a><a class="nav-link" href="#"><span>Releases</span></a><a class="nav-link" href="#"><span>Requirements</span></a><a class="nav-link" href="#"><span>Records</span></a><a class="nav-link" href="#"><span>Decisions</span></a><a class="nav-link" href="#"><span>Rooms</span><span class="nav-count">2</span></a>
+    </div>
+    <div class="rail-foot">
+      <div class="who"><span class="avatar" aria-hidden="true">MO</span>
+        <div><div class="who-name">Maya Okafor</div><div class="small muted">@maya</div></div></div>
+      <div class="actions"><a class="btn" href="#">Account</a><button type="button">Sign out</button></div>
+    </div>
+  </nav>
+  <div class="content">
+    <div class="main-top"><button type="button" class="menu-toggle ghost">Menu</button>
+      <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a></div>
+    <main class="main" id="main" tabindex="-1">
+<div class="stack">
+  <div class="page-head"><h1 tabindex="-1">My work</h1>
+    <p class="lede">Everything waiting on you across 2 active project(s). Opening a task never marks it done.</p></div>
+  <section class="panel" aria-labelledby="h-agent-prompts">
+    <div class="panel-head"><h2 class="small" id="h-agent-prompts">Copy prompt for my agent</h2></div>
+    <div class="panel-body">
+      <p class="small muted">Paste into the agent’s chat in its folder. The agent first checks its own list in Orchestra and reports any difference to you before acting.</p>
+      <div class="copy-row"><button type="button">Copy prompt for Piper</button><button type="button">Copy prompt for Otto</button></div>
+      <p class="small muted">Piper: 1 item(s) · Otto: 1 item(s) · snapshot Nov 6, 01:04</p>
+    </div>
+  </section>
+  <section class="panel" aria-labelledby="h-agents">
+    <div class="panel-head"><h2 class="small" id="h-agents">Your agents <span class="nav-count">2 need you</span></h2>
+      <span class="small muted">As of 01:04 · <button type="button" class="link">Refresh</button></span></div>
+    <div class="panel-body agent-grid">
+      <div class="stack" data-agent="piper">
+        <article class="agent-card needs">
+          <div class="agent-head"><div><h3>Piper</h3><div class="small muted">Claude chat · last active 2 hours ago</div></div>
+            <span class="chip warn">Has feedback to act on</span></div>
+          <p class="next">Next: Piper has feedback on order-7 — respond to the three review items. <span class="who-acts you">you</span></p>
+          <div class="resume"><div class="resume-row"><span class="resume-label">Folder</span>
+            <span class="path mono">~/agents/piper</span><button type="button">Resume</button></div></div>
+          <p class="small muted">Works in: Order portal, Billing</p>
+          <div class="copy-row"><button type="button">Set up folder</button></div>
+        </article>
+      </div>
+      <div class="stack" data-agent="jules">
+        <article class="agent-card">
+          <div class="agent-head"><div><h3>Jules</h3><div class="small muted">Gemini chat · last active yesterday</div></div>
+            <span class="chip accent">Could take more work</span></div>
+          <p class="next">Next: 3 unclaimed task(s) in its projects. <span class="who-acts you">you</span></p>
+          <div class="resume"><div class="resume-row"><span class="resume-label">Folder</span>
+            <span class="path mono">~/agents/jules</span><button type="button">Resume</button></div></div>
+          <p class="small muted">Works in: Order portal</p>
+        </article>
+      </div>
+    </div>
+  </section>
+  <section class="panel" aria-labelledby="h-Revisionsrequested">
+    <div class="panel-head"><h2 class="small" id="h-Revisionsrequested">Revisions requested <span class="nav-count">1</span></h2></div>
+    <div class="table-wrap"><table class="task-list-work">
+      <thead><tr>
+  <th scope="col" class="task-title-column">Task</th>
+  <th scope="col" class="hide-narrow task-project-column">Project</th>
+  <th scope="col" class="task-state-column">State</th>
+  <th scope="col" class="task-next-column">Next action</th>
+  <th scope="col" class="hide-narrow task-updated-column">Updated</th>
+</tr></thead><tbody>
+      <tr class="row-link">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Refund webhook retries">Refund webhook retries</a>
+    <div class="sub">P0 · <span class="mono">order-7</span></div></td>
+  <td class="hide-narrow task-project-column">Order portal</td>
+  <td class="task-state-column"><span class="chip warn">Changes requested</span></td>
+  <td class="task-next-column">you · respond to the three review items <span class="chip crit">Blocked</span></td>
+  <td class="hide-narrow muted task-updated-column">Nov 4, 22:31</td>
+</tr>
+      </tbody></table></div>
+  </section>
+  <section class="panel" aria-labelledby="h-Waitingforyourreview">
+    <div class="panel-head"><h2 class="small" id="h-Waitingforyourreview">Waiting for your review <span class="nav-count">2</span></h2>
+      <span class="small muted">Stays here until you act — no reminder needed</span></div>
+    <div class="table-wrap"><table class="task-list-work">
+      <thead><tr>
+  <th scope="col" class="task-title-column">Task</th>
+  <th scope="col" class="hide-narrow task-project-column">Project</th>
+  <th scope="col" class="task-state-column">State</th>
+  <th scope="col" class="task-next-column">Next action</th>
+  <th scope="col" class="hide-narrow task-updated-column">Updated</th>
+</tr></thead><tbody>
+      <tr class="row-link">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Website look and feel: a design system">Website look and feel: a design system</a>
+    <div class="sub">P2 · <span class="mono">order-14</span></div></td>
+  <td class="hide-narrow task-project-column">Order portal</td>
+  <td class="task-state-column"><span class="chip accent">Awaiting review</span></td>
+  <td class="task-next-column">you · review the delivered contribution</td>
+  <td class="hide-narrow muted task-updated-column">Nov 6, 01:12</td>
+</tr>
+      <tr class="row-link">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Export the ledger as CSV">Export the ledger as CSV</a>
+    <div class="sub">P2 · <span class="mono">order-9</span></div></td>
+  <td class="hide-narrow task-project-column">Billing</td>
+  <td class="task-state-column"><span class="chip accent">Awaiting review</span></td>
+  <td class="task-next-column">you · review the delivered contribution</td>
+  <td class="hide-narrow muted task-updated-column">Nov 5, 09:04</td>
+</tr>
+      </tbody></table></div>
+  </section>
+  <section class="panel" aria-labelledby="h-Assignedtoyou">
+    <div class="panel-head"><h2 class="small" id="h-Assignedtoyou">Assigned to you <span class="nav-count">1</span></h2></div>
+    <div class="table-wrap"><table class="task-list-work">
+      <thead><tr>
+  <th scope="col" class="task-title-column">Task</th>
+  <th scope="col" class="hide-narrow task-project-column">Project</th>
+  <th scope="col" class="task-state-column">State</th>
+  <th scope="col" class="task-next-column">Next action</th>
+  <th scope="col" class="hide-narrow task-updated-column">Updated</th>
+</tr></thead><tbody>
+      <tr class="row-link">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Set up agent prompts for the team">Set up agent prompts for the team</a>
+    <div class="sub">P3 · <span class="mono">order-16</span></div></td>
+  <td class="hide-narrow task-project-column">Order portal</td>
+  <td class="task-state-column"><span class="chip accent">In progress</span></td>
+  <td class="task-next-column">you · deliver the first draft</td>
+  <td class="hide-narrow muted task-updated-column">Nov 3, 18:40</td>
+</tr>
+      </tbody></table></div>
+  </section>
+  <p class="empty-line">Nothing blocked on anyone else.</p>
+</div>
+    </main>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestra mock-up</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<div class="mock-note">Mock-up with made-up data — look only, not the .522 shell</div>
+<div class="shell">
+  <a class="skip" href="#main">Skip to content</a>
+  <nav class="rail" id="rail" aria-label="Main">
+    <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a>
+    <div class="rail-section"><a class="nav-link" href="#"><span>My work</span><span class="nav-count">3</span></a><a class="nav-link" href="#"><span>My agents</span><span class="nav-count">1</span></a><a class="nav-link" href="#"><span>All projects</span></a></div>
+    <div class="rail-section">
+      <label class="rail-label" for="project-switch">Project</label>
+      <select id="project-switch" class="project-switch" aria-label="Current project">
+        <option value="">Choose a project…</option>
+        <option selected>Order portal</option>
+        <option>Billing</option>
+      </select>
+      <a class="nav-link" href="#" aria-current="page"><span>Tasks</span><span class="nav-count">17</span></a><a class="nav-link" href="#"><span>Reviews</span><span class="nav-count">2</span></a><a class="nav-link" href="#"><span>Releases</span></a><a class="nav-link" href="#"><span>Requirements</span></a><a class="nav-link" href="#"><span>Records</span></a><a class="nav-link" href="#"><span>Decisions</span></a><a class="nav-link" href="#"><span>Rooms</span><span class="nav-count">2</span></a>
+    </div>
+    <div class="rail-foot">
+      <div class="who"><span class="avatar" aria-hidden="true">MO</span>
+        <div><div class="who-name">Maya Okafor</div><div class="small muted">@maya</div></div></div>
+      <div class="actions"><a class="btn" href="#">Account</a><button type="button">Sign out</button></div>
+    </div>
+  </nav>
+  <div class="content">
+    <div class="main-top"><button type="button" class="menu-toggle ghost">Menu</button>
+      <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a></div>
+    <main class="main" id="main" tabindex="-1">
+<div class="stack">
+  <div class="page-head">
+    <div><nav class="crumbs" aria-label="Breadcrumb"><a href="#">Projects</a> / <span>Order portal</span></nav>
+      <h1 tabindex="-1">Order portal</h1>
+      <p class="lede">The customer-facing ordering site: catalogue, basket, checkout and refunds.</p></div>
+    <div class="actions"><a class="btn primary" href="#">New task</a></div>
+  </div>
+  <section class="summary" aria-label="This project now">
+    <div class="chips"><span class="chip " data-summary="open">Tasks</span><span class="chip plain" data-summary="review">Review states vary by row</span></div>
+    <div class="meta">Who acts next is named on each row.</div>
+  </section>
+  <section class="panel" aria-labelledby="tasks-heading">
+    <div class="panel-head"><h2 class="small" id="tasks-heading">Tasks</h2>
+      <div class="toolbar">
+        <input type="search" placeholder="Search tasks" aria-label="Search tasks">
+        <div class="seg" role="group" aria-label="Status">
+          <button type="button" aria-pressed="true">Open</button>
+          <button type="button" aria-pressed="false">In progress</button>
+          <button type="button" aria-pressed="false">Closed</button>
+        </div>
+        <select aria-label="Review state"><option>Any review state</option></select>
+        <label class="check"><input type="checkbox"> Show requirements</label>
+      </div></div>
+    <div class="table-wrap"><table class="stack-narrow task-list-project">
+      <caption class="visually-hidden">Tasks in Order portal</caption>
+      <thead><tr>
+        <th scope="col" class="task-title-column">Task</th>
+        <th scope="col" class="task-state-column">State</th>
+        <th scope="col" class="task-next-column">Who acts next</th>
+        <th scope="col" class="hide-narrow task-updated-column">Updated</th>
+      </tr></thead>
+      <tbody>
+      <tr class="row-link task-row">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Website look and feel: a design system">Website look and feel: a design system</a>
+    <div class="sub">P2 · <span class="mono">order-14</span></div></td>
+  <td class="task-state-column"><span class="chip accent">Awaiting review</span></td>
+  <td class="who-acts-cell task-next-column" data-who-acts="Lee Park"><span class="who-acts">Sam Rivera · an owner (you) reviews the contribution</span></td>
+  <td class="hide-narrow muted task-updated-column">Nov 6, 01:12</td>
+</tr>
+      <tr class="row-link task-row">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Timed wake-ups on a lane">Timed wake-ups on a lane</a>
+    <div class="sub">P1 · <span class="mono">order-11</span></div></td>
+  <td class="task-state-column"><span class="chip ok">Approved · not integrated</span></td>
+  <td class="who-acts-cell task-next-column" data-who-acts="Lee Park"><span class="who-acts">Lee Park · the coordinator integrates r2 (bb19f62) into main</span></td>
+  <td class="hide-narrow muted task-updated-column">Nov 5, 16:58</td>
+</tr>
+      <tr class="row-link task-row">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Export the ledger as CSV">Export the ledger as CSV</a>
+    <div class="sub">P2 · <span class="mono">order-9</span></div></td>
+  <td class="task-state-column"><span class="chip accent">Awaiting review</span></td>
+  <td class="who-acts-cell task-next-column" data-who-acts="Lee Park"><span class="who-acts">Maya Okafor · review the delivered contribution</span></td>
+  <td class="hide-narrow muted task-updated-column">Nov 5, 09:04</td>
+</tr>
+      <tr class="row-link task-row">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Refund webhook retries">Refund webhook retries</a>
+    <div class="sub">P0 · <span class="mono">order-7</span></div></td>
+  <td class="task-state-column"><span class="chip warn">Changes requested</span></td>
+  <td class="who-acts-cell task-next-column" data-who-acts="Lee Park"><span class="who-acts">Sam Rivera · respond to the three review items</span></td>
+  <td class="hide-narrow muted task-updated-column">Nov 4, 22:31</td>
+</tr>
+      <tr class="row-link task-row">
+  <td class="task-title-cell"><span class="chip " title="A requirement record, not claimable work">Requirement</span> <a class="title task-list-title" href="#" title="Returns must cite the ledger">Returns must cite the ledger</a>
+    <div class="sub">P3 · <span class="mono">order-15</span> · <a href="#">Edit on Requirements</a></div></td>
+  <td class="task-state-column"><span class="chip ">Open</span></td>
+  <td class="who-acts-cell task-next-column" data-who-acts="Lee Park"><span class="who-acts none">anyone · claim and define it</span></td>
+  <td class="hide-narrow muted task-updated-column">Oct 30, 11:02</td>
+</tr>
+      <tr class="row-link task-row">
+  <td class="task-title-cell"><a class="title task-list-title" href="#" title="Import the old catalogue">Import the old catalogue</a>
+    <div class="sub">P2 · <span class="mono">order-3</span></div></td>
+  <td class="task-state-column"><span class="chip plain">Closed</span></td>
+  <td class="who-acts-cell task-next-column" data-who-acts="Lee Park"><span class="muted">—</span></td>
+  <td class="hide-narrow muted task-updated-column">Oct 12, 15:20</td>
+</tr>
+      </tbody></table></div>
+    <div class="pager"><span class="num">1–6 of 34</span>
+      <div class="actions"><button type="button" disabled>Previous</button><button type="button">Next</button></div></div>
+  </section>
+  <details class="fold"><summary>Coordinator tools <span class="fold-hint">merge slot, guidance, onboarding</span></summary>
+    <div class="fold-body"><p class="empty-line">Nothing here in the mock-up.</p></div></details>
+</div>
+    </main>
+  </div>
+</div>
+</body>
+</html>

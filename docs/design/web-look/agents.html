@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestra mock-up</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<div class="mock-note">Mock-up with made-up data — look only, not the .522 shell</div>
+<div class="shell">
+  <a class="skip" href="#main">Skip to content</a>
+  <nav class="rail" id="rail" aria-label="Main">
+    <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a>
+    <div class="rail-section"><a class="nav-link" href="#"><span>My work</span><span class="nav-count">3</span></a><a class="nav-link" href="#" aria-current="page"><span>My agents</span><span class="nav-count">1</span></a><a class="nav-link" href="#"><span>All projects</span></a></div>
+    <div class="rail-section">
+      <label class="rail-label" for="project-switch">Project</label>
+      <select id="project-switch" class="project-switch" aria-label="Current project">
+        <option value="">Choose a project…</option>
+        <option selected>Order portal</option>
+        <option>Billing</option>
+      </select>
+      <a class="nav-link" href="#"><span>Tasks</span><span class="nav-count">17</span></a><a class="nav-link" href="#"><span>Reviews</span><span class="nav-count">2</span></a><a class="nav-link" href="#"><span>Releases</span></a><a class="nav-link" href="#"><span>Requirements</span></a><a class="nav-link" href="#"><span>Records</span></a><a class="nav-link" href="#"><span>Decisions</span></a><a class="nav-link" href="#"><span>Rooms</span><span class="nav-count">2</span></a>
+    </div>
+    <div class="rail-foot">
+      <div class="who"><span class="avatar" aria-hidden="true">MO</span>
+        <div><div class="who-name">Maya Okafor</div><div class="small muted">@maya</div></div></div>
+      <div class="actions"><a class="btn" href="#">Account</a><button type="button">Sign out</button></div>
+    </div>
+  </nav>
+  <div class="content">
+    <div class="main-top"><button type="button" class="menu-toggle ghost">Menu</button>
+      <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a></div>
+    <main class="main" id="main" tabindex="-1">
+<div class="stack">
+  <div class="page-head"><h1 tabindex="-1">My agents</h1>
+    <p class="lede">One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.</p>
+    <div class="actions"><button type="button" class="primary">Add an agent…</button></div></div>
+  <div class="agent-grid">
+    <div class="stack" data-agent="piper">
+  <article class="agent-card needs">
+    <div class="agent-head"><div><h3>Piper</h3><div class="small muted">Claude chat · last active 2 hours ago</div></div><span class="chip warn">Has feedback to act on</span></div>
+    <p class="next">Next: Piper has feedback on order-7 — respond to the three review items. <span class="who-acts you">you</span></p>
+    <div class="resume"><div class="resume-row"><span class="resume-label">Folder</span><span class="path mono">~/agents/piper</span><button type="button">Resume</button></div></div>
+    <p class="small muted">Works in: Order portal, Billing</p>
+  </article>
+  <details class="agent-details" open><summary>Details and settings</summary>
+    <div class="stack"><p class="empty-line">Folded in the mock-up.</p></div></details>
+</div>
+    <div class="stack" data-agent="otto">
+  <article class="agent-card">
+    <div class="agent-head"><div><h3>Otto</h3><div class="small muted">GitHub Copilot chat · last active 14 minutes ago</div></div><span class="chip ">Working</span></div>
+    <p class="next">Next: Otto is implementing order-16.</p>
+    <div class="resume"><div class="resume-row"><span class="resume-label">Folder</span><span class="path mono">~/agents/otto</span><button type="button">Resume</button></div></div>
+    <p class="small muted">Works in: Order portal, Billing</p>
+  </article>
+  <details class="agent-details"><summary>Details and settings</summary>
+    <div class="stack"><p class="empty-line">Folded in the mock-up.</p></div></details>
+</div>
+    <div class="stack" data-agent="rae">
+  <article class="agent-card">
+    <div class="agent-head"><div><h3>Rae</h3><div class="small muted">Claude chat · last active 3 hours ago</div></div><span class="chip ok">Waiting for review</span></div>
+    <p class="next">Next: r1 of order-12 awaits review.</p>
+    <div class="resume"><div class="resume-row"><span class="resume-label">Folder</span><span class="path mono">~/agents/rae</span><button type="button">Resume</button></div></div>
+    <p class="small muted">Works in: Order portal, Billing</p>
+  </article>
+  <details class="agent-details"><summary>Details and settings</summary>
+    <div class="stack"><p class="empty-line">Folded in the mock-up.</p></div></details>
+</div>
+    <div class="stack" data-agent="jules">
+  <article class="agent-card needs">
+    <div class="agent-head"><div><h3>Jules</h3><div class="small muted">Gemini chat · last active yesterday</div></div><span class="chip accent">Could take more work</span></div>
+    <p class="next">Next: 3 unclaimed task(s) in its projects. <span class="who-acts you">you</span></p>
+    <div class="resume"><div class="resume-row"><span class="resume-label">Folder</span><span class="path mono">~/agents/jules</span><button type="button">Resume</button></div></div>
+    <p class="small muted">Works in: Order portal</p>
+  </article>
+  <details class="agent-details"><summary>Details and settings</summary>
+    <div class="stack"><p class="empty-line">Folded in the mock-up.</p></div></details>
+</div>
+  </div>
+  <div class="copy-row" data-agent-pages=""><span class="small muted">4 shown of 4 agents</span></div>
+</div>
+    </main>
+  </div>
+</div>
+</body>
+</html>
