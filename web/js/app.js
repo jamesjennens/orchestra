@@ -2,7 +2,7 @@
 import { h, mount, brandMark, initials, confirmDialog, toast } from './dom.js';
 import { createApi, fetchTransport } from './api.js';
 import { describe } from './ui.js';
-import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage, SECTION_LABELS, rememberProject, rememberedProject, forgetProject } from './routes.js';
+import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage, SECTION_LABELS, searchLeftMessage, rememberProject, rememberedProject, forgetProject } from './routes.js';
 import * as auth from './views/auth.js';
 import * as work from './views/work.js';
 import * as project from './views/project.js';
@@ -101,7 +101,7 @@ export async function start(root, options = {}) {
     try { await api.logout(); } catch { /* the session is gone either way */ }
     agents.clearWizardStorage();
     forgetProject(storage, ctx.me && ctx.me.id);
-    pendingUser = ctx.me && ctx.me.id;
+    if (ctx.me) pendingUser = ctx.me.id;   // a second click finds nobody signed in and must not clear it
     token += 1;
     ctx.me = null; ctx.projects = [];
     // The next person to sign in on this browser starts at home, not on this person's last page.
@@ -113,7 +113,7 @@ export async function start(root, options = {}) {
     agents.clearWizardStorage();
     // Another tab signed out: nothing of this person's is kept, and no late write comes from the page left.
     forgetProject(storage, ctx.me && ctx.me.id);
-    pendingUser = ctx.me && ctx.me.id;
+    if (ctx.me) pendingUser = ctx.me.id;
     token += 1;
     ctx.me = null;
     showLogin('Your session has ended. Sign in again to continue.');
@@ -148,18 +148,23 @@ export async function start(root, options = {}) {
   function switchProject(targetPid) {
     // Read the current route and its project's sections before ctx.go changes location.hash.
     const route = currentRoute();
-    const here = ctx.projects.find((p) => p.id === projectOf(route));
+    const here = ctx.projects.find((p) => p.id === projectOf(route.split('?')[0]));
     const hereSections = here ? projectSections(here) : [];
     const target = ctx.projects.find((p) => p.id === targetPid);
     const sections = target ? projectSections(target) : [];
-    // Handover and Notes are open to every member and are not rail entries: a target the person can open serves them.
+    // Handover and Notes are not rail entries; the target is kept on them. Handover opens for every member; Notes
+    // can answer "No access" to a viewer, which its page says (the section is still the one asked for).
     const t = switchTarget(route, targetPid, sections.map(([seg]) => seg).concat(target ? ['handover', 'notes'] : []));
     ctx.go(t.path);
+    const lines = [];
     if (t.fellBack) {
       const name = target ? target.name : 'that project';
-      const label = t.section && ((hereSections.find(([seg]) => seg === t.section) || [])[1] || SECTION_LABELS[t.section]);
-      toast(fallbackMessage(name, label, t.page));
+      const label = t.section && ((hereSections.find(([seg]) => seg === t.section) || [])[1] || (Object.hasOwn(SECTION_LABELS, t.section) ? SECTION_LABELS[t.section] : ''));
+      // An unknown section (a hand-written URL) has no name to give: the page-level sentence, not the task one.
+      lines.push(t.section && !label ? fallbackMessage(name, '', 'other') : fallbackMessage(name, label, t.page));
     }
+    if (t.qDropped) lines.push(searchLeftMessage(here ? here.name : 'the project you left'));
+    if (lines.length) toast(lines.join(' '));
   }
 
   function buildShell(route) {

@@ -111,10 +111,13 @@ export function switchTarget(route, targetPid, sections) {
   if (section === 'new') return tasks('new');
   // kittrial-5bb.522 slice 1: the view's filters survive the switch (they mean the same in every project).
   const kept = switchQuery(search);
+  // A search that stays behind is said so (qLeft), alone or with a fallback sentence.
+  const qLeft = new URLSearchParams(search || '').get('q');
+  const dropped = qLeft && !mayCross('q', qLeft) ? { qDropped: true } : {};
   if (section === '' || sections.includes(section)) {
-    return { path: (section ? `/p/${targetPid}/${section}` : `/p/${targetPid}`) + kept, fellBack: false, section };
+    return { path: (section ? `/p/${targetPid}/${section}` : `/p/${targetPid}`) + kept, fellBack: false, section, ...dropped };
   }
-  return { path: `/p/${targetPid}` + kept, fellBack: true, section };
+  return { path: `/p/${targetPid}` + kept, fellBack: true, section, ...dropped };
 }
 
 // The query keys that are view filters, the same in every project (kittrial-5bb.522 slice 1). Every other key
@@ -124,15 +127,17 @@ export const SWITCH_FILTER_KEYS = ['status', 'q', 'review', 'requirements'];
 // A value crosses only when it means the same in every project (r2): status, review and requirements when it is a
 // word of their vocabulary; q when no word in it has the shape of an id. A search for an id (task_18cb2f,
 // alpha-7k2, kittrial-5bb.522, room_7f3a, r-9d4487e9c7da, REQ-7) names one record of one project, so it stays
-// behind. The ONE pattern: letters and digits joined by '-', '_' or '.', at least once. Plain words cross; a
-// hyphenated word such as set-up has the shape too and stops crossing, which is accepted.
-export const ID_SHAPED = /^[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)+$/;
+// behind. The ONE pattern, tested once on the whole value (no split, no trim, so an id next to any other
+// character is still found and the test is linear): a letter or digit, one or more of '-', '_' or '.', then a
+// letter or digit. Plain words cross; a hyphenated or dotted word such as set-up has the shape too and stops
+// crossing, which is accepted.
+export const ID_SHAPED = /[A-Za-z0-9][-_.]+[A-Za-z0-9]/;
 const SWITCH_WORDS = new Map([
   ['status', ['active', 'closed', 'all']],
   ['review', ['awaiting-review', 'legacy-review-ready', 'changes-requested', 'approved', 'awaiting-integration', 'error', 'withdrawn', 'superseded', 'none']],
   ['requirements', ['1']],
 ]);
-const namesARecord = (text) => text.split(/[\s,;:!?()"'[\]]+/).some((word) => ID_SHAPED.test(word.replace(/^[-_.]+|[-_.]+$/g, '')));
+const namesARecord = (text) => ID_SHAPED.test(text);
 export function mayCross(key, value) {
   if (key === 'q') return !namesARecord(value);
   const words = SWITCH_WORDS.get(key);
@@ -173,6 +178,11 @@ export function rememberedProject(storage, userId, projects) {
 export function forgetProject(storage, userId) {
   if (!storage || !userId) return;
   try { storage.removeItem(LAST_PROJECT_PREFIX + userId); } catch { /* ignore */ }
+}
+
+// The line the toast adds when a switch leaves the search behind (switchTarget's qDropped).
+export function searchLeftMessage(oldName) {
+  return `The search was not carried over, because it names something in ${oldName}.`;
 }
 
 // The sentence the switcher's toast shows after a fallback, one true reason per case. `label` is the section's

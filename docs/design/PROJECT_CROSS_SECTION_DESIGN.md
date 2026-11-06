@@ -244,18 +244,23 @@ the project itself; the always-Tasks landing is .504's, above) and §1.9 for Tas
     `review` as one of the review-state words (`awaiting-review`, `legacy-review-ready`, `changes-requested`,
     `approved`, `awaiting-integration`, `error`, `withdrawn`, `superseded`, `none`); `requirements` as `1`. Any
     other value is dropped (a task id typed into `status` does not cross).
-  - **The `q` pattern (one):** a search crosses unless a word in it has the shape of an id, that is letters and
-    digits joined by `-`, `_` or `.` at least once (`/^[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)+$/`, routes.js
-    `ID_SHAPED`, after trimming separators at a word's ends and splitting on spaces and punctuation). It covers
-    `task_18cb2f`, `alpha-1`, `alpha-7k2`, `room_7f3a`, `r-9d4487e9c7da`, `REQ-7`, `kittrial-5bb.522`. A search for
-    an id names one record of one project, so it stays behind. Plain words cross. A hyphenated word such as
-    `set-up` has the shape too and stops crossing; that is accepted.
+  - **The `q` pattern (one):** a search crosses unless the value contains the shape of an id, that is a letter or
+    digit, one or more of `-`, `_` or `.`, then a letter or digit (`/[A-Za-z0-9][-_.]+[A-Za-z0-9]/`, routes.js
+    `ID_SHAPED`), tested once on the whole value: no splitting and no trimming, so an id next to any character
+    (`` `X` ``, `#X`, `<X>`, `id=X`, `X/`, a pasted task link, `key@3`, smart quotes, `X…`, `task__x`) is found,
+    and the test is linear. It covers `task_18cb2f`, `alpha-1`, `alpha-7k2`, `room_7f3a`, `r-9d4487e9c7da`,
+    `REQ-7`, `kittrial-5bb.522`. A search for an id names one record of one project, so it stays behind. Plain
+    words cross. Any hyphenated or dotted word (`set-up`, `e.g.`, `v1.2`) has the shape too and stops crossing;
+    that is accepted.
+  - **A search that stays behind is said so:** the toast adds "The search was not carried over, because it names
+    something in A." (A is the project left), alone or after a fallback sentence.
   - **Records' `state`** is not carried: no page writes it, and only keys a page writes are carried.
   - **A key that names a record of A** (`?proposal=<key>` on Reviews, project.js:638) or a mode of one page is
     dropped, because B has no such record.
 - **(b) Fallback to Tasks.** If the section is not available in B for this person (Set up for a non-owner, Program
   where B has none), B's Tasks list opens and the toast says so once. This is as today; the filters still apply to
-  Tasks. Handover and Notes are open to every member, so they keep their section in any project the person can open.
+  Tasks. Handover and Notes are not rail entries and keep their section in any project the person can open.
+  Handover opens for every member; Notes can answer "No access" to a viewer of B (the page says so; no toast).
 - **(c) A record page of A** opens B's matching list where B serves it, with nothing of the page's query, and the
   toast gives the true reason (one sentence each, routes.js `fallbackMessage`):
   - a task page (`#/p/A/t/ID`) opens B's Tasks: "Task pages belong to one project, so B opened on Tasks.";
@@ -266,7 +271,7 @@ the project itself; the always-Tasks landing is .504's, above) and §1.9 for Tas
   - where B does not serve that list (Decisions on a server without them), B's Tasks opens: "B has no Decisions
     page, so it opened on Tasks.";
   - a section B lacks (Set up, Program): "B has no Set up page, so it opened on Tasks." (filters kept);
-  - any other page of A (a design or trace page): "That page belongs to one project, so B opened on Tasks."
+  - an unknown section of A (a hand-written URL) and any other page of A (a design or trace page): "That page belongs to one project, so B opened on Tasks."
 - **(d) The project is remembered.** The last project a person opened is kept in their browser as
   `orchestra.lastProject.<user id>` and cleared on sign-out and when the session is lost (a 401).
   - On a page without a project (My work, My agents, Projects), the rail shows that project in the switcher, with

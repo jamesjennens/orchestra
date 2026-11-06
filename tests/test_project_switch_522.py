@@ -271,6 +271,31 @@ class BrowserBehaviour(unittest.TestCase):
     def test_s3_the_status_words_and_inherited_names_in_the_url(self):
         self.check('s3_the_status_words_and_inherited_names_in_the_url')
 
+    # r3
+    def test_m1b_a_search_left_behind_is_said_once_and_alone_or_with_a_fallback_sentence(self):
+        self.check('m1b_a_search_left_behind_is_said_once_and_alone_or_with_a_fallback_sentence')
+
+    def test_m1b_with_a_fallback_the_two_sentences_share_one_toast(self):
+        self.check('m1b_with_a_fallback_the_two_sentences_share_one_toast')
+
+    def test_m1b_no_search_no_line(self):
+        self.check('m1b_no_search_no_line')
+
+    def test_s1a_a_new_render_on_the_same_path_does_not_take_the_old_timers_write(self):
+        self.check('s1a_a_new_render_on_the_same_path_does_not_take_the_old_timers_write')
+
+    def test_s1a_the_rail_tasks_link_from_a_closed_list_inside_the_window(self):
+        self.check('s1a_the_rail_tasks_link_from_a_closed_list_inside_the_window')
+
+    def test_s1b_an_archived_projects_page_does_not_become_the_remembered_project(self):
+        self.check('s1b_an_archived_projects_page_does_not_become_the_remembered_project')
+
+    def test_n2_a_double_click_on_sign_out_still_sends_the_next_person_home(self):
+        self.check('n2_a_double_click_on_sign_out_still_sends_the_next_person_home')
+
+    def test_n3_an_inherited_name_as_a_section_puts_no_code_in_the_toast(self):
+        self.check('n3_an_inherited_name_as_a_section_puts_no_code_in_the_toast')
+
     # notes
     def test_n4_the_group_asked_for_says_none_even_when_it_is_needs_operator_attention(self):
         self.check('n4_the_group_asked_for_says_none_even_when_it_is_needs_operator_attention')

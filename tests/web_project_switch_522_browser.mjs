@@ -72,6 +72,7 @@ const USERS = {
   a: { id: 'usr_a', username: 'a', display_name: 'A', superuser: false },
   b: { id: 'usr_b', username: 'b', display_name: 'B', superuser: false },
 };
+const ARCHIVED = { id: 'eta', name: 'Eta', role: 'owner', usable: true, archived: true };
 const TASKS = { alpha: [{ id: 'alpha-1', title: 'One', status: 'open', updated_at: '2026-01-01T00:00:00Z' }], beta: [] };
 const calls = [];
 let projectList = () => ({ status: 200, data: { items: PROJECTS } });
@@ -86,7 +87,7 @@ function transport(method, path) {
   if (p === '/v1/sessions/current') return Promise.resolve({ status: 200, data: { user: USERS.a, csrf_token: 'tok' } });
   if (p === '/v1/projects') return Promise.resolve(projectList());
   const project = /^\/v1\/projects\/([a-z]+)$/.exec(p);
-  if (project) return Promise.resolve({ status: 200, data: PROJECTS.find((x) => x.id === project[1]) });
+  if (project) return Promise.resolve({ status: 200, data: PROJECTS.concat([ARCHIVED]).find((x) => x.id === project[1]) });
   const tasks = /^\/v1\/projects\/([a-z]+)\/tasks$/.exec(p);
   if (tasks) return Promise.resolve({ status: 200, data: { items: TASKS[tasks[1]] || [], next_cursor: null } });
   if (/\/queue$/.test(p)) return Promise.resolve({ status: 200, data: { items: [] } });
@@ -287,6 +288,22 @@ await test('m1_q_crosses_only_without_an_id_shaped_word', async () => {
     same(q(id), '/p/beta', 'an id: ' + id);
   }
   same(q('set-up'), '/p/beta', 'a hyphenated word has an id\'s shape and may stay behind');
+  // r3: an id next to any other character is still an id (the whole value is tested, no split, no trim).
+  const ids = ['task_18913a1f7280', 'alpha-1', 'kittrial-5bb.522', 'room_7f3a', 'REQ-7'];
+  const shapes = [(x) => '`' + x + '`', (x) => '#' + x, (x) => '<' + x + '>', (x) => 'id=' + x, (x) => x + '/', (x) => x + '..', (x) => x + '...',
+    (x) => 'http://orchestra.example/#/p/alpha/t/' + x, (x) => 'ref.' + x + '@3', (x) => '\u201c' + x + '\u201d', (x) => x + '\u2026', (x) => '@' + x,
+    (x) => '$' + x, (x) => '%' + x, (x) => '^' + x, (x) => '~' + x, (x) => '*' + x + '*', (x) => '\\' + x, (x) => '|' + x + '|', (x) => '&' + x,
+    (x) => '+' + x, (x) => '\u00ab' + x + '\u00bb', (x) => '[' + x + ']', (x) => '{' + x + '}', (x) => x + '-', (x) => '-' + x, (x) => x.replace(/[_-]/, '__'),
+    (x) => 'wish ' + x, (x) => x + ' wish', (x) => x + ';', (x) => x + '?'];
+  let tried = 0;
+  for (const id of ids) for (const shape of shapes) { const text = shape(id); tried += 1; same(q(text), '/p/beta', 'an id with a neighbour: ' + text); }
+  if (tried < 52) throw new Error('only ' + tried + ' shapes');
+  same(q('ref.a--b'), '/p/beta', 'a doubled separator');
+  for (const word of ["don't", 'R&D', 'TCP/IP', '#tag', 'caf\u00e9', '\u65e5\u672c\u8a9e', 'wish list', 'k1', 'R01']) same(q(word), '/p/beta?q=' + new URLSearchParams({ q: word }).toString().slice(2), 'plain: ' + word);
+  const started = Date.now();
+  q('a' + '-'.repeat(100000));
+  q('-'.repeat(100000) + ' wish');
+  if (Date.now() - started > 1000) throw new Error('a long run of hyphens takes ' + (Date.now() - started) + ' ms');
 });
 
 await test('m1_status_review_requirements_cross_only_as_words_of_their_vocabulary', async () => {
@@ -530,6 +547,90 @@ await test('n2_a_deep_link_opened_with_nobody_signed_in_is_for_whoever_signs_in'
   await ctx.signedIn(USERS.b);
   await settle(20);
   same(route(), '/p/alpha/reviews?review=changes-requested', 'the deep link');
+});
+
+const newToasts = (before) => toasts().slice(before);
+
+// ---- r3 m1b: a search that stays behind is said so ------------------------------------------------------------
+await test('m1b_a_search_left_behind_is_said_once_and_alone_or_with_a_fallback_sentence', async () => {
+  const LEFT = 'The search was not carried over, because it names something in Alpha.';
+  let before = toasts().length;
+  const { root } = await boot('#/p/alpha?q=alpha-1');
+  await chooseProject(root, 'beta');
+  same([route(), newToasts(before)], ['/p/beta', [LEFT]], 'a search that names a task of Alpha');
+  before = toasts().length;
+  const second = await boot('#/p/alpha?q=wish');
+  await chooseProject(second.root, 'beta');
+  same(newToasts(before).filter((t) => t.includes('not carried')), [], 'a plain word crosses, no line');
+});
+
+await test('m1b_with_a_fallback_the_two_sentences_share_one_toast', async () => {
+  const before = toasts().length;
+  const { root } = await boot('#/p/alpha/setup?q=alpha-1&status=closed');
+  await chooseProject(root, 'beta');
+  same([route(), newToasts(before)], ['/p/beta?status=closed', ['Beta has no Set up page, so it opened on Tasks. The search was not carried over, because it names something in Alpha.']], 'both');
+});
+
+await test('m1b_no_search_no_line', async () => {
+  const before = toasts().length;
+  const { root } = await boot('#/p/alpha?status=closed');
+  await chooseProject(root, 'beta');
+  same([route(), newToasts(before)], ['/p/beta?status=closed', []], 'nothing to say');
+});
+
+// ---- r3 s1: two cases that had no test --------------------------------------------------------------------------
+await test('s1a_a_new_render_on_the_same_path_does_not_take_the_old_timers_write', async () => {
+  const { root } = await boot('#/p/alpha');
+  await typeInSearch(root, 'zzz');
+  await settle(30);
+  await chooseProject(root, 'beta');
+  await chooseProject(root, 'alpha');
+  await settle(400);
+  same([route(), page(root).querySelector('#task-search').value], ['/p/alpha', ''], 'Alpha, Beta, Alpha inside the window');
+});
+
+await test('s1a_the_rail_tasks_link_from_a_closed_list_inside_the_window', async () => {
+  const { root } = await boot('#/p/alpha?status=closed');
+  await typeInSearch(root, 'zzz');
+  await settle(30);
+  location.hash = '/p/alpha';
+  await settle(400);
+  same([route(), pressed(root), page(root).querySelector('#task-search').value], ['/p/alpha', ['Active'], ''], 'the link\'s own URL');
+});
+
+await test('s1b_an_archived_projects_page_does_not_become_the_remembered_project', async () => {
+  projectList = () => ({ status: 200, data: { items: PROJECTS.concat([ARCHIVED]) } });
+  const { root, storage } = await boot('#/p/alpha');
+  same(storage.getItem(KEY('a')), 'alpha', 'remembered');
+  location.hash = '/p/eta';
+  await settle(30);
+  same(root.querySelector('h1') && root.querySelector('h1').textContent, 'Eta', 'the archived page itself opened');
+  same(storage.getItem(KEY('a')), 'alpha', 'still alpha');
+});
+
+// ---- r3 n2 / n3 -----------------------------------------------------------------------------------------------
+await test('n2_a_double_click_on_sign_out_still_sends_the_next_person_home', async () => {
+  const { ctx } = await boot('#/agents');
+  location.hash = '/p/alpha/reviews?review=changes-requested';
+  await settle(20);
+  location.hash = '/p/alpha/rooms';
+  await settle(20);
+  await ctx.signOut();
+  await ctx.signOut();
+  await browser.traverse(-1);
+  await settle(20);
+  await ctx.signedIn(USERS.b);
+  await settle(20);
+  same(route(), '/', 'the next person');
+});
+
+await test('n3_an_inherited_name_as_a_section_puts_no_code_in_the_toast', async () => {
+  for (const name of ['constructor', 'toString', 'nosuchpage']) {
+    const before = toasts().length;
+    const { root } = await boot('#/p/alpha/' + name);
+    await chooseProject(root, 'beta');
+    same([route(), newToasts(before)], ['/p/beta', ['That page belongs to one project, so Beta opened on Tasks.']], name);
+  }
 });
 
 console.log(failed ? `FAILED ${failed}` : 'ALL OK');
