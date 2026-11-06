@@ -2184,9 +2184,10 @@ class Service:
         before this call is observed here, so an in-flight mutation can never
         inherit authority the caller has already lost. Derived fields are refreshed
         from live state rather than trusted from the original request. A ``moment``
-        is this request's own :meth:`_expiry_now`; only read routes pass one; it
-        freezes only the monotone half of expiry; the raw half, revocation,
-        disablement and membership stay live.
+        is this request's own :meth:`_expiry_now`; only read routes (and
+        :meth:`create_agent`, under ``store.lock``) pass one; it freezes only the
+        monotone half of expiry; the raw half, revocation, disablement and membership
+        stay live.
         """
         if principal is None:
             raise unauthenticated()
@@ -2269,9 +2270,9 @@ class Service:
         revocation cannot interleave between the check and the write. The decision
         itself is :func:`http_authority.decide`, the same function the canonical
         endpoint runs immediately before the effect. A ``moment`` is this request's
-        own :meth:`_expiry_now`; only read routes pass one; it freezes only the
-        monotone half of expiry; the raw half, revocation, disablement and
-        membership stay live.
+        own :meth:`_expiry_now`; only read routes (and :meth:`create_agent`, under
+        ``store.lock``) pass one; it freezes only the monotone half of expiry; the raw
+        half, revocation, disablement and membership stay live.
         """
         with self.store.lock:
             return self._check_authority_locked(principal, project_id, capability,
@@ -3719,10 +3720,13 @@ class Service:
             return []
         if not agent.get('enabled'):
             return []
+        owner_id = agent.get('owner')
         with self.store.lock:
             moment = self._expiry_now() if moment is None else moment
             found = []
             for project_id in sorted({p for p in (agent.get('projects') or ()) if isinstance(p, str)}):
+                if owner_id not in self.state.get('memberships', {}).get(project_id, {}):
+                    continue
                 if not self._may_coordinate(project_id, agent):
                     continue
                 held = coordinator_grant(self.state, project_id, agent['id'])

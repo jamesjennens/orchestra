@@ -1003,14 +1003,19 @@ class WizardCoordinatorGrantTests(Grants):
             after_grant = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=token)
             self.assertEqual(200, after_grant.status, after_grant.data)
             self.assertEqual([], after_grant.data['coordinate_grantable_projects'])
-        # Superuser-not-member case: admin owns an agent in olive_only (where admin is not in memberships[olive_only]).
+        # Superuser-not-member case (m1-nonmember-superuser): admin owns an agent in olive_only (where admin is not
+        # in memberships[olive_only]). coordinate_grantable_projects leaves out any project whose agent's owner is not
+        # a member of it (the same rule as agent_coordinates); a non-member superuser grants on the Members page only.
         olive_only = self.create_project(self.tokens['olive'], 'OliveOnly')
         admin_agent_res = self.request('POST', '/v1/agents',
                                        {'name': 'AdminHawk', 'projects': [olive_only]},
                                        token=self.admin)
         self.assertEqual(201, admin_agent_res.status, admin_agent_res.data)
         admin_agent_id = admin_agent_res.data['agent']['id']
-        self.assertEqual([olive_only], admin_agent_res.data['agent']['coordinate_grantable_projects'])
+        self.assertEqual([], admin_agent_res.data['agent']['coordinate_grantable_projects'])
+        admin_before = self.request('GET', '/v1/agents/%s' % admin_agent_id, token=self.admin)
+        self.assertEqual(200, admin_before.status, admin_before.data)
+        self.assertEqual([], admin_before.data['coordinate_grantable_projects'])
         self.assertEqual(200, self.request('PUT', '/v1/projects/%s/agents/%s/coordinator' % (olive_only, admin_agent_id),
                                            {}, token=self.admin).status)
         admin_after = self.request('GET', '/v1/agents/%s' % admin_agent_id, token=self.admin)

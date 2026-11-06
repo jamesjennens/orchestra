@@ -2985,10 +2985,13 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   owner is a member of and whether each has effect now, and `coordinate_grantable_projects`,
   the sorted list of unarchived granted project IDs where the signed-in caller may newly
   grant this agent coordination now (`PUT /v1/projects/{project}/agents/{id}/coordinator`:
-  the agent is enabled, its owner is a coordinator or owner of the project, the agent does
-  not already hold an effective grant there, and the caller holds `project.admin`). Only the
-  agent's owner, or a superuser, signed in as a person sees either field; no other member
-  and no credential (the agent's own on `/v1/agents/me` included) does. In the set-up
+  the agent is enabled, the agent's owner is a member of the project with coordinator or
+  owner role — the same owner-member rule as `coordinates`, so a non-member superuser grants
+  on the Members page only — the agent does not already hold an effective grant there, and
+  the caller holds `project.admin`). Only the agent's owner, or a superuser, signed in as a
+  person sees `coordinates` and a populated `coordinate_grantable_projects`; any other
+  caller and any credential read (`/v1/agents/me` and `/v1/agents/me/next`) receives
+  `coordinate_grantable_projects: []` and no `coordinates` field. In the set-up
   wizard, when `coordinate_grantable_projects` is non-empty and the agent does not yet hold
   an effective coordinator grant, the role screen offers `Coordinator of <project>` choices
   and an explicit `Make coordinator of <project>` button that calls the existing `PUT` route

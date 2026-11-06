@@ -2424,13 +2424,17 @@ console.log(JSON.stringify({
             # and the Enter notice on the test screen.
             'testScreenSaysPasteAndPressEnter',
             'nonOwnerHasNoCoordinatorChoice',
+            'nonMemberSuperuserProjectOmittedFromWizard',
             'ownerSeesCoordinatorChoiceForEachGrantableProject',
             'selectingCoordinatorRadioShowsButtonWithoutGranting',
             'coordinatorChoiceHoldsNextWithOneLine',
             'switchingCoordinatorProjectUpdatesButtonWithoutWriting',
             'switchingBackToWorkerHidesButtonAndRevokesNothing',
+            'radioChangeDuringRefusedPutReenablesNewButton',
             'refusedCoordinatorGrantShowsErrorAndLeavesWorkerGuide',
             'rereadWithoutEffectiveGrantSaysSoInOneLine',
+            'rereadWithoutGrantableProjectClearsChoiceAndRerenders',
+            'failedRereadAfterCommittedPutSaysMayBeSavedAndRereadBeforeRetrying',
             'clickingMakeCoordinatorGrantsAndShowsHeldReadOnly',
             'clickingMakeCoordinatorUpdatesGuideAndPromptFromStart',
         }, set(observed))

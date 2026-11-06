@@ -1023,7 +1023,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     // saved as its role on Orchestra (a worker/reviewer setting), so there is nothing to choose here.
     role: () => setupText.coordinating(payload) ? [
       h('p', { class: 'small', 'data-role-coordinator': 'true' },
-        `${payload.name} holds the coordinator grant for ${payload.coordinates.join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
+        `${payload.name} holds the coordinator grant for ${payload.coordinates.map(projectLabel).join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
       more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Members & settings page, and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
     ] : (() => {
       const grantable = payload.coordinateGrantableProjects || [];
@@ -1194,13 +1194,21 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     let fresh;
     try {
       await ctx.api.grantCoordinator(pid, payload.agentId);
-      fresh = await ctx.api.agent(payload.agentId);
+      try {
+        fresh = await ctx.api.agent(payload.agentId);
+      } catch (rereadError) {
+        const wrapped = new Error(`The coordinator grant for ${projectLabel(pid)} may be saved, but re-reading ${payload.name} failed. Re-open this set-up to re-read before retrying.`);
+        if (rereadError && rereadError.requestId) wrapped.requestId = rereadError.requestId;
+        wizard.showError(wrapped);
+        return;
+      }
     } catch (error) {
       wizard.showError(error);
       return;
     } finally {
       state.grantingCoordinator = false;
       if (btn) btn.disabled = false;
+      if (grantRow.firstChild) grantRow.firstChild.disabled = false;
     }
     const freshAgent = (fresh && fresh.agent) || fresh || {};
     Object.assign(agent, freshAgent);
@@ -1212,8 +1220,13 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
     }
     if (!payload.coordinates.includes(pid)) {
+      if (!(payload.coordinateGrantableProjects || []).includes(pid)) {
+        state.coordinatorProject = null;
+        render();
+      } else {
+        syncGrantRow();
+      }
       wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));
-      syncGrantRow();
       return;
     }
     state.coordinatorProject = null;

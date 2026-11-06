@@ -1463,46 +1463,72 @@ class AgentReadCostTests(AgentHarness):
         self.assertEqual(5, len(self.backend.own_calls))
 
     def test_two_requests_either_side_of_expiry_see_different_answers(self):
-        # kittrial-5bb.521 condition 1 & S9: a request moment is valid for one request only and
-        # is never cached on the Service or across requests. Two requests on either side of
+        # kittrial-5bb.521 condition 1, S9 & s2-me-paths: a request moment is valid for one request
+        # only and is never cached on the Service or across requests. Two requests on either side of
         # a credential's expiry see different answers across all five read paths (full list,
         # bounded page, single agent, /me, /me/next), including after a backward clock step.
+        # /me and /me/next are called with a second credential on the same agent that stays live,
+        # watching the expiring credential's working flag in the route's own agent view.
         agent_id, secret, created = self.agent_secret(self.alex, projects=list(self.projects))
         cred_id = created['credential']['id']
+        live_issued = self.request('POST', '/v1/agents/%s/credentials' % agent_id,
+                                   {'label': 'stays-live'}, token=self.alex)
+        self.assertEqual(201, live_issued.status, live_issued.data)
+        live_secret = live_issued.data['credential']['secret']
+        live_id = live_issued.data['credential']['id']
         now = self.service._expiry_now()
         with self.service.store.lock:
             self.service.state['credentials'][cred_id]['expires_at'] = now + 30
             self.service.store.save()
+
+        def cred_map(creds):
+            return {c['id']: c for c in creds}
+
         for path in ('/v1/agents', '/v1/agents?limit=20'):
             res = self.request('GET', path, token=self.alex)
             self.assertEqual(200, res.status, (path, res.data))
             item = next(a for a in res.data['items'] if a['id'] == agent_id)
-            self.assertTrue(item['credentials'][0]['working'], path)
-            self.assertFalse(item['credentials'][0]['revoked'], path)
+            by_id = cred_map(item['credentials'])
+            self.assertTrue(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
         one_before = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex)
         self.assertEqual(200, one_before.status, one_before.data)
-        self.assertTrue(one_before.data['credentials'][0]['working'])
-        me_before = self.request('GET', '/v1/agents/me', token=secret)
-        self.assertEqual(200, me_before.status, me_before.data)
-        self.assertTrue(me_before.data['agent']['credentials'][0]['working'])
-        next_before = self.request('GET', '/v1/agents/me/next', token=secret)
-        self.assertEqual(200, next_before.status, next_before.data)
+        self.assertTrue(cred_map(one_before.data['credentials'])[cred_id]['working'])
+        self.assertTrue(cred_map(one_before.data['credentials'])[live_id]['working'])
+        for path in ('/v1/agents/me', '/v1/agents/me/next'):
+            me_before = self.request('GET', path, token=live_secret)
+            self.assertEqual(200, me_before.status, (path, me_before.data))
+            by_id = cred_map(me_before.data['agent']['credentials'])
+            self.assertTrue(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
 
         base_clock = time.time()
         self.service.store.clock = lambda: base_clock + 60
         # Advance the monotone floor past expiry, then step the raw wall clock backward:
-        # the monotone half keeps the credential expired across all five read routes.
+        # the monotone half keeps cred_id expired across all five read routes while live_id stays working.
         self.assertGreaterEqual(self.service._expiry_now(), now + 60)
         self.service.store.clock = lambda: base_clock - 3600
         for path in ('/v1/agents', '/v1/agents?limit=20'):
             res = self.request('GET', path, token=self.alex)
             self.assertEqual(200, res.status, (path, res.data))
             item = next(a for a in res.data['items'] if a['id'] == agent_id)
-            self.assertFalse(item['credentials'][0]['working'], path)
-            self.assertFalse(item['credentials'][0]['revoked'], path)
+            by_id = cred_map(item['credentials'])
+            self.assertFalse(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
         one_after = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex)
         self.assertEqual(200, one_after.status, one_after.data)
-        self.assertFalse(one_after.data['credentials'][0]['working'])
+        self.assertFalse(cred_map(one_after.data['credentials'])[cred_id]['working'])
+        self.assertTrue(cred_map(one_after.data['credentials'])[live_id]['working'])
+        for path in ('/v1/agents/me', '/v1/agents/me/next'):
+            me_after = self.request('GET', path, token=live_secret)
+            self.assertEqual(200, me_after.status, (path, me_after.data))
+            by_id = cred_map(me_after.data['agent']['credentials'])
+            self.assertFalse(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
         self.assertEqual(401, self.request('GET', '/v1/agents/me', token=secret).status)
         self.assertEqual(401, self.request('GET', '/v1/agents/me/next', token=secret).status)
 
