@@ -2420,6 +2420,17 @@ console.log(JSON.stringify({
             'coordinatorSetupHintPresentWithoutGrant',
             'noEffectGrantIsAWorker',
             'noEffectGrantShowsCoordinatorHint',
+            # kittrial-5bb.521: making the agent a coordinator from the wizard's role screen,
+            # and the Enter notice on the test screen.
+            'testScreenSaysPasteAndPressEnter',
+            'nonOwnerHasNoCoordinatorChoice',
+            'ownerSeesCoordinatorChoiceForEachGrantableProject',
+            'selectingCoordinatorRadioShowsButtonWithoutGranting',
+            'switchingCoordinatorProjectUpdatesButtonWithoutWriting',
+            'switchingBackToWorkerHidesButtonAndRevokesNothing',
+            'refusedCoordinatorGrantShowsErrorAndLeavesWorkerGuide',
+            'clickingMakeCoordinatorGrantsAndShowsHeldReadOnly',
+            'clickingMakeCoordinatorUpdatesGuideAndPromptFromStart',
         }, set(observed))
 
 

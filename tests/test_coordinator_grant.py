@@ -54,6 +54,11 @@ class Grants(test_own_party.Party):
         return {item['id']: item for item in self.request('GET', '/v1/projects/%s/agents' % self.project,
                                                           token=token or self.tokens['olive']).data['items']}
 
+    def audited(self, project=None):
+        with self.service.store.lock:
+            return [(event['action'], event['outcome'], event['reason']) for event in self.service.state['audit']
+                    if event['action'].startswith('agents.coordinator.') and event['project_id'] == (project or self.project)]
+
 
 class RoleTests(Grants):
 
@@ -943,6 +948,135 @@ class PageTests(Grants):
         self.assertEqual(seen['can'], {'approveOwner': True, 'approveCoordinator': True, 'approveContributor': False,
                                        'ownerCoordinator': False, 'writeCoordinator': True})
         # What the page did is what the server holds: given and removed, so none now.
+        self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
+
+
+class WizardCoordinatorGrantTests(Grants):
+    """kittrial-5bb.521: ``coordinate_grantable_projects`` on the agent view and the wizard's
+    explicit ``PUT /v1/projects/{pid}/agents/{aid}/coordinator`` action."""
+
+    def test_coordinate_grantable_projects_is_for_the_caller_who_may_grant_now(self):
+        # 1. A non-owner coordinator (cora is 'coordinator' of Alpha, not 'owner'):
+        #    cannot grant, so coordinate_grantable_projects is [].
+        cora_read = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.tokens['cora'])
+        self.assertEqual(200, cora_read.status, cora_read.data)
+        self.assertEqual([], cora_read.data['coordinate_grantable_projects'])
+        cora_list = self.request('GET', '/v1/agents', token=self.tokens['cora'])
+        self.assertEqual(200, cora_list.status, cora_list.data)
+        self.assertEqual([], cora_list.data['items'][0]['coordinate_grantable_projects'])
+        self.assertEqual(403, self.grant(token=self.tokens['cora']).status)
+
+        # 2. A superuser reading cora's agent (cora is a coordinator of Alpha, so her agent may
+        #    coordinate Alpha, and the superuser holds CAP_PROJECT_ADMIN): sees [Alpha].
+        admin_read = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.admin)
+        self.assertEqual(200, admin_read.status, admin_read.data)
+        self.assertEqual([self.project], admin_read.data['coordinate_grantable_projects'])
+
+        # 3. A project owner who owns her own agent in Alpha (olive): sees [Alpha].
+        _, olive_agent_id = self.agent_with_id('olive', 'Osprey')
+        olive_read = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=self.tokens['olive'])
+        self.assertEqual(200, olive_read.status, olive_read.data)
+        self.assertEqual([self.project], olive_read.data['coordinate_grantable_projects'])
+
+        # 4. An agent whose owner is only a contributor (carl's Wren): neither carl, nor olive,
+        #    nor the superuser gets Alpha in coordinate_grantable_projects, because _may_coordinate
+        #    is false when the agent's owner is not at least a coordinator.
+        _, carl_agent_id = self.agent_with_id('carl', 'Wren')
+        for who_token in (self.tokens['carl'], self.tokens['olive'], self.admin):
+            got = self.request('GET', '/v1/agents/%s' % carl_agent_id, token=who_token)
+            if got.status == 200:
+                self.assertEqual([], got.data['coordinate_grantable_projects'])
+
+        # 5. A disabled agent cannot be granted: coordinate_grantable_projects becomes [].
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/disable' % olive_agent_id, {},
+                                           token=self.tokens['olive']).status)
+        disabled_read = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=self.tokens['olive'])
+        self.assertEqual([], disabled_read.data['coordinate_grantable_projects'])
+
+    def test_no_credential_or_outsider_can_see_or_grant_coordinator(self):
+        # 1. An agent token (GET /v1/agents/me, GET /v1/agents/{aid}, PUT .../coordinator).
+        me = self.request('GET', '/v1/agents/me', token=self.agent)
+        self.assertEqual(200, me.status, me.data)
+        self.assertEqual([], me.data['agent']['coordinate_grantable_projects'])
+        by_id = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.agent)
+        self.assertEqual(403, by_id.status, by_id.data)
+        self.assertNotIn('coordinate_grantable_projects', json.dumps(by_id.data))
+        self.assertEqual(403, self.grant(token=self.agent).status)
+
+        # 2. A worker credential (POST /v1/projects/{pid}/worker-credentials).
+        issued = self.request('POST', '/v1/projects/%s/worker-credentials' % self.project,
+                              {'label': 'worker-cred'}, token=self.tokens['olive'])
+        self.assertEqual(201, issued.status, issued.data)
+        worker_secret = issued.data['credential']['secret'] if 'credential' in issued.data else issued.data['secret']
+        worker_get = self.request('GET', '/v1/agents/%s' % self.agent_id, token=worker_secret)
+        self.assertEqual(403, worker_get.status, worker_get.data)
+        self.assertNotIn('coordinate_grantable_projects', json.dumps(worker_get.data))
+        self.assertEqual(403, self.grant(token=worker_secret).status)
+
+        # 3. A person outside the project (otto) and another project's existence:
+        #    never reveals another project's existence and cannot grant.
+        self.ids['otto'] = self.create_account(self.admin, 'otto', 'otto-password-1')
+        self.tokens['otto'] = self.login('otto', 'otto-password-1')[0]
+        otto_project = self.create_project(self.tokens['otto'], 'OttoProj')
+        secret_project = self.create_project(self.admin, 'SecretProject')
+        # Even if a hand-edited state listed secret_project on otto's agent, otto is not a member of
+        # secret_project or Alpha, so coordinate_grantable_projects never names either.
+        _, otto_agent_id = self.agent_with_id('otto', 'Owl', projects=[otto_project])
+        with self.service.store.lock:
+            self.service.state['agents'][otto_agent_id]['projects'] = [otto_project, self.project, secret_project]
+        otto_read = self.request('GET', '/v1/agents/%s' % otto_agent_id, token=self.tokens['otto'])
+        self.assertEqual(200, otto_read.status, otto_read.data)
+        self.assertEqual([otto_project], otto_read.data['coordinate_grantable_projects'])
+        self.assertNotIn(self.project, otto_read.data['coordinate_grantable_projects'])
+        self.assertNotIn(secret_project, json.dumps(otto_read.data['coordinate_grantable_projects']))
+        self.assertEqual(404, self.grant(agent_id=self.agent_id, token=self.tokens['otto']).status)
+        self.assertEqual(404, self.grant(agent_id=otto_agent_id, token=self.tokens['otto']).status)
+
+    def test_stale_page_refuses_put_after_authority_is_removed_and_audits_grant(self):
+        # Make cora an owner of Alpha so the wizard's initial GET /v1/agents/{aid} offers Alpha.
+        self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)
+        initial = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.tokens['cora'])
+        self.assertEqual(200, initial.status, initial.data)
+        self.assertEqual([self.project], initial.data['coordinate_grantable_projects'])
+
+        # Before cora clicks "Make coordinator of Alpha" on the open page, her role is lowered to
+        # coordinator (and then removed from the project). Both stale-page PUTs are refused.
+        self.assertEqual(200, self.member('cora', 'coordinator', token=self.admin).status)
+        stale_coord = self.grant(token=self.tokens['cora'])
+        self.assertEqual(403, stale_coord.status, stale_coord.data)
+        self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
+
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['cora']),
+                                           token=self.tokens['olive']).status)
+        stale_removed = self.grant(token=self.tokens['cora'])
+        self.assertEqual(404, stale_removed.status, stale_removed.data)
+        self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
+
+        # Restore cora as owner and grant through the wizard's PUT route: audited identically to Members page.
+        self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)
+        granted = self.grant(token=self.tokens['cora'])
+        self.assertEqual(200, granted.status, granted.data)
+        self.assertEqual(('agents.coordinator.grant', 'committed', 'agent %s' % self.agent_id),
+                         self.audited()[-1])
+
+    def test_no_create_time_coordinator_and_refused_grant_leaves_worker_intact(self):
+        # POST /v1/agents and PATCH /v1/agents/{aid} reject 'coordinator' as a role.
+        bad_create = self.request('POST', '/v1/agents',
+                                  {'name': 'Bad', 'projects': [self.project], 'role': 'coordinator'},
+                                  token=self.tokens['cora'])
+        self.assertIn(bad_create.status, (400, 422), bad_create.data)
+        bad_patch = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                                 {'role': 'coordinator'}, token=self.tokens['cora'])
+        self.assertIn(bad_patch.status, (400, 422), bad_patch.data)
+
+        # Creating an agent as a non-owner coordinator creates a working agent; a refused grant
+        # leaves no half-made agent and no grant.
+        refused = self.grant(token=self.tokens['cora'])
+        self.assertEqual(403, refused.status, refused.data)
+        after = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.tokens['cora'])
+        self.assertEqual(200, after.status, after.data)
+        self.assertEqual('worker', after.data.get('role', 'worker'))
+        self.assertEqual([], after.data['coordinates'])
         self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
 
 

@@ -1437,9 +1437,18 @@ class AgentReadCostTests(AgentHarness):
 
     def test_owner_list_reads_each_project_once_per_request(self):
         self.backend.list_calls = []
-        listing = self.request('GET', '/v1/agents', token=self.alex)
+        expiry_calls = [0]
+        original_expiry_now = self.service._expiry_now
+        def counting_expiry_now():
+            expiry_calls[0] += 1
+            return original_expiry_now()
+        with mock.patch.object(self.service, '_expiry_now', side_effect=counting_expiry_now):
+            listing = self.request('GET', '/v1/agents', token=self.alex)
         self.assertEqual(200, listing.status, listing.data)
         self.assertEqual(10, listing.data['total'])
+        # kittrial-5bb.521: one request moment is threaded through internal expiry checks
+        # (1 in authenticate + 1 in agents_list = 2 calls, instead of 234).
+        self.assertLessEqual(expiry_calls[0], 2)
         # 10 agents x 5 projects would be 50 reads; the request performs 5.
         self.assertEqual(5, len(self.backend.list_calls))
         self.assertEqual(set(self.projects), {call[0] for call in self.backend.list_calls})
@@ -1452,6 +1461,32 @@ class AgentReadCostTests(AgentHarness):
         self.request('GET', '/v1/agents', token=self.alex)
         self.assertEqual(5, len(self.backend.list_calls))
         self.assertEqual(5, len(self.backend.own_calls))
+
+    def test_two_requests_either_side_of_expiry_see_different_answers(self):
+        # kittrial-5bb.521 condition 1: a request moment is valid for one request only and
+        # is never cached on the Service or across requests. Two requests on either side of
+        # a credential's expiry see different answers.
+        agent_id, secret, created = self.agent_secret(self.alex, projects=list(self.projects))
+        cred_id = created['credential']['id']
+        now = self.service._expiry_now()
+        with self.service.store.lock:
+            self.service.state['credentials'][cred_id]['expires_at'] = now + 30
+            self.service.store.save()
+        before_list = self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual(200, before_list.status, before_list.data)
+        before_item = next(item for item in before_list.data['items'] if item['id'] == agent_id)
+        self.assertTrue(before_item['credentials'][0]['working'])
+        self.assertFalse(before_item['credentials'][0]['revoked'])
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=secret).status)
+
+        base_clock = time.time()
+        self.service.store.clock = lambda: base_clock + 60
+        after_list = self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual(200, after_list.status, after_list.data)
+        after_item = next(item for item in after_list.data['items'] if item['id'] == agent_id)
+        self.assertFalse(after_item['credentials'][0]['working'])
+        self.assertFalse(after_item['credentials'][0]['revoked'])
+        self.assertEqual(401, self.request('GET', '/v1/agents/me', token=secret).status)
 
     def test_agent_next_reads_every_granted_project_once(self):
         agent_id, secret, _ = self.agent_secret(self.alex, projects=list(self.projects))

@@ -892,7 +892,7 @@ function issueBlock(ctx, agent, payload, wizard) {
 }
 
 function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
-  const payload = setupText.secretlessPayload(source, location.origin);
+  let payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
   const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate })]];
   const folder = payload.workingDirectory;
@@ -908,6 +908,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     runs: setupText.runsFromStored(same),
     bridge: setupText.runsFromStored(same) === 'bridge',
     role: (same && setupText.BRIDGE_ROLES.includes(same.role) && same.role) || (agent.role === 'reviewer' ? 'reviewer' : 'worker'),
+    coordinatorProject: null,
     screen: 'system',
     stepStartedAt: Date.now(),
     checkVerified: false,
@@ -996,15 +997,24 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       h('p', { class: 'small', 'data-role-coordinator': 'true' },
         `${payload.name} holds the coordinator grant for ${payload.coordinates.join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
       more(h('p', { class: 'small muted' }, 'The grant is given and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.')),
-    ] : [
-      h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
-      h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
-        "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again."),
-      h('div', { class: 'copy-row', 'data-role-choice': 'true' },
-        choice('setup-role', 'worker', 'Works on tasks', state.role === 'worker', () => saveRole('worker')),
-        choice('setup-role', 'reviewer', 'Reviews deliveries', state.role === 'reviewer', () => saveRole('reviewer'))),
-      more(h('p', { class: 'small muted' }, `This is saved as ${payload.name}’s role on Orchestra. A worker keeps the “Deliver and review” scope, which it needs to deliver its own work; only the reviewer role adds other people’s deliveries to its list.`)),
-    ],
+    ] : (() => {
+      const grantable = payload.coordinateGrantableProjects || [];
+      return [
+        h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
+        grantable.length === 0 ? h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
+          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again.") : null,
+        h('div', { class: 'copy-row', 'data-role-choice': 'true' },
+          choice('setup-role', 'worker', 'Works on tasks', !state.coordinatorProject && state.role === 'worker', () => selectRole('worker')),
+          choice('setup-role', 'reviewer', 'Reviews deliveries', !state.coordinatorProject && state.role === 'reviewer', () => selectRole('reviewer')),
+          ...grantable.map((pid) => choice('setup-role', 'coordinator:' + pid, 'Coordinator of ' + pid, state.coordinatorProject === pid, () => selectCoordinatorProject(pid)))),
+        state.coordinatorProject && grantable.includes(state.coordinatorProject)
+          ? h('div', { class: 'copy-row', 'data-coordinator-grant-row': 'true' },
+              h('button', { type: 'button', class: 'primary', 'data-action': 'grant-coordinator', 'data-project': state.coordinatorProject, onclick: () => grantCoordinatorRole(state.coordinatorProject) },
+                'Make coordinator of ' + state.coordinatorProject))
+          : null,
+        more(h('p', { class: 'small muted' }, `This is saved as ${payload.name}’s role on Orchestra. A worker keeps the “Deliver and review” scope, which it needs to deliver its own work; only the reviewer role adds other people’s deliveries to its list.`)),
+      ];
+    })(),
     'cert-save': () => [
       h('p', { class: 'small' }, 'This server has its own certificate. Save it; the next screen moves it into place.'),
       h('div', { class: 'copy-row' }, h('button', { type: 'button', class: 'primary', 'data-action': 'save-certificate',
@@ -1050,7 +1060,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       const check = setupText.checkCommands(payload, { hasCertificate });
       const plain = setupText.testCommands(payload);
       return [
-        h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It checks the file, then calls Orchestra; it prints the agent’s details when it works.`),
+        h('p', { class: 'small' }, `Paste this into ${osWords(state.os).shell} and press Enter (pasting waits for Enter to run). It checks the file, calls Orchestra, and prints the agent’s details.`),
         commandLine(posix ? check.posix : check.powershell, 'self-check command'),
         more(h('p', { class: 'small muted' }, 'The plain test, without the checks:'),
           h('code', { class: 'path' }, posix ? plain.posix : plain.powershell),
@@ -1121,12 +1131,55 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 
   async function saveRole(role) {
     state.role = role;
+    if (dialog.wizard) {
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
+    }
     persist();
     wizard.clearError();
     if (ctx && ctx.api && typeof ctx.api.updateAgent === 'function' && payload.agentId) {
       try { await ctx.api.updateAgent(payload.agentId, { role }); }
       catch (error) { wizard.showError(error); }
     }
+  }
+
+  async function selectRole(role) {
+    const hadCoordinator = state.coordinatorProject !== null;
+    state.coordinatorProject = null;
+    if (hadCoordinator) render();
+    await saveRole(role);
+  }
+
+  function selectCoordinatorProject(pid) {
+    state.coordinatorProject = pid;
+    wizard.clearError();
+    render();
+  }
+
+  async function grantCoordinatorRole(pid) {
+    wizard.clearError();
+    if (!ctx || !ctx.api || typeof ctx.api.grantCoordinator !== 'function' || !payload.agentId) return;
+    try {
+      await ctx.api.grantCoordinator(pid, payload.agentId);
+    } catch (error) {
+      wizard.showError(error);
+      return;
+    }
+    const current = Array.isArray(agent.coordinates) ? agent.coordinates.slice() : [];
+    if (!current.some((c) => c && c.project === pid && c.effective === true)) {
+      current.push({ project: pid, effective: true });
+    }
+    agent.coordinates = current;
+    if (Array.isArray(agent.coordinate_grantable_projects)) {
+      agent.coordinate_grantable_projects = agent.coordinate_grantable_projects.filter((p) => p !== pid);
+    }
+    payload = setupText.secretlessPayload({ ...(source || {}), agent }, location.origin);
+    PAYLOAD_META.set(payload, { certificate, bridgeServer });
+    files[1][1] = setupText.agentGuide(payload, { hasCertificate });
+    if (dialog.wizard) {
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
+    }
+    state.coordinatorProject = null;
+    render();
   }
 
   // ---- moving between screens ----------------------------------------------------------------

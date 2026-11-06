@@ -398,6 +398,8 @@ export function secretlessPayload(created, fallbackServer) {
     // kittrial-5bb.387: the projects where this agent's coordinator grant has effect now (the agent
     // record's `coordinates`, shown to its owner only). Non-empty: AGENT.md is the coordinator's.
     coordinates: Object.freeze(coordinatedProjects(agent.coordinates)),
+    // kittrial-5bb.521: the projects where the caller may grant this agent the coordinator role now.
+    coordinateGrantableProjects: Object.freeze(grantableProjects(agent.coordinate_grantable_projects)),
   });
 }
 
@@ -406,6 +408,13 @@ export function coordinatedProjects(coordinates) {
   const ids = (Array.isArray(coordinates) ? coordinates : [])
     .filter((c) => c && c.effective === true && typeof c.project === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$/.test(c.project))
     .map((c) => c.project);
+  return [...new Set(ids)].sort();
+}
+
+// The project ids where the caller may grant this agent the coordinator role now, sorted and without repeats.
+export function grantableProjects(projects) {
+  const ids = (Array.isArray(projects) ? projects : [])
+    .filter((p) => typeof p === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$/.test(p));
   return [...new Set(ids)].sort();
 }
 

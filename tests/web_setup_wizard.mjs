@@ -75,6 +75,10 @@ const server = {
   revoked: [],
   posts: [],
   listNew: false,
+  coordinateGrantableProjects: undefined,
+  coordinatorGrants: [],
+  coordinatorRevokes: [],
+  failCoordinatorGrant: false,
 };
 let sessionReads = 0;
 let agentReads = 0;
@@ -88,7 +92,18 @@ const api = createApi(async (method, path, _headers, text) => {
     agentReads += 1;
     return { status: 200, data: { id: 'agent_1', name: 'Kestrel', owner: 'u1', role: 'worker', scopes: server.scopes, scopes_source: 'stored',
       working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'], last_seen_at: server.lastSeen, credentials: server.credentials,
-      ...(server.coordinates ? { coordinates: server.coordinates } : {}) } };
+      ...(server.coordinates ? { coordinates: server.coordinates } : {}),
+      ...(server.coordinateGrantableProjects !== undefined ? { coordinate_grantable_projects: server.coordinateGrantableProjects } : {}) } };
+  }
+  const coordRoute = /^\/v1\/projects\/([a-z0-9_-]+)\/agents\/(agent_[0-9]+)\/coordinator$/.exec(path);
+  if (method === 'PUT' && coordRoute) {
+    if (server.failCoordinatorGrant) return { status: 403, data: { error: { code: 'forbidden', message: 'Only a project owner or superuser may grant the coordinator role.' } } };
+    server.coordinatorGrants.push(coordRoute[1] + '/' + coordRoute[2]);
+    return { status: 200, data: { project_id: coordRoute[1], agent_id: coordRoute[2], coordinator_grant: true, effective: true } };
+  }
+  if (method === 'DELETE' && coordRoute) {
+    server.coordinatorRevokes.push(coordRoute[1] + '/' + coordRoute[2]);
+    return { status: 200, data: {} };
   }
   if (method === 'POST' && path === '/v1/agents/agent_1/credentials') {
     if (server.failIssue) return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached.' } } };
@@ -287,6 +302,7 @@ out.longCommandIsCopyAndCollapsed = selfCheckLine.getAttribute('data-long-comman
   && selfCheckLine.all((e) => e.tagName === 'DETAILS')[0].all((e) => e.tagName === 'CODE').length === 1;
 out.selfCheckBypassesTheProxyForThisHostOnly = selfCheck.includes('--noproxy 127.0.0.1 --max-time 20') && !selfCheck.includes('--noproxy "*"');
 out.selfCheckSaysTheProxySentence = selfCheck.includes('a proxy probably answered; check HTTPS_PROXY in this shell, or ask IT to let this computer reach 127.0.0.1 directly.');
+out.testScreenSaysPasteAndPressEnter = shownText(d).includes('Paste this into a terminal and press Enter (pasting waits for Enter to run). It checks the file, calls Orchestra, and prints the agent’s details.');
 await d.wizard.next();
 out.testScreenChecksBeforeNext = screenOf(d) === 'test'
   && /Run the command above, then click Next again\./.test(attr(d, 'data-wizard-check-status', 'true')[0].textContent);
@@ -436,6 +452,73 @@ out.noEffectGrantIsAWorker = attr(d, 'data-role-coordinator', 'true').length ===
 out.noEffectGrantShowsCoordinatorHint = attr(d, 'data-role-coordinator-help', 'true').length === 1;
 server.coordinates = undefined;
 for (const open of openDialogs()) await open.close();   // a dialog left open keeps its online check going
+
+// ---- kittrial-5bb.521: making the agent a coordinator from the wizard's role screen ----------------
+store.clear();
+server.coordinates = undefined;
+server.coordinateGrantableProjects = [];
+d = await openWizard();
+await d.wizard.next();
+out.nonOwnerHasNoCoordinatorChoice = !windowsChoice(d, 'setup-role', 'coordinator:p1') && !button(d, 'grant-coordinator')
+  && attr(d, 'data-role-coordinator-help', 'true').length === 1;
+store.clear();
+server.coordinateGrantableProjects = ['p1', 'p2'];
+d = await openWizard();
+await d.wizard.next();
+out.ownerSeesCoordinatorChoiceForEachGrantableProject = Boolean(windowsChoice(d, 'setup-role', 'coordinator:p1'))
+  && Boolean(windowsChoice(d, 'setup-role', 'coordinator:p2'))
+  && attr(d, 'data-role-coordinator-help', 'true').length === 0
+  && !button(d, 'grant-coordinator');
+const rolesBeforeCoordSelect = server.roles.length;
+await windowsChoice(d, 'setup-role', 'coordinator:p1').dispatch('change');
+await tick();
+out.selectingCoordinatorRadioShowsButtonWithoutGranting = server.coordinatorGrants.length === 0
+  && server.roles.length === rolesBeforeCoordSelect
+  && Boolean(button(d, 'grant-coordinator'))
+  && button(d, 'grant-coordinator').textContent === 'Make coordinator of p1';
+await windowsChoice(d, 'setup-role', 'coordinator:p2').dispatch('change');
+await tick();
+out.switchingCoordinatorProjectUpdatesButtonWithoutWriting = server.coordinatorGrants.length === 0
+  && server.coordinatorRevokes.length === 0
+  && Boolean(button(d, 'grant-coordinator'))
+  && button(d, 'grant-coordinator').textContent === 'Make coordinator of p2';
+await windowsChoice(d, 'setup-role', 'worker').dispatch('change');
+await tick();
+out.switchingBackToWorkerHidesButtonAndRevokesNothing = !button(d, 'grant-coordinator')
+  && server.coordinatorGrants.length === 0
+  && server.coordinatorRevokes.length === 0
+  && windowsChoice(d, 'setup-role', 'worker').checked === true;
+await windowsChoice(d, 'setup-role', 'coordinator:p1').dispatch('change');
+await tick();
+server.failCoordinatorGrant = true;
+await button(d, 'grant-coordinator').dispatch('click');
+await tick(); await tick();
+const grantError = attr(d, 'data-wizard-error', 'true')[0];
+out.refusedCoordinatorGrantShowsErrorAndLeavesWorkerGuide = grantError.hidden === false
+  && grantError.textContent.includes('Only a project owner or superuser may grant the coordinator role.')
+  && attr(d, 'data-role-coordinator', 'true').length === 0
+  && !d.wizard.prompt.includes('## You coordinate')
+  && d.wizard.prompt.includes('role is worker');
+server.failCoordinatorGrant = false;
+await button(d, 'grant-coordinator').dispatch('click');
+await tick(); await tick();
+out.clickingMakeCoordinatorGrantsAndShowsHeldReadOnly = JSON.stringify(server.coordinatorGrants) === JSON.stringify(['p1/agent_1'])
+  && server.coordinatorRevokes.length === 0
+  && attr(d, 'data-role-coordinator', 'true').length === 1
+  && /Kestrel holds the coordinator grant for p1: it is set up as a coordinator\./.test(shownText(d))
+  && !button(d, 'grant-coordinator')
+  && !windowsChoice(d, 'setup-role', 'worker');
+d.wizard.show('system');
+await windowsChoice(d, 'setup-bridge', 'no').dispatch('change');
+d.wizard.show('files');
+const filesScreenText = d.all(() => true).map((e) => e.textContent).join('\n');
+out.clickingMakeCoordinatorUpdatesGuideAndPromptFromStart = d.wizard.prompt.includes('## You coordinate')
+  && d.wizard.prompt.includes('You hold the coordinator grant for p1.')
+  && d.wizard.prompt.includes('role is coordinator')
+  && filesScreenText.includes('## You coordinate')
+  && filesScreenText.includes('You hold the coordinator grant for p1.');
+server.coordinateGrantableProjects = undefined;
+for (const open of openDialogs()) await open.close();
 
 // ---- kittrial-5bb.456: what the agent runs in, the secret screens and the credentials -------------
 store.clear();
