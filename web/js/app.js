@@ -178,7 +178,7 @@ export async function start(root, options = {}) {
       // An unknown section (a hand-written URL) has no name to give: the page-level sentence, not the task one.
       lines.push(t.section && !label ? fallbackMessage(name, '', 'other') : fallbackMessage(name, label, t.page));
     }
-    if (t.qDropped) lines.push(searchLeftMessage(here ? here.name : 'the project you left'));
+    if (t.qDropped) lines.push(searchLeftMessage());
     if (lines.length) toast(lines.join(' '));
   }
 

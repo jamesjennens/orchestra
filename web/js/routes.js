@@ -183,8 +183,9 @@ export function forgetProject(storage, userId) {
 }
 
 // The line the toast adds when a switch leaves the search behind (switchTarget's qDropped).
-export function searchLeftMessage(oldName) {
-  return `The search was not carried over, because it names something in ${oldName}.`;
+// The coordinator's wording (approval of slice 1 r3): the search's shape is the reason, not the old project.
+export function searchLeftMessage() {
+  return 'The search was not carried over, because it looks like an id, and ids belong to one project.';
 }
 
 // The sentence the switcher's toast shows after a fallback, one true reason per case. `label` is the section's

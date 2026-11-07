@@ -252,8 +252,9 @@ the project itself; the always-Tasks landing is .504's, above) and §1.9 for Tas
     `REQ-7`, `kittrial-5bb.522`. A search for an id names one record of one project, so it stays behind. Plain
     words cross. Any hyphenated or dotted word (`set-up`, `e.g.`, `v1.2`) has the shape too and stops crossing;
     that is accepted.
-  - **A search that stays behind is said so:** the toast adds "The search was not carried over, because it names
-    something in A." (A is the project left), alone or after a fallback sentence.
+  - **A search that stays behind is said so:** the toast adds "The search was not carried over, because it looks
+    like an id, and ids belong to one project." (the coordinator's wording, approval of slice 1 r3), alone or after a
+    fallback sentence.
   - **Records' `state`** is not carried: no page writes it, and only keys a page writes are carried.
   - **A key that names a record of A** (`?proposal=<key>` on Reviews, project.js:638) or a mode of one page is
     dropped, because B has no such record.

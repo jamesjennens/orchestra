@@ -303,6 +303,9 @@ class BrowserBehaviour(unittest.TestCase):
     def test_n1_a_session_lost_in_another_tab_forgets_the_project_and_nothing_is_written_back(self):
         self.check('n1_a_session_lost_in_another_tab_forgets_the_project_and_nothing_is_written_back')
 
+    def test_n1_every_throwing_section_writes_nothing_back_after_a_lost_session(self):
+        self.check('n1_every_throwing_section_writes_nothing_back_after_a_lost_session')
+
     def test_n2_the_next_person_does_not_land_on_the_last_ones_url_after_a_lost_session(self):
         self.check('n2_the_next_person_does_not_land_on_the_last_ones_url_after_a_lost_session')
 
