@@ -133,9 +133,29 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   font-size: 11px; font-weight: 700; background: var(--accent-soft); color: var(--accent);
 }
 .main { min-width: 0; padding: 20px 28px 48px; display: flex; flex-direction: column; gap: var(--s-4); }
-.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+/* ---------- page header (kittrial-5bb.525 slice b): what this is | its one number | next action ---------- */
+.page-head {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--s-2) var(--s-8); align-items: end;
+  padding-bottom: var(--s-6); border-bottom: 1px solid var(--line);
+}
+.page-head .ph-title { min-width: 0; display: flex; flex-direction: column; gap: var(--s-1); }
 .page-head h1, .auth-card h1 { overflow-wrap: anywhere; }
-.page-head .lede { margin-top: 4px; color: var(--muted); }
+.page-head .lede { margin-top: var(--s-1); color: var(--ink-2); }
+.page-key { display: flex; flex-direction: column; align-items: flex-end; text-align: right; }
+.page-key .key-num {
+  font-family: var(--font-display); font-size: var(--t-4xl); font-weight: 600; line-height: 1;
+  font-variant-numeric: tabular-nums lining-nums; color: var(--ink); white-space: nowrap;
+}
+.page-key .key-label { font-size: var(--t-sm); color: var(--muted); margin-top: var(--s-2); white-space: nowrap; }
+.page-head > .actions { justify-content: flex-end; }
+@media (min-width: 761px) { .page-head h1 { font-size: var(--t-3xl); } }
+@media (max-width: 760px) {
+  .page-head { grid-template-columns: minmax(0, 1fr); gap: var(--s-3); padding-bottom: var(--s-4); }
+  .page-key { flex-direction: row; align-items: baseline; gap: var(--s-2); text-align: left; }
+  .page-key .key-num { font-size: var(--t-3xl); }
+  .page-key .key-label { margin-top: 0; white-space: normal; }
+  .page-head > .actions { justify-content: flex-start; }
+}
 .crumbs { font-size: var(--t-sm); color: var(--muted); display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .crumbs a { color: var(--muted); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }

@@ -61,14 +61,50 @@ export function lifecycleStrip(lifecycle) {
     }));
 }
 
-export function pageHead({ crumbs, title, lede, actions }) {
-  return h('header', { class: 'page-head' },
-    h('div', null,
+// The page header (kittrial-5bb.525 slice b): what this page is (its h1), the page's one key
+// number, and its next action. The key is { num, label, source } when the page already knows
+// it, or 'pending' when the page's own read fills it later through setPageKey. A page with no
+// honest number passes no key and shows none: never a count of the rows on one page, never a
+// guess. `source` names where the number comes from (data-key-source), for the tests.
+export function pageHead({ crumbs, title, lede, actions, key }) {
+  const keyNum = h('span', { class: 'key-num' });
+  const keyLabel = h('span', { class: 'key-label' });
+  const keyNode = key ? h('div', { class: 'page-key', 'data-page-key': '', hidden: true }, keyNum, keyLabel) : null;
+  const head = h('header', { class: 'page-head' },
+    h('div', { class: 'ph-title' },
       crumbs && crumbs.length ? h('nav', { class: 'crumbs', 'aria-label': 'Breadcrumb' },
         crumbs.flatMap((c, i) => [i ? h('span', { 'aria-hidden': 'true' }, '/') : null, c.href ? h('a', { href: c.href }, c.label) : h('span', null, c.label)])) : null,
       h('h1', { tabindex: '-1', id: 'page-title' }, title),
       lede ? h('p', { class: 'lede' }, lede) : null),
+    keyNode,
     actions ? h('div', { class: 'actions' }, actions) : null);
+  head.pageKey = keyNode && { node: keyNode, num: keyNum, label: keyLabel };
+  if (key && key !== 'pending') setPageKey(head, key);
+  return head;
+}
+
+// Fills (or, with no key, hides) the key number of a header made by pageHead.
+export function setPageKey(head, key) {
+  const parts = head && head.pageKey;
+  if (!parts) return;
+  const { node } = parts;
+  const known = Boolean(key) && key.num !== null && key.num !== undefined && key.num !== '';
+  node.hidden = !known;
+  parts.num.textContent = known ? String(key.num) : '';
+  parts.label.textContent = known ? key.label : '';
+  if (known && key.source) node.setAttribute('data-key-source', key.source); else node.removeAttribute('data-key-source');
+}
+
+// "3 hours", "2 days": how long ago an ISO time was, for a key number. Null when unknown.
+export function durationSince(iso, now = Date.now()) {
+  const at = Date.parse(iso);
+  if (!iso || Number.isNaN(at)) return null;
+  const minutes = Math.max(0, Math.floor((now - at) / 60000));
+  const unit = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  if (minutes < 60) return unit(minutes, 'minute');
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return unit(hours, 'hour');
+  return unit(Math.floor(hours / 24), 'day');
 }
 
 export function empty(title, body, action) {

@@ -34,6 +34,28 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
     }))));
 }
 
+// The header's key (kittrial-5bb.525 slice b): everything that waits on you, counted from the
+// three lists this page shows. When the read is incomplete (a project unreadable, or more work
+// than one read covers) the sum is not the whole, so the page shows no number (the banner says why).
+function workKey(data, incomplete, revisions, assigned) {
+  if (incomplete) return null;
+  const n = revisions.length + data.to_review.length + assigned.length;
+  return { num: n, label: n === 1 ? 'waits on you' : 'wait on you', source: 'my-work:revisions+to_review+assigned' };
+}
+
+// The next action: the oldest review first, then the oldest revision request, then the oldest
+// assigned task. None when nothing waits.
+function workNext(ctx, data, revisions, assigned) {
+  const since = (t) => Date.parse(t.waiting_since || t.updated_at || '') || Infinity;
+  const oldest = (rows) => rows.slice().sort((a, b) => since(a) - since(b))[0];
+  const [rows, label] = data.to_review.length ? [data.to_review, 'Open the oldest review']
+    : revisions.length ? [revisions, 'Open the oldest revision request']
+      : assigned.length ? [assigned, 'Open your oldest task'] : [[], null];
+  if (!label) return null;
+  const t = oldest(rows);
+  return h('a', { class: 'btn primary', href: ctx.href(`/p/${t.project_id}/t/${t.id}`), 'data-next-action': t.id }, label);
+}
+
 export async function home(ctx) {
   if (!ctx.projects.length) return welcome(ctx);
   const [data, contributions] = await Promise.all([ctx.api.myWork(), myContributionsPanel(ctx)]);
@@ -58,7 +80,8 @@ export async function home(ctx) {
     h('div', { class: 'panel-body agent-grid' }, needed.map((a) => h('div', { class: 'stack', 'data-agent': a.id || a.agent_id || a.name },
       agentCard(ctx, a, { compact: false }))))) : null;
   return h('div', { class: 'stack' },
-    pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.` }),
+    pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.`,
+      key: workKey(data, incomplete, revisions, assigned), actions: workNext(ctx, data, revisions, assigned) }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,
     agentPromptPanel(ctx, data),
     contributions,

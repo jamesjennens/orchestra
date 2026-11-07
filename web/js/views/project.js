@@ -1,5 +1,5 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId } from '../ui.js';
+import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { proposeSection } from './proposals.js';
 export { proposeSection } from './proposals.js';
@@ -38,6 +38,12 @@ export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'],
 async function load(ctx, pid) {
   const project = await ctx.api.project(pid);
   return project;
+}
+
+// What the Tasks key counts, in the words of the filter it was read with.
+function tasksKeyLabel(state) {
+  if (state.q || state.review) return 'matching';
+  return state.status === 'active' ? 'open' : state.status === 'closed' ? 'closed' : 'in all';
 }
 
 function crumbs(ctx, project, extra) {
@@ -506,6 +512,9 @@ export async function overview(ctx, { pid }) {
     ctx.setQuery(params, view);
   };
   const tableHost = h('div', { class: 'panel' });
+  // The page is the project's Tasks list: the h1 says so, the crumb names the project.
+  const head = pageHead({ crumbs: crumbs(ctx, project, 'Tasks'), title: 'Tasks', lede: project.description || null, key: 'pending',
+    actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null });
 
   const search = h('input', { type: 'search', id: 'task-search', placeholder: 'Search title, description or ID', 'aria-label': 'Search tasks', value: state.q });
   // A requirement record or BRD section is a visible row the server never calls claimable
@@ -538,6 +547,9 @@ export async function overview(ctx, { pid }) {
       return;
     } finally { tableHost.removeAttribute('aria-busy'); }
     const allRows = page.items;
+    // The header's key (kittrial-5bb.525 slice b): the server's total for the list as filtered
+    // (page.total), never the rows on this page. No total, no number.
+    setPageKey(head, typeof page.total === 'number' ? { num: page.total, label: tasksKeyLabel(state), source: 'page.total' } : null);
     // Requirement records are marked by the server and, unless the filter asks for them,
     // left out of the task view (kittrial-5bb.277). The count is kept so the page can say
     // that rows were left out instead of reading as if the tracker held no work at all.
@@ -631,8 +643,7 @@ export async function overview(ctx, { pid }) {
     host);
 
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project), title: project.name, lede: project.description || null,
-      actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null }),
+    head,
     archivedBanner(project),
     unusableBanner(project),
     setupLine,
@@ -916,11 +927,23 @@ export async function settings(ctx, { pid }) {
   const coordination = coordinationPanel(ctx, project);
   // Delegated decision rights (kittrial-5bb.407): read by every member; recorded only by a person owner.
   const delegated = delegationsPanel(ctx, project, { owner: project.role === 'owner' });
+  // The header (kittrial-5bb.525 slice b): the key is the project's member count, from the
+  // members read (its total, or the rows when the read says there is no further page); the
+  // next action, for an owner, takes the reader to the "Add by username" form below.
+  const head = pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.',
+    key: 'pending', actions: owner && !project.archived ? h('button', { type: 'button', class: 'primary', 'data-next-action': 'add-member', onclick: () => {
+      const input = document.getElementById('m-username');
+      if (!input) return;
+      input.scrollIntoView({ block: 'center' });
+      input.focus({ preventScroll: true });
+    } }, 'Add a member') : null });
 
   async function drawMembers() {
     let data;
-    try { data = await ctx.api.members(pid); } catch (error) { membersHost.replaceChildren(errorState(error, drawMembers)); return; }
+    try { data = await ctx.api.members(pid); } catch (error) { setPageKey(head, null); membersHost.replaceChildren(errorState(error, drawMembers)); return; }
     const rows = data.items.slice().sort((a, b) => a.display_name.localeCompare(b.display_name));
+    const members = typeof data.total === 'number' ? data.total : data.next_cursor ? null : rows.length;
+    setPageKey(head, members === null ? null : { num: members, label: members === 1 ? 'member' : 'members', source: typeof data.total === 'number' ? 'members.total' : 'members.items' });
     membersHost.replaceChildren(
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Members ', h('span', { class: 'nav-count' }, rows.length)), h('span', { class: 'small muted hide-narrow' }, 'Viewers read · contributors claim and deliver · coordinators also approve · owners also manage')),
       h('div', { class: 'table-wrap' }, h('table', null,
@@ -1072,7 +1095,7 @@ export async function settings(ctx, { pid }) {
       } }, 'Archive project')))) : null;
 
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
+    head,
     archivedBanner(project),
     unusableBanner(project),
     // kittrial-5bb.442: the hand-over walkthrough, checked live (each member reads their own).

@@ -2,7 +2,7 @@
 // owner opens this page they see which agent has something to do and which folder to
 // open in VS Code to resume it. Agents themselves read work over the REST API.
 import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
-import { pageHead, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
+import { pageHead, setPageKey, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
@@ -290,6 +290,16 @@ export async function list(ctx) {
     }
     return ownersOf(loaded.items).length > 1;
   }
+  // The header (kittrial-5bb.525 slice b): the key is the server's total of the agents this list
+  // reads (data.total), filled when the read returns; the next action takes the reader to the
+  // "Add an agent" form further down this page.
+  const head = pageHead({ title: 'My agents', lede: 'One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.',
+    key: 'pending', actions: h('button', { type: 'button', class: 'primary', 'data-next-action': 'add-agent', onclick: () => {
+      const input = document.getElementById('a-name');
+      if (!input) return;
+      input.scrollIntoView({ block: 'center' });
+      input.focus({ preventScroll: true });
+    } }, 'Add an agent') });
   const filter = h('div', { class: 'stack' },
     ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
       h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
@@ -300,13 +310,15 @@ export async function list(ctx) {
     } }), 'Show agents with inferred or unknown scopes') : null);
   async function load() {
     let data;
-    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
+    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { setPageKey(head, null); host.replaceChildren(errorState(error, load)); return; }
     const items = data.items;
     loaded.items = items;
     loaded.total = data.total || items.length;
     // The filter is caller-level: keep every owner the caller may see, across pages, so the
     // Mine/All choice never appears on one page and vanishes on the next (kittrial-5bb.561 r2).
     for (const owner of ownersOf(items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
+    setPageKey(head, typeof data.total === 'number' ? { num: data.total,
+      label: unconfirmedOnly ? 'with inferred or unknown scopes' : data.total === 1 ? 'agent' : 'agents', source: 'agents.total' } : null);
     host.removeAttribute('aria-busy');
     const showFilter = mineShown();
     const shown = visibleItems();
@@ -623,7 +635,7 @@ export async function list(ctx) {
   });
 
   const page = h('div', { class: 'stack' },
-    pageHead({ title: 'My agents', lede: 'One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.' }),
+    head,
     filter, host,
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add an agent')), h('div', { class: 'panel-body' }, form)));
   if (ownerField) {

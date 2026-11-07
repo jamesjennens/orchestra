@@ -509,7 +509,8 @@ export function createMock(options = {}) {
       last_seen_at: a.last_seen_at || null, projects: projectsOf, items: items.sort((x, y) => (x.kind === 'feedback' ? -1 : y.kind === 'feedback' ? 1 : 0)), attention, claimable, disabled: a.disabled || db.users[a.agent_of].disabled };
   };
   const agentsOf = (uid) => Object.values(db.users).filter((u) => u.agent_of === uid);
-  on('GET', '/v1/agents', () => ok({ items: agentsOf(db.session).map((a) => agentView(a, me())) }));
+  // The real list is paged and carries its total (http_service agents_list); so does this one.
+  on('GET', '/v1/agents', () => { const items = agentsOf(db.session).map((a) => agentView(a, me())); return ok({ items, total: items.length, next_cursor: null }); });
   on('POST', '/v1/agents', (b) => {
     const title = String(b.name || '').trim();
     if (title.length < 2 || title.length > 40) return err(422, 'invalid_payload', 'Agent name must be 2–40 characters');

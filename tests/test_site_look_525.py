@@ -102,22 +102,91 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
+FONT = ('"Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, "Noto Sans", '
+        '"DejaVu Sans", Arial, sans-serif')
+MONO = '"Cascadia Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace'
+SHADOW = {'light': '0 1px 2px rgba(29, 28, 33, .05), 0 8px 24px rgba(29, 28, 33, .06)',
+          'dark': '0 1px 2px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .35)'}
+# Theme-independent additions both dark blocks repeat by decision (slice a, 18:13Z), so each block lists every addition.
+REPEATED_SIZES = {'radius-lg', 'measure', 's-12', 't-3xl', 't-4xl'}
+DARK_MEDIA = '@media (prefers-color-scheme: dark)'
+DARK_MEDIA_SELECTOR = ':root:not([data-theme="light"])'
+DARK_FORCED_SELECTOR = ':root[data-theme="dark"]'
+
+
+def css_rules(css):
+    """Every style rule of a stylesheet in source order, as (media, selectors, [(property, value)]).
+
+    media is None at the top level, else the normalised @media prelude. Comments are dropped;
+    @keyframes and other at-rules are skipped. Source order is what the cascade uses between
+    rules of one selector, so "the last declaration wins" can be read off this list."""
+    css = re.sub(r'/\*.*?\*/', '', css, flags=re.S)
+    rules = []
+
+    def walk(text, media):
+        pos = 0
+        head_re = re.compile(r'\s*([^{}]+?)\s*\{')
+        while True:
+            m = head_re.match(text, pos)
+            if not m:
+                return
+            head, depth, j = m.group(1).strip(), 1, m.end()
+            while depth:
+                depth += {'{': 1, '}': -1}.get(text[j], 0)
+                j += 1
+            body, pos = text[m.end():j - 1], j
+            if head.startswith('@media'):
+                walk(body, ' '.join(head.split()))
+            elif not head.startswith('@'):
+                selectors = tuple(' '.join(part.split()) for part in head.split(','))
+                decls = [tuple(x.strip() for x in part.split(':', 1)) for part in body.split(';') if ':' in part]
+                rules.append((media, selectors, decls))
+
+    walk(css, None)
+    return rules
+
+
+def winning(rules, selector, properties, media=None):
+    """The (property, value) that wins for an exact selector among the given properties: the last one declared."""
+    found = None
+    for rule_media, selectors, decls in rules:
+        if rule_media == media and selector in selectors:
+            for prop, value in decls:
+                if prop in properties:
+                    found = (prop, value)
+    return found
+
+
+def tokens(rules, selector, media=None):
+    """Custom properties declared on a selector, the last declaration of each winning."""
+    out = {}
+    for rule_media, selectors, decls in rules:
+        if rule_media == media and selector in selectors:
+            out.update((prop[2:], value) for prop, value in decls if prop.startswith('--'))
+    return out
+
+
 def token_blocks(css):
-    """The three blocks as {name: value}: light, dark by media query, dark by data-theme."""
-    light = css[css.index(':root {'):css.index('@media (prefers-color-scheme: dark)')]
-    media = re.search(r':root:not\(\[data-theme="light"\]\)\s*\{([^}]*)\}', css).group(1)
-    forced = re.search(r':root\[data-theme="dark"\]\s*\{([^}]*)\}', css).group(1)
-    parse = lambda block: dict(re.findall(r'--([\w-]+):\s*([^;]+?);', block))
-    return parse(light), parse(media), parse(forced)
+    """The tokens as they win: light (:root), and the two dark blocks (system setting, data-theme)."""
+    rules = css_rules(css)
+    return (tokens(rules, ':root'), tokens(rules, DARK_MEDIA_SELECTOR, DARK_MEDIA),
+            tokens(rules, DARK_FORCED_SELECTOR))
 
 
 class FreshTokens(unittest.TestCase):
-    """The values on the frozen names, the additions, and their contrast (runs everywhere)."""
+    """The values on the frozen names, the additions, and their contrast (runs everywhere).
+
+    Every check reads the value that WINS in the cascade (the last declaration of a token, or
+    of a rule's property, in source order), so a later duplicate cannot override a pinned value
+    while the first declaration still satisfies the test."""
 
     @classmethod
     def setUpClass(cls):
         cls.css = CSS.read_text()
+        cls.rules = css_rules(cls.css)
         cls.light, cls.media, cls.forced = token_blocks(cls.css)
+        # what a dark page resolves: the dark block over the light one
+        cls.themes = {'light': cls.light, 'dark': {**cls.light, **cls.media}, 'dark (data-theme)': {**cls.light, **cls.forced}}
 
     def test_light_values(self):
         for name, value in {**LIGHT, **SIZES}.items():
@@ -129,6 +198,23 @@ class FreshTokens(unittest.TestCase):
                 self.assertEqual(value, block.get(name), '--' + name)
         self.assertEqual(self.media, self.forced, 'the two dark blocks must agree')
 
+    def test_dark_blocks_declare_exactly_the_themed_tokens(self):
+        # Should 1 (slice a review): each dark block's KEY SET is pinned. Every token the light block
+        # gives a colour or the shadow is re-declared (nothing missing), plus the additions repeated
+        # by decision, and nothing else (nothing extra, nothing the light block lacks).
+        themed = {name for name, value in self.light.items() if re.fullmatch(r'#[0-9a-fA-F]{6}', value) or name == 'shadow'}
+        expected = sorted(themed | REPEATED_SIZES)
+        self.assertEqual(expected, sorted(self.media), 'dark block (prefers-color-scheme)')
+        self.assertEqual(expected, sorted(self.forced), 'dark block (data-theme)')
+        self.assertLessEqual(set(self.media), set(self.light))
+
+    def test_font_mono_and_shadow_in_every_theme(self):
+        # Note 3: the stacks and the shadow, as each theme resolves them.
+        for theme, values in self.themes.items():
+            self.assertEqual(FONT, values['font'], theme)
+            self.assertEqual(MONO, values['mono'], theme)
+            self.assertEqual(SHADOW['light' if theme == 'light' else 'dark'], values['shadow'], theme)
+
     def test_additions_are_in_every_block(self):
         for block in (self.light, self.media, self.forced):
             for name in ADDITIONS:
@@ -138,39 +224,42 @@ class FreshTokens(unittest.TestCase):
                 self.assertEqual(SIZES[name], self.media[name])
 
     def test_frozen_pins_of_523_hold(self):
-        # .523's pins (test_site_look_523.test_tokens_and_the_one_colour_fix) are kept, not changed.
-        for pin in ('--t-2xs: 11px;', '--t-2xl: 24px;', '--warn: #9a5c00;', '--s-1: 4px;'):
-            self.assertIn(pin, self.css)
+        # .523's pins (test_site_look_523.test_tokens_and_the_one_colour_fix), as values that win.
+        for name, value in (('t-2xs', '11px'), ('t-2xl', '24px'), ('warn', '#9a5c00'), ('s-1', '4px')):
+            self.assertEqual(value, self.light[name], '--' + name)
 
     def test_every_pair_meets_aa_in_both_themes(self):
         # measured on the values app.css actually ships (both dark blocks), not on this file's constants
         failures = []
-        for theme, values in (('light', self.light), ('dark', self.media), ('dark (data-theme)', self.forced)):
+        for theme, values in self.themes.items():
             for fg, bg, need, where in PAIRS:
                 ratio = contrast(values[fg], values[bg])
                 if ratio < need:
                     failures.append(f'{theme} {fg} on {bg} ({where}): {ratio:.2f} < {need}')
         self.assertEqual([], failures)
 
+    def edge(self, selector):
+        return winning(self.rules, selector, ('border', 'border-color'))
+
     def test_controls_take_the_field_line_edge(self):
-        button = self.css[self.css.index('button, .btn {'):self.css.index('button:hover, .btn:hover')]
-        field = self.css[self.css.index('input, select, textarea {'):self.css.index('input[type="checkbox"]')]
-        seg = self.css[self.css.index('.seg {'):self.css.index('.seg button {')]
-        for rule in (button, field, seg):
-            self.assertIn('border: 1px solid var(--field-line);', rule)
+        for selector in ('button', '.btn', 'input', 'select', 'textarea', '.seg'):
+            self.assertEqual(('border', '1px solid var(--field-line)'), self.edge(selector), selector)
         # the danger button's 45% crit mix measured 2.20:1 (light) and 2.60:1 (dark) as an edge
-        self.assertIn('button.danger { color: var(--crit); border-color: var(--field-line); }', self.css)
+        self.assertEqual(('border-color', 'var(--field-line)'), self.edge('button.danger'))
+        self.assertEqual(('color', 'var(--crit)'), winning(self.rules, 'button.danger', ('color',)))
 
     def test_in_progress_has_its_own_state_colour(self):
-        self.assertIn('.chip.info { background: var(--info-soft); } .chip.info::before { background: var(--info); }',
-                      self.css)
+        self.assertEqual(('background', 'var(--info-soft)'), winning(self.rules, '.chip.info', ('background', 'background-color')))
+        self.assertEqual(('background', 'var(--info)'), winning(self.rules, '.chip.info::before', ('background', 'background-color')))
         ui = UI.read_text()
         self.assertIn("in_progress: ['In progress', 'info']", ui)
         self.assertIn("'awaiting-review': ['Awaiting review', 'warn']", ui)
 
     def test_the_serif_is_for_the_h1_only(self):
-        self.assertIn('h1, h2, h3 { font-family: var(--font);', self.css)
-        self.assertIn('h1 { font-family: var(--font-display);', self.css)
+        family = ('font-family', 'font')
+        self.assertEqual(('font-family', 'var(--font-display)'), winning(self.rules, 'h1', family))
+        for selector in ('h2', 'h3'):
+            self.assertEqual(('font-family', 'var(--font)'), winning(self.rules, selector, family), selector)
         self.assertTrue(self.light['font-display'].endswith('serif') and 'sans' not in self.light['font-display'])
 
 

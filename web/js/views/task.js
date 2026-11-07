@@ -1,6 +1,6 @@
 import { h, time, confirmDialog, shortSha, toast } from '../dom.js';
 import { markdown } from '../md.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, describe, errorState, actorWords } from '../ui.js';
+import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, describe, errorState, actorWords, durationSince } from '../ui.js';
 import { canWrite, canApprove, isOwner } from './project.js';
 import { lifecyclePanel } from './lifecycle.js';
 import { taskFilesPanel } from './taskFiles.js';
@@ -91,6 +91,28 @@ export async function detail(ctx, { pid, tid }) {
       h('span', { class: 'mono' }, t.id)),
     next ? h('p', { class: 'next' }, h('b', null, 'Next: '), next.text, ' ',
       h('span', { class: 'who-acts' + (whoActs === 'you' || whoActs === 'you (project owner)' || whoActs === 'you (coordinator)' ? ' you' : '') }, whoActs)) : null);
+  // The header (kittrial-5bb.525 slice b). Its key: how long a delivered contribution has waited
+  // for review, from the contribution's own delivery time (review.contribution.at, shown as
+  // "Delivered" below); no number in any other state. Its next action: the server's next step
+  // (t.next_action) as the header's button, only when the reader is the one who acts and the
+  // form for it is on this page, in the Contribution & review panel; the button takes the
+  // reader there and moves nothing.
+  const delivered = review.contribution;
+  const waited = review.state === 'awaiting-review' && delivered && delivered.at ? durationSince(delivered.at) : null;
+  const headKey = waited ? { num: waited, label: owner ? 'waiting for your review' : 'waiting for review', source: 'review.contribution.at' } : null;
+  const youAct = whoActs === 'you' || whoActs === 'you (project owner)' || whoActs === 'you (coordinator)';
+  const formHere = (owner && delivered && review.state === 'awaiting-review' && !project.archived)
+    || (mine && writer && review.state === 'changes-requested' && t.status !== 'closed');
+  if (next && youAct && formHere) {
+    const claimFirst = actions.some((b) => String(b.className).includes('primary'));
+    actions.unshift(h('button', { type: 'button', class: claimFirst ? null : 'primary', 'data-next-action': 'review', onclick: () => {
+      const target = document.getElementById('review-h');
+      if (!target) return;
+      target.setAttribute('tabindex', '-1');
+      target.scrollIntoView({ block: 'start' });
+      target.focus({ preventScroll: true });
+    } }, next.text));
+  }
   // The integration-evidence link stays one banner below the strip for approved work.
   // The facts panel starts hidden inside the closed Owner-tools fold (and until the
   // lifecycle read lands), so the link opens the fold first (b1.3): otherwise the
@@ -359,7 +381,7 @@ export async function detail(ctx, { pid, tid }) {
     h('div', { class: 'panel-head' }, h('h2', { id: 'wanted-h' }, 'What is wanted')),
     h('div', { class: 'panel-body md' }, markdown(t.description || '')));
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + pid) }, { label: t.id }], title: t.title, actions }),
+    pageHead({ crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + pid) }, { label: t.id }], title: t.title, key: headKey, actions }),
     summaryStrip,
     // kittrial-5bb.425 part 2: the task's own req: and design: tokens, resolved by the server (TRACEABILITY_DESIGN §5.2).
     brief.description_pointers ? h('section', { class: 'panel', 'aria-label': 'What this task cites', 'data-description-pointers': '1' },
