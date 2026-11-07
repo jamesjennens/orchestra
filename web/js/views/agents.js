@@ -2,7 +2,7 @@
 // owner opens this page they see which agent has something to do and which folder to
 // open in VS Code to resume it. Agents themselves read work over the REST API.
 import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
-import { pageHead, setPageKey, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
+import { pageHead, setPageKey, empty, field, setFieldError, formValues, act, errorState, describe, loading } from '../ui.js';
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
@@ -249,7 +249,9 @@ export async function list(ctx) {
   // The page's structure is there at once, in its final order; the agents and the accounts fill in
   // their own places (kittrial-5bb.456 item 1), so nothing below them is pushed down later.
   const host = h('div', { class: 'stack', 'data-agents-host': '', 'aria-busy': 'true' },
-    h('div', { class: 'panel', 'data-agents-loading': '', role: 'status', style: 'min-height: 6rem' }, h('div', { class: 'panel-body muted' }, 'Loading your agents…')));
+    // The skeleton in the agents' own place (kittrial-5bb.525 slice e): it says so to a screen
+    // reader, and the cards replace it where it stands (kittrial-5bb.456 item 1).
+    h('div', { class: 'panel', 'data-agents-loading': '' }, h('div', { class: 'panel-body' }, loading('Loading your agents…'))));
   let unconfirmedOnly = false;
   let cursor = null;
   let mineOnly = true;

@@ -332,6 +332,42 @@ class FreshTables(unittest.TestCase):
         self.assertEqual('none', self.win('td .who-acts::before', 'content'))
 
 
+class FreshStates(unittest.TestCase):
+    """Slice (e): empty, loading and error states as the cascade resolves them (runs everywhere)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rules = css_rules(CSS.read_text())
+
+    def win(self, selector, *properties, media=None):
+        found = winning(self.rules, selector, properties, media=media)
+        return found and found[1]
+
+    def test_the_shimmer_stops_under_reduced_motion(self):
+        self.assertTrue(self.win('.sk', 'animation', 'animation-name').startswith('shimmer'))
+        self.assertEqual('none', self.win('.sk', 'animation', 'animation-name', media='@media (prefers-reduced-motion: reduce)'))
+
+    def test_an_error_is_the_crit_well_with_readable_text(self):
+        self.assertEqual('var(--crit-soft)', self.win('.state.error', 'background', 'background-color'))
+        self.assertEqual('4px solid var(--crit)', self.win('.state.error', 'border-left'))
+        self.assertEqual('var(--ink-2)', self.win('.state.error .state-text p', 'color'))
+        self.assertEqual('var(--ink)', self.win('.state-text strong', 'color'))
+        # Try again on the well: its edge is the crit rule (field-line measured 2.99:1 on crit-soft)
+        self.assertEqual('var(--crit)', self.win('.state.error button', 'border-color', 'border'))
+        light, media, forced = token_blocks(CSS.read_text())
+        for theme, values in (('light', light), ('dark', {**light, **media})):
+            self.assertGreaterEqual(contrast(values['crit'], values['crit-soft']), 3.0, theme)
+        # the pairs it uses meet AA in both themes (ink-2 and ink on crit-soft are in PAIRS too)
+        light, media, forced = token_blocks(CSS.read_text())
+        for theme, values in (('light', light), ('dark', {**light, **media}), ('dark (data-theme)', {**light, **forced})):
+            self.assertGreaterEqual(contrast(values['ink-2'], values['crit-soft']), 4.5, theme)
+            self.assertGreaterEqual(contrast(values['ink'], values['crit-soft']), 4.5, theme)
+
+    def test_an_empty_state_is_a_dashed_well(self):
+        self.assertEqual('1px dashed var(--line-strong)', self.win('.state', 'border'))
+        self.assertEqual('var(--ground)', self.win('.state', 'background', 'background-color'))
+
+
 def harness_page(theme):
     js = (ROOT / 'web' / 'js').as_uri()
     set_theme = "document.documentElement.dataset.theme = 'dark';" if theme == 'dark' else ''
@@ -342,6 +378,7 @@ def harness_page(theme):
 <script type="module">
 import {{ start }} from '{js}/app.js';
 import {{ createMock }} from '{js}/mock.js';
+import {{ errorState, empty, loading }} from '{js}/ui.js';
 {set_theme}
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const parse = (c) => {{
@@ -434,6 +471,14 @@ try {{
   await go('agents', '/agents');
   await go('reviews', '/p/proj_portal/reviews');
   await go('settings', '/p/proj_portal/settings');
+  // slice (e): the three states, rendered by the real helpers inside the app's own main
+  const main = document.getElementById('main');
+  main.replaceChildren(
+    errorState({{ status: 503, code: 'busy', message: 'The server is busy just now.', requestId: 'req_4f19c2' }}, () => {{}}),
+    empty('Nothing to confirm', 'An agent that asks to join one of your projects appears here.'),
+    loading('Loading activity…'));
+  await wait(50);
+  out.pages.push(['states', measure('states')]);
 }} catch (e) {{ out.errors.push(String(e && e.stack || e)); }}
 document.title = 'MEASURE' + JSON.stringify(out);
 </script></body></html>'''
@@ -472,11 +517,17 @@ class FreshContrastMeasured(unittest.TestCase):
     def check(self, width, height, theme, prefers_dark=False):
         data = run_harness(find_browser(), width, height, theme, prefers_dark)
         self.assertEqual([], data['errors'])
-        self.assertEqual(['sign-in', 'my-work', 'tasks', 'task', 'agents', 'reviews', 'settings'],
+        self.assertEqual(['sign-in', 'my-work', 'tasks', 'task', 'agents', 'reviews', 'settings', 'states'],
                          [p for p, _ in data['pages']])
         if prefers_dark:
             self.assertTrue(data['dark'], 'the browser did not report prefers-color-scheme: dark')
         bad, rows = failures_of(data)
+        # slice (e): the error state's text was measured on its crit-soft well (ink-2 on crit-soft)
+        states = dict(data['pages'])['states']['texts']
+        well = [key.split(' on ')[1].split()[0] for key, v in states.items() if v['sample'] == 'Could not load this page']
+        self.assertEqual(1, len(well), states)
+        self.assertTrue(any(key.split(' on ')[1].split()[0] == well[0] and v['sample'] != 'Could not load this page'
+                            for key, v in states.items()), 'the error text on the crit-soft well was not measured')
         buttons = {page: found['cellButtons'] for page, found in data['pages']}
         self.assertTrue(buttons['settings'], 'the members table has its Remove buttons to measure')
         self.assertEqual([], [(page, b) for page, found in buttons.items() for b in found if b['lines'] > 1])

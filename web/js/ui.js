@@ -107,12 +107,45 @@ export function durationSince(iso, now = Date.now()) {
   return unit(Math.floor(hours / 24), 'day');
 }
 
-export function empty(title, body, action) {
-  return h('div', { class: 'empty' }, h('strong', null, title), body ? h('p', null, body) : null, action || null);
+// Empty, loading and error states (kittrial-5bb.525 slice e): a small round icon, a title that
+// says what would be here, one sentence on how it gets there, and the action when there is one.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const STATE_ICONS = {
+  empty: ['M4 13l2.5-7h11L20 13', 'M4 13v5h16v-5h-5a3 3 0 0 1-6 0z'],
+  error: ['M12 4l9 16H3z', 'M12 10v4', 'M12 17.5v.01'],
+};
+function stateIcon(kind) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.8');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  STATE_ICONS[kind].forEach((d) => {
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', d);
+    svg.appendChild(path);
+  });
+  return h('span', { class: 'state-icon' }, svg);
 }
 
-export function loading(label = 'Loading…') {
-  return h('div', { class: 'loading', role: 'status' }, label);
+export function empty(title, body, action) {
+  return h('div', { class: 'state', 'data-state': 'empty' }, stateIcon('empty'),
+    h('div', { class: 'state-text' }, h('strong', null, title), body ? h('p', null, body) : null),
+    action ? h('div', { class: 'state-act' }, action) : null);
+}
+
+// Loading: a skeleton in the shape of what will come, never a blank. Its words are for screen
+// readers (role=status); the bars are decoration, and they stop shimmering under reduced motion.
+const SKELETON = [['60', '30'], ['80', '40'], ['40', '30']];
+export function loading(label = 'Loading…', rows = 3) {
+  return h('div', { class: 'loading', role: 'status', 'aria-busy': 'true', 'data-state': 'loading' },
+    h('span', { class: 'visually-hidden' }, label),
+    h('div', { class: 'skeleton', 'aria-hidden': 'true' },
+      Array.from({ length: rows }, (_, i) => h('div', { class: 'sk-row' }, h('span', { class: 'sk sk-dot' }),
+        h('span', { class: 'sk-lines' }, SKELETON[i % SKELETON.length].map((w) => h('span', { class: 'sk sk-w' + w })))))));
 }
 
 // Explains an API failure in the user's terms, with the server request id for support.
@@ -147,12 +180,15 @@ export function describe(error) {
   }
 }
 
+// An error: inline where the read failed, on the crit tone with its rule and icon; what failed,
+// the server's reason in the reader's words, the request id for support, and Try again.
 export function errorState(error, retry) {
-  return h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'alert' },
-    h('strong', null, error && error.status === 404 ? 'Not found' : error && error.status === 403 ? 'No access' : 'Could not load this page'),
-    h('p', null, describe(error)),
-    error && error.requestId ? h('p', { class: 'small mono' }, 'Request ' + error.requestId) : null,
-    retry ? h('button', { type: 'button', onclick: retry }, 'Try again') : null));
+  return h('div', { class: 'state error', role: 'alert', 'data-state': 'error' }, stateIcon('error'),
+    h('div', { class: 'state-text' },
+      h('strong', null, error && error.status === 404 ? 'Not found' : error && error.status === 403 ? 'No access' : 'Could not load this page'),
+      h('p', null, describe(error)),
+      error && error.requestId ? h('p', { class: 'state-req mono' }, 'Request ' + error.requestId) : null),
+    retry ? h('div', { class: 'state-act' }, h('button', { type: 'button', onclick: retry }, 'Try again')) : null);
 }
 
 // Runs a mutation with a busy button, a clear failure message and — when the outcome is

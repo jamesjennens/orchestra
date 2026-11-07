@@ -317,9 +317,51 @@ form.respond { border-top: 1px solid var(--line); padding-top: 12px; margin-top:
 .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 
 /* ---------- empty/loading/error ---------- */
-.empty { padding: 32px 16px; text-align: center; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 8px; border: 1px dashed var(--line-strong); border-radius: var(--radius); }
+.empty { padding: var(--s-6) var(--s-4); text-align: center; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: var(--s-2); border: 1px dashed var(--line-strong); border-radius: var(--radius-lg); background: var(--ground); }
 .empty strong { color: var(--ink); font-size: var(--t-lg); }
-.loading { padding: 32px; color: var(--muted); font-size: var(--t-sm); }
+
+/* ---------- empty, loading and error states (kittrial-5bb.525 slice e) ---------- */
+/* a round icon, what would be here, how it gets there, and the action; empty is a dashed well */
+.state {
+  display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; gap: var(--s-1) var(--s-4); align-items: center;
+  padding: var(--s-4) var(--s-5); border-radius: var(--radius-lg); background: var(--ground); border: 1px dashed var(--line-strong);
+  color: var(--muted); text-align: left;
+}
+.panel > .state { margin: var(--s-3); }
+.state-icon {
+  width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--surface); border: 1px solid var(--line); color: var(--muted);
+}
+.state-icon svg { width: 18px; height: 18px; }
+.state-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.state-text strong { color: var(--ink); font-weight: 650; }
+.state-text p { margin: 0; font-size: var(--t-sm); color: var(--muted); }
+/* an error is the crit tone, with its rule: what failed, why, the request id and Try again */
+.state.error { background: var(--crit-soft); border: 1px solid color-mix(in srgb, var(--crit) 35%, transparent); border-left: 4px solid var(--crit); }
+.state.error .state-icon { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 35%, transparent); }
+.state.error .state-text p { color: var(--ink-2); }
+.state-req { font-family: var(--mono); font-size: var(--t-xs); }
+/* on the crit well a control's --field-line edge is under 3:1 (2.99 light); Try again takes the well's own rule */
+.state.error button, .state.error .btn { border-color: var(--crit); }
+/* loading: a skeleton in the shape of what comes, never a blank */
+.loading { padding: var(--s-2) 0; color: var(--muted); font-size: var(--t-sm); }
+.skeleton { display: flex; flex-direction: column; gap: var(--s-3); }
+.sk-row { display: grid; grid-template-columns: 12px minmax(0, 1fr); gap: var(--s-3); align-items: start; }
+.sk-lines { display: flex; flex-direction: column; gap: var(--s-2); }
+.sk {
+  display: block; height: 10px; border-radius: 5px;
+  background: linear-gradient(90deg, var(--surface-2) 0%, var(--line) 50%, var(--surface-2) 100%); background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+.sk-dot { width: 12px; height: 12px; border-radius: 50%; }
+.sk-w30 { width: 30%; } .sk-w40 { width: 40%; } .sk-w60 { width: 60%; } .sk-w80 { width: 80%; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+/* the shimmer stops for a reader who asked for less motion (this rule names it; the global one may change) */
+@media (prefers-reduced-motion: reduce) { .sk { animation: none; } }
+@media (max-width: 760px) {
+  .state { grid-template-columns: 36px minmax(0, 1fr); padding: var(--s-4); }
+  .state-act { grid-column: 2; justify-self: start; margin-top: var(--s-1); }
+}
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; color: var(--ink); }
 a.card:hover { border-color: var(--accent); text-decoration: none; }
