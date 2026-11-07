@@ -112,8 +112,10 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   display: flex; flex-direction: column; gap: 14px; padding: 16px 12px;
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
 }
-.brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px; font-weight: 650; font-size: var(--t-lg); color: var(--ink); }
-.brand-mark { width: 22px; height: 22px; flex: none; }
+/* the mark and the wordmark (kittrial-5bb.525 slice d): the tile, then "Orchestra" in the display serif */
+.brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px; color: var(--ink); }
+.brand > span { font-family: var(--font-display); font-weight: 600; font-size: var(--t-xl); letter-spacing: -.01em; line-height: 1; }
+.brand-mark { width: 24px; height: 24px; flex: none; }
 .rail-section { display: flex; flex-direction: column; gap: 2px; }
 .rail-label { font-size: var(--t-xs); font-weight: 600; color: var(--muted); padding: 0 8px 4px; }  /* sentence case, not 11px caps (525 c) */
 .nav-link {
@@ -327,10 +329,43 @@ a.card:hover { border-color: var(--accent); text-decoration: none; }
 .step { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px; display: flex; flex-direction: column; gap: 8px; }
 
 /* ---------- auth ---------- */
-.auth { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
-.auth-card { width: 100%; max-width: 380px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 28px; display: flex; flex-direction: column; gap: 18px; }
-.auth-card .brand { padding: 0; }
-.auth-foot { font-size: var(--t-xs); color: var(--muted); }
+/* sign-in (kittrial-5bb.525 slice d): the brand side on paper, the form on the working surface */
+.auth { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(380px, 1fr); }  /* the frame fills the window */
+.auth-side {
+  background: var(--ground); border-right: 1px solid var(--line); padding: var(--s-12);
+  display: flex; flex-direction: column; justify-content: space-between; gap: var(--s-8); overflow: hidden;
+}
+.auth-side .brand { padding: 0; }
+.auth-side .brand-mark { width: 32px; height: 32px; }
+.auth-side .brand > span { font-size: var(--t-2xl); }
+.auth-pitch { display: flex; flex-direction: column; gap: var(--s-4); max-width: 30ch; }
+.auth-pitch p { color: var(--ink-2); font-size: var(--t-lg); }
+.auth-pitch .auth-headline { font-family: var(--font-display); font-size: var(--t-4xl); font-weight: 600; line-height: 1.15; letter-spacing: -.015em; color: var(--ink); }
+.auth-score { width: min(420px, 100%); align-self: flex-end; }
+.auth-score rect { fill: var(--line-strong); }
+.auth-score rect.lead { fill: var(--accent); }
+.auth-fine { font-size: var(--t-sm); color: var(--muted); }
+.auth-main { display: grid; place-items: center; padding: var(--s-12) var(--s-6); background: var(--surface); }
+.auth-card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: var(--s-5); }
+.auth-card h1 { font-size: var(--t-3xl); }
+.auth-card-brand { display: none; padding: 0; }
+.auth-card .field input { min-height: 42px; font-size: var(--t-lg); }
+.auth-card button.primary { min-height: 44px; font-size: var(--t-md); }
+/* A field with a link on its label's line; the link stays after the input in tab order. */
+.field.with-aside { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--s-2); row-gap: var(--s-1); align-items: baseline; }
+.field.with-aside > label { grid-row: 1; grid-column: 1; }
+.field.with-aside > .field-aside { grid-row: 1; grid-column: 2; font-size: var(--t-sm); }
+.field.with-aside > :not(label):not(.field-aside) { grid-column: 1 / -1; }
+.auth-foot { font-size: var(--t-sm); color: var(--muted); border-top: 1px solid var(--line); padding-top: var(--s-4); }
+@media (max-width: 760px) {
+  .auth { grid-template-columns: minmax(0, 1fr); }
+  .auth-side { display: none; }
+  .auth-main { place-items: start center; padding: var(--s-8) var(--s-5); }
+  .auth-card h1 { font-size: var(--t-2xl); }
+  .auth-card-brand { display: flex; }
+  .auth-card-brand .brand-mark { width: 30px; height: 30px; }
+  .auth-card-brand > span { font-size: var(--t-xl); }
+}
 
 /* ---------- dialog & toast ---------- */
 dialog { border: 1px solid var(--line); border-radius: 10px; padding: 0; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); width: min(520px, calc(100vw - 32px)); }
