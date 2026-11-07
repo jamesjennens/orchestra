@@ -250,7 +250,8 @@ class FreshTokens(unittest.TestCase):
 
     def test_in_progress_has_its_own_state_colour(self):
         self.assertEqual(('background', 'var(--info-soft)'), winning(self.rules, '.chip.info', ('background', 'background-color')))
-        self.assertEqual(('background', 'var(--info)'), winning(self.rules, '.chip.info::before', ('background', 'background-color')))
+        # slice (c): the dot is the chip's own text colour, so In progress reads in --info throughout
+        self.assertEqual(('color', 'var(--info)'), winning(self.rules, '.chip.info', ('color',)))
         ui = UI.read_text()
         self.assertIn("in_progress: ['In progress', 'info']", ui)
         self.assertIn("'awaiting-review': ['Awaiting review', 'warn']", ui)
@@ -261,6 +262,74 @@ class FreshTokens(unittest.TestCase):
         for selector in ('h2', 'h3'):
             self.assertEqual(('font-family', 'var(--font)'), winning(self.rules, selector, family), selector)
         self.assertTrue(self.light['font-display'].endswith('serif') and 'sans' not in self.light['font-display'])
+
+
+JS_ROOT = ROOT / 'web' / 'js'
+# The one place the accent may still look like a chip: the set-up wizard's "Step N of 6" says
+# where the reader is (interaction and position, not a state).
+ACCENT_ALLOWED = ("h('span', { class: 'chip accent', 'data-wizard-progress': 'true' })",)
+
+
+class FreshTables(unittest.TestCase):
+    """Slice (c): tables and lists that read at a glance, state colours only for states (runs everywhere)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.css = CSS.read_text()
+        cls.rules = css_rules(cls.css)
+
+    def win(self, selector, *properties):
+        found = winning(self.rules, selector, properties)
+        return found and found[1]
+
+    def test_table_heads_and_rail_labels_are_sentence_case(self):
+        for selector in ('th', '.rail-label'):
+            self.assertIn(self.win(selector, 'text-transform'), (None, 'none'), selector)
+            self.assertIn(self.win(selector, 'letter-spacing'), (None, '0', 'normal'), selector)
+            self.assertEqual('var(--t-xs)', self.win(selector, 'font-size', 'font'), selector)
+        self.assertEqual('var(--s-2) var(--s-3)', self.win('th', 'padding'))
+        self.assertEqual('var(--s-3)', self.win('td', 'padding'))
+
+    def test_chip_text_takes_its_state_colour(self):
+        self.assertEqual('var(--idle)', self.win('.chip', 'color'))
+        for tone in ('ok', 'warn', 'crit', 'info'):
+            self.assertEqual(f'var(--{tone})', self.win(f'.chip.{tone}', 'color'), tone)
+            self.assertEqual(f'var(--{tone}-soft)', self.win(f'.chip.{tone}', 'background', 'background-color'), tone)
+        self.assertEqual('currentColor', self.win('.chip::before', 'background', 'background-color'))
+        self.assertEqual('var(--ink-2)', self.win('.chip.plain', 'color'))
+        # every tone on its own soft ground meets AA as 12px text, in both themes (the values that win)
+        light, media, forced = token_blocks(self.css)
+        for theme, values in (('light', light), ('dark', {**light, **media}), ('dark (data-theme)', {**light, **forced})):
+            for tone in ('idle', 'ok', 'warn', 'crit', 'info'):
+                self.assertGreaterEqual(contrast(values[tone], values[tone + '-soft']), 4.5, f'{theme} {tone}')
+
+    def test_changes_requested_is_crit(self):
+        ui = UI.read_text()
+        self.assertIn("'changes-requested': ['Changes requested', 'crit']", ui)
+
+    def test_the_accent_is_never_a_state_tone(self):
+        # A chip, a dot or a tone table naming 'accent' is a state drawn in the interaction colour.
+        found = []
+        for path in sorted(JS_ROOT.rglob('*.js')):
+            for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+                if re.search(r"'accent'|\bchip accent\b|\bdot accent\b|'(chip|dot) ' \+[^;]*'accent'", line) \
+                        and not any(allowed in line for allowed in ACCENT_ALLOWED):
+                    found.append(f'{path.relative_to(ROOT)}:{number}: {line.strip()[:120]}')
+        self.assertEqual([], found)
+
+    def test_buttons_in_cells_keep_one_line(self):
+        for selector in ('td > button', 'td > .btn'):
+            self.assertEqual('nowrap', self.win(selector, 'white-space'), selector)
+
+    def test_rows_waiting_on_you_carry_the_bar(self):
+        self.assertEqual('inset 3px 0 0 var(--accent)', self.win('tbody tr.mine > td:first-child', 'box-shadow'))
+        phone = winning(self.rules, 'table.stack-narrow tr.mine', ('box-shadow',), media='@media (max-width: 760px)')
+        self.assertEqual(('box-shadow', 'inset 3px 0 0 var(--accent)'), phone)
+        project = (JS_ROOT / 'views' / 'project.js').read_text(encoding='utf-8')
+        self.assertIn("class: 'row-link task-row' + (waitsOnYou(ctx, project, t) ? ' mine' : '')", project)
+
+    def test_who_acts_in_a_cell_has_no_arrow(self):
+        self.assertEqual('none', self.win('td .who-acts::before', 'content'))
 
 
 def harness_page(theme):
@@ -337,7 +406,17 @@ function measure(page) {{
     const key = (edge ? hex(edge) : 'none') + '/' + hex(fill) + ' on ' + hex(around);
     if (!controls[key]) controls[key] = {{ ratio: v, need: 3, sample: (el.textContent || el.tagName).trim().slice(0, 30), cls: String(el.className).slice(0, 40), page }};
   }});
-  return {{ texts, controls }};
+  // slice (c): a button in a table cell keeps its label on one line (count its text's line boxes)
+  const cellButtons = [];
+  document.querySelectorAll('td > button, td > .btn').forEach((el) => {{
+    const r = el.getBoundingClientRect(); if (r.width < 2 || r.height < 2) return;
+    const text = Array.from(el.childNodes).find((n) => n.nodeType === 3 && n.textContent.trim());
+    if (!text) return;
+    const range = document.createRange(); range.selectNodeContents(text);
+    const lines = new Set(Array.from(range.getClientRects()).map((x) => Math.round(x.top))).size;
+    cellButtons.push({{ text: el.textContent.trim().slice(0, 30), lines }});
+  }});
+  return {{ texts, controls, cellButtons }};
 }}
 const out = {{ pages: [], dark: matchMedia('(prefers-color-scheme: dark)').matches, errors: [] }};
 try {{
@@ -398,6 +477,9 @@ class FreshContrastMeasured(unittest.TestCase):
         if prefers_dark:
             self.assertTrue(data['dark'], 'the browser did not report prefers-color-scheme: dark')
         bad, rows = failures_of(data)
+        buttons = {page: found['cellButtons'] for page, found in data['pages']}
+        self.assertTrue(buttons['settings'], 'the members table has its Remove buttons to measure')
+        self.assertEqual([], [(page, b) for page, found in buttons.items() for b in found if b['lines'] > 1])
         report = os.environ.get('ORCHESTRA_AA_REPORT')
         if report:
             with open(report, 'a', encoding='utf-8') as f:

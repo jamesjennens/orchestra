@@ -75,6 +75,17 @@ class PageHeadKey(unittest.TestCase):
         self.assertKey(data['afterClosed'], expected['closed'], 'closed', 'page.total')
         self.assertEqual([('New task', True)], [(a['text'], a['primary']) for a in head['actions']])
 
+    def test_tasks_rows_that_wait_on_you_are_marked(self):
+        # slice (c): the accent bar marks exactly the rows whose next step is the reader's
+        data = observed(self)['tasks']
+        seen = data['rowsSeen']
+        self.assertTrue(seen)
+        self.assertTrue(any(r['mine'] for r in seen), 'the fixture must hold a row that waits on the owner')
+        self.assertTrue(any(not r['mine'] for r in seen), 'and one that does not')
+        for row in seen:
+            expected = data['rowsExpected'][row['id']]
+            self.assertEqual((expected, expected, expected), (row['mine'], row['flag'], row['hidden']), row)
+
     def test_task_waiting_for_review(self):
         data, head = self.head('taskWaiting')
         expected = data['expected']

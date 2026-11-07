@@ -19,7 +19,7 @@ export const FACTS = [
 const REVIEW = {
   'none': ['No contribution', ''],
   'awaiting-review': ['Awaiting review', 'warn'],  // kittrial-5bb.525: the accent is not a state
-  'changes-requested': ['Changes requested', 'warn'],
+  'changes-requested': ['Changes requested', 'crit'],  // kittrial-5bb.525 (c): sent back
   'approved': ['Approved · not integrated', 'ok'],
   'awaiting-integration': ['Awaiting integration', 'ok'],
   'integrated': ['Integrated', 'ok'],

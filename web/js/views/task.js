@@ -7,8 +7,8 @@ import { taskFilesPanel } from './taskFiles.js';
 import { childForm } from './children.js';
 
 const ACTIONS = {
-  'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'accent'], 'task-updated': ['Edited the task', ''],
-  'contribution': ['Delivered a contribution', 'accent'], 'change-requested': ['Requested a change', 'warn'], 'change-resolved': ['Change resolved', 'ok'],
+  'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'info'], 'task-updated': ['Edited the task', ''],
+  'contribution': ['Delivered a contribution', 'warn'], 'change-requested': ['Requested a change', 'warn'], 'change-resolved': ['Change resolved', 'ok'],
   'review-approve': ['Approved', 'ok'], 'review-request-changes': ['Requested changes', 'warn'],
   'approve': ['Approved', 'ok'], 'request-changes': ['Requested changes', 'warn'], 'respond': ['Responded to review', ''], 'recommend': ['Recommended approval', ''],
   'checkpoint-added': ['Recorded a checkpoint', ''], 'checkpoint': ['Recorded a checkpoint', ''], 'comment': ['Commented', ''],

@@ -40,6 +40,16 @@ async function load(ctx, pid) {
   return project;
 }
 
+// A row waits on the reader when the server's next step is theirs (kittrial-5bb.525 slice c):
+// a review or integration step for an owner or coordinator, the assignee's step for the assignee.
+export function waitsOnYou(ctx, project, t) {
+  const who = t.next_action && t.next_action.who;
+  if (!who || t.status === 'closed') return false;
+  if (who === 'owner') return canApprove(project);
+  if (who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
+  return false;
+}
+
 // What the Tasks key counts, in the words of the filter it was read with.
 function tasksKeyLabel(state) {
   if (state.q || state.review) return 'matching';
@@ -588,8 +598,10 @@ export async function overview(ctx, { pid }) {
           h('th', { scope: 'col', class: 'task-state-column' }, 'State'),
           h('th', { scope: 'col', class: 'task-next-column' }, 'Who acts next'),
           h('th', { scope: 'col', class: 'hide-narrow num task-updated-column' }, 'Updated'))),
-        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link task-row', 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
+        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link task-row' + (waitsOnYou(ctx, project, t) ? ' mine' : ''), 'data-waits-on-you': waitsOnYou(ctx, project, t) ? 'true' : null, 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
           h('td', { class: 'task-title-cell' },
+            // The bar on a row that waits on the reader is visual; a screen reader hears it here.
+            waitsOnYou(ctx, project, t) ? h('span', { class: 'visually-hidden' }, 'Waits on you: ') : null,
             // A requirement record is marked plainly and points at the Requirements page,
             // never offered as ordinary work (kittrial-5bb.277).
             t.requirement_record ? h('span', { class: 'chip', title: 'A requirement record, not claimable work' }, 'Requirement') : null,

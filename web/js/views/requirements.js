@@ -6,7 +6,7 @@ import { markdown, section, mentions } from '../md.js';
 import * as ownerView from './owner_requirements.js';
 import { attestationPanel } from './decision_attest.js';
 
-const STATE = { accepted: ['Accepted', 'ok'], draft: ['Draft', 'warn'], proposed: ['Proposed', 'accent'], rejected: ['Rejected', 'crit'] };
+const STATE = { accepted: ['Accepted', 'ok'], draft: ['Draft', 'warn'], proposed: ['Proposed', 'info'], rejected: ['Rejected', 'crit'] };
 const stateChip = (s) => { const [label, tone] = STATE[s] || [s, '']; return h('span', { class: 'chip ' + tone }, label); };
 const KIND = {
   'requirement-revision-v1': 'Requirement revision', review: 'Review', disposition: 'Review disposition', 'publication evidence': 'Publication evidence',
@@ -89,7 +89,7 @@ export async function requirement(ctx, { pid, rid }) {
   const body = hasSections ? parts.filter(([, v]) => v).map(([name, v]) => h('section', { class: 'req-part' }, h('h3', { class: 'small' }, name), markdown(v, { link }))) : [markdown(r.description, { link })];
 
   const decisionList = (items, note) => items.length ? h('ul', { class: 'open-items' }, items.map((d) => h('li', null,
-    h('a', { href: ctx.href(`/p/${pid}/decisions/${d.id}`) }, d.title.replace(/^Decision:\s*/, '')), ' ', h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : 'accent') }, d.status === 'closed' ? 'Settled' : 'In force'),
+    h('a', { href: ctx.href(`/p/${pid}/decisions/${d.id}`) }, d.title.replace(/^Decision:\s*/, '')), ' ', h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : 'info') }, d.status === 'closed' ? 'Settled' : 'In force'),
     d.why ? h('div', { class: 'small muted' }, d.why) : null))) : h('p', { class: 'small muted' }, note);
 
   return h('div', { class: 'stack' },
@@ -125,7 +125,7 @@ export async function decisions(ctx, { pid }) {
       lede: 'Choices the team recorded, with the authority, rationale and alternatives behind them. Newest first.' }),
     data.items.length ? h('section', { class: 'panel' }, h('ul', { class: 'decision-list' }, data.items.map((d) => h('li', null,
       h('div', { class: 'toolbar' }, h('a', { class: 'title', href: ctx.href(`/p/${pid}/decisions/${d.id}`) }, d.title.replace(/^Decision:\s*/, '')),
-        h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : 'accent') }, d.status === 'closed' ? 'Settled' : 'In force')),
+        h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : 'info') }, d.status === 'closed' ? 'Settled' : 'In force')),
       d.summary ? h('p', { class: 'small muted clamp' }, d.summary) : null,
       h('div', { class: 'small muted' }, h('span', { class: 'mono' }, d.id), ' · recorded ', time(d.created_at)))))) :
       h('div', { class: 'panel' }, empty('No decisions recorded', 'Decisions appear here once someone records one with its rationale.')));
@@ -140,7 +140,7 @@ export async function decision(ctx, { pid, did }) {
   const parts = ['Decision', 'Rationale', 'Alternatives', 'Alternatives Considered', 'Consequences', 'Scope'].map((name) => [name, section(d.description, name)]).filter(([, v]) => v);
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, [{ label: 'Decisions', href: ctx.href(`/p/${pid}/decisions`) }, { label: d.id }]), title: d.title.replace(/^Decision:\s*/, '') }),
-    h('div', { class: 'toolbar' }, h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : 'accent') }, d.status === 'closed' ? 'Settled' : 'In force'), h('span', { class: 'small muted' }, 'Recorded ', time(d.created_at))),
+    h('div', { class: 'toolbar' }, h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : 'info') }, d.status === 'closed' ? 'Settled' : 'In force'), h('span', { class: 'small muted' }, 'Recorded ', time(d.created_at))),
     h('div', { class: 'detail' },
       h('div', { class: 'stack' },
         h('section', { class: 'panel' }, h('div', { class: 'panel-body prose-md decision-body' },
@@ -169,7 +169,7 @@ function recordComments(rec, link) {
       const long = typeof c.body === 'string' && c.body.length > 1200;
       const content = h('div', { class: 'event-body prose-md' + (long ? ' collapsible' : '') }, body);
       const toggle = long ? h('button', { type: 'button', class: 'link', onclick: (e) => { content.classList.toggle('expanded'); e.currentTarget.textContent = content.classList.contains('expanded') ? 'Show less' : 'Show all'; } }, 'Show all') : null;
-      return h('li', null, h('span', { class: 'dot ' + (/review|disposition/.test(c.kind || '') ? 'warn' : /acceptance|evidence/.test(c.kind || '') ? 'ok' : 'accent'), 'aria-hidden': 'true' }),
+      return h('li', null, h('span', { class: 'dot ' + (/review|disposition/.test(c.kind || '') ? 'warn' : /acceptance|evidence/.test(c.kind || '') ? 'ok' : ''), 'aria-hidden': 'true' }),
         h('div', null, h('div', { class: 'event-head' }, h('span', { class: 'chip plain' }, label), h('strong', null, c.author), time(c.at)), content, toggle));
     })));
 }
@@ -183,7 +183,7 @@ export async function record(ctx, { pid, id }) {
   const link = linker(ctx, pid, known, data.keys);
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, [{ label: 'Requirements', href: ctx.href(`/p/${pid}/requirements`) }, { label: d.id }]), title: d.title }),
-    h('div', { class: 'toolbar' }, h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : 'accent') }, d.status === 'closed' ? 'Closed' : 'Open'), h('span', { class: 'small muted' }, d.type || 'record', ' · created ', time(d.created_at))),
+    h('div', { class: 'toolbar' }, h('span', { class: 'chip ' + (d.status === 'closed' ? 'ok' : '') }, d.status === 'closed' ? 'Closed' : 'Open'), h('span', { class: 'small muted' }, d.type || 'record', ' · created ', time(d.created_at))),
     h('div', { class: 'detail' },
       h('div', { class: 'stack' },
         d.description ? h('section', { class: 'panel' }, h('div', { class: 'panel-body prose-md' }, markdown(d.description, { link }))) : null,

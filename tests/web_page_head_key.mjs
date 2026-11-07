@@ -66,10 +66,19 @@ const out = {};
   const active = await api.tasks(PID, { limit: 10, status: 'active', q: '', review_state: '' });
   const closed = await api.tasks(PID, { limit: 10, status: 'closed', q: '', review_state: '' });
   const first = header(page);
+  // slice (c): the rows that wait on the reader, as the view marks them and as the server's next step says
+  const rowsSeen = page.all((e) => e.tagName === 'TR' && String(e.className).includes('task-row')).map((tr) => {
+    const link = tr.all((e) => e.tagName === 'A' && String(e.className).includes('title'))[0];
+    return { id: link.attributes.href.split('/t/')[1], mine: String(tr.className).split(' ').includes('mine'),
+      flag: tr.attributes['data-waits-on-you'] === 'true', hidden: tr.textContent.startsWith('Waits on you: ') };
+  });
+  const role = projects.find((p) => p.id === PID).role;
+  const rowsExpected = Object.fromEntries(active.items.map((t) => [t.id, Boolean(t.next_action) && t.status !== 'closed'
+    && (t.next_action.who === 'owner' ? ['owner', 'coordinator', 'superuser'].includes(role) : t.next_action.who === 'assignee' && t.assignee === me.id)]));
   const closedButton = page.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Closed')[0];
   await closedButton.dispatch('click');
   await settle();
-  out.tasks = { head: first, afterClosed: header(page).key,
+  out.tasks = { head: first, afterClosed: header(page).key, rowsSeen, rowsExpected,
     expected: { active: String(active.total), activeRows: active.items.length, closed: String(closed.total), project: projects.find((p) => p.id === PID).name },
     crumbs: page.all((e) => e.tagName === 'NAV' && e.attributes['aria-label'] === 'Breadcrumb')[0].textContent };
 }

@@ -21,7 +21,7 @@ export async function users(ctx) {
       h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Person'), h('th', { scope: 'col' }, 'Access'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Created'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
       h('tbody', null, rows.map((u) => h('tr', null,
         h('td', null, h('div', { class: 'toolbar' }, h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(u.display_name)), h('div', null, h('div', { class: 'title' }, u.display_name), h('div', { class: 'sub' }, '@' + u.username, ' · ', h('code', null, u.id))))),
-        h('td', null, u.disabled ? h('span', { class: 'chip crit' }, 'Disabled') : u.superuser ? h('span', { class: 'chip accent' }, 'Superuser') : h('span', { class: 'chip ok' }, 'Active')),
+        h('td', null, u.disabled ? h('span', { class: 'chip crit' }, 'Disabled') : u.superuser ? h('span', { class: 'chip plain' }, 'Superuser') : h('span', { class: 'chip ok' }, 'Active')),
         h('td', { class: 'hide-narrow muted' }, time(u.created_at)),
         h('td', null, u.disabled ? null : h('div', { class: 'actions' },
           h('button', { type: 'button', onclick: async (e) => {

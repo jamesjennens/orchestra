@@ -115,7 +115,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px; font-weight: 650; font-size: var(--t-lg); color: var(--ink); }
 .brand-mark { width: 22px; height: 22px; flex: none; }
 .rail-section { display: flex; flex-direction: column; gap: 2px; }
-.rail-label { font-size: var(--t-2xs); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 0 8px 4px; }
+.rail-label { font-size: var(--t-xs); font-weight: 600; color: var(--muted); padding: 0 8px 4px; }  /* sentence case, not 11px caps (525 c) */
 .nav-link {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 6px 8px; border-radius: var(--radius); color: var(--ink-2);
@@ -232,11 +232,16 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 .panel-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: var(--t-sm); }
+/* tables that read at a glance (kittrial-5bb.525 slice c): heads in 12px sentence case, rows with room */
 th {
-  text-align: left; font-weight: 600; font-size: var(--t-xs); letter-spacing: .06em; text-transform: uppercase;
-  color: var(--muted); padding: 7px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--surface);
+  text-align: left; font-weight: 600; font-size: var(--t-xs);
+  color: var(--muted); padding: var(--s-2) var(--s-3); border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--surface);
 }
-td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td { padding: var(--s-3); border-bottom: 1px solid var(--line); vertical-align: top; }
+/* a row that waits on the reader carries a 3px accent bar ("where you are"), never a state colour */
+tbody tr.mine > td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+/* a button in a cell keeps its label on one line (Remove broke into two at 375px) */
+td > button, td > .btn { white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr.row-link { cursor: pointer; }
 tbody tr.row-link:hover td { background: var(--surface-2); }
@@ -250,14 +255,19 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
      cell of a fixed-width table column */
   display: inline-flex; align-items: center; gap: 5px; white-space: normal; max-width: 100%; overflow-wrap: anywhere;
   font-size: var(--t-xs); font-weight: 600; line-height: 18px; padding: 1px 8px; border-radius: 8px;
-  background: var(--idle-soft); color: var(--ink-2);
+  background: var(--idle-soft); color: var(--idle);
 }
-.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--idle); flex: none; }
-.chip.ok { background: var(--ok-soft); } .chip.ok::before { background: var(--ok); }
-.chip.warn { background: var(--warn-soft); } .chip.warn::before { background: var(--warn); }
-.chip.crit { background: var(--crit-soft); } .chip.crit::before { background: var(--crit); }
-.chip.accent { background: var(--accent-soft); } .chip.accent::before { background: var(--accent); }
-.chip.info { background: var(--info-soft); } .chip.info::before { background: var(--info); }
+/* the tone dot is the chip's own text colour: a state reads in its colour, its dot and its word */
+.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+.chip.ok { background: var(--ok-soft); color: var(--ok); }
+.chip.warn { background: var(--warn-soft); color: var(--warn); }
+.chip.crit { background: var(--crit-soft); color: var(--crit); }
+.chip.info { background: var(--info-soft); color: var(--info); }
+/* not a state: "where you are" (the wizard's step) */
+.chip.accent { background: var(--accent-soft); color: var(--ink); }
+.chip.accent::before { background: var(--accent); }
+/* not a state either: a word in a chip shape (a role, a priority, a final record) */
+.chip.plain { color: var(--ink-2); }
 .chip.plain::before { display: none; }
 .role { font-size: var(--t-xs); font-weight: 600; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 6px; line-height: 18px; }
 
@@ -291,6 +301,7 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
 .timeline.timeline-plain li::before { display: none; }
 .dot { width: 11px; height: 11px; border-radius: 50%; margin: 5px 0 0 3px; background: var(--idle); box-shadow: 0 0 0 3px var(--surface); }
 .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.crit { background: var(--crit); } .dot.accent { background: var(--accent); }
+.dot.info { background: var(--info); }
 .event-head { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .event-body { margin-top: 4px; color: var(--ink-2); font-size: var(--t-sm); }
 .request-list { margin: 6px 0 0; padding-left: 18px; font-size: var(--t-sm); display: flex; flex-direction: column; gap: 6px; }
@@ -437,7 +448,7 @@ h1[tabindex="-1"]:focus-visible { outline-offset: 4px; }
 .who-acts.agent { background: var(--surface-2); }
 /* in a table cell the who-acts line is plain wrappable text, not a box */
 td .who-acts { display: inline; border: 0; border-radius: 0; padding: 0; line-height: 1.6; }
-td .who-acts::before { content: "→ "; }
+td .who-acts::before { content: none; }
 
 /* ---------- on-page navigation for long pages ---------- */
 .on-page { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: var(--t-sm); padding: 0 2px; }
@@ -474,7 +485,7 @@ details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(-
 .empty-line { font-size: var(--t-sm); color: var(--muted); padding: 6px 0; }
 
 /* ---------- counts in section heads ---------- */
-.count { font-size: var(--t-xs); font-weight: 600; color: var(--muted); background: var(--surface-2); border-radius: 10px;
+.count { font-size: var(--t-xs); font-weight: 650; color: var(--ink-2); background: var(--surface-2); border-radius: 10px;
   padding: 0 7px; line-height: 18px; font-variant-numeric: tabular-nums; }
 
 /* ---------- task list: one row, the facts a reader scans ---------- */
@@ -529,4 +540,7 @@ th.task-updated-column, td.task-updated-column { text-align: right; }
   .task-list-project td.task-title-cell, .task-list-project td.task-state-column,
   .task-list-project td.task-next-column { grid-column: 1 / -1; }
   .task-list-project td.task-state-column { display: grid; grid-template-columns: none; justify-items: start; }
+  /* the "waits on you" bar moves from the first cell to the stacked row */
+  table.stack-narrow tr.mine, .task-list-work tr.mine { box-shadow: inset 3px 0 0 var(--accent); }
+  table.stack-narrow tr.mine > td:first-child, .task-list-work tr.mine > td:first-child { box-shadow: none; }
 }

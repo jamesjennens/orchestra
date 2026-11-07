@@ -15,7 +15,7 @@ export const ATTENTION = {
   // could not be read is never headed "Could take more work".
   error: ['Could not read its work', 'crit'],
   unknown: ['Work read incomplete', 'warn'],
-  idle: ['Could take more work', 'accent'],
+  idle: ['Could take more work', ''],
   working: ['Working', ''],
   waiting: ['Waiting for review', 'ok'],
   blocked: ['Blocked', 'crit'],

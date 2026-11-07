@@ -9,8 +9,8 @@ import { h, time } from '../dom.js';
 import { empty, field, setFieldError, formValues, act, describe, errorState } from '../ui.js';
 
 const STATES = {
-  'submitted': ['Submitted', 'accent'],
-  'under-review': ['Under review', 'accent'],
+  'submitted': ['Submitted', 'warn'],
+  'under-review': ['Under review', 'info'],
   'needs-info': ['Needs information', 'warn'],
   'escalated-to-owner': ['Escalated to the owner', 'warn'],
   'approved': ['Approved', 'ok'],
@@ -273,7 +273,7 @@ function dispositionText(d) {
 }
 
 function timelineItem(d) {
-  const tone = { rejected: 'crit', 'needs-info': 'warn', 'escalated-to-owner': 'warn', approved: 'ok', incorporated: 'ok' }[d.to_state] || 'accent';
+  const tone = { rejected: 'crit', 'needs-info': 'warn', 'escalated-to-owner': 'warn', approved: 'ok', incorporated: 'ok' }[d.to_state] || '';
   return h('li', null, h('span', { class: 'dot ' + (d.standing === 'counted' ? tone : '') }),
     h('div', null,
       h('div', null, h('strong', null, dispositionText(d)), ' ', h('span', { class: 'small muted' }, time(d.at))),
