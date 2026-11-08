@@ -118,16 +118,61 @@ class PageHeadKey(unittest.TestCase):
         self.assertTrue(data['after'] is None or not data['after']['shown'], data['after'])
         self.assertEqual(1, data['error'])
 
+    # Tasks rows (web_page_head_key.mjs, ROWS), read by Alpha's owner (olga), a coordinator (nia) and a
+    # contributor (cara). For each row and reader: is it marked as waiting on the reader, and whom does the
+    # Who acts next cell name. Each from the row's own facts:
+    #   r_rev     sam's delivery, awaiting review: an owner step that asks to act -> the owner and the
+    #             coordinator review (You); the contributor cannot (An owner or coordinator)
+    #   r_int     sam's approved work: integrate -> the same as r_rev
+    #   r_epic    an epic: its owner step only says what it is -> nobody (No one), never marked
+    #   r_reqrec  a requirement record that says where it is edited -> No one
+    #   r_reqacc  a requirement waiting for acceptance: an owner step that asks to act -> as r_rev
+    #   r_held    a held integration: released on the coordination host only -> never marked here
+    #   r_held_open a held integration with no assignee: still released on the coordination host only, so
+    #             never marked here (only its held state tells it apart from work to assign)
+    #   r_assign  unassigned under assigned claiming: an owner or coordinator assigns -> You for the owner
+    #             and the coordinator; An owner or coordinator for the contributor
+    #   r_mine    cara's task to deliver -> You for cara; her name for the others
+    #   r_back    sent back to cara -> the same as r_mine
+    #   r_claim   a claim -> Anyone, marked for no one
+    #   r_blocked blocked by a dependency: the owner step only says so -> No one
+    #   r_error   needs operator attention -> An operator, marked for no one
+    #   r_unknown no next step known -> no name (unknown), not marked
+    OWNER_STEP, CARA = 'An owner or coordinator', 'Cara Diaz'
+    ROW_FACTS = {
+        #            owner              coordinator        contributor
+        'r_rev':    (('You', True),     ('You', True),     (OWNER_STEP, False)),
+        'r_int':    (('You', True),     ('You', True),     (OWNER_STEP, False)),
+        'r_epic':   (('No one', False), ('No one', False), ('No one', False)),
+        'r_reqrec': (('No one', False), ('No one', False), ('No one', False)),
+        'r_reqacc': (('You', True),     ('You', True),     (OWNER_STEP, False)),
+        'r_held':   (('A coordinator, on the coordination host', False),) * 3,
+        'r_held_open': (('A coordinator, on the coordination host', False),) * 3,
+        'r_assign': (('You', True),     ('You', True),     (OWNER_STEP, False)),
+        'r_mine':   ((CARA, False),     (CARA, False),     ('You', True)),
+        'r_back':   ((CARA, False),     (CARA, False),     ('You', True)),
+        'r_claim':  (('Anyone', False),) * 3,
+        'r_blocked': (('No one', False),) * 3,
+        'r_error':  (('An operator', False),) * 3,
+        'r_unknown': (('unknown', False),) * 3,
+    }
+    READERS = ('owner', 'coordinator', 'contributor')
+
     def test_tasks_rows_that_wait_on_you_are_marked(self):
-        # slice (c): the accent bar marks exactly the rows whose next step is the reader's
-        data = observed(self)['tasks']
-        seen = data['rowsSeen']
-        self.assertTrue(seen)
-        self.assertTrue(any(r['mine'] for r in seen), 'the fixture must hold a row that waits on the owner')
-        self.assertTrue(any(not r['mine'] for r in seen), 'and one that does not')
-        for row in seen:
-            expected = data['rowsExpected'][row['id']]
-            self.assertEqual((expected, expected, expected), (row['mine'], row['flag'], row['hidden']), row)
+        # the bar, the hidden words and the name come from one answer, for each reader
+        seen = observed(self)['rows']
+        for column, reader in enumerate(self.READERS):
+            self.assertEqual(sorted(self.ROW_FACTS), sorted(seen[reader]), reader)
+            for row, facts in self.ROW_FACTS.items():
+                name, mine = facts[column]
+                got = seen[reader][row]
+                with self.subTest(reader=reader, row=row):
+                    self.assertEqual((mine, mine, mine), (got['mine'], got['flag'], got['hidden']))
+                    self.assertEqual(name, got['name'])
+                    # "You" is the accent word, and only on the reader's own rows
+                    self.assertEqual(['You'] if mine else [], got['accent'])
+                    if name != 'unknown':
+                        self.assertTrue(got['cell'].startswith(name + ' · '), got['cell'])
 
     def test_task_waiting_for_review(self):
         data, head = self.head('taskWaiting')

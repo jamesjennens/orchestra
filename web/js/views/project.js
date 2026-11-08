@@ -1,5 +1,5 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
-import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId } from '../ui.js';
+import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId, ownerStepAsks } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { proposeSection } from './proposals.js';
 export { proposeSection } from './proposals.js';
@@ -40,14 +40,44 @@ async function load(ctx, pid) {
   return project;
 }
 
-// A row waits on the reader when the server's next step is theirs (kittrial-5bb.525 slice c):
-// a review or integration step for an owner or coordinator, the assignee's step for the assignee.
+// A Tasks row waits on the reader when the server's next step is theirs (kittrial-5bb.525 c r2): the
+// same rule as My work's (ui.js waitsOnReader and ownerStepAsks), with the approver check for this one
+// project. An owner step counts only when it asks someone to act; one that only says what the row is
+// (an epic, a record, a decision, a blocked or non-claimable row) waits on no one.
+// A 'coordinator' step is the reader's only for an unassigned task under assigned claiming, where an
+// owner or coordinator assigns; a held integration is released on the coordination host, never here.
 export function waitsOnYou(ctx, project, t) {
   const who = t.next_action && t.next_action.who;
   if (!who || t.status === 'closed') return false;
+  if (who === 'coordinator') return t.review_state !== 'held' && !t.assignee && canApprove(project);
+  if (who === 'owner' && !ownerStepAsks(t)) return false;
   if (who === 'owner') return canApprove(project);
   if (who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
   return false;
+}
+
+// Who acts next on a row, from its next step and the reader: one answer for the row's bar, its
+// hidden "Waits on you:" and the name in the Who acts next cell, so the three cannot disagree.
+// - "You" when the step is the reader's;
+// - the assignee's name for the assignee's step; "Anyone" for a claim;
+// - "An owner or coordinator" for an owner step that asks someone to act, and for assigning work
+//   under assigned claiming; "A coordinator, on the coordination host" for a held integration;
+// - "An operator" for a row that needs operator attention;
+// - "No one" for an owner step that only says what the row is (an epic, a record, a decision, a
+//   blocked or non-claimable row): its own words follow, and nobody is waited on.
+export function whoActsNext(ctx, project, t) {
+  const step = t.next_action;
+  const mine = waitsOnYou(ctx, project, t);
+  let name;
+  if (!step) name = null;
+  else if (mine) name = 'You';
+  else if (step.who === 'assignee') name = t.assignee_name || t.assignee || 'The assignee';
+  else if (step.who === 'anyone') name = 'Anyone';
+  else if (step.who === 'coordinator') name = t.review_state === 'held' ? 'A coordinator, on the coordination host' : 'An owner or coordinator';
+  else if (ownerStepAsks(t)) name = 'An owner or coordinator';
+  else if (t.review_state === 'error') name = 'An operator';
+  else name = 'No one';
+  return { mine, name, text: step ? step.text : null };
 }
 
 // What the Tasks key counts, in the words of the filter it was read with.
@@ -613,10 +643,10 @@ export async function overview(ctx, { pid }) {
           h('th', { scope: 'col', class: 'task-state-column' }, 'State'),
           h('th', { scope: 'col', class: 'task-next-column' }, 'Who acts next'),
           h('th', { scope: 'col', class: 'hide-narrow num task-updated-column' }, 'Updated'))),
-        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link task-row' + (waitsOnYou(ctx, project, t) ? ' mine' : ''), 'data-waits-on-you': waitsOnYou(ctx, project, t) ? 'true' : null, 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
+        h('tbody', null, rows.map((t) => { const acts = whoActsNext(ctx, project, t); return h('tr', { class: 'row-link task-row' + (acts.mine ? ' mine' : ''), 'data-waits-on-you': acts.mine ? 'true' : null, 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
           h('td', { class: 'task-title-cell' },
             // The bar on a row that waits on the reader is visual; a screen reader hears it here.
-            waitsOnYou(ctx, project, t) ? h('span', { class: 'visually-hidden' }, 'Waits on you: ') : null,
+            acts.mine ? h('span', { class: 'visually-hidden' }, 'Waits on you: ') : null,
             // A requirement record is marked plainly and points at the Requirements page,
             // never offered as ordinary work (kittrial-5bb.277).
             t.requirement_record ? h('span', { class: 'chip', title: 'A requirement record, not claimable work' }, 'Requirement') : null,
@@ -632,12 +662,13 @@ export async function overview(ctx, { pid }) {
           // carries an assignee with no name yet, and otherwise 'anyone'.
           // Stays textContent: untrusted text stays text.
           h('td', { class: 'task-state-column' }, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
-          h('td', { class: 'who-acts-cell task-next-column', 'data-who-acts': t.assignee_name || (t.assignee ? t.assignee : 'anyone') },
-            h('span', { class: 'who-acts' + (t.assignee ? '' : ' none') },
-              (t.assignee_name || (t.assignee ? t.assignee : 'anyone')),
+          // Who acts next: the name from whoActsNext (the same answer as the bar), then the step's own words.
+          h('td', { class: 'who-acts-cell task-next-column', 'data-who-acts': acts.name || 'unknown' },
+            h('span', { class: 'who-acts' + (acts.mine ? ' you' : '') + (acts.name === 'No one' ? ' none' : '') },
+              acts.mine ? h('b', null, acts.name) : (acts.name || '—'),
               ' · ',
-              (t.next_action ? t.next_action.text : '—'))),
-          h('td', { class: 'hide-narrow muted num task-updated-column' }, t.updated_at ? time(t.updated_at) : '')))))) :
+              (acts.text || '—'))),
+          h('td', { class: 'hide-narrow muted num task-updated-column' }, t.updated_at ? time(t.updated_at) : '')); })))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
       ...(partial ? [partial] : []),
       h('div', { class: 'pager' },

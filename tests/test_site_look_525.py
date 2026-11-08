@@ -326,10 +326,16 @@ class FreshTables(unittest.TestCase):
         phone = winning(self.rules, 'table.stack-narrow tr.mine', ('box-shadow',), media='@media (max-width: 760px)')
         self.assertEqual(('box-shadow', 'inset 3px 0 0 var(--accent)'), phone)
         project = (JS_ROOT / 'views' / 'project.js').read_text(encoding='utf-8')
-        self.assertIn("class: 'row-link task-row' + (waitsOnYou(ctx, project, t) ? ' mine' : '')", project)
+        # c r2: the bar, the hidden words and the name come from one answer per row (whoActsNext)
+        self.assertIn("const acts = whoActsNext(ctx, project, t); return h('tr', { class: 'row-link task-row' + (acts.mine ? ' mine' : '')", project)
 
     def test_who_acts_in_a_cell_has_no_arrow(self):
         self.assertEqual('none', self.win('td .who-acts::before', 'content'))
+
+    def test_you_is_the_accent_word_in_the_who_acts_cell(self):
+        # c r2: "You" in the accent (WEB_FRESH_LOOK §6), a word in the cell, not the pill .who-acts.you is elsewhere
+        self.assertEqual('var(--accent)', self.win('td .who-acts.you b', 'color'))
+        self.assertEqual('none', self.win('td .who-acts.you', 'background', 'background-color'))
 
 
 class FreshStates(unittest.TestCase):

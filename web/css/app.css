@@ -526,6 +526,10 @@ h1[tabindex="-1"]:focus-visible { outline-offset: 4px; }
 /* in a table cell the who-acts line is plain wrappable text, not a box */
 td .who-acts { display: inline; border: 0; border-radius: 0; padding: 0; line-height: 1.6; }
 td .who-acts::before { content: none; }
+/* "You" in the accent when the row's step is the reader's (WEB_FRESH_LOOK §6; kittrial-5bb.525 c r2); in a cell
+   it is the word, not the pill .who-acts.you is elsewhere */
+td .who-acts.you { background: none; border-color: transparent; color: var(--ink-2); }
+td .who-acts.you b { color: var(--accent); font-weight: 650; }
 
 /* ---------- on-page navigation for long pages ---------- */
 .on-page { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: var(--t-sm); padding: 0 2px; }

@@ -91,19 +91,10 @@ const owen = { ...ctx, me: { id: 'usr_owen', display_name: 'Owen' },
   const active = await api.tasks(PID, { limit: 10, status: 'active', q: '', review_state: '' });
   const closed = await api.tasks(PID, { limit: 10, status: 'closed', q: '', review_state: '' });
   const first = header(page);
-  // slice (c): the rows that wait on the reader, as the view marks them and as the server's next step says
-  const rowsSeen = page.all((e) => e.tagName === 'TR' && String(e.className).includes('task-row')).map((tr) => {
-    const link = tr.all((e) => e.tagName === 'A' && String(e.className).includes('title'))[0];
-    return { id: link.attributes.href.split('/t/')[1], mine: String(tr.className).split(' ').includes('mine'),
-      flag: tr.attributes['data-waits-on-you'] === 'true', hidden: tr.textContent.startsWith('Waits on you: ') };
-  });
-  const role = projects.find((p) => p.id === PID).role;
-  const rowsExpected = Object.fromEntries(active.items.map((t) => [t.id, Boolean(t.next_action) && t.status !== 'closed'
-    && (t.next_action.who === 'owner' ? ['owner', 'coordinator', 'superuser'].includes(role) : t.next_action.who === 'assignee' && t.assignee === me.id)]));
   const closedButton = page.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Closed')[0];
   await closedButton.dispatch('click');
   await settle();
-  out.tasks = { head: first, afterClosed: header(page).key, rowsSeen, rowsExpected,
+  out.tasks = { head: first, afterClosed: header(page).key,
     expected: { active: String(active.total), activeRows: active.items.length, closed: String(closed.total), project: projects.find((p) => p.id === PID).name },
     crumbs: page.all((e) => e.tagName === 'NAV' && e.attributes['aria-label'] === 'Breadcrumb')[0].textContent };
 }
@@ -206,6 +197,43 @@ const pressed = (page, label) => page.all((e) => e.tagName === 'BUTTON' && e.tex
   await settle();
   out.agentsFailedReread = { before, after: header(page).key, error: page.all((e) => e.attributes && e.attributes['data-state'] === 'error').length,
     expected: { num: String(first.total) } };
+}
+
+// Tasks rows (kittrial-5bb.525 c r2): a fixture whose facts are written here. test_page_head_key.py states,
+// for each reader, which rows are marked and what the Who acts next cell names, from these facts alone.
+const step = (who, text) => ({ who, text });
+const ROWS = [
+  { id: 'r_rev', assignee: 'usr_sam', assignee_name: 'Sam Ito', review_state: 'awaiting-review', next_action: step('owner', 'Review the delivered contribution') },
+  { id: 'r_int', assignee: 'usr_sam', assignee_name: 'Sam Ito', review_state: 'approved', next_action: step('owner', 'Integrate the approved contribution') },
+  { id: 'r_epic', issue_type: 'epic', review_state: 'none', next_action: step('owner', 'This is an epic, not a unit of work: work its tasks') },
+  { id: 'r_reqrec', requirement_record: true, requirement_state: 'draft', review_state: 'none', next_action: step('owner', "Requirement record: edit it on the project's Requirements page") },
+  { id: 'r_reqacc', requirement_record: true, requirement_state: 'awaiting-acceptance', review_state: 'none', next_action: step('owner', "Requirement waiting for acceptance: accept it on the project's Requirements page") },
+  { id: 'r_held', assignee: 'usr_sam', assignee_name: 'Sam Ito', review_state: 'held', next_action: step('coordinator', 'Release the integration hold or record a corrected verification') },
+  // a held integration with no assignee: only the held state keeps it from looking like work to assign
+  { id: 'r_held_open', review_state: 'held', next_action: step('coordinator', 'Release the integration hold or record a corrected verification') },
+  { id: 'r_assign', review_state: 'none', next_action: step('coordinator', "Only the project's coordinators assign work here; nothing is assigned to you yet.") },
+  { id: 'r_mine', assignee: 'usr_cara', assignee_name: 'Cara Diaz', review_state: 'none', next_action: step('assignee', 'Deliver a contribution') },
+  { id: 'r_back', assignee: 'usr_cara', assignee_name: 'Cara Diaz', review_state: 'changes-requested', next_action: step('assignee', 'Address the requested changes') },
+  { id: 'r_claim', review_state: 'none', next_action: step('anyone', 'Claim this task') },
+  { id: 'r_blocked', review_state: 'none', open_dependencies: ['alpha-x'], next_action: step('owner', 'Blocked by alpha-x') },
+  { id: 'r_error', review_state: 'error', next_action: step('owner', 'Needs operator attention') },
+  { id: 'r_unknown', review_state: null, next_action: null },
+].map((t) => ({ project_id: 'alpha', title: t.id, status: 'open', priority: 2, ...t }));
+const READERS = { owner: { id: 'usr_olga', role: 'owner' }, coordinator: { id: 'usr_nia', role: 'coordinator' }, contributor: { id: 'usr_cara', role: 'contributor' } };
+out.rows = {};
+for (const [label, reader] of Object.entries(READERS)) {
+  const alpha = { id: 'alpha', name: 'Alpha', role: reader.role, archived: false, usable: true, description: '' };
+  const stub = { ...api, project: async () => alpha, tasks: async () => ({ items: ROWS, total: ROWS.length, next_cursor: null }) };
+  const page = await project.overview({ ...ctx, api: stub, me: { id: reader.id, display_name: label }, projects: [alpha],
+    query: new URLSearchParams('requirements=1') }, { pid: 'alpha' });
+  await settle();
+  out.rows[label] = Object.fromEntries(page.all((e) => e.tagName === 'TR' && String(e.className).includes('task-row')).map((tr) => {
+    const link = tr.all((e) => e.tagName === 'A' && String(e.className).includes('title'))[0];
+    const cell = tr.all((e) => e.tagName === 'TD' && String(e.className).includes('who-acts-cell'))[0];
+    return [link.attributes.href.split('/t/')[1], { mine: String(tr.className).split(' ').includes('mine'),
+      flag: tr.attributes['data-waits-on-you'] === 'true', hidden: tr.textContent.startsWith('Waits on you: '),
+      name: cell.attributes['data-who-acts'], accent: cell.all((e) => e.tagName === 'B').map((b) => b.textContent), cell: cell.textContent }];
+  }));
 }
 
 console.log(JSON.stringify(out));

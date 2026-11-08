@@ -1,5 +1,5 @@
 import { h, time, copyButton, confirmDialog } from '../dom.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag } from '../ui.js';
+import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag, waitsOnReader } from '../ui.js';
 import { agentCard, attentionOf } from './agents.js';
 import { myContributionsPanel } from './proposals.js';
 
@@ -34,22 +34,7 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
     }))));
 }
 
-// What waits on the reader (kittrial-5bb.525 slice b, r2): a task whose next step is theirs.
-// - The assignee's step, for the assignee.
-// - An owner step, for an owner or coordinator of the task's project, and only the steps that ask
-//   someone to act: review, integrate, close an integrated task, or accept a requirement. An epic,
-//   a record, a decision or a dependency-blocked row also carries an owner step, but it only says
-//   what the row is, so it waits on no one.
-// A delivered task is in its assignee's `assigned` list but waits on its owner; an owner's own
-// delivered task is in both of the owner's lists. Each is counted once, for whoever acts.
-const OWNER_ACTS = new Set(['awaiting-review', 'legacy-review-ready', 'approved', 'awaiting-integration', 'integrated']);
-export function waitsOnReader(ctx, t, approvesIn) {
-  const step = t && t.next_action;
-  if (!step || t.status === 'closed') return false;
-  if (step.who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
-  if (step.who !== 'owner' || !approvesIn(t.project_id)) return false;
-  return OWNER_ACTS.has(t.review_state) || (t.requirement_record === true && t.requirement_state === 'awaiting-acceptance');
-}
+// What waits on the reader is ui.js's waitsOnReader (kittrial-5bb.525 slice b r2; shared with Tasks since (c) r2).
 
 // Who may take an owner step in a project: an owner or coordinator there (the project list's role),
 // or anyone the server put a row of that project in `to_review` for (it does so only with approve rights).

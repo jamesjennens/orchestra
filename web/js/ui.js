@@ -84,6 +84,30 @@ export function pageHead({ crumbs, title, lede, actions, key, tabTitle }) {
   return head;
 }
 
+// What waits on the reader (kittrial-5bb.525 slice b, r2): a task whose next step is theirs.
+// - The assignee's step, for the assignee.
+// - An owner step, for an owner or coordinator of the task's project, and only the steps that ask
+//   someone to act: review, integrate, close an integrated task, or accept a requirement. An epic,
+//   a record, a decision or a dependency-blocked row also carries an owner step, but it only says
+//   what the row is, so it waits on no one.
+// A delivered task is in its assignee's `assigned` list but waits on its owner; an owner's own
+// delivered task is in both of the owner's lists. Each is counted once, for whoever acts.
+const OWNER_ACTS = new Set(['awaiting-review', 'legacy-review-ready', 'approved', 'awaiting-integration', 'integrated']);
+export function waitsOnReader(ctx, t, approvesIn) {
+  const step = t && t.next_action;
+  if (!step || t.status === 'closed') return false;
+  if (step.who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
+  if (step.who !== 'owner' || !approvesIn(t.project_id)) return false;
+  return ownerStepAsks(t);
+}
+
+// An owner step that asks someone to act (review, integrate, close an integrated task, accept a
+// requirement), as opposed to one that only says what the row is (an epic, a record, a decision, a
+// blocked or non-claimable row). My work and Tasks both take it from here (kittrial-5bb.525 c r2).
+export function ownerStepAsks(t) {
+  return OWNER_ACTS.has(t.review_state) || (t.requirement_record === true && t.requirement_state === 'awaiting-acceptance');
+}
+
 // Fills (or, with no key, hides) the key number of a header made by pageHead.
 export function setPageKey(head, key) {
   const parts = head && head.pageKey;
