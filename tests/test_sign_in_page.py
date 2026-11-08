@@ -70,5 +70,72 @@ class SignInPage(unittest.TestCase):
         self.assertEqual(['label', 'input:password', 'reset'], reset[0]['order'])
 
 
+
+# kittrial-5bb.525 r2 (d): the phone fold, measured in a real headless Chromium (found as test_site_look_523
+# finds it). The real login view and app.css: at 375 px the brand side is not displayed and the card's own
+# mark is; at 1280 px the reverse. Kills the reviewer's MD1 (the phone rule's `.auth-side { display: none }`).
+def fold_page():
+    js = (KIT / 'web' / 'js').as_uri()
+    css = (KIT / 'web' / 'css' / 'app.css').as_uri()
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="{css}"></head>
+<body><div id="app"></div><script type="module">
+import {{ login }} from '{js}/views/auth.js';
+const out = {{}};
+try {{
+  const root = document.getElementById('app');
+  root.replaceChildren(login({{ options: {{}}, api: {{}}, root }}));
+  await new Promise((r) => setTimeout(r, 50));
+  const box = (sel) => {{ const el = document.querySelector(sel); if (!el) return null; const r = el.getBoundingClientRect();
+    return {{ display: getComputedStyle(el).display, width: Math.round(r.width), height: Math.round(r.height) }}; }};
+  out.side = box('.auth-side');
+  out.cardMark = box('.auth-card-brand');
+  out.cardMarkSvg = box('.auth-card-brand .brand-mark');
+  out.scroll = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+}} catch (e) {{ out.error = String(e && e.stack || e); }}
+document.title = 'MEASURE' + JSON.stringify(out);
+</script></body></html>"""
+
+
+def measure_fold(width, height):
+    import html as html_lib, re, tempfile
+    from test_site_look_523 import find_browser
+    with tempfile.TemporaryDirectory() as tmp:
+        page = Path(tmp) / 'fold.html'
+        page.write_text(fold_page(), encoding='utf-8')
+        proc = subprocess.run([find_browser(), '--headless', '--no-sandbox', '--disable-gpu', '--allow-file-access-from-files',
+                               f'--window-size={width},{height}', '--virtual-time-budget=5000', '--dump-dom', page.as_uri()],
+                              capture_output=True, text=True, timeout=120)
+    m = re.search(r'<title>(MEASURE.*?)</title>', proc.stdout, re.S)
+    if not m:
+        raise AssertionError('measurement did not run: ' + proc.stderr[-600:])
+    return json.loads(html_lib.unescape(m.group(1))[len('MEASURE'):])
+
+
+def _browser():
+    from test_site_look_523 import find_browser
+    return find_browser()
+
+
+@unittest.skipUnless(_browser(), 'no headless chromium found (set ORCHESTRA_WEB_TEST_BROWSER)')
+class SignInPhoneFold(unittest.TestCase):
+
+    def test_the_brand_side_folds_away_on_a_phone(self):
+        data = measure_fold(375, 812)
+        self.assertNotIn('error', data, data.get('error'))
+        self.assertEqual('none', data['side']['display'], data)
+        self.assertEqual((0, 0), (data['side']['width'], data['side']['height']))
+        self.assertNotEqual('none', data['cardMark']['display'], data)
+        self.assertGreater(data['cardMarkSvg']['width'], 0, data)
+        self.assertLessEqual(data['scroll'], 0, 'the sign-in page scrolls sideways at 375 px')
+
+    def test_on_a_wide_screen_the_brand_side_shows_and_the_card_mark_does_not(self):
+        data = measure_fold(1280, 800)
+        self.assertNotIn('error', data, data.get('error'))
+        self.assertNotEqual('none', data['side']['display'], data)
+        self.assertGreater(data['side']['width'], 300, data)
+        self.assertEqual('none', data['cardMark']['display'], data)
+
+
 if __name__ == '__main__':
     unittest.main()
