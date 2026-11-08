@@ -332,6 +332,13 @@ class FreshTables(unittest.TestCase):
     def test_who_acts_in_a_cell_has_no_arrow(self):
         self.assertEqual('none', self.win('td .who-acts::before', 'content'))
 
+    def test_the_rail_is_paper_and_the_working_surface_white(self):
+        # r2 (rail): WEB_FRESH_LOOK.md §1, "a warm paper ground for the rail and a white working surface"
+        self.assertEqual('var(--surface)', self.win('body', 'background', 'background-color'))
+        self.assertEqual('var(--ground)', self.win('.rail', 'background', 'background-color'))
+        stripe = winning(self.rules, '.shell', ('background', 'background-image'), media='@media (min-width: 761px)')
+        self.assertTrue(stripe and ' '.join(stripe[1].split()).startswith('linear-gradient(90deg, var(--ground) 0 calc(var(--rail) - 1px)'), stripe)
+
     def test_you_is_the_accent_word_in_the_who_acts_cell(self):
         # c r2: "You" in the accent (WEB_FRESH_LOOK §6), a word in the cell, not the pill .who-acts.you is elsewhere
         self.assertEqual('var(--accent)', self.win('td .who-acts.you b', 'color'))
@@ -465,7 +472,9 @@ function measure(page) {{
   const last = acts.length ? Array.from(acts[0].querySelectorAll('a, button')).pop() : null;
   const headAlign = last ? {{ gap: Math.round(head.getBoundingClientRect().right - last.getBoundingClientRect().right),
     key: Boolean(head.querySelector('[data-page-key]:not([hidden])')) }} : null;
-  return {{ texts, controls, cellButtons, headAlign, tab: document.title }};
+  const rail = document.querySelector('.rail');
+  const grounds = {{ body: getComputedStyle(document.body).backgroundColor, rail: rail ? getComputedStyle(rail).backgroundColor : null }};
+  return {{ texts, controls, cellButtons, headAlign, tab: document.title, grounds }};
 }}
 const out = {{ pages: [], dark: matchMedia('(prefers-color-scheme: dark)').matches, errors: [] }};
 try {{
@@ -549,6 +558,15 @@ class FreshContrastMeasured(unittest.TestCase):
         self.assertTrue(any(not a['key'] for a in aligned.values()), 'a page without a key must be measured')
         if width > 760:
             self.assertEqual({}, {page: a for page, a in aligned.items() if abs(a['gap']) > 1})
+        # r2 (rail): on every signed-in page the rail is the paper ground and the working surface white, in the
+        # theme's own tokens (light: #f6f5f2 / #ffffff; dark: #121116 / #1a1920)
+        dark = theme == 'dark' or prefers_dark
+        tokens = DARK if dark else LIGHT
+        rgb = lambda hexv: 'rgb(%d, %d, %d)' % tuple(int(hexv[i:i + 2], 16) for i in (1, 3, 5))
+        for page, found in data['pages']:
+            if page in ('sign-in',):
+                continue
+            self.assertEqual({'body': rgb(tokens['surface']), 'rail': rgb(tokens['ground'])}, found['grounds'], page)
         # r2: the Tasks tab names the project (the mock's portal project is "Customer portal")
         self.assertEqual('Tasks · Customer portal · Orchestra', dict(data['pages'])['tasks']['tab'])
         buttons = {page: found['cellButtons'] for page, found in data['pages']}

@@ -74,8 +74,9 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { height: 100%; }
+/* the working surface is white, the rail warm paper (WEB_FRESH_LOOK.md §1; fresh.css:70, :94); kittrial-5bb.525 r2 */
 body {
-  margin: 0; background: var(--ground); color: var(--ink);
+  margin: 0; background: var(--surface); color: var(--ink);
   font: var(--t-md)/1.5 var(--font); -webkit-font-smoothing: antialiased;
 }
 a { color: var(--accent); text-decoration: none; }
@@ -102,13 +103,13 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 @media (min-width: 761px) {
   .shell {
     background: linear-gradient(90deg,
-      var(--surface) 0 calc(var(--rail) - 1px),
+      var(--ground) 0 calc(var(--rail) - 1px),
       var(--line) calc(var(--rail) - 1px) var(--rail),
       transparent var(--rail));
   }
 }
 .rail {
-  background: var(--surface); border-right: 1px solid var(--line);
+  background: var(--ground); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 14px; padding: 16px 12px;
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
 }
