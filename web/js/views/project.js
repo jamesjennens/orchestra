@@ -487,7 +487,10 @@ export async function overview(ctx, { pid }) {
       pageHead({ crumbs: crumbs(ctx, project), title: project.name }),
       archivedBanner(project),
       unusableBanner(project),
-      h('p', null, h('a', { href: ctx.href(`/p/${pid}/settings`) }, 'Members, credentials and archive')));
+      // kittrial-5bb.522 slice 2 r2 (Should 1): members are on People since the split; credentials and
+      // archiving stay on Settings.
+      h('p', null, h('a', { href: ctx.href(`/p/${pid}/people`), 'data-link': 'unusable-members' }, 'Members'),
+        ' · ', h('a', { href: ctx.href(`/p/${pid}/settings`), 'data-link': 'unusable-settings' }, 'Credentials and archive')));
   }
   // kittrial-5bb.522 slice 1 (.502 §1.9): the filters are the URL's query, read here and written back on each
   // change, so a filtered list is shareable, reload-safe and survives a project switch.
@@ -1029,6 +1032,12 @@ function projectAgentsPanel(ctx, project, coordination) {
   return agentsHost;
 }
 
+// The hand-over walkthrough's link, on People and Agents as on Settings (PROJECT_CROSS_SECTION_DESIGN.md §3.6;
+// kittrial-5bb.522 slice 2 r2, note 3): the walkthrough's steps are fixed on these two pages.
+function handoverLink(ctx, pid) {
+  return h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator'));
+}
+
 export async function people(ctx, { pid }) {
   const project = await load(ctx, pid);
   const owner = isOwner(project);
@@ -1037,6 +1046,7 @@ export async function people(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'People'), title: 'People', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
+    handoverLink(ctx, pid),
     membersPanel(ctx, project, coordination),
     // kittrial-5bb.578: invite links, moved with the members from Members & settings to People.
     invitePanel(ctx, project),
@@ -1051,9 +1061,18 @@ export async function projectAgents(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Agents'), title: 'Agents', lede: owner ? 'Which agents work here and which of them coordinate.' : null }),
     archivedBanner(project),
     unusableBanner(project),
+    handoverLink(ctx, pid),
     owner ? projectAgentsPanel(ctx, project, coordination)
       : h('p', { 'data-note': 'agents-owner-only' }, 'Only this project’s owners see its agents here. Your own agents are under ', h('a', { href: ctx.href('/agents') }, 'My agents'), '.'),
     coordination.node);
+}
+
+// The Settings lede, true for each role (kittrial-5bb.522 slice 2 r2, Should 3): a coordinator who is not an
+// owner can save how work is handed out (the claiming PUT needs coordinate), and nothing else on the page.
+export function settingsLede(project, owner) {
+  if (owner) return 'How work is claimed and approved, credentials, activity and archiving.';
+  if (project.can_coordinate) return 'You can change how work is handed out; only project owners can change the rest.';
+  return 'Only project owners can change these.';
 }
 
 export async function settings(ctx, { pid }) {
@@ -1116,7 +1135,7 @@ export async function settings(ctx, { pid }) {
       } }, 'Archive project')))) : null;
 
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project, 'Settings'), title: 'Settings', lede: owner ? 'How work is claimed and approved, credentials, activity and archiving.' : 'Only project owners can change these.' }),
+    pageHead({ crumbs: crumbs(ctx, project, 'Settings'), title: 'Settings', lede: settingsLede(project, owner) }),
     archivedBanner(project),
     unusableBanner(project),
     // kittrial-5bb.442: the hand-over walkthrough, checked live (each member reads their own).

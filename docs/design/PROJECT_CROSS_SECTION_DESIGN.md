@@ -160,7 +160,8 @@ Agents in Alpha                        [ Add agent ]  [ ] include my agents not 
 - **The Project tab** is `/p/{remembered}`. A rail click on "Project" with nothing remembered shows the project picker, which is today's `/projects` cards.
 - **Members & settings is split in two:**
   - **People** (`/p/{pid}/people`) and **Agents** (`/p/{pid}/agents`) take the members panel (project.js:832-882) and the "Agents in this project" panel (project.js:888-934) as they are.
-  - **Settings** keeps claiming, agent approval, credentials, audit, guidance, coordination, delegations, and the links to the hand-over walkthrough and notes (project.js:990-1000).
+  - **Settings** keeps claiming, agent approval, credentials, audit, guidance, delegations, and the links to the hand-over walkthrough and notes (project.js:990-1000).
+  - **Who coordinates** moved to People and Agents as built in slice 2, where roles and grants are changed (its line: "owners change roles on People and grants on Agents").
   - **Old links:** the old `/p/{pid}/settings` route stays and opens Settings, so old links work.
 - **"Add person":** today's username lookup (GET /v1/accounts/lookup, project.js:878) plus role, then PUT member. A superuser may also pick from the People list. Everyone else adds by exact username, as today, because they cannot list accounts.
 - **"Add agent":** for the viewer's own agents, PATCH /v1/agents/{aid} `projects` (agents.js:401). Another person's agent joins a project only through its owner, as today (`_agent_projects`, http_auth.py:3314). The section says so: "Ask cora to add Egret to this project from Agents."

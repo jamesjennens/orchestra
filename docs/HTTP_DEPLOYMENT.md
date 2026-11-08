@@ -2643,7 +2643,7 @@ exactly as it refuses the superuser's own session. `tests/test_grant_issuer.py` 
 answers; neither rule was widened.
 
 The
-project's settings page lists "Agents in this project" for an owner with a "Make
+project's Agents page (`#/p/NAME/agents`; on the settings page before kittrial-5bb.522 slice 2) lists "Agents in this project" for an owner with a "Make
 coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
 grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by
 another account "You hold the coordinator grant in this project: review it, then approve
