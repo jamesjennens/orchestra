@@ -46,7 +46,8 @@ class WebStates(unittest.TestCase):
     def test_loading_is_announced_and_shows_a_skeleton(self):
         data = observed(self)
         load = data['loading']
-        self.assertEqual(('status', 'true', 'loading'), (load['role'], load['busy'], load['state']))
+        # e r2: the status message is not itself busy; the region being loaded is (test_page_head_key checks it)
+        self.assertEqual(('status', None, 'loading'), (load['role'], load['busy'], load['state']))
         self.assertEqual(['Loading your agents…'], load['hidden'])
         self.assertEqual('Loading your agents…', load['text'])   # the only words: the skeleton has none
         self.assertEqual(['true'], load['skeleton'])
@@ -58,12 +59,28 @@ class WebStates(unittest.TestCase):
         err = data['error']
         self.assertEqual((['state', 'error'], 'alert', 'error'), (err['classes'], err['role'], err['state']))
         self.assertEqual('Could not load this page', err['title'])
-        self.assertEqual([['', data['error']['describe']], ['state-req mono', 'Request req_4f19c2']], err['paragraphs'])
+        self.assertEqual([['', 'The server did not answer (503). Nothing was changed. The server said: The server is busy just now.'],
+                          ['state-req mono', 'Request req_4f19c2']], err['paragraphs'])
         self.assertEqual(['Try again'], err['buttons'])
         self.assertEqual(['true'], err['icons'])
         self.assertEqual(1, data['retried'])
         self.assertEqual(('Not found', []), (data['error404']['title'], data['error404']['buttons']))
         self.assertEqual('No access', data['error403']['title'])
+
+    def test_a_failed_read_says_nothing_was_changed(self):
+        # e r2: a failed READ: what is true, never a write's "may not have been saved" or "do not reload"
+        data = observed(self)
+        self.assertEqual(['The server did not answer (503). Nothing was changed. The server said: The tracker did not answer in time.',
+                          'Request req_1'], data['read503Said'])
+        self.assertEqual(['The server did not answer (502). Nothing was changed.'], data['read502Bare'])
+        self.assertEqual(['The server did not answer (504). Nothing was changed.'], data['read504Code'])
+        self.assertEqual(['The server could not be reached. Nothing was changed; check the connection, then try again.'], data['readNetwork'])
+        for key in ('read503Said', 'read502Bare', 'read504Code', 'readNetwork'):
+            text = ' '.join(data[key]).lower()
+            for phrase in ('may not have been saved', 'reload', 'same button', 'whether this was saved'):
+                self.assertNotIn(phrase, text, key)
+        # a write keeps describe()'s uncertain-outcome advice
+        self.assertIn('could not confirm whether this was saved', data['writeStill'])
 
     def test_the_agents_page_loads_with_the_skeleton(self):
         # agents.js:199 was a 6rem text box ("Loading your agents…"); the cards now replace the

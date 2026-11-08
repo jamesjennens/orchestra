@@ -102,8 +102,17 @@ class PageHeadKey(unittest.TestCase):
         self.assertTrue(data['before']['shown'])
         self.assertTrue(data['failed']['key'] is None or not data['failed']['key']['shown'], data['failed'])
         self.assertEqual(1, data['failed']['error'])
+        # the reviewer's ME1: the failed list offers Try again (else it stays failed)
+        self.assertTrue(data['failed']['retry'], 'the failed Tasks read offers no Try again')
         # Try again reads Closed and shows its count
         self.assertKey(data['retried'], data['expected']['closed'], 'closed items', 'page.total')
+
+    def test_aria_busy_is_on_the_region_being_loaded(self):
+        # e r2: the agents' region is busy while read, the loading message is not; neither stays busy after
+        data = observed(self)['agentsBusy']
+        self.assertEqual({'host': 'true', 'status': [None], 'loading': 1}, data['during'])
+        self.assertEqual({'host': None, 'status': [], 'loading': 0}, data['after'])
+        self.assertEqual({'host': None, 'status': [], 'loading': 0}, data['afterFailure'])
 
     def test_tasks_drops_an_answer_that_lands_out_of_order(self):
         data = observed(self)['tasksOutOfOrder']

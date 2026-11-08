@@ -312,7 +312,9 @@ export async function list(ctx) {
     } }), 'Show agents with inferred or unknown scopes') : null);
   async function load() {
     let data;
-    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { setPageKey(head, null); host.replaceChildren(errorState(error, load)); return; }
+    // The agents' region is busy while it is read, every time (kittrial-5bb.525 e r2), and not after a failure.
+    host.setAttribute('aria-busy', 'true');
+    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { setPageKey(head, null); host.replaceChildren(errorState(error, load)); return; } finally { host.removeAttribute('aria-busy'); }
     const items = data.items;
     loaded.items = items;
     loaded.total = data.total || items.length;

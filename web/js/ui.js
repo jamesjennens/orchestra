@@ -164,9 +164,11 @@ export function empty(title, body, action) {
 
 // Loading: a skeleton in the shape of what will come, never a blank. Its words are for screen
 // readers (role=status); the bars are decoration, and they stop shimmering under reduced motion.
+// It is not itself aria-busy (a busy live region may be held back by assistive technology): the
+// region being loaded carries aria-busy, set and cleared by the view that reads it.
 const SKELETON = [['60', '30'], ['80', '40'], ['40', '30']];
 export function loading(label = 'Loading…', rows = 3) {
-  return h('div', { class: 'loading', role: 'status', 'aria-busy': 'true', 'data-state': 'loading' },
+  return h('div', { class: 'loading', role: 'status', 'data-state': 'loading' },
     h('span', { class: 'visually-hidden' }, label),
     h('div', { class: 'skeleton', 'aria-hidden': 'true' },
       Array.from({ length: rows }, (_, i) => h('div', { class: 'sk-row' }, h('span', { class: 'sk sk-dot' }),
@@ -205,13 +207,27 @@ export function describe(error) {
   }
 }
 
+// A failed READ in the reader's words (kittrial-5bb.525 e r2). Nothing was being saved, so it never says a
+// change "may not have been saved" or "do not reload" (describe() says that, rightly, for writes). It names
+// what is true: the server did not answer, or could not be reached; nothing was changed; and the server's own
+// sentence when its body sent one (a body without one leaves only the code, or 'Request failed').
+export function describeRead(error) {
+  if (!error) return 'The page could not be read. Nothing was changed.';
+  if (error.status === 0) return 'The server could not be reached. Nothing was changed; check the connection, then try again.';
+  if (error.status >= 500 && error.status !== 501) {
+    const said = error.message && error.message !== error.code && error.message !== 'Request failed' ? String(error.message).trim() : '';
+    return `The server did not answer (${error.status}). Nothing was changed.` + (said ? ' The server said: ' + said : '');
+  }
+  return describe(error);
+}
+
 // An error: inline where the read failed, on the crit tone with its rule and icon; what failed,
 // the server's reason in the reader's words, the request id for support, and Try again.
 export function errorState(error, retry) {
   return h('div', { class: 'state error', role: 'alert', 'data-state': 'error' }, stateIcon('error'),
     h('div', { class: 'state-text' },
       h('strong', null, error && error.status === 404 ? 'Not found' : error && error.status === 403 ? 'No access' : 'Could not load this page'),
-      h('p', null, describe(error)),
+      h('p', null, describeRead(error)),
       error && error.requestId ? h('p', { class: 'state-req mono' }, 'Request ' + error.requestId) : null),
     retry ? h('div', { class: 'state-act' }, h('button', { type: 'button', onclick: retry }, 'Try again')) : null);
 }

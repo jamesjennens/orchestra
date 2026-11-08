@@ -152,8 +152,9 @@ const pressed = (page, label) => page.all((e) => e.tagName === 'BUTTON' && e.tex
   failNext = true;
   await pressed(page, 'Closed').dispatch('click');
   await settle();
-  const failed = { key: header(page).key, error: page.all((e) => e.attributes && e.attributes['data-state'] === 'error').length };
-  await pressed(page, 'Try again').dispatch('click');
+  const failed = { key: header(page).key, error: page.all((e) => e.attributes && e.attributes['data-state'] === 'error').length,
+    retry: Boolean(pressed(page, 'Try again')) };
+  if (failed.retry) await pressed(page, 'Try again').dispatch('click');
   await settle();
   const closed = await api.tasks(PID, { limit: 10, status: 'closed', q: '', review_state: '' });
   out.tasksFailedReread = { before, failed, retried: header(page).key, expected: { closed: String(closed.total) } };
@@ -234,6 +235,27 @@ for (const [label, reader] of Object.entries(READERS)) {
       flag: tr.attributes['data-waits-on-you'] === 'true', hidden: tr.textContent.startsWith('Waits on you: '),
       name: cell.attributes['data-who-acts'], accent: cell.all((e) => e.tagName === 'B').map((b) => b.textContent), cell: cell.textContent }];
   }));
+}
+
+// e r2: aria-busy is on the region being loaded (the agents host), never on the status message; it is
+// cleared when the read answers and when it fails.
+{
+  const busy = (page) => {
+    const host = page.all((e) => e.attributes && e.attributes['data-agents-host'] !== undefined)[0];
+    const status = page.all((e) => e.attributes && e.attributes.role === 'status' && String(e.className).includes('loading'));
+    return { host: host.attributes['aria-busy'] || null, status: status.map((e) => e.attributes['aria-busy'] || null), loading: status.length };
+  };
+  const first = await api.agents({ limit: 20, cursor: null, unconfirmed: 'false' });
+  let release;
+  const held = { ...api, agents: () => new Promise((r) => { release = () => r(first); }) };
+  const page = await agents.list({ ...ctx, api: held });
+  const during = busy(page);
+  release();
+  await settle();
+  const after = busy(page);
+  const failing = await agents.list({ ...ctx, api: { ...api, agents: async () => { throw failure(); } } });
+  await settle();
+  out.agentsBusy = { during, after, afterFailure: busy(failing) };
 }
 
 console.log(JSON.stringify(out));
