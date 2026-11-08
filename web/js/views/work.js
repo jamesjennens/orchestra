@@ -34,23 +34,50 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
     }))));
 }
 
-// The header's key (kittrial-5bb.525 slice b): everything that waits on you, counted from the
-// three lists this page shows. When the read is incomplete (a project unreadable, or more work
-// than one read covers) the sum is not the whole, so the page shows no number (the banner says why).
-function workKey(data, incomplete, revisions, assigned) {
-  if (incomplete) return null;
-  const n = revisions.length + data.to_review.length + assigned.length;
-  return { num: n, label: n === 1 ? 'waits on you' : 'wait on you', source: 'my-work:revisions+to_review+assigned' };
+// What waits on the reader (kittrial-5bb.525 slice b, r2): a task whose next step is theirs.
+// - The assignee's step, for the assignee.
+// - An owner step, for an owner or coordinator of the task's project, and only the steps that ask
+//   someone to act: review, integrate, close an integrated task, or accept a requirement. An epic,
+//   a record, a decision or a dependency-blocked row also carries an owner step, but it only says
+//   what the row is, so it waits on no one.
+// A delivered task is in its assignee's `assigned` list but waits on its owner; an owner's own
+// delivered task is in both of the owner's lists. Each is counted once, for whoever acts.
+const OWNER_ACTS = new Set(['awaiting-review', 'legacy-review-ready', 'approved', 'awaiting-integration', 'integrated']);
+export function waitsOnReader(ctx, t, approvesIn) {
+  const step = t && t.next_action;
+  if (!step || t.status === 'closed') return false;
+  if (step.who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
+  if (step.who !== 'owner' || !approvesIn(t.project_id)) return false;
+  return OWNER_ACTS.has(t.review_state) || (t.requirement_record === true && t.requirement_state === 'awaiting-acceptance');
 }
 
-// The next action: the oldest review first, then the oldest revision request, then the oldest
-// assigned task. None when nothing waits.
+// Who may take an owner step in a project: an owner or coordinator there (the project list's role),
+// or anyone the server put a row of that project in `to_review` for (it does so only with approve rights).
+function approverIn(ctx, data) {
+  const reviewing = new Set(data.to_review.map((t) => t.project_id));
+  return (pid) => reviewing.has(pid) || ['owner', 'coordinator', 'superuser'].includes(((ctx.projects || []).find((p) => p.id === pid) || {}).role);
+}
+
+// The header's key: the distinct tasks (project and id) that wait on the reader, across the lists
+// this page shows. When the read is incomplete (a project unreadable, or more work than one read
+// covers) the count is not the whole, so the page shows no number (the banner says why).
+function workKey(ctx, data, incomplete, revisions, assigned) {
+  if (incomplete) return null;
+  const n = revisions.concat(data.to_review, assigned)
+    .reduce((ids, t) => (waitsOnReader(ctx, t, approverIn(ctx, data)) ? ids.add(t.project_id + '/' + t.id) : ids), new Set()).size;
+  return { num: n, label: n === 1 ? 'waits on you' : 'wait on you', source: 'my-work:distinct-next-step-is-yours' };
+}
+
+// The next action: the oldest review or other owner step that waits on you, then the oldest
+// revision request, then the oldest of your own tasks to deliver. None when nothing waits.
 function workNext(ctx, data, revisions, assigned) {
+  const yours = (rows) => rows.filter((t) => waitsOnReader(ctx, t, approverIn(ctx, data)));
   const since = (t) => Date.parse(t.waiting_since || t.updated_at || '') || Infinity;
   const oldest = (rows) => rows.slice().sort((a, b) => since(a) - since(b))[0];
-  const [rows, label] = data.to_review.length ? [data.to_review, 'Open the oldest review']
-    : revisions.length ? [revisions, 'Open the oldest revision request']
-      : assigned.length ? [assigned, 'Open your oldest task'] : [[], null];
+  const reviews = yours(data.to_review), revise = yours(revisions), deliver = yours(assigned);
+  const [rows, label] = reviews.length ? [reviews, 'Open the oldest review']
+    : revise.length ? [revise, 'Open the oldest revision request']
+      : deliver.length ? [deliver, 'Open your oldest task'] : [[], null];
   if (!label) return null;
   const t = oldest(rows);
   return h('a', { class: 'btn primary', href: ctx.href(`/p/${t.project_id}/t/${t.id}`), 'data-next-action': t.id }, label);
@@ -81,7 +108,7 @@ export async function home(ctx) {
       agentCard(ctx, a, { compact: false }))))) : null;
   return h('div', { class: 'stack' },
     pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.`,
-      key: workKey(data, incomplete, revisions, assigned), actions: workNext(ctx, data, revisions, assigned) }),
+      key: workKey(ctx, data, incomplete, revisions, assigned), actions: workNext(ctx, data, revisions, assigned) }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,
     agentPromptPanel(ctx, data),
     contributions,

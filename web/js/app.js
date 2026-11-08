@@ -262,7 +262,9 @@ export async function start(root, options = {}) {
         mount(main, h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'alert' }, h('strong', null, 'Could not load this page'), h('p', null, describe(error)))));
       }
       const title = main.querySelector('h1');
-      document.title = (title ? title.textContent + ' · ' : '') + 'Orchestra';
+      // The h1 names the tab, or its data-tab-title when the h1 alone would not say where it is (Tasks · Alpha).
+      const named = title ? (title.getAttribute('data-tab-title') || title.textContent) : '';
+      document.title = (named ? named + ' · ' : '') + 'Orchestra';
       try { window.scrollTo(0, 0); } catch { /* ignore */ }
       if (title) title.focus({ preventScroll: true });
       return;

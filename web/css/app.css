@@ -149,7 +149,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   font-variant-numeric: tabular-nums lining-nums; color: var(--ink); white-space: nowrap;
 }
 .page-key .key-label { font-size: var(--t-sm); color: var(--muted); margin-top: var(--s-2); white-space: nowrap; }
-.page-head > .actions { justify-content: flex-end; }
+.page-head > .actions { justify-content: flex-end; grid-column: -2 / -1; }  /* flush right with or without a key */
 @media (min-width: 761px) { .page-head h1 { font-size: var(--t-3xl); } }
 @media (max-width: 760px) {
   .page-head { grid-template-columns: minmax(0, 1fr); gap: var(--s-3); padding-bottom: var(--s-4); }

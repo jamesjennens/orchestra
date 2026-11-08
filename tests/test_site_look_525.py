@@ -453,7 +453,13 @@ function measure(page) {{
     const lines = new Set(Array.from(range.getClientRects()).map((x) => Math.round(x.top))).size;
     cellButtons.push({{ text: el.textContent.trim().slice(0, 30), lines }});
   }});
-  return {{ texts, controls, cellButtons }};
+  // r2: the header's action sits flush right, with or without a key; and the tab's own title
+  const head = document.querySelector('header.page-head');
+  const acts = head ? Array.from(head.children).filter((e) => e.classList.contains('actions')) : [];
+  const last = acts.length ? Array.from(acts[0].querySelectorAll('a, button')).pop() : null;
+  const headAlign = last ? {{ gap: Math.round(head.getBoundingClientRect().right - last.getBoundingClientRect().right),
+    key: Boolean(head.querySelector('[data-page-key]:not([hidden])')) }} : null;
+  return {{ texts, controls, cellButtons, headAlign, tab: document.title }};
 }}
 const out = {{ pages: [], dark: matchMedia('(prefers-color-scheme: dark)').matches, errors: [] }};
 try {{
@@ -468,6 +474,9 @@ try {{
   const task = document.querySelector('a[href*="/t/"]');
   if (task) await go('task', task.getAttribute('href').replace(/^#/, ''));
   else out.errors.push('no task link on Tasks');
+  // r2: a plain task (open, nothing delivered: an action, no key) and People (key and action)
+  await go('task-plain', '/p/proj_portal/t/task_port007');
+  await go('people', '/p/proj_portal/people');
   await go('agents', '/agents');
   await go('reviews', '/p/proj_portal/reviews');
   await go('settings', '/p/proj_portal/settings');
@@ -517,7 +526,7 @@ class FreshContrastMeasured(unittest.TestCase):
     def check(self, width, height, theme, prefers_dark=False):
         data = run_harness(find_browser(), width, height, theme, prefers_dark)
         self.assertEqual([], data['errors'])
-        self.assertEqual(['sign-in', 'my-work', 'tasks', 'task', 'agents', 'reviews', 'settings', 'states'],
+        self.assertEqual(['sign-in', 'my-work', 'tasks', 'task', 'task-plain', 'people', 'agents', 'reviews', 'settings', 'states'],
                          [p for p, _ in data['pages']])
         if prefers_dark:
             self.assertTrue(data['dark'], 'the browser did not report prefers-color-scheme: dark')
@@ -528,6 +537,14 @@ class FreshContrastMeasured(unittest.TestCase):
         self.assertEqual(1, len(well), states)
         self.assertTrue(any(key.split(' on ')[1].split()[0] == well[0] and v['sample'] != 'Could not load this page'
                             for key, v in states.items()), 'the error text on the crit-soft well was not measured')
+        # r2: the action is flush right on every page that has one, keyed or not (32px short before)
+        # (on a phone the action starts its own line, left-aligned, by design)
+        aligned = {page: found['headAlign'] for page, found in data['pages'] if found['headAlign']}
+        self.assertTrue(any(not a['key'] for a in aligned.values()), 'a page without a key must be measured')
+        if width > 760:
+            self.assertEqual({}, {page: a for page, a in aligned.items() if abs(a['gap']) > 1})
+        # r2: the Tasks tab names the project (the mock's portal project is "Customer portal")
+        self.assertEqual('Tasks · Customer portal · Orchestra', dict(data['pages'])['tasks']['tab'])
         buttons = {page: found['cellButtons'] for page, found in data['pages']}
         self.assertTrue(buttons['settings'], 'the members table has its Remove buttons to measure')
         self.assertEqual([], [(page, b) for page, found in buttons.items() for b in found if b['lines'] > 1])

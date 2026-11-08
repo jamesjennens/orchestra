@@ -51,9 +51,11 @@ export function waitsOnYou(ctx, project, t) {
 }
 
 // What the Tasks key counts, in the words of the filter it was read with.
+// "items", not "tasks": the server's total counts requirement records too, which this list hides
+// by default (kittrial-5bb.525 r2; a server total of tasks alone is a follow-up).
 function tasksKeyLabel(state) {
-  if (state.q || state.review) return 'matching';
-  return state.status === 'active' ? 'open' : state.status === 'closed' ? 'closed' : 'in all';
+  if (state.q || state.review) return 'matching items';
+  return state.status === 'active' ? 'open items' : state.status === 'closed' ? 'closed items' : 'items in all';
 }
 
 function crumbs(ctx, project, extra) {
@@ -526,7 +528,7 @@ export async function overview(ctx, { pid }) {
   };
   const tableHost = h('div', { class: 'panel' });
   // The page is the project's Tasks list: the h1 says so, the crumb names the project.
-  const head = pageHead({ crumbs: crumbs(ctx, project, 'Tasks'), title: 'Tasks', lede: project.description || null, key: 'pending',
+  const head = pageHead({ crumbs: crumbs(ctx, project, 'Tasks'), title: 'Tasks', tabTitle: 'Tasks · ' + project.name, lede: project.description || null, key: 'pending',
     actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null });
 
   const search = h('input', { type: 'search', id: 'task-search', placeholder: 'Search title, description or ID', 'aria-label': 'Search tasks', value: state.q });
@@ -550,15 +552,25 @@ export async function overview(ctx, { pid }) {
   let debounce;
   search.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(() => { state.q = search.value.trim(); state.cursor = null; state.stack = []; writeQuery(); draw(); }, 250); });
 
+  // Each read is numbered; only the newest one's answer is shown (kittrial-5bb.525 r2). An older answer
+  // that lands last would otherwise put one filter's rows and count under another filter's words.
+  let reads = 0;
   async function draw() {
+    const asked = ++reads;
     tableHost.setAttribute('aria-busy', 'true');
     let page;
     try {
       page = await ctx.api.tasks(pid, { limit: PAGE, cursor: state.cursor, status: state.status, q: state.q, review_state: state.review });
     } catch (error) {
+      if (asked !== reads) return;
+      tableHost.removeAttribute('aria-busy');
+      // A failed read has no count: the previous filter's number must not stay over the error.
+      setPageKey(head, null);
       tableHost.replaceChildren(errorState(error, draw));
       return;
-    } finally { tableHost.removeAttribute('aria-busy'); }
+    }
+    if (asked !== reads) return;
+    tableHost.removeAttribute('aria-busy');
     const allRows = page.items;
     // The header's key (kittrial-5bb.525 slice b): the server's total for the list as filtered
     // (page.total), never the rows on this page. No total, no number.

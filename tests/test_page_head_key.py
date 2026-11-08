@@ -52,17 +52,37 @@ class PageHeadKey(unittest.TestCase):
         self.assertTrue(key['shown'], key)
         self.assertEqual((num, label, source), (key['num'], key['label'], key['source']))
 
-    def test_my_work(self):
+    # My work's fixture (web_page_head_key.mjs, FIXTURE_ROWS). The reader owns Alpha and contributes to Beta.
+    # Which rows wait on the reader, from each row's own facts:
+    #   a1  the reader's own delivery in Alpha, awaiting review: waits (the reader reviews in Alpha); it is
+    #       in assigned AND to_review, and counts once
+    #   b1  the reader's delivery in Beta, awaiting review: waits on Beta's owner, not on the reader
+    #   b2  the reader's task in Beta, nothing delivered: waits (deliver)
+    #   b3  sent back to the reader in Beta: waits (address the changes)
+    #   a2  sam's delivery in Alpha, awaiting review: waits (review)
+    #   a3  sam's approved work in Alpha: waits (integrate)
+    #   a5  a requirement in Alpha waiting for acceptance: waits (accept)
+    #   a6  a requirement record in Alpha that only says where it is edited: waits on no one
+    # So 6 rows wait: a1, b2, b3, a2, a3, a5. The oldest review among them is a2 (48 hours).
+    MY_WORK_WAITING = 6
+
+    def test_my_work_counts_each_task_that_waits_on_you_once(self):
         data, head = self.head('myWork')
         self.assertEqual(['My work'], head['h1'])
-        self.assertFalse(data['expected']['incomplete'])
-        n = data['expected']['num']
-        self.assertKey(head['key'], n, 'waits on you' if n == '1' else 'wait on you', 'my-work:revisions+to_review+assigned')
+        # the fixture holds what the rule must handle: an own task in both lists, a delivery waiting on its owner
+        self.assertIn('a1', data['fixture']['assigned'])
+        self.assertIn('a1', data['fixture']['to_review'])
+        self.assertIn('b1', data['fixture']['assigned'])
+        self.assertKey(head['key'], str(self.MY_WORK_WAITING), 'wait on you', 'my-work:distinct-next-step-is-yours')
         self.assertTrue(head['actions'], 'My work must offer its next action')
-        self.assertEqual('Open the oldest review', head['actions'][0]['text'])
-        self.assertTrue(head['actions'][0]['primary'])
-        self.assertEqual(data['expected']['oldestReview'], head['actions'][0]['next'])
-        self.assertTrue(head['actions'][0]['href'].endswith('/t/' + data['expected']['oldestReview']))
+        first = head['actions'][0]
+        self.assertEqual(('Open the oldest review', True, 'a2'), (first['text'], first['primary'], first['next']))
+        self.assertTrue(first['href'].endswith('/p/alpha/t/a2'))
+
+    def test_my_work_shows_no_number_when_its_read_is_incomplete(self):
+        # the reviewer's MB1: the same lists in a truncated read are not the whole, so no key
+        data, head = self.head('myWorkTruncated')
+        self.assertIsNone(head['key'])
 
     def test_tasks_key_is_the_servers_total_not_the_page(self):
         data, head = self.head('tasks')
@@ -71,9 +91,32 @@ class PageHeadKey(unittest.TestCase):
         expected = data['expected']
         # The fixture must hold more open tasks than one page, or this test could not tell the two apart.
         self.assertNotEqual(expected['active'], str(expected['activeRows']))
-        self.assertKey(head['key'], expected['active'], 'open', 'page.total')
-        self.assertKey(data['afterClosed'], expected['closed'], 'closed', 'page.total')
+        self.assertKey(head['key'], expected['active'], 'open items', 'page.total')
+        self.assertKey(data['afterClosed'], expected['closed'], 'closed items', 'page.total')
+        # the tab names the project again: 'Tasks · <project>' (app.js reads data-tab-title)
+        self.assertEqual('Tasks · Customer portal', head['tabTitle'])
         self.assertEqual([('New task', True)], [(a['text'], a['primary']) for a in head['actions']])
+
+    def test_tasks_failed_reread_after_a_filter_clears_the_key(self):
+        data = observed(self)['tasksFailedReread']
+        self.assertTrue(data['before']['shown'])
+        self.assertTrue(data['failed']['key'] is None or not data['failed']['key']['shown'], data['failed'])
+        self.assertEqual(1, data['failed']['error'])
+        # Try again reads Closed and shows its count
+        self.assertKey(data['retried'], data['expected']['closed'], 'closed items', 'page.total')
+
+    def test_tasks_drops_an_answer_that_lands_out_of_order(self):
+        data = observed(self)['tasksOutOfOrder']
+        self.assertNotEqual(data['expected']['all'], data['expected']['closed'])
+        self.assertKey(data['key'], data['expected']['all'], 'items in all', 'page.total')
+        self.assertEqual(data['expected']['allIds'], data['rowIds'])
+
+    def test_my_agents_failed_reread_clears_the_key(self):
+        # the reviewer's MB2: a re-read that fails must not leave the previous count
+        data = observed(self)['agentsFailedReread']
+        self.assertKey(data['before'], data['expected']['num'], 'agent' if data['expected']['num'] == '1' else 'agents', 'agents.total')
+        self.assertTrue(data['after'] is None or not data['after']['shown'], data['after'])
+        self.assertEqual(1, data['error'])
 
     def test_tasks_rows_that_wait_on_you_are_marked(self):
         # slice (c): the accent bar marks exactly the rows whose next step is the reader's

@@ -66,7 +66,7 @@ export function lifecycleStrip(lifecycle) {
 // it, or 'pending' when the page's own read fills it later through setPageKey. A page with no
 // honest number passes no key and shows none: never a count of the rows on one page, never a
 // guess. `source` names where the number comes from (data-key-source), for the tests.
-export function pageHead({ crumbs, title, lede, actions, key }) {
+export function pageHead({ crumbs, title, lede, actions, key, tabTitle }) {
   const keyNum = h('span', { class: 'key-num' });
   const keyLabel = h('span', { class: 'key-label' });
   const keyNode = key ? h('div', { class: 'page-key', 'data-page-key': '', hidden: true }, keyNum, keyLabel) : null;
@@ -74,7 +74,8 @@ export function pageHead({ crumbs, title, lede, actions, key }) {
     h('div', { class: 'ph-title' },
       crumbs && crumbs.length ? h('nav', { class: 'crumbs', 'aria-label': 'Breadcrumb' },
         crumbs.flatMap((c, i) => [i ? h('span', { 'aria-hidden': 'true' }, '/') : null, c.href ? h('a', { href: c.href }, c.label) : h('span', null, c.label)])) : null,
-      h('h1', { tabindex: '-1', id: 'page-title' }, title),
+      // The tab names the page; a page whose h1 alone would not say where it is (Tasks) names its place too.
+      h('h1', { tabindex: '-1', id: 'page-title', 'data-tab-title': tabTitle || null }, title),
       lede ? h('p', { class: 'lede' }, lede) : null),
     keyNode,
     actions ? h('div', { class: 'actions' }, actions) : null);
