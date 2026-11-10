@@ -1436,6 +1436,31 @@ def chain(found, voided=()):
     return ordered
 
 
+SAME_COMMIT_REFUSAL_SENTENCE = (
+    'this commit was already reviewed and changes were requested; '
+    'answer the review with respond, or deliver a new commit'
+)
+
+
+def same_commit_refusal_message(review_id):
+    return '%s (review %s)' % (SAME_COMMIT_REFUSAL_SENTENCE, review_id)
+
+
+class SameCommitChangesRequested(ValueError):
+    """A new ``contribute`` repeated the commit of a delivery with an active ``request-changes``."""
+
+    code = 'same-commit-changes-requested'
+    http_status = 409
+
+    def __init__(self, task, review_id, commit):
+        self.task = task
+        self.review_id = review_id
+        self.commit = commit
+        self.detail = {'code': self.code, 'http_status': self.http_status,
+                       'task': task, 'review_id': review_id, 'commit': commit}
+        super().__init__(same_commit_refusal_message(review_id))
+
+
 class StaleReviewPrevious(ValueError):
     """A new review operation named a `previous` that is no longer the chain head.
 
@@ -2591,6 +2616,62 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
     return answer
 
 
+def _approval_invalidated_by_void(approval_id, voids, positions):
+    approval_position = positions.get(approval_id) if positions else None
+    for p, c in (voids or ()):
+        if p.get('target_kind') != 'contribution-review':
+            continue
+        void_position = positions.get(str(c['id'])) if positions else None
+        if approval_position is None or void_position is None or void_position > approval_position:
+            return True
+    return False
+
+
+def active_changes_requested_review_id(ordered, state, voids=None, positions=None):
+    """Return the ``request-changes`` comment id blocking a same-commit ``contribute``, or ``None``.
+
+    Reads only review records on ``state['contribution']`` (the task's latest delivery).
+    A ``respond`` answers items without superseding the review; ``approve``, ``withdraw``
+    (rejection/withdrawal), or the requester resolving/downgrading every blocking item
+    supersedes or retracts it.
+    """
+    latest = state.get('contribution')
+    if latest is None or state.get('withdrawal') is not None:
+        return None
+    current_id = latest['comment_id']
+    after_latest = False
+    blocking = {}
+    for p, c in ordered:
+        cid = str(c['id'])
+        op = p['operation']
+        if op == 'contribute':
+            after_latest = (cid == current_id)
+            continue
+        if not after_latest or p.get('contribution') != current_id:
+            continue
+        if op == 'request-changes':
+            for item in p['items']:
+                if item.get('severity', 'blocking') != 'note':
+                    blocking[(cid, item['id'])] = 'open'
+        elif op == 'respond':
+            for res in p['resolutions']:
+                key = (res['request'], res['item'])
+                if key in blocking:
+                    blocking[key] = 'responded'
+        elif op == 'resolve-item':
+            blocking.pop((p['request'], p['item']), None)
+        elif op == 'approve':
+            if not _approval_invalidated_by_void(cid, voids, positions):
+                blocking.clear()
+    open_ids = [req_id for (req_id, _), status in blocking.items() if status == 'open']
+    if open_ids:
+        return open_ids[-1]
+    responded_ids = [req_id for (req_id, _), status in blocking.items() if status == 'responded']
+    if responded_ids:
+        return responded_ids[-1]
+    return None
+
+
 def project(issue, operators=None, journal=None, reverts=None, invalid_reverts=None):
     """Raw workflow projection for one issue; ``journal`` is the project directory
     holding the host-issued ``.integration-reverts/`` journal (None trusts no
@@ -3214,6 +3295,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})],
                          voids, invalid, refused, preview_positions, reverts, invalid_reverts, closed=closed,
                          assignee=issue.get('assignee'))
+    if payload['operation'] == 'contribute' and state.get('contribution') is not None:
+        if payload['commit'].lower() == state['contribution']['commit'].lower():
+            blocking_review = active_changes_requested_review_id(ordered, state, voids, positions)
+            if blocking_review is not None:
+                raise SameCommitChangesRequested(task, blocking_review, payload['commit'])
     # A follow-on may only base itself on a prior revision approved by a distinct
     # native author and genuinely integrated. Resolve the approving record from the
     # chain and the integration evidence from the shared review-state projection

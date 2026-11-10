@@ -354,8 +354,13 @@ def dispatch(canonical, request, tmp, run=None):
     if action in ('brief', 'history'):
         from briefing import execute as briefing_execute
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
+        options = {}
+        if 'operators' in inspect.signature(briefing_execute).parameters:
+            config_file = canonical.root / 'deployment.private.json'
+            options['operators'] = (json.loads(config_file.read_text(encoding='utf-8')).get('operators') or []) \
+                if config_file.is_file() else []
         output = briefing_execute(canonical.root, canonical.path, project, actor, action,
-                                  args, items, run)
+                                  args, items, run, **options)
         return envelope(0, output)
     if action == 'review':
         from work import execute as work_execute
@@ -364,13 +369,20 @@ def dispatch(canonical, request, tmp, run=None):
         # the deployment configuration; mirror that here so the HTTP binding tests can
         # reach the new record shapes (kittrial-5bb.110 item 9). A revision that
         # predates the switch keeps its old behaviour.
+        options = {}
+        parameters = inspect.signature(work_execute).parameters
+        if 'operators' in parameters:
+            config_file = canonical.root / 'deployment.private.json'
+            options['operators'] = (json.loads(config_file.read_text(encoding='utf-8')).get('operators') or []) \
+                if config_file.is_file() else []
         try:
             from admin import review_workflow_writes
             review_writes = review_workflow_writes(canonical.root)
         except ImportError:
             review_writes = None
-        result = work_execute(canonical.path, actor, 'review', args, items, run,
-                              review_writes=review_writes)
+        if 'review_writes' in parameters:
+            options['review_writes'] = review_writes
+        result = work_execute(canonical.path, actor, 'review', args, items, run, **options)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action in ('work', 'handoff'):
         from work import execute as work_execute
@@ -969,6 +981,14 @@ def main():
             answer = dispatch(canonical, request, tmp, run_callable)
     except Exception as error:  # noqa: BLE001 - report, never traceback
         answer = envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
+        try:
+            from review_workflow import SameCommitChangesRequested
+        except ImportError:
+            SameCommitChangesRequested = ()
+        if isinstance(error, SameCommitChangesRequested):
+            answer['stderr'] = 'ValueError: %s\n' % error
+            answer['review_status'] = 409
+            answer['review_id'] = error.review_id
         import actor_names                    # a local import elsewhere in main() shadows the module name
         if isinstance(error, actor_names.TrackerUnreadable):
             # As endpoint.main does: an export that could not be read is a host fault the

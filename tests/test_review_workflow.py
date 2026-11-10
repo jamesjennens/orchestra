@@ -59,7 +59,7 @@ class ReviewWorkflowTests(unittest.TestCase):
         request = self.request()
         self.issue['comments'].append(dict(id='checkpoint', author='worker', created_at='2026-09-16T00:00:00Z',
                                            text='Kind: task-checkpoint-v1\n{"summary":"Ready for review"}'))
-        second = self.send(self.contribution(delivery=dict(kind='remote', remote='ssh://git.example/project', branch='fix/revised')))['comment_id']
+        second = self.send(self.contribution(commit='d'*40, delivery=dict(kind='remote', remote='ssh://git.example/project', branch='fix/revised')))['comment_id']
         state = w.project(self.issue)
         self.assertEqual(state['review_state'], 'changes-requested')
         self.assertEqual(state['pending_requests'][0]['contribution'], first)

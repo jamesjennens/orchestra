@@ -4058,12 +4058,16 @@ def main():
         import raw_lifecycle
         if isinstance(e,raw_lifecycle.Refusal):
             answer['stderr']=f'ValueError: {e}\n'
-        from review_workflow import CoordinatorRuleRefusal
+        from review_workflow import CoordinatorRuleRefusal, SameCommitChangesRequested
         if isinstance(e,CoordinatorRuleRefusal):
             # Preserve the host's ValueError sentence while identifying a kit rule
             # refusal explicitly. HTTP never decides this from words in stderr.
             answer['stderr']=f'ValueError: {e}\n'
             answer['refused']='coordinator-rule'
+        if isinstance(e,SameCommitChangesRequested):
+            answer['stderr']=f'ValueError: {e}\n'
+            answer['review_status']=409
+            answer['review_id']=e.review_id
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
             # The export could not be read (bd failed, or answered something that is not

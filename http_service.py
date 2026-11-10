@@ -1227,6 +1227,12 @@ class InProcessBackend:
                 delivery_block = {'kind': 'remote', 'remote': '', 'branch': branch}
             else:
                 delivery_block = {'kind': 'bundle', 'path': '', 'sha256': digest}
+            current = [r for r in contributions if r['kind'] == 'contribution']
+            if current and commit.lower() == current[-1]['commit'].lower():
+                review_id = self._active_changes_requested_review_id(contributions, current[-1]['id'])
+                if review_id is not None:
+                    from review_workflow import same_commit_refusal_message
+                    raise conflict(same_commit_refusal_message(review_id), {'review_id': review_id})
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
                       'repository': repository, 'delivery': delivery_block,
@@ -1421,6 +1427,39 @@ class InProcessBackend:
                 continue
             newest[author_key(record['actor'])] = record
         return sorted(newest.values(), key=lambda record: (record['after'], record['created_at']), reverse=True)
+
+    @staticmethod
+    def _active_changes_requested_review_id(records, latest_id):
+        """Return the ``request-changes`` id blocking a same-commit ``contribute``, or ``None``."""
+        after_latest = False
+        blocking = {}
+        for record in records:
+            kind = record.get('kind')
+            if kind == 'contribution':
+                after_latest = (record.get('id') == latest_id)
+                continue
+            if not after_latest or record.get('contribution_id') != latest_id:
+                continue
+            if kind == 'request-changes':
+                items = record.get('items') or (
+                    [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
+                for item in items:
+                    if item.get('severity') != 'note':
+                        blocking[(record['id'], item['id'])] = 'open'
+            elif kind == 'respond':
+                for res in record.get('resolutions') or []:
+                    key = (res['request'], res['item'])
+                    if key in blocking:
+                        blocking[key] = 'responded'
+            elif kind == 'approve':
+                blocking.clear()
+        open_ids = [req_id for (req_id, _), status in blocking.items() if status == 'open']
+        if open_ids:
+            return open_ids[-1]
+        responded_ids = [req_id for (req_id, _), status in blocking.items() if status == 'responded']
+        if responded_ids:
+            return responded_ids[-1]
+        return None
 
     @staticmethod
     def _requests(records, open_only=False):
@@ -2828,6 +2867,13 @@ class EndpointBackend:
             error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
                                       422: 'invalid'}.get(status, 'unavailable'),
                               (reply.get('stderr') or 'Lifecycle state cannot be read').strip())
+            error.nothing_done = True
+            raise error
+        if action == 'review' and isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                reply.get('review_status') == 409 and isinstance(reply.get('review_id'), str) and reply['review_id']:
+            from review_workflow import same_commit_refusal_message
+            error = conflict(same_commit_refusal_message(reply['review_id']),
+                             {'review_id': reply['review_id']})
             error.nothing_done = True
             raise error
         if action == 'task-file' and isinstance(reply, dict) and reply.get('returncode') == 2 and \
