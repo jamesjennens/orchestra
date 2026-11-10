@@ -1069,6 +1069,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       h('p', { class: 'small' }, folder ? 'Open this folder in VS Code (File > Open Folder), then run the command below (' : 'Open the agent’s folder in VS Code (File > Open Folder), then run the command below (',
         h('kbd', null, osWords(state.os).palette), ').'),
       folder ? commandLine(folder, 'folder path') : null,
+      // kittrial-5bb.545: on the Bridge path, the proxy exclusion comes before Set up, for the host this page uses.
+      state.bridge ? h('p', { class: 'small', 'data-bridge-no-proxy': 'true' }, setupText.bridgeNoProxySentence(bridgeServer)) : null,
       commandLine('Orchestra Bridge: Set up', 'VS Code command'),
       more(h('p', { class: 'small muted' }, 'It chooses this agent from your credential file, confirms the server, trusts the certificate by its fingerprint, tests the connection, writes .orchestra/agent.json and .orchestra/AGENT.md and turns watching on. Next checks that the agent reached Orchestra.'),
         hasCertificate ? fingerprintNotes(certificate) : null,

@@ -259,6 +259,12 @@ export function curlFlags(server, maxTime = CURL_MAX_TIME) {
 export function proxySentence(server) {
   return `The answer did not come from Orchestra (a web page, an error without Orchestra's details, or no answer in ${CURL_MAX_TIME} seconds): a proxy probably answered; check HTTPS_PROXY in this shell, or ask IT to let this computer reach ${serverHost(server)} directly.`;
 }
+//: The wizard's line before "Orchestra Bridge: Set up" on the Bridge path (kittrial-5bb.545): VS Code's own
+//: requests go through its proxy settings, so the person excludes this host there first. The page changes
+//: no setting; the host is the one this page is connected to, as serverHost gives it.
+export function bridgeNoProxySentence(server) {
+  return `If this computer uses a proxy, first add ${serverHost(server)} to VS Code's Http: No Proxy setting (File > Preferences > Settings, search “No Proxy”; on macOS Code > Settings).`;
+}
 
 // Commands that prove the stored secret works (they never contain it).
 export function testCommands(payload) {
