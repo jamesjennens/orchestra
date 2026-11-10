@@ -56,10 +56,10 @@ NOBODY = 'agent_0123456789abcdef'
 #: The whole generated section for SERVER and FILE, word for word. The Bridge's copy follows this text.
 PINNED = '''## Assigning a task
 
-Read the roster first: GET https://office.example:7443/v1/projects/PROJECT/assignment-roster lists the actor ids you may assign to (each item's actor, with its name and kind). expected_assignee is the task's current assignee (task.assignee in GET https://office.example:7443/v1/projects/PROJECT/tasks/TASK/brief), or null when nobody holds it. Never use a display name: assignee and expected_assignee take an actor id exactly as the roster lists it.
+Read the roster first: GET https://office.example:7443/v1/projects/PROJECT/assignment-roster lists the actor ids you may assign to (each item's actor, with its name and kind), 50 to a page: while next_cursor is not null, read the next page with ?cursor=NEXT_CURSOR. expected_assignee is the task's current assignee (task.assignee in GET https://office.example:7443/v1/projects/PROJECT/tasks/TASK/brief), or null when nobody holds it. Never use a display name: assignee and expected_assignee take an actor id exactly as the roster lists it.
 - Windows (PowerShell): '{"expected_assignee":null,"assignee":"worker-kestrel","reason":"Next slice: the login form","allow_pending_review":false,"allow_held_slot":false}' | curl.exe -fsS --noproxy office.example --max-time 60 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" -X POST -H "Content-Type: application/json" -H "Idempotency-Key: KEY" --data-binary '@-' 'https://office.example:7443/v1/projects/PROJECT/tasks/TASK/assign'
 - macOS/Linux: printf '%s' '{"expected_assignee":null,"assignee":"worker-kestrel","reason":"Next slice: the login form","allow_pending_review":false,"allow_held_slot":false}' | curl -fsS --noproxy office.example --max-time 60 -K ~/.orchestra-agent-kestrel.curlrc -X POST -H 'Content-Type: application/json' -H 'Idempotency-Key: KEY' --data-binary @- 'https://office.example:7443/v1/projects/PROJECT/tasks/TASK/assign'
-The body has exactly these five fields: expected_assignee (the current holder's actor id, or null), assignee (the actor id from the roster that gets the task), reason (1 to 1000 characters of plain text, kept in the task), allow_pending_review (true only to take a task away from a holder whose delivery awaits review or has changes requested; the review items are kept) and allow_held_slot (true only to take a task away from a holder who holds the merge slot for it; the slot stays with its holder). KEY is your own Idempotency-Key for this one assignment, 8 to 128 URL-safe characters. Reuse the same Idempotency-Key and body after an uncertain answer (503 or 124); never mint a new key for the same intent.
+The body has exactly these five fields: expected_assignee (the current holder's actor id, or null), assignee (the actor id from the roster that gets the task), reason (1 to 1000 characters of plain text, kept in the task), allow_pending_review (true only to take a task away from a holder whose delivery awaits review or has changes requested; the review items are kept) and allow_held_slot (true only to take a task away from a holder who holds the merge slot for it; the slot stays with its holder). The reason sits inside single quotes: leave out ' (and on Windows also curly quotes and other non-ASCII characters, which PowerShell 5.1 sends as ?), or write the body to a file and send it with --data-binary '@FILE' as the long-text rule above says. KEY is your own Idempotency-Key for this one assignment: 8 to 128 letters, digits, '.', '_', ':' or '-', starting with a letter or digit. Reuse the same Idempotency-Key and body after an uncertain answer (503 or 124); never mint a new key for the same intent.
 If the server refuses:
 - 422 "Assignment requires its exact closed field set": send the five fields above, all of them and nothing else.
 - 409 "so the name cannot be stored: name the actor id to use": the assignee is not an actor id of this project; read the roster again and send an actor it lists.
@@ -71,7 +71,7 @@ If the server refuses:
 REFUSAL_LINE = re.compile(r'^- (\d{3}) "([^"]+)": .+$')
 #: Part 2: the long-text paragraph of "## Every call", word for word, for the Bridge's copy. Its numbers are checked
 #: against field_limits.DESCRIPTION_MAX and http_service.MAX_ATTACHMENT_BYTES, never written here as expectations.
-LONG_TEXT_PINNED = 'Long text, such as a task description, a comment or a report, goes in a file in this folder, never inside one long command line: write the JSON body to the file and send it with --data-binary @FILE in place of the body, or upload it as a task file (the Task files section). The server takes a task description of up to 20000 characters and a comment of up to 65536 UTF-8 bytes (64 KiB), so never trim text to fit a command line. If a stored description reads shorter than you expected, read it again with GET .../tasks/TASK/brief (task.description) or the task-file route before concluding that it was cut.'
+LONG_TEXT_PINNED = 'Long text, such as a task description, a comment or a report, goes in a file in this folder, never inside one long command line: write the JSON body to the file and send it with --data-binary \'@FILE\' (quoted, so PowerShell does not read the @) in place of the body, or upload it as a task file (the Task files section). The server takes a task description of up to 20000 characters and a comment of up to 65536 UTF-8 bytes (64 KiB), so never trim text to fit a command line. If a stored description reads shorter than you expected, read it again with GET .../tasks/TASK/brief (task.description) or the task-file route before concluding that it was cut.'
 DESCRIPTION_LIMIT = re.compile(r'a task description of up to (\d+) characters')
 COMMENT_LIMIT = re.compile(r'a comment of up to (\d+) UTF-8 bytes')
 
@@ -198,6 +198,44 @@ class AgentMdTests(unittest.TestCase):
         self.assertIn('POST .../tasks/TASK/assign to hand a task to a worker (see ## Assigning a task); ', steps[5])
 
 
+    def field_line(self):
+        section = section_of(self.coordinator()['guide'])
+        found = [line for line in section if line.startswith('The body has exactly these five fields: ')]
+        self.assertEqual(1, len(found), section)
+        return found[0]
+
+    def test_the_reason_quoting_sentence_follows_the_field_list(self):
+        # Review S1 (2026-11-10): the reason sits inside a single-quoted body on both systems; a ' ends it.
+        line = self.field_line()
+        sentence = ("The reason sits inside single quotes: leave out ' (and on Windows also curly quotes and other "
+                    "non-ASCII characters, which PowerShell 5.1 sends as ?), or write the body to a file and send it "
+                    "with --data-binary '@FILE' as the long-text rule above says.")
+        self.assertIn(sentence, line)
+        self.assertLess(line.index('allow_held_slot (true only'), line.index(sentence))
+        self.assertLess(line.index(sentence), line.index('KEY is your own Idempotency-Key'))
+        # The example's own reason keeps that rule, and the long-text rule it points to comes before the section.
+        self.assertNotIn("'", EXAMPLE['reason'])
+        guide = self.coordinator()['guide']
+        self.assertLess(guide.index('Long text, such as a task description'), guide.index(HEADING))
+
+    def test_the_key_rule_is_the_servers_pattern(self):
+        # Review N1: the words name what http_service.IDEMPOTENCY_KEY takes; each claim is probed against it.
+        line = self.field_line()
+        self.assertIn("KEY is your own Idempotency-Key for this one assignment: 8 to 128 letters, digits, '.', '_', "
+                      "':' or '-', starting with a letter or digit.", line)
+        key = http_service.IDEMPOTENCY_KEY
+        for good in ('a' * 8, '7' * 128, 'Ab.c_d:e-f'):
+            self.assertRegex(good, key)
+        for bad in ('a' * 7, 'a' * 129, '-abcdefgh', '.abcdefgh', 'abcdefg/h', 'abcdefg h', 'abcdefg~h'):
+            self.assertNotRegex(bad, key)
+
+    def test_the_roster_names_its_pages(self):
+        # Optional clause of the review: the roster comes in pages of DEFAULT_PAGE with next_cursor.
+        section = '\n'.join(section_of(self.coordinator()['guide']))
+        found = re.search(r'(\d+) to a page: while next_cursor is not null, read the next page with \?cursor=NEXT_CURSOR\.', section)
+        self.assertIsNotNone(found, section)
+        self.assertEqual(http_service.DEFAULT_PAGE, int(found.group(1)))
+
 class LongTextTests(unittest.TestCase):
     """Part 2: long text goes in a file, in every agent's AGENT.md."""
 
@@ -228,7 +266,7 @@ class LongTextTests(unittest.TestCase):
             paragraph = self.paragraph(role)
             self.assertEqual(1, self.guides()[role]['guide'].count(paragraph), role)
             self.assertIn('never inside one long command line', paragraph)
-            self.assertIn('--data-binary @FILE', paragraph)
+            self.assertIn("--data-binary '@FILE'", paragraph)
             self.assertIn('upload it as a task file', paragraph)
         self.assertIn('## You coordinate', self.guides()['coordinator']['guide'])
         self.assertNotIn('## You coordinate', self.guides()['worker']['guide'])
@@ -250,6 +288,13 @@ class LongTextTests(unittest.TestCase):
         for role in ('worker', 'coordinator'):
             self.assertEqual(LONG_TEXT_PINNED, self.paragraph(role), role)
             self.assertEqual(LONG_TEXT_PINNED, self.guides()[role]['rule'])
+
+    def test_the_file_form_is_quoted_for_powershell(self):
+        # Review N3: in PowerShell a bare leading @ is the splat operator; '@FILE' works on both systems.
+        for role in ('worker', 'coordinator'):
+            paragraph = self.paragraph(role)
+            self.assertIn("--data-binary '@FILE'", paragraph, role)
+            self.assertIsNone(re.search(r"(?<!')@FILE", paragraph), role)
 
 
 def only_own_tests(cls):

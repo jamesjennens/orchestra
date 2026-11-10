@@ -58,7 +58,7 @@ globalThis.window = {
 };
 
 const { createApi } = await import(apiUrl);
-const { setupWizardPage, WIZARD_STORAGE_KEY, clearWizardStorage } = await import(agentsUrl);
+const { setupWizardPage, WIZARD_STORAGE_KEY, clearWizardStorage, list: agentsList } = await import(agentsUrl);
 const setupText = await import(new URL('../agentSetup.js', agentsUrl).href);
 const { SESSION_IDLE_WARNING_EVENT } = await import(apiUrl);
 const { toast } = await import(domUrl);
@@ -578,6 +578,51 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
   && promptText.includes(setupText.PASTED_SECRET_RULE)
   && promptText.split('\n').filter((line) => line.startsWith('5. ') && line.includes(setupText.PASTED_SECRET_RULE)).length === 1
   && /do not use it and do not save it: say that it is now exposed and ask your owner to issue a new one/.test(setupText.PASTED_SECRET_RULE);
+// ---- kittrial-5bb.550 r2 (review S2): the proxy line names the host this page uses, on the create path too ----
+// The server's create answer carries a configured public address (setup.config.server_url) that differs from
+// location.origin; the Bridge is given location.origin, so the line must name its host, with macOS chosen.
+{
+  for (const open of openDialogs()) await open.close();
+  store.clear();
+  const PUBLIC = 'https://orchestra.public.example';
+  const createdAgent = { id: 'agent_9', name: 'Heron', owner: 'u1', projects: [], working_directory: '/home/olive/heron', scopes: ['read', 'tasks'], scopes_source: 'stored', credentials: [] };
+  const answer = { agent: createdAgent, credential: { id: 'cred_9', secret: SECRET }, setup: { config: { agent_id: 'agent_9', name: 'Heron', server_url: PUBLIC, projects: [] } } };
+  const overrides = {
+    agents: async () => ({ items: [], total: 0, next_cursor: null }),
+    accounts: async () => ({ items: [] }),
+    agentHistory: async () => ({ items: [] }),
+    createAgent: async () => answer,
+    agentCertificate: async () => null,
+    agent: async () => createdAgent,
+  };
+  const stubApi = new Proxy(api, { get: (target, key) => (key in overrides ? overrides[key] : target[key]) });
+  const originalQueryAll = Element.prototype.querySelectorAll;
+  Element.prototype.querySelectorAll = function (selector) {
+    if (selector === 'input[name=project]:checked') return this.all((e) => e.tagName === 'INPUT' && e.getAttribute('name') === 'project' && e.checked);
+    return originalQueryAll.call(this, selector);
+  };
+  const page = await agentsList({ ...ctx, api: stubApi, projects: [], render() {}, refreshProjects: async () => {} });
+  await new Promise((r) => setTimeout(r, 50));
+  page.querySelector('#a-name').value = 'Heron';
+  await page.all((e) => e.tagName === 'FORM' && e.querySelector('#a-name'))[0].dispatch('submit');
+  await new Promise((r) => setTimeout(r, 300));
+  Element.prototype.querySelectorAll = originalQueryAll;
+  const wizards = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+  d = wizards[wizards.length - 1];
+  d.wizard.show('system');
+  await windowsChoice(d, 'setup-os', 'macos').dispatch('change');
+  await windowsChoice(d, 'setup-bridge', 'yes').dispatch('change');
+  d.wizard.show('vscode');
+  const line = noProxyLine(d);
+  // The precondition: the wizard's own payload for this answer does carry the configured public address.
+  out.noProxyLineNamesThisPagesHostOnCreateWithAConfiguredAddress = setupText.secretlessPayload(answer, location.origin).server === PUBLIC
+    && wizards.length === 1 && line.length === 1
+    && line[0].textContent.startsWith('If this computer uses a proxy, first add 127.0.0.1 to VS Code\'s Http: No Proxy setting (')
+    && !line[0].textContent.includes('orchestra.public.example');
+  for (const open of openDialogs()) await open.close();
+  store.clear();
+}
+
 for (const open of openDialogs()) await open.close();
 
 console.log(JSON.stringify(out));
