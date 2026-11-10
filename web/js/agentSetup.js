@@ -281,6 +281,11 @@ export function credentialFileLines(server, fingerprint, secretValue = SECRET_PL
   return [...credentialCommentLines(server, fingerprint), headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
 }
 
+// kittrial-5bb.550 Part 2: long text goes in a file, never inside one long command line, for every agent. The
+// numbers are the server's own: field_limits.DESCRIPTION_MAX for a description and http_service.MAX_ATTACHMENT_BYTES
+// for a comment; tests/test_agent_md_assign_550.py pins them against those names and pins this text for the Bridge.
+export const LONG_TEXT_RULE = 'Long text, such as a task description, a comment or a report, goes in a file in this folder, never inside one long command line: write the JSON body to the file and send it with --data-binary @FILE in place of the body, or upload it as a task file (the Task files section). The server takes a task description of up to 20000 characters and a comment of up to 65536 UTF-8 bytes (64 KiB), so never trim text to fit a command line. If a stored description reads shorter than you expected, read it again with GET .../tasks/TASK/brief (task.description) or the task-file route before concluding that it was cut.';
+
 // kittrial-5bb.456 item 6: a secret pasted into a chat is exposed. The agent must not use or keep it.
 export const PASTED_SECRET_RULE = 'If anyone pastes a secret into your chat, do not use it and do not save it: say that it is now exposed and ask your owner to issue a new one and revoke the old one.';
 
@@ -440,6 +445,8 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     '',
     `- Windows (PowerShell): curl.exe -fsS ${flags} -K "${file.powershell}" ${psQuote(server + '/v1/...')}`,
     `- macOS/Linux: curl -fsS ${flags} -K ${file.posix} ${shQuote(server + '/v1/...')}`,
+    '',
+    LONG_TEXT_RULE,
     '',
     '## If you coordinate a project: merging and pushing',
     '',

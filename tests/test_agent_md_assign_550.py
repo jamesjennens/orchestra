@@ -9,7 +9,10 @@ real endpoint and a real bd, as tests/test_claim_held.RealStackTests runs it; th
 AGENT.md, which is not in this repository, follows that pin.
 """
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -17,6 +20,8 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import field_limits
+import http_service
 import task_assignment
 import test_bd_label_aliases as rb
 import test_claim_held as held_stack
@@ -64,6 +69,12 @@ If the server refuses:
 '''
 
 REFUSAL_LINE = re.compile(r'^- (\d{3}) "([^"]+)": .+$')
+#: Part 2: the long-text paragraph of "## Every call", word for word, for the Bridge's copy. Its numbers are checked
+#: against field_limits.DESCRIPTION_MAX and http_service.MAX_ATTACHMENT_BYTES, never written here as expectations.
+LONG_TEXT_PINNED = 'Long text, such as a task description, a comment or a report, goes in a file in this folder, never inside one long command line: write the JSON body to the file and send it with --data-binary @FILE in place of the body, or upload it as a task file (the Task files section). The server takes a task description of up to 20000 characters and a comment of up to 65536 UTF-8 bytes (64 KiB), so never trim text to fit a command line. If a stored description reads shorter than you expected, read it again with GET .../tasks/TASK/brief (task.description) or the task-file route before concluding that it was cut.'
+DESCRIPTION_LIMIT = re.compile(r'a task description of up to (\d+) characters')
+COMMENT_LIMIT = re.compile(r'a comment of up to (\d+) UTF-8 bytes')
+
 WINDOWS = re.compile(r"^- Windows \(PowerShell\): '(\{.*\})' \| curl\.exe .* -X POST .* --data-binary '@-' '(\S+)'$")
 POSIX = re.compile(r"^- macOS/Linux: printf '%s' '(\{.*\})' \| curl .* -X POST .* --data-binary @- '(\S+)'$")
 
@@ -187,6 +198,60 @@ class AgentMdTests(unittest.TestCase):
         self.assertIn('POST .../tasks/TASK/assign to hand a task to a worker (see ## Assigning a task); ', steps[5])
 
 
+class LongTextTests(unittest.TestCase):
+    """Part 2: long text goes in a file, in every agent's AGENT.md."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.both = None
+
+    def guides(self):
+        if self.both is None:
+            type(self).both = {role: node_json(self, (
+                "const p = m.secretlessPayload(%s, %r);"
+                "console.log(JSON.stringify({guide: m.agentGuide(p), rule: m.LONG_TEXT_RULE}))")
+                % (BUNDLE % coordinates, SERVER))
+                for role, coordinates in (('worker', '[]'), ('coordinator', "[{ project: 'alpha', effective: true }]"))}
+        return self.both
+
+    def paragraph(self, role):
+        guide = self.guides()[role]['guide']
+        lines = guide.split('\n')
+        start = lines.index('## Every call')
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith('## '))
+        found = [line for line in lines[start:end] if line.startswith('Long text, ')]
+        self.assertEqual(1, len(found), 'one long-text paragraph in "## Every call" of the %s AGENT.md' % role)
+        return found[0]
+
+    def test_the_paragraph_is_in_both_the_workers_and_the_coordinators_agent_md_once(self):
+        for role in ('worker', 'coordinator'):
+            paragraph = self.paragraph(role)
+            self.assertEqual(1, self.guides()[role]['guide'].count(paragraph), role)
+            self.assertIn('never inside one long command line', paragraph)
+            self.assertIn('--data-binary @FILE', paragraph)
+            self.assertIn('upload it as a task file', paragraph)
+        self.assertIn('## You coordinate', self.guides()['coordinator']['guide'])
+        self.assertNotIn('## You coordinate', self.guides()['worker']['guide'])
+
+    def test_the_numbers_are_the_servers_own(self):
+        paragraph = self.paragraph('worker')
+        self.assertEqual(field_limits.DESCRIPTION_MAX, int(DESCRIPTION_LIMIT.search(paragraph).group(1)))
+        self.assertEqual(http_service.MAX_ATTACHMENT_BYTES, int(COMMENT_LIMIT.search(paragraph).group(1)))
+        self.assertIn('so never trim text to fit a command line', paragraph)
+
+    def test_the_reread_sentence_names_the_brief_route(self):
+        paragraph = self.paragraph('coordinator')
+        sentence = [s for s in paragraph.split('. ') if s.startswith('If a stored description reads shorter than you expected')]
+        self.assertEqual(1, len(sentence), paragraph)
+        self.assertIn('read it again with GET .../tasks/TASK/brief (task.description)', sentence[0])
+        self.assertIn('before concluding that it was cut', sentence[0])
+
+    def test_the_pinned_paragraph(self):
+        for role in ('worker', 'coordinator'):
+            self.assertEqual(LONG_TEXT_PINNED, self.paragraph(role), role)
+            self.assertEqual(LONG_TEXT_PINNED, self.guides()[role]['rule'])
+
+
 def only_own_tests(cls):
     """The fixtures are TestCases with tests of their own; this class runs only its own."""
     for base in (rb.RealBdLabelAliasTests, held_stack.RealStackTests):
@@ -260,6 +325,36 @@ class RealRouteTests(held_stack.RealStackTests):
         again = self.assign(body, key='assign-550-example-00000001')
         self.assertEqual(200, again.status, again.data)
         self.assertEqual(answer.data['notice']['sha256'], again.data['notice']['sha256'])
+
+    def test_h_a_long_description_sent_from_a_file_reads_back_whole_through_the_brief(self):
+        """Part 2's advice, done: a 5000-character description in a JSON body file, sent with curl -K CONF
+        --data-binary @FILE as the granted agent, then read back through GET .../brief."""
+        curl = shutil.which('curl')
+        if not curl:
+            self.skipTest('curl is not installed')
+        folder = Path(self.tmp) / 'long-text'
+        folder.mkdir()
+        text = ''.join('Line %04d of the login form description: fields, validation and the error states.\n' % n
+                       for n in range(1, 200))[:5000]
+        self.assertEqual(5000, len(text))
+        self.assertLessEqual(len(text), field_limits.DESCRIPTION_MAX)
+        body = folder / 'create.json'
+        body.write_text(json.dumps({'title': 'the login form, described', 'description': text}), encoding='utf-8')
+        # The credential file of the paragraph's -K: the test agent's own secret, in the test's folder only.
+        conf = folder / 'agent.curlrc'
+        conf.write_text('header = "Authorization: Bearer %s"\n' % self.secret, encoding='utf-8')
+        url = 'http://127.0.0.1:%d/v1/projects/pp/tasks' % self.port
+        made = subprocess.run([curl, '-fsS', '--noproxy', '127.0.0.1', '--max-time', '60', '-K', str(conf), '-X', 'POST',
+                               '-H', 'Content-Type: application/json', '-H', 'Idempotency-Key: long-text-550-00000001',
+                               '--data-binary', '@' + str(body), url],
+                              capture_output=True, text=True, timeout=120, env=dict(os.environ, HOME=str(folder)))
+        self.assertEqual(0, made.returncode, made.stderr)
+        created = json.loads(made.stdout)
+        task = created['id']
+        brief = self.request('GET', '%s/%s/brief' % (self.tasks, task), token=self.secret)
+        self.assertEqual(200, brief.status, brief.data)
+        self.assertEqual(text, brief.data['task']['description'], 'the whole description, as sent')
+        self.assertEqual(5000, len(brief.data['task']['description']))
 
     def test_e_each_refusal_line_quotes_the_real_answer(self):
         body = self.body()
