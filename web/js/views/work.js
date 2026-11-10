@@ -36,11 +36,16 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
 
 // What waits on the reader is ui.js's waitsOnReader (kittrial-5bb.525 slice b r2; shared with Tasks since (c) r2).
 
-// Who may take an owner step in a project: an owner or coordinator there (the project list's role),
-// or anyone the server put a row of that project in `to_review` for (it does so only with approve rights).
+// Who may take an owner step on a row (kittrial-5bb.525 r3, FIXP: the party rule). A review or integration
+// step counts only when the server listed THAT row in this reader's to_review: the server applies the party
+// rule there (an author or assignee of the reader's own party is left out), and a project role does not.
+// Other owner steps (closing an integrated task, accepting a requirement) are not in to_review; for them an
+// owner or coordinator of the project, as the project list says, is the one who acts.
+const REVIEW_STEPS = new Set(['awaiting-review', 'legacy-review-ready', 'approved', 'awaiting-integration']);
 function approverIn(ctx, data) {
-  const reviewing = new Set(data.to_review.map((t) => t.project_id));
-  return (pid) => reviewing.has(pid) || ['owner', 'coordinator', 'superuser'].includes(((ctx.projects || []).find((p) => p.id === pid) || {}).role);
+  const listed = new Set(data.to_review.map((t) => t.project_id + '/' + t.id));
+  const role = (pid) => ['owner', 'coordinator', 'superuser'].includes(((ctx.projects || []).find((p) => p.id === pid) || {}).role);
+  return (t) => (REVIEW_STEPS.has(t.review_state) ? listed.has(t.project_id + '/' + t.id) : role(t.project_id));
 }
 
 // The header's key: the distinct tasks (project and id) that wait on the reader, across the lists

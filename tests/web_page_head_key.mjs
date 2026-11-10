@@ -69,9 +69,14 @@ const FIXTURE_ROWS = {
   // a requirement waiting for acceptance, and a requirement record that only says where it is edited
   a5: row('alpha', 'a5', { assignee: 'usr_owen', review_state: 'none', requirement_record: true, requirement_state: 'awaiting-acceptance', next_action: { who: 'owner', text: "Requirement waiting for acceptance: accept it on the project's Requirements page" } }),
   a6: row('alpha', 'a6', { assignee: 'usr_owen', review_state: 'none', requirement_record: true, requirement_state: 'draft', next_action: { who: 'owner', text: "Requirement record: edit it on the project's Requirements page" } }),
+  // r3 (FIXP): the reader's own delivery in Alpha, which the reader owns, that the server LEFT OUT of to_review
+  // (the party rule: an approval by the reader's own party would be refused). It is only in assigned.
+  a7: row('alpha', 'a7', { assignee: 'usr_owen', review_state: 'awaiting-review', waiting_since: ago(60), next_action: { who: 'owner', text: 'Review the delivered contribution' } }),
+  // r3 (FIXA): an epic assigned to the reader; its step reads "Deliver a contribution", but an epic is not work
+  a8: row('alpha', 'a8', { assignee: 'usr_owen', issue_type: 'epic', review_state: 'none', updated_at: ago(70), next_action: { who: 'assignee', text: 'Deliver a contribution' } }),
 };
 const F = FIXTURE_ROWS;
-const fixture = (extra) => ({ assigned: [F.a1, F.b1, F.b2, F.b3, F.a5, F.a6], to_review: [F.a1, F.a2, F.a3], agents: [], agent_prompts: [], ...extra });
+const fixture = (extra) => ({ assigned: [F.a1, F.b1, F.b2, F.b3, F.a5, F.a6, F.a7, F.a8], to_review: [F.a1, F.a2, F.a3], agents: [], agent_prompts: [], ...extra });
 const owen = { ...ctx, me: { id: 'usr_owen', display_name: 'Owen' },
   projects: [{ id: 'alpha', name: 'Alpha', role: 'owner' }, { id: 'beta', name: 'Beta', role: 'contributor' }] };
 {
@@ -212,6 +217,9 @@ const ROWS = [
   { id: 'r_held', assignee: 'usr_sam', assignee_name: 'Sam Ito', review_state: 'held', next_action: step('coordinator', 'Release the integration hold or record a corrected verification') },
   // a held integration with no assignee: only the held state keeps it from looking like work to assign
   { id: 'r_held_open', review_state: 'held', next_action: step('coordinator', 'Release the integration hold or record a corrected verification') },
+  // r3 (FIXA): an epic and a decision under assigned claiming, which the server gives the coordinator step
+  { id: 'r_epic_assign', issue_type: 'epic', review_state: 'none', next_action: step('coordinator', "Only the project's coordinators assign work here; nothing is assigned to you yet.") },
+  { id: 'r_decision_assign', labels: ['decision'], review_state: 'none', next_action: step('coordinator', "Only the project's coordinators assign work here; nothing is assigned to you yet.") },
   { id: 'r_assign', review_state: 'none', next_action: step('coordinator', "Only the project's coordinators assign work here; nothing is assigned to you yet.") },
   { id: 'r_mine', assignee: 'usr_cara', assignee_name: 'Cara Diaz', review_state: 'none', next_action: step('assignee', 'Deliver a contribution') },
   { id: 'r_back', assignee: 'usr_cara', assignee_name: 'Cara Diaz', review_state: 'changes-requested', next_action: step('assignee', 'Address the requested changes') },
@@ -256,6 +264,19 @@ for (const [label, reader] of Object.entries(READERS)) {
   const failing = await agents.list({ ...ctx, api: { ...api, agents: async () => { throw failure(); } } });
   await settle();
   out.agentsBusy = { during, after, afterFailure: busy(failing) };
+}
+
+// r3: one item, under each filter's word (the service would say total 1)
+{
+  const one = { ...api, tasks: async () => ({ items: [{ id: 'only', project_id: PID, title: 'only', status: 'open', review_state: 'none', next_action: { who: 'anyone', text: 'Claim this task' } }], total: 1, next_cursor: null }) };
+  const page = await project.overview({ ...ctx, api: one }, { pid: PID });
+  await settle();
+  const words = { open: header(page).key.label };
+  await pressed(page, 'Closed').dispatch('click'); await settle(); words.closed = header(page).key.label;
+  await pressed(page, 'All').dispatch('click'); await settle(); words.all = header(page).key.label;
+  const review = page.all((e) => e.tagName === 'SELECT' && e.attributes.id === 'review-filter')[0];
+  review.value = 'approved'; await review.dispatch('change'); await settle(); words.matching = header(page).key.label;
+  out.oneItem = words;
 }
 
 console.log(JSON.stringify(out));

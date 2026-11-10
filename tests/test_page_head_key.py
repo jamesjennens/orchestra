@@ -63,6 +63,9 @@ class PageHeadKey(unittest.TestCase):
     #   a3  sam's approved work in Alpha: waits (integrate)
     #   a5  a requirement in Alpha waiting for acceptance: waits (accept)
     #   a6  a requirement record in Alpha that only says where it is edited: waits on no one
+    #   a7  the reader's own delivery in Alpha, awaiting review, that the server did NOT list in to_review (the
+    #       party rule: an approval by the reader's own party would be refused): waits on no one here (r3, FIXP)
+    #   a8  an epic assigned to the reader: its step says "Deliver", but an epic is not work (r3, FIXA)
     # So 6 rows wait: a1, b2, b3, a2, a3, a5. The oldest review among them is a2 (48 hours).
     MY_WORK_WAITING = 6
 
@@ -73,6 +76,9 @@ class PageHeadKey(unittest.TestCase):
         self.assertIn('a1', data['fixture']['assigned'])
         self.assertIn('a1', data['fixture']['to_review'])
         self.assertIn('b1', data['fixture']['assigned'])
+        self.assertIn('a7', data['fixture']['assigned'])
+        self.assertNotIn('a7', data['fixture']['to_review'])
+        self.assertIn('a8', data['fixture']['assigned'])
         self.assertKey(head['key'], str(self.MY_WORK_WAITING), 'wait on you', 'my-work:distinct-next-step-is-yours')
         self.assertTrue(head['actions'], 'My work must offer its next action')
         first = head['actions'][0]
@@ -92,7 +98,7 @@ class PageHeadKey(unittest.TestCase):
         # The fixture must hold more open tasks than one page, or this test could not tell the two apart.
         self.assertNotEqual(expected['active'], str(expected['activeRows']))
         self.assertKey(head['key'], expected['active'], 'open items', 'page.total')
-        self.assertKey(data['afterClosed'], expected['closed'], 'closed items', 'page.total')
+        self.assertKey(data['afterClosed'], expected['closed'], 'closed item' if expected['closed'] == '1' else 'closed items', 'page.total')
         # the tab names the project again: 'Tasks · <project>' (app.js reads data-tab-title)
         self.assertEqual('Tasks · Customer portal', head['tabTitle'])
         self.assertEqual([('New task', True)], [(a['text'], a['primary']) for a in head['actions']])
@@ -105,7 +111,7 @@ class PageHeadKey(unittest.TestCase):
         # the reviewer's ME1: the failed list offers Try again (else it stays failed)
         self.assertTrue(data['failed']['retry'], 'the failed Tasks read offers no Try again')
         # Try again reads Closed and shows its count
-        self.assertKey(data['retried'], data['expected']['closed'], 'closed items', 'page.total')
+        self.assertKey(data['retried'], data['expected']['closed'], 'closed item' if data['expected']['closed'] == '1' else 'closed items', 'page.total')
 
     def test_aria_busy_is_on_the_region_being_loaded(self):
         # e r2: the agents' region is busy while read, the loading message is not; neither stays busy after
@@ -113,6 +119,11 @@ class PageHeadKey(unittest.TestCase):
         self.assertEqual({'host': 'true', 'status': [None], 'loading': 1}, data['during'])
         self.assertEqual({'host': None, 'status': [], 'loading': 0}, data['after'])
         self.assertEqual({'host': None, 'status': [], 'loading': 0}, data['afterFailure'])
+
+    def test_one_item_reads_in_the_singular(self):
+        # r3: "1 open item", "1 closed item", "1 item in all", "1 matching item"
+        self.assertEqual({'open': 'open item', 'closed': 'closed item', 'all': 'item in all', 'matching': 'matching item'},
+                         observed(self)['oneItem'])
 
     def test_tasks_drops_an_answer_that_lands_out_of_order(self):
         data = observed(self)['tasksOutOfOrder']
@@ -139,6 +150,8 @@ class PageHeadKey(unittest.TestCase):
     #   r_held    a held integration: released on the coordination host only -> never marked here
     #   r_held_open a held integration with no assignee: still released on the coordination host only, so
     #             never marked here (only its held state tells it apart from work to assign)
+    #   r_epic_assign / r_decision_assign  an epic, and a decision (label 'decision'), under assigned claiming: the
+    #             server gives them the coordinator's step, but they are records, not work -> No one (r3, FIXA)
     #   r_assign  unassigned under assigned claiming: an owner or coordinator assigns -> You for the owner
     #             and the coordinator; An owner or coordinator for the contributor
     #   r_mine    cara's task to deliver -> You for cara; her name for the others
@@ -157,6 +170,8 @@ class PageHeadKey(unittest.TestCase):
         'r_reqacc': (('You', True),     ('You', True),     (OWNER_STEP, False)),
         'r_held':   (('A coordinator, on the coordination host', False),) * 3,
         'r_held_open': (('A coordinator, on the coordination host', False),) * 3,
+        'r_epic_assign': (('No one', False),) * 3,
+        'r_decision_assign': (('No one', False),) * 3,
         'r_assign': (('You', True),     ('You', True),     (OWNER_STEP, False)),
         'r_mine':   ((CARA, False),     (CARA, False),     ('You', True)),
         'r_back':   ((CARA, False),     (CARA, False),     ('You', True)),

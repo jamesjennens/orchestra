@@ -1,5 +1,5 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
-import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId, ownerStepAsks } from '../ui.js';
+import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId, ownerStepAsks, isDescriptive } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { proposeSection } from './proposals.js';
 export { proposeSection } from './proposals.js';
@@ -49,6 +49,8 @@ async function load(ctx, pid) {
 export function waitsOnYou(ctx, project, t) {
   const who = t.next_action && t.next_action.who;
   if (!who || t.status === 'closed') return false;
+  // an epic, a decision, a gate, a job, an event, a merge slot: never the reader's step (r3, FIXA)
+  if (isDescriptive(t)) return false;
   if (who === 'coordinator') return t.review_state !== 'held' && !t.assignee && canApprove(project);
   if (who === 'owner' && !ownerStepAsks(t)) return false;
   if (who === 'owner') return canApprove(project);
@@ -69,7 +71,8 @@ export function whoActsNext(ctx, project, t) {
   const step = t.next_action;
   const mine = waitsOnYou(ctx, project, t);
   let name;
-  if (!step) name = null;
+  if (isDescriptive(t)) name = 'No one';       // whatever its next step says (r3, FIXA)
+  else if (!step) name = null;
   else if (mine) name = 'You';
   else if (step.who === 'assignee') name = t.assignee_name || t.assignee || 'The assignee';
   else if (step.who === 'anyone') name = 'Anyone';
@@ -83,9 +86,10 @@ export function whoActsNext(ctx, project, t) {
 // What the Tasks key counts, in the words of the filter it was read with.
 // "items", not "tasks": the server's total counts requirement records too, which this list hides
 // by default (kittrial-5bb.525 r2; a server total of tasks alone is a follow-up).
-function tasksKeyLabel(state) {
-  if (state.q || state.review) return 'matching items';
-  return state.status === 'active' ? 'open items' : state.status === 'closed' ? 'closed items' : 'items in all';
+function tasksKeyLabel(state, n) {
+  const item = n === 1 ? 'item' : 'items';   // "1 open item", "2 open items" (r3)
+  if (state.q || state.review) return 'matching ' + item;
+  return state.status === 'active' ? 'open ' + item : state.status === 'closed' ? 'closed ' + item : item + ' in all';
 }
 
 function crumbs(ctx, project, extra) {
@@ -604,7 +608,7 @@ export async function overview(ctx, { pid }) {
     const allRows = page.items;
     // The header's key (kittrial-5bb.525 slice b): the server's total for the list as filtered
     // (page.total), never the rows on this page. No total, no number.
-    setPageKey(head, typeof page.total === 'number' ? { num: page.total, label: tasksKeyLabel(state), source: 'page.total' } : null);
+    setPageKey(head, typeof page.total === 'number' ? { num: page.total, label: tasksKeyLabel(state, page.total), source: 'page.total' } : null);
     // Requirement records are marked by the server and, unless the filter asks for them,
     // left out of the task view (kittrial-5bb.277). The count is kept so the page can say
     // that rows were left out instead of reading as if the tracker held no work at all.

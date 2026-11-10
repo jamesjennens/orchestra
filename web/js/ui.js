@@ -95,10 +95,22 @@ export function pageHead({ crumbs, title, lede, actions, key, tabTitle }) {
 const OWNER_ACTS = new Set(['awaiting-review', 'legacy-review-ready', 'approved', 'awaiting-integration', 'integrated']);
 export function waitsOnReader(ctx, t, approvesIn) {
   const step = t && t.next_action;
-  if (!step || t.status === 'closed') return false;
+  if (!step || t.status === 'closed' || isDescriptive(t)) return false;
   if (step.who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
-  if (step.who !== 'owner' || !approvesIn(t.project_id)) return false;
+  // approvesIn is asked about the ROW (kittrial-5bb.525 r3, FIXP): My work answers from the server's own
+  // to_review list for review and integration steps, which carries the party rule.
+  if (step.who !== 'owner' || !approvesIn(t)) return false;
   return ownerStepAsks(t);
+}
+
+// A row of a descriptive type says what it is and waits on no one, whatever its next step says
+// (kittrial-5bb.525 r3, FIXA): work.py:19's CLAIMABLE_EXCLUDED_TYPES, and the two labels that count the
+// same way, DECISION_LABEL ('decision') and MERGE_SLOT_LABEL ('gt:slot'). Tasks and My work both use it.
+const DESCRIPTIVE_TYPES = new Set(['epic', 'decision', 'gate', 'job', 'event', 'merge-slot']);
+const DESCRIPTIVE_LABELS = new Set(['decision', 'gt:slot']);
+export function isDescriptive(t) {
+  return DESCRIPTIVE_TYPES.has(String((t && t.issue_type) || 'task'))
+    || (Array.isArray(t && t.labels) && t.labels.some((label) => DESCRIPTIVE_LABELS.has(label)));
 }
 
 // An owner step that asks someone to act (review, integrate, close an integrated task, accept a
