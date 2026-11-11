@@ -303,7 +303,7 @@ d = await openWizard();
 d.wizard.show('system');   // it resumed the stored screen; the choices are on the first one
 await windowsChoice(d, 'setup-bridge', 'no').dispatch('change');
 out.longPathWithoutCertificateRestricts = JSON.stringify(d.wizard.plan()) === JSON.stringify(
-  ['system', 'role', 'secret', 'restrict', 'test', 'files', 'vscode', 'resume']);
+  ['system', 'role', 'secret', 'restrict', 'rewrite', 'test', 'files', 'vscode', 'resume']);
 await windowsChoice(d, 'setup-os', 'windows').dispatch('change');
 await windowsChoice(d, 'setup-bridge', 'yes').dispatch('change');
 out.shortPathOnWindowsHasNoChmod = !d.wizard.plan().includes('restrict');
@@ -447,6 +447,28 @@ out.bridgeRoutePreselected = windowsChoice(d, 'setup-bridge', 'yes').checked ===
 await windowsChoice(d, 'setup-bridge', 'none').dispatch('change');
 out.noBridgePlanHasNoVsCodeScreen = !d.wizard.plan().includes('vscode') && d.wizard.plan().at(-1) === 'resume';
 out.noBridgeRouteStoredWithoutASecret = JSON.parse(store.get(WIZARD_STORAGE_KEY)).runs === 'none';
+out.noBridgeChoiceExplainsWatch = attr(d, 'data-no-bridge-watch', 'true')[0].hidden === false;
+d.wizard.show('files');
+out.noBridgeSavedGuideHasWatch = d.textContent.includes('## Waiting for work (without Orchestra Bridge)')
+  && d.textContent.includes('Never end the turn idle without a watch running');
+d.wizard.show('system');
+const proxyChoice = attr(d, 'data-noproxy-choice', 'true')[0];
+out.proxyChoiceIsOffByDefault = proxyChoice.checked !== true;
+proxyChoice.checked = true;
+await proxyChoice.dispatch('change');
+out.proxyChoiceStoredWithoutSecret = JSON.parse(store.get(WIZARD_STORAGE_KEY)).noproxy === true
+  && !store.get(WIZARD_STORAGE_KEY).includes(SECRET);
+d.wizard.show('rewrite');
+out.proxyChoiceReachesRewrite = commandText(d, 'rewrite command').includes('noproxy = "127.0.0.1"');
+d.wizard.show('system');
+const proxyOff = attr(d, 'data-noproxy-choice', 'true')[0];
+proxyOff.checked = false;
+await proxyOff.dispatch('change');
+d.wizard.show('rewrite');
+out.proxyOffStillOffersCleanup = !commandText(d, 'rewrite command').includes('noproxy = "127.0.0.1"')
+  && commandText(d, 'rewrite command').includes('noproxy');
+d.wizard.show('system');
+
 out.noBridgeWalkSkipsVsCode = !(await walk(d)).includes('vscode');
 out.noBridgeResumeSaysPasteIntoTheChat = /Paste this into the agent’s chat/.test(shownText(d)) && /never the secret/.test(shownText(d));
 out.olderRouteStillHasVsCode = setupText.screenPlan({ bridge: false, os: 'windows', vscode: true }).includes('vscode');

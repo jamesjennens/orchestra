@@ -98,11 +98,12 @@ export function certificateCurlLines(certFile, { windows = false } = {}) {
 // line, and AGENT.md stays `-K FILE` only), then the header line. The paths here are the
 // Notepad body: the person types their own full path (see certificateCurlLines); the rewrite
 // command writes the expanded path on their machine.
-export function credentialFileBody(secretValue, certFile, { windows = false, hasCertificate = false } = {}) {
+export function credentialFileBody(secretValue, certFile, { windows = false, hasCertificate = false, noproxy = false, server = null } = {}) {
   const lines = [];
   if (hasCertificate && certFile) {
     lines.push(...certificateCurlLines(certFile, { windows }));
   }
+  if (noproxy) lines.push(noproxyLine(server));
   lines.push(headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue));
   return lines.join('\n') + '\n';
 }
@@ -152,18 +153,19 @@ export function credentialCommentLines(server, fingerprint) {
 // 01a12488, item 4). If the credential file is a symlink, the move replaces the symlink with a
 // regular file and the old target keeps its own content (review 01a12488, item 3).
 const CREDENTIAL_MANAGED_PATTERN =
-  "'(^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*=)|(^[[:space:]]*cacert[[:space:]]*=)|(^[[:space:]]*ssl-no-revoke[[:space:]]*$)'";
+  "'(^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*=)|(^[[:space:]]*cacert[[:space:]]*=)|(^[[:space:]]*(--)?noproxy([[:space:]=:]|$))|(^[[:space:]]*ssl-no-revoke[[:space:]]*$)'";
 const POWERSHELL_MANAGED_PATTERN =
-  "'(?m)^([ \\t]*#[ \\t]*server([ \\t]+certificate[ \\t]+sha256)?[ \\t]*=[^\\r\\n]*\\r?\\n?|[ \\t]*cacert[ \\t]*=[^\\r\\n]*\\r?\\n?|[ \\t]*ssl-no-revoke[ \\t]*\\r?\\n?)'";
+  "'(?m)^([ \\t]*#[ \\t]*server([ \\t]+certificate[ \\t]+sha256)?[ \\t]*=[^\\r\\n]*\\r?\\n?|[ \\t]*(--)?noproxy(?:[ \\t=:][^\\r\\n]*)?\\r?$\\n?|[ \\t]*cacert[ \\t]*=[^\\r\\n]*\\r?\\n?|[ \\t]*ssl-no-revoke[ \\t]*\\r?\\n?)'";
 
 function powershellLiteral(text) {
   return text.replace(/`/g, '``').replace(/\$/g, '`$').replace(/"/g, '`"');
 }
 
-export function credentialFileCommand(file, comments, { certFile = null, hasCertificate = false } = {}) {
+export function credentialFileCommand(file, comments, { certFile = null, hasCertificate = false, noproxy = false, server = null } = {}) {
   // POSIX rewrite: managed lines as printf arguments. `cacert = $HOME/...` is written so the
   // shell expands $HOME; curl does not expand ~ or $HOME inside a config file.
   const posixManaged = comments.slice();
+  if (noproxy) posixManaged.push(noproxyLine(server));
   if (hasCertificate && certFile) {
     posixManaged.push(`cacert = $HOME/${certFile.name}`);
   }
@@ -176,6 +178,7 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
   // (kittrial-5bb.275 rev3). ssl-no-revoke is included as a safe option for Windows curl.exe
   // (not claimed as required once cacert names the real file).
   const psParts = comments.map((line) => psQuote(line) + ' + "`r`n"');
+  if (noproxy) psParts.push(psQuote(noproxyLine(server)) + ' + "`r`n"');
   if (hasCertificate && certFile) {
     // Emits: "cacert = `"" + ([Environment]::GetFolderPath('UserProfile') -replace '\\','/') + "/NAME.crt`"`r`n"
     // The string must CLOSE after the escaped quote: `" is the quote character inside the
@@ -252,6 +255,11 @@ export function serverHost(server) {
   try { host = new URL(String(server)).hostname.replace(/^\[(.*)\]$/, '$1'); } catch { host = ''; }
   return /^[A-Za-z0-9._:-]+$/.test(host) ? host : 'localhost';
 }
+// A managed curl-config option is opt-in and must never fall back to a different host.
+export function noproxyLine(server) {
+  if (serverUrlProblem(server)) throw new Error('A valid server address is required for proxy bypass');
+  return `noproxy = "${serverHost(server)}"`;
+}
 export function curlFlags(server, maxTime = CURL_MAX_TIME) {
   return `--noproxy ${serverHost(server)} --max-time ${maxTime}`;
 }
@@ -277,8 +285,8 @@ export function testCommands(payload) {
 // Orchestra Bridge 0.14's Set up proposes the server and checks the fingerprint itself, so the
 // short path needs no rewrite command (kittrial-5bb.348). `secretValue` is the fresh secret, passed
 // in by the one screen that shows it; every other caller gets the placeholder.
-export function credentialFileLines(server, fingerprint, secretValue = SECRET_PLACEHOLDER) {
-  return [...credentialCommentLines(server, fingerprint), headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
+export function credentialFileLines(server, fingerprint, secretValue = SECRET_PLACEHOLDER, { noproxy = false } = {}) {
+  return [...credentialCommentLines(server, fingerprint), ...(noproxy ? [noproxyLine(server)] : []), headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
 }
 
 // kittrial-5bb.456 item 6: a secret pasted into a chat is exposed. The agent must not use or keep it.
@@ -298,11 +306,11 @@ export function runsFromStored(stored) {
   if (stored && RUNS_IN.includes(stored.runs)) return stored.runs;
   return stored && stored.bridge === false ? 'older' : 'bridge';
 }
-export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false, vscode = true } = {}) {
+export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false, vscode = true, noproxy = false } = {}) {
   const posix = osKind(os) === 'posix';
   if (bridge) return ['system', 'role', 'secret', ...(posix ? ['restrict'] : []), 'vscode', 'resume'];
   return ['system', 'role', ...(hasCertificate ? ['cert-save', 'cert-move'] : []), 'secret',
-    ...(hasCertificate ? ['rewrite'] : (posix ? ['restrict'] : [])), 'test', 'files', ...(vscode ? ['vscode'] : []), 'resume'];
+    ...(posix && !hasCertificate && !noproxy ? ['restrict'] : []), 'rewrite', 'test', 'files', ...(vscode ? ['vscode'] : []), 'resume'];
 }
 
 // Browsers strip the leading dot when saving .orchestra-agent-<slug>.crt into Downloads
@@ -413,7 +421,50 @@ export function agentJson(payload) {
   return JSON.stringify({ server_url: payload.server, agent_id: payload.agentId, projects: payload.projects, name: payload.name }, null, 2) + '\n';
 }
 
-export function agentGuide(payload, { hasCertificate = false } = {}) {
+// A no-Bridge worker needs a tool-tracked watch, not a detached shell daemon.
+export function workerWaitLoop(server, file) {
+  const url = server + '/v1/agents/me/wait';
+  const flags = curlFlags(server, AGENT_CURL_MAX_TIME);
+  const ps = `& { $since='FINGERPRINT'; while ($true) { Start-Sleep -Seconds 60; $raw = & curl.exe -fsS ${flags} -K "${file.powershell}" --get --data-urlencode "since=$since" ${psQuote(url)}; if ($LASTEXITCODE -ne 0) { throw 'Orchestra watch failed: reconcile the error before restarting.' }; $v = $raw | ConvertFrom-Json -ErrorAction Stop; if ($v.form -ne 'worker' -or $v.fingerprint -notmatch '^wait1:[a-f0-9]{64}$' -or $v.changed -isnot [bool]) { throw 'Unexpected Orchestra wait response' }; if ($v.changed) { $raw; break }; $since=$v.fingerprint } }`;
+  const py = `import json, re, subprocess, time\nsince = "FINGERPRINT"\nwhile True:\n    time.sleep(60)\n    raw = subprocess.check_output(["curl", "-fsS", ${flags.split(' ').map(x => JSON.stringify(x)).join(', ')}, "-K", ${JSON.stringify(file.posix)}, "--get", "--data-urlencode", "since=" + since, ${JSON.stringify(url)}], text=True)\n    view = json.loads(raw)\n    if view.get("form") != "worker" or not re.fullmatch(r"wait1:[a-f0-9]{64}", view.get("fingerprint", "")) or type(view.get("changed")) is not bool:\n        raise ValueError("Unexpected Orchestra wait response")\n    if view["changed"]:\n        print(raw)\n        break\n    since = view["fingerprint"]`;
+  // Expand only the credential path on the agent's own machine, never its content.
+  const posix = `python3 -c ${shQuote(py.replace(JSON.stringify(file.posix), 'str(__import__("pathlib").Path(' + JSON.stringify(file.posix) + ').expanduser())'))}`;
+  return [
+    '', '## Waiting for work (without Orchestra Bridge)', '',
+    'When the checkpoint says then stop, stop working on that task; keep this watch for the coordinator’s answer or another assignment. Never end the turn idle without a watch running that your tool will notify you about when it completes.',
+    `First read GET ${url} with curl -K. Reconcile /v1/agents/me/next and any items before waiting; take FINGERPRINT from that last handled reply. Do not replace it with a new baseline when starting the watch: a change between the read and the watch must wake you.`,
+    'Run ONE command below as a BACKGROUND task tracked by your agent tool, with FINGERPRINT replaced. It reads every 60 seconds and exits when changed is true, returning the reply so the tool invokes you again. Do not use nohup, a detached daemon, or a shell that returns without tracking completion. If your tool cannot notify completion, keep the command in the foreground. A failed command also needs your attention; do not leave a failed watch as though it were running.',
+    '- Windows (PowerShell): ' + ps,
+    '- macOS/Linux (requires python3 and curl; if absent, use an available JSON parser with the same checks): ' + posix,
+    'On completion, read /v1/agents/me/next and the task’s newest history, act on your move, then restart with the last handled fingerprint. On 401/403, malformed JSON, or another error, reconcile it; never treat an error as unchanged. Orchestra Bridge already watches for its own worker windows; do not run this extra watch in those windows.', '',
+  ];
+}
+
+export function integrationExample(server) {
+  const scope = { source_commit: '1'.repeat(40), integration_commit: '2'.repeat(40), release_id: '', environment: '' };
+  const evidence = ['https://example.org/reviews/REVIEW'];
+  return [
+    '', '### Worked integration without a release', '',
+    'Replace PROJECT, TASK, BRANCH, the example commits, evidence pointers, and EXPECTED_SCOPE_TOKEN with the actual integration-check/lifecycle read. The source is the approved commit; the integration commit is the merge commit you actually push. Use null for expected_scope_token only when the read says no scope exists; otherwise use its current token. All bodies below are JSON, sent with curl -K, Content-Type: application/json, and a different stable Idempotency-Key for each write. Reuse the same key and exact body after an uncertain answer.',
+    `1. GET ${server}/v1/projects/PROJECT/tasks/TASK/integration-check?target=BRANCH; stop on refusal.`,
+    `2. POST ${server}/v1/projects/PROJECT/merge-slot`,
+    '~~~json', JSON.stringify({ task_id: 'TASK', target: 'BRANCH' }), '~~~',
+    '3. Fetch, check out BRANCH and merge the approved source commit as a merge commit. Run the project’s tests and retain their actual evidence. Push that merge with your own repository-scoped credential. Stop if any step fails; record tested evidence as tested, not integrated.',
+    `4. GET ${server}/v1/projects/PROJECT/tasks/TASK/lifecycle for the current scope_token. POST ${server}/v1/projects/PROJECT/tasks/TASK/lifecycle/scope`,
+    '~~~json', JSON.stringify({ scope, expected_scope_token: 'EXPECTED_SCOPE_TOKEN', evidence, provenance: 'performed' }), '~~~',
+    'Save the returned scope_token; subsequent facts carry the identical four-field scope object, not that token as an extra body field. Empty release_id and environment mean this is plain integration, with no release.',
+    `5. POST ${server}/v1/projects/PROJECT/tasks/TASK/lifecycle/facts/reviewed`,
+    '~~~json', JSON.stringify({ value: 'passed', scope, evidence, provenance: 'performed' }), '~~~',
+    'Only record performed review when you actually performed it and the current independent approval permits integration. When recording someone else’s review use provenance reported and point to their review; do not claim their work as your own.',
+    `6. POST ${server}/v1/projects/PROJECT/tasks/TASK/lifecycle/facts/integrated`,
+    '~~~json', JSON.stringify({ value: 'passed', scope, evidence: ['https://example.org/commits/MERGE'], provenance: 'performed' }), '~~~',
+    'Inspect the result and integration-check ledger; a timeout is not proof of success. Resume the first uncommitted step with its existing identity.',
+    `7. After committed integration, POST ${server}/v1/projects/PROJECT/merge-slot/release`,
+    '~~~json', '{}', '~~~', '',
+  ];
+}
+
+export function agentGuide(payload, { hasCertificate = false, bridge = true } = {}) {
   const file = payload.secretFile;
   const server = payload.server;
   // kittrial-5bb.348: the agent's own calls bypass a command-line proxy for this server only and stop
@@ -448,6 +499,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     `- Run the project's tests in that checkout and record the result as tested evidence, not as integrated.`,
     `- Push the target branch with YOUR OWN repository-scoped credential. Never use the server's credential, the Orchestra secret, or a credential that belongs to the server or another person. The server records the integration as your word; the push itself is not checked.`,
     `- Record the scope with source_commit = the approved commit and integration_commit = the merge commit you pushed, then reviewed=passed and integrated=passed, with ONE stable Idempotency-Key per step. Reuse that exact key and body after an uncertain answer (503 or 124); never mint a new identity for the same intent. Then release the merge slot.`,
+    ...(coordinating(payload) ? integrationExample(server) : []),
     `- Resume from the first ledger row that is not committed. Read the ledger with GET ${server}/v1/projects/PROJECT/tasks/TASK/integration-check (its next rows) or the HTTP client's ledger command. A committed row's fact is the native event id, or the mark sha256 for the integrated mark: report it to your owner in the delivery comment.`,
     `- What stays a person's step: the repository-scoped credential and the decision that you may push with it; the approval unless a granted agent already holds it; the decision when an unchecked row (base membership, tests, pushed result) says the server cannot know; a forced release of a slot; and every void, revert and reconciliation.`,
     '',
@@ -481,6 +533,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     ...runSteps(server, file),
     troubleStep(6, payload, file),
     '7. Stop and ask your owner if anything is unclear.',
+    ...(!bridge ? workerWaitLoop(server, file) : []),
     ]),
     '',
     `The whole order, for every kind of worker, is the kit's document "How work is found": GET ${server}/v1/docs/finding-work`,
@@ -623,6 +676,7 @@ export function coordinatorWaitLoop(server, file) {
 // What an agent does at every run, in its own words: the order of the kit's document "How work is
 // found" (docs/FINDING_WORK.md) for an agent with a web credential. tests/test_finding_work.py pins
 // this order to the order GET /v1/agents/me/next gives.
+export const WAITING_ON_SENTENCE = ' When you finish work that has no git delivery (a document, an analysis, a checked answer), or you need the coordinator\'s answer, record a checkpoint with lane_state waiting_on coordinator (the Bridge tool orchestra_checkpoint takes waiting_on: coordinator), then stop; a task with a git delivery is still delivered with a contribution.';
 export const RUN_ORDER = ['guidance', 'own-tasks', 'ready-list', 'held', 'checkpoint'];
 export function runSteps(server, file) {
   const flags = curlFlags(server, AGENT_CURL_MAX_TIME);
@@ -631,7 +685,7 @@ export function runSteps(server, file) {
     `2. Your own tasks: GET ${server}/v1/agents/me/next, for example curl.exe -fsS ${flags} -K "${file.powershell}" ${psQuote(server + '/v1/agents/me/next')}. The reply lists your own tasks first: review requests to address, then a task you left blocked, then one in progress. Act on the first. Blocked and in-progress tasks flag newer activity since your checkpoint. Before you act, read the linked task brief and its newer summary; read its history for full comments (the same address ending in /history). Unknown coverage needs reconciliation; reading acknowledges nothing. A path on someone else's machine is not reachable: do not search for it; ask in the task for the content or a repository path. When you need a decision or information, ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you.`,
     '3. Only when none of your own tasks needs action: the tasks the same reply says you could claim. Claim exactly one that nobody holds, and work on that one until it is delivered.',
     '4. A task assigned to somebody else is held, and so is one somebody else claimed: leave it. A parent or coordination task is background for a task you picked, not an inbox: nothing is posted there for you.',
-    '5. Record a checkpoint when you stop, with what you need to continue, and deliver work for review through the API, always with curl -K as above. If an answer is needed before you can proceed, record an open item of kind blocker, not only a question. Only blockers and dependencies mark undelivered work as blocked; delivered work follows its review state.',
+    '5. Record a checkpoint when you stop, with what you need to continue, and deliver work for review through the API, always with curl -K as above. If an answer is needed before you can proceed, record an open item of kind blocker, not only a question. Only blockers and dependencies mark undelivered work as blocked; delivered work follows its review state.' + WAITING_ON_SENTENCE,
   ];
 }
 
@@ -653,13 +707,13 @@ export function resumePrompt(name, workingDirectory = null) {
 // review 01a12408, item 2). `role` names what this window does (the extension's worker or
 // reviewer) so the person picks the same there; `certificate` is the route's answer
 // (GET /v1/service/certificate) or null when the service has none (plain http, the tunnel).
-export function setupPrompt(payload, { role = 'worker', certificate = null, bridgeServer = null } = {}) {
+export function setupPrompt(payload, { role = 'worker', certificate = null, bridgeServer = null, bridge = true, noproxy = false } = {}) {
   const fingerprint = (certificate && certificate.sha256) || null;
   const hasCertificate = Boolean(fingerprint);
   const address = bridgeServer || payload.server;
   const comments = credentialCommentLines(address, fingerprint);
   const command = credentialFileCommand(payload.secretFile, comments,
-    { certFile: payload.certificateFile, hasCertificate });
+    { certFile: payload.certificateFile, hasCertificate, noproxy, server: address });
   // kittrial-5bb.387: an agent with an effective coordinator grant is set up as the extension's
   // coordinator (its role since 0.13.0); nothing is written as the agent's server-side role.
   const roleWord = coordinating(payload) ? 'coordinator' : BRIDGE_ROLES.includes(role) ? role : 'worker';
@@ -677,7 +731,7 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
     '~~~',
     `3. Create ${GUIDE_PATH} with exactly this content:`,
     '~~~markdown',
-    agentGuide(payload, { hasCertificate }).trimEnd(),
+    agentGuide(payload, { hasCertificate, bridge }).trimEnd(),
     '~~~',
     `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file in this folder.`,
     `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing. ${PASTED_SECRET_RULE}`,

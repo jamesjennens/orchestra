@@ -734,6 +734,7 @@ function writeWizardStorage(state) {
       runs: state.runs,
       os: state.os,
       role: state.role || 'worker',
+      noproxy: state.noproxy === true,
     }));
   } catch { /* ignore storage errors */ }
 }
@@ -775,7 +776,7 @@ const SCREEN_TITLES = Object.freeze({
   'cert-move': 'Move the certificate',
   secret: 'Save your secret',
   restrict: 'Restrict the file',
-  rewrite: 'Add the certificate path',
+  rewrite: 'Update the credential options',
   test: 'Test it',
   files: 'Save the agent’s files',
   vscode: 'Set up in VS Code',
@@ -840,11 +841,11 @@ function secretNotice(justCreated) {
       'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Members & settings page first.') : null);
 }
 
-function secretLinesBlock(payload, secretValue, os) {
+function secretLinesBlock(payload, secretValue, os, noproxy = false) {
   const meta = PAYLOAD_META.get(payload) || {};
   const address = meta.bridgeServer || payload.server;
   const fingerprint = (meta.certificate && meta.certificate.sha256) || null;
-  const lines = setupText.credentialFileLines(address, fingerprint, secretValue);
+  const lines = setupText.credentialFileLines(address, fingerprint, secretValue, { noproxy });
   const file = setupText.osSecretFile(payload.secretFile, os);
   const posix = setupText.osKind(os) === 'posix';
   return h('div', { class: 'stack', 'data-secret-lines': 'true' },
@@ -894,7 +895,7 @@ function issueBlock(ctx, agent, payload, wizard) {
 function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
   const payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
-  const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate })]];
+  const files = () => [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate, bridge: state.bridge })]];
   const folder = payload.workingDirectory;
   // The address the extension must use is the one this page is connected to, not the configured
   // public address, which may be a name that does not resolve from this person's network.
@@ -907,6 +908,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     os: (same && same.os) || setupText.detectOs(),
     runs: setupText.runsFromStored(same),
     bridge: setupText.runsFromStored(same) === 'bridge',
+    noproxy: Boolean(same && same.noproxy),
     role: (same && setupText.BRIDGE_ROLES.includes(same.role) && same.role) || (agent.role === 'reviewer' ? 'reviewer' : 'worker'),
     screen: 'system',
     stepStartedAt: Date.now(),
@@ -918,8 +920,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     issued,
   };
   if (!setupText.OS_CHOICES.some(([v]) => v === state.os)) state.os = 'windows';
-  const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
-  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate });
+  const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.bridge, noproxy: state.noproxy });
+  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate, noproxy: state.noproxy });
   if (state.secretValue) {
     // A fresh secret exists only while this dialog is open: open where it is saved (Back reaches the
     // system and role screens), never two clicks away from it.
@@ -984,6 +986,10 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       h('div', { class: 'copy-row', 'data-bridge-choice': 'true' },
         ...RUNS_CHOICES.map(([value, runs, label]) => choice('setup-bridge', value, label, state.runs === runs, () => {
           state.runs = runs; state.bridge = runs === 'bridge'; persist(); showProgress(); }))),
+      h('label', { class: 'small' }, h('input', { type: 'checkbox', 'data-noproxy-choice': 'true', checked: state.noproxy,
+        onchange: (event) => { state.noproxy = event.target.checked; persist(); showProgress(); } }),
+      ' Bypass a command-line proxy for this Orchestra server only (optional).'),
+      h('p', { class: 'small', 'data-no-bridge-watch': 'true', hidden: state.runs !== 'none' }, 'Without the Bridge, keep the background watch in AGENT.md running to receive work.'),
       setupText.osKind(state.os) === 'windows'
         ? h('p', { class: 'small muted', 'data-windows-policy': 'true' }, 'On Windows, if VS Code terminals hang or the agent gets no command output, see “Windows: VS Code terminals hang or show no output” in docs/ONBOARDING.md.')
         : null,
@@ -1023,7 +1029,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     secret: () => [
       state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,
       state.secretValue
-        ? secretLinesBlock(payload, state.secretValue, state.os)
+        ? secretLinesBlock(payload, state.secretValue, state.os, state.noproxy)
         : issueBlock(ctx, agent, payload, wizard),
       state.issued ? more(h('p', { class: 'small', 'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ') },
         'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.')) : null,
@@ -1036,13 +1042,13 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     rewrite: () => {
       const meta = PAYLOAD_META.get(payload) || {};
       const comments = setupText.credentialCommentLines(meta.bridgeServer || payload.server, (certificate && certificate.sha256) || null);
-      const rewrite = setupText.credentialFileCommand(payload.secretFile, comments, { certFile: payload.certificateFile, hasCertificate });
+      const rewrite = setupText.credentialFileCommand(payload.secretFile, comments, { certFile: payload.certificateFile, hasCertificate, noproxy: state.noproxy, server: meta.bridgeServer || payload.server });
       const posix = setupText.osKind(state.os) === 'posix';
       return [
-        h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It writes the certificate’s full path into the file, so that curl accepts the server.`),
+        h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It rewrites the managed options in your credential file for the choices you made.`),
         commandLine(posix ? rewrite.posix : rewrite.powershell, 'rewrite command'),
         more(h('p', { class: 'small muted' }, 'It rewrites only that one file, in place, and prints nothing; the secret stays where it is. Running it twice leaves the same content. If you cannot run it, type your own full path instead of <your-name>:'),
-          h('pre', { class: 'json' }, setupText.credentialFileBody(null, payload.certificateFile, { windows: !posix, hasCertificate: true }).trimEnd())),
+          h('pre', { class: 'json' }, setupText.credentialFileBody(null, payload.certificateFile, { windows: !posix, hasCertificate, noproxy: state.noproxy, server: meta.bridgeServer || payload.server }).trimEnd())),
       ];
     },
     test: () => {
@@ -1061,9 +1067,9 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       h('p', { class: 'small' }, 'Pick the agent’s folder. Two small files are written there; neither holds the secret.'),
       saveFilesRow(),
       more(h('p', { class: 'small muted' }, 'It writes .orchestra/agent.json and .orchestra/AGENT.md and adds .orchestra/ to an existing .gitignore. Or paste this prompt into the agent’s own chat, opened in its folder; it does the same and puts the server address into your credential file:'),
-        h('div', { class: 'copy-row' }, copyButton(SETUP_PROMPT_LABEL, () => setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer }), { what: 'Setup prompt' })),
-        fileBlock(setupText.CONFIG_PATH, files[0][1], folder, setupText.CONFIG_PATH),
-        fileBlock(setupText.GUIDE_PATH, files[1][1], folder, setupText.GUIDE_PATH)),
+        h('div', { class: 'copy-row' }, copyButton(SETUP_PROMPT_LABEL, () => setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.bridge, noproxy: state.noproxy }), { what: 'Setup prompt' })),
+        fileBlock(setupText.CONFIG_PATH, files()[0][1], folder, setupText.CONFIG_PATH),
+        fileBlock(setupText.GUIDE_PATH, files()[1][1], folder, setupText.GUIDE_PATH)),
     ],
     vscode: () => [
       h('p', { class: 'small' }, folder ? 'Open this folder in VS Code (File > Open Folder), then run the command below (' : 'Open the agent’s folder in VS Code (File > Open Folder), then run the command below (',
@@ -1101,7 +1107,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       wizard.clearError();
       button.disabled = true;
       try {
-        const result = await saveSetupFiles(files);
+        const result = await saveSetupFiles(files());
         if (!result.cancelled) {
           saveStatus.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.`;
           saveStatus.hidden = false;
@@ -1132,7 +1138,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   // ---- moving between screens ----------------------------------------------------------------
   function persist() {
     touchKeepAlive();
-    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, os: state.os, role: state.role });
+    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, os: state.os, role: state.role, noproxy: state.noproxy });
   }
 
   // The badge counts the screens of the chosen path; the heading below it is the screen's one title
@@ -1141,6 +1147,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   function showProgress() {
     const list = plan();
     progress.textContent = `Step ${list.indexOf(state.screen) + 1} of ${list.length}`;
+    const watchHint = [...screenNode.querySelectorAll('p')].find((p) => p.getAttribute('data-no-bridge-watch') === 'true');
+    if (watchHint) watchHint.hidden = state.runs !== 'none';
   }
 
   function render() {
