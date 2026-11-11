@@ -77,6 +77,13 @@ def node_json(test, script):
     return json.loads(out.stdout)
 
 
+def _coordinator_run_steps(guide):
+    """The daily steps have their own section; integration examples are numbered too."""
+    section = guide.split('\n## Steps\n', 1)[1].split('\n## ', 1)[0]
+    return [line for line in section.split('\n')
+            if line and line.split('.', 1)[0].isdigit()]
+
+
 BUNDLE = "{ agent: { id: 'agent_7', name: 'kestrel', owner_display_name: 'Olive', projects: ['alpha', 'beta'], coordinates: %s }, setup: {} }"
 
 
@@ -114,7 +121,7 @@ class CoordinatorGuideTests(unittest.TestCase):
         self.assertIn('## You coordinate', guide)
         self.assertIn('You hold the coordinator grant for alpha, beta. You handle what waits on the coordinator; workers do the tasks.', guide)
         self.assertNotIn('Claim exactly one', got['guide'])
-        steps = [line for line in guide if line and line.split('.', 1)[0].isdigit()]
+        steps = _coordinator_run_steps(got['guide'])
         self.assertEqual(got['steps'], steps[:len(got['steps'])])
         self.assertTrue(steps[0].startswith('1. On your first run and after a set-up change (not at every run)'))
         self.assertIn('## Your first check', steps[0])
@@ -170,7 +177,7 @@ class CoordinatorGuideTests(unittest.TestCase):
 
     def test_coordinator_step_numbers_include_the_reference_step_and_trouble_step(self):
         got = self.guides("[{ project: 'alpha', effective: true }]")
-        steps = [line for line in got['guide'].split('\n') if line and line.split('.', 1)[0].isdigit()]
+        steps = _coordinator_run_steps(got['guide'])
         self.assertTrue(steps[0].startswith('1. On your first run'))
         self.assertTrue(steps[1].startswith('2. Read GET https://office.example:7443/v1/projects/PROJECT/guidance first.'))
         self.assertTrue(steps[8].startswith('9. Approve, not recommend:'))
