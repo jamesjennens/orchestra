@@ -989,6 +989,7 @@ def main():
             answer['stderr'] = 'ValueError: %s\n' % error
             answer['review_status'] = 409
             answer['review_id'] = error.review_id
+            answer['review_answered'] = bool(getattr(error, 'answered', False))
         import actor_names                    # a local import elsewhere in main() shadows the module name
         if isinstance(error, actor_names.TrackerUnreadable):
             # As endpoint.main does: an export that could not be read is a host fault the

@@ -3768,6 +3768,20 @@ line separately and unconfined.
   carries `needs_respond` and stays open across revisions until a `respond` resolves
   it. Requests recorded in older disposable state, without that flag, keep the old
   rule (the next revision resolves them).
+  While the task's latest delivery has a blocking `request-changes` not yet settled by an
+  un-invalidated `approve`, a `withdraw`, or full requester item resolution (`resolve-item`), a
+  new `contribute` through `POST /v1/projects/{id}/tasks/{task}/reviews` that repeats the same
+  commit SHA (case-folded) is refused with HTTP `409` (`error.code: "conflict"`, structured
+  `error.detail: {"review_id": "<id>"}`; canonical exception `code:
+  "same-commit-changes-requested"`, CLI exit status `2` and endpoint keys `review_status: 409`,
+  `review_id`, `review_answered`) on both the endpoint and in-process backends (kittrial-5bb.556).
+  While any blocking item is open, `error.message` is `this commit was already reviewed and
+  changes were requested; answer the review with respond, or deliver a new commit (review <id>)`;
+  once every blocking item is answered with `respond` and awaits re-review, `error.message` is
+  `this commit was already reviewed and its requested changes were answered; wait for the
+  reviewer to review it again, or deliver a new commit (review <id>)`. An exact `operation_id`
+  retry of the original `contribute` (or a repeat with the same `Idempotency-Key`) still
+  reconciles (`201`, `reconciled: true`) on both backends without duplicating the contribution.
 - **Account lookup residual risk.** `GET /v1/accounts/lookup` answers exact usernames
   for a project administrator. With the in-process backend any account may create a
   project and so become one; with the endpoint backend only a superuser registers projects

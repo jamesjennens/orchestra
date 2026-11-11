@@ -781,6 +781,26 @@ The first line is the human refusal; the second is the same structured error as 
 
 The returned values are an identifier and a state label, not the chain content. Re-read `review TASK` before deciding, then resubmit with a new operation ID and `previous` set to the returned `latest_comment_id`. The field saves one round trip; it never replaces reading.
 
+## Same commit while requested changes are active (kittrial-5bb.556)
+
+When a task's latest delivery has a blocking `request-changes` that has not yet been settled by an un-invalidated `approve`, a `withdraw` (`withdrawn` or `superseded`), or the requester resolving/downgrading every blocking item with `resolve-item`, a new `contribute` naming the same commit SHA (case-folded) is refused before any native write, even if `base_commit`, `delivery`, `repository` or `summary` differs.
+
+While any blocking item of that delivery's reviews is still open, the refusal sentence is:
+
+```text
+this commit was already reviewed and changes were requested; answer the review with respond, or deliver a new commit (review <id>)
+```
+
+Once every blocking item has been answered with `respond` (so the delivery awaits re-review and is not yet settled), the refusal sentence is:
+
+```text
+this commit was already reviewed and its requested changes were answered; wait for the reviewer to review it again, or deliver a new commit (review <id>)
+```
+
+- **CLI / SSH endpoint**: prints `ValueError: <sentence>` on stderr, writes nothing and exits with status `2`. The structured exception (`SameCommitChangesRequested`) carries `detail` with `code` `"same-commit-changes-requested"`, `http_status` `409`, `task`, `review_id`, `commit` and `answered`, and the endpoint envelope adds `review_status: 409`, `review_id: "<id>"` and `review_answered` (`false` or `true`).
+- **HTTP (`POST /v1/projects/{id}/tasks/{task}/reviews`)**: returns HTTP status `409` (`error.code` `"conflict"`) with `error.message` set to the same sentence and `error.detail` `{"review_id": "<id>"}` on both the endpoint and disposable in-process backends, writing nothing.
+- **Exact retries**: an exact `operation_id` retry of the original `contribute` (or a repeat with the same `Idempotency-Key`) still reconciles (`201`, `reconciled: true`) instead of hitting this `409`.
+
 ## Discover current work
 
 ```sh

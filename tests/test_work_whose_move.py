@@ -54,7 +54,8 @@ class ReviewMoveTests(unittest.TestCase):
         item = owned(data)['items'][0]
         self.assertEqual((item['review_state'], item['whose_move']), ('changes-requested', 'you'))
         for said in ('This is your work now', '1 outstanding review item', '`review %s`' % TASK,
-                     'a revision that supersedes this contribution', 'respond to each item'):
+                     'respond to each item; where an item needs a code change, deliver a new commit '
+                     'that supersedes this contribution; the same commit is refused'):
             with self.subTest(said=said):
                 self.assertIn(said, item['next'])
 
@@ -264,7 +265,7 @@ class CheckpointWaitReconciliationTests(unittest.TestCase):
         self.assertEqual((item['review_state'], item['whose_move']), ('changes-requested', 'you'))
         self.assertIn('respond to each item', item['next'])
         self.assertIn('has already been delivered', item['next'])
-        self.assertNotIn('deliver a revision that supersedes', item['next'])
+        self.assertNotIn('deliver a new commit that supersedes', item['next'])
         self.assertEqual(work.queue(data, 'alice/session', ['--mine'])['your_move']['count'], 1)
 
     def test_an_open_item_on_the_current_contribution_beside_older_ones_is_not_a_redelivery(self):
@@ -282,7 +283,8 @@ class CheckpointWaitReconciliationTests(unittest.TestCase):
         item = owned(data)['items'][0]
         self.assertEqual((item['review_state'], item['whose_move']), ('changes-requested', 'you'))
         self.assertFalse(item['redelivered'])
-        self.assertIn('deliver a revision that supersedes', item['next'])
+        self.assertIn('respond to each item; where an item needs a code change, deliver a new commit '
+                      'that supersedes this contribution; the same commit is refused', item['next'])
         self.assertNotIn('has already been delivered', item['next'])
 
 
@@ -334,7 +336,9 @@ class ServedRuleTests(unittest.TestCase):
             text = ' '.join((KIT / name).read_text(encoding='utf-8').split())
             lower = text.lower()
             with self.subTest(text=name):
-                self.assertIn('is your work until you deliver a revision', text)
+                self.assertIn('is your work (respond to each item; where an item needs a code change, '
+                              'deliver a new commit that supersedes this contribution; the same commit '
+                              'is refused)', text)
                 self.assertIn('never applies', lower)
                 self.assertIn('nothing changed', lower)
                 self.assertIn('reviewer or the coordinator', text)

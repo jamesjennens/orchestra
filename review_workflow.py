@@ -1441,9 +1441,15 @@ SAME_COMMIT_REFUSAL_SENTENCE = (
     'answer the review with respond, or deliver a new commit'
 )
 
+SAME_COMMIT_ANSWERED_REFUSAL_SENTENCE = (
+    'this commit was already reviewed and its requested changes were answered; '
+    'wait for the reviewer to review it again, or deliver a new commit'
+)
 
-def same_commit_refusal_message(review_id):
-    return '%s (review %s)' % (SAME_COMMIT_REFUSAL_SENTENCE, review_id)
+
+def same_commit_refusal_message(review_id, answered=False):
+    sentence = SAME_COMMIT_ANSWERED_REFUSAL_SENTENCE if answered else SAME_COMMIT_REFUSAL_SENTENCE
+    return '%s (review %s)' % (sentence, review_id)
 
 
 class SameCommitChangesRequested(ValueError):
@@ -1452,13 +1458,15 @@ class SameCommitChangesRequested(ValueError):
     code = 'same-commit-changes-requested'
     http_status = 409
 
-    def __init__(self, task, review_id, commit):
+    def __init__(self, task, review_id, commit, answered=False):
         self.task = task
         self.review_id = review_id
         self.commit = commit
+        self.answered = bool(answered)
         self.detail = {'code': self.code, 'http_status': self.http_status,
-                       'task': task, 'review_id': review_id, 'commit': commit}
-        super().__init__(same_commit_refusal_message(review_id))
+                       'task': task, 'review_id': review_id, 'commit': commit,
+                       'answered': self.answered}
+        super().__init__(same_commit_refusal_message(review_id, answered=self.answered))
 
 
 class StaleReviewPrevious(ValueError):
@@ -2627,17 +2635,17 @@ def _approval_invalidated_by_void(approval_id, voids, positions):
     return False
 
 
-def active_changes_requested_review_id(ordered, state, voids=None, positions=None):
-    """Return the ``request-changes`` comment id blocking a same-commit ``contribute``, or ``None``.
+def active_changes_requested_review(ordered, state, voids=None, positions=None):
+    """Return ``(review_id, answered)`` blocking a same-commit ``contribute``, or ``(None, False)``.
 
     Reads only review records on ``state['contribution']`` (the task's latest delivery).
-    A ``respond`` answers items without superseding the review; ``approve``, ``withdraw``
-    (rejection/withdrawal), or the requester resolving/downgrading every blocking item
-    supersedes or retracts it.
+    A ``respond`` answers items without superseding the review (``answered=True`` once no
+    blocking item remains ``open``); ``approve``, ``withdraw`` (rejection/withdrawal), or
+    the requester resolving/downgrading every blocking item supersedes or retracts it.
     """
     latest = state.get('contribution')
     if latest is None or state.get('withdrawal') is not None:
-        return None
+        return None, False
     current_id = latest['comment_id']
     after_latest = False
     blocking = {}
@@ -2665,11 +2673,16 @@ def active_changes_requested_review_id(ordered, state, voids=None, positions=Non
                 blocking.clear()
     open_ids = [req_id for (req_id, _), status in blocking.items() if status == 'open']
     if open_ids:
-        return open_ids[-1]
+        return open_ids[-1], False
     responded_ids = [req_id for (req_id, _), status in blocking.items() if status == 'responded']
     if responded_ids:
-        return responded_ids[-1]
-    return None
+        return responded_ids[-1], True
+    return None, False
+
+
+def active_changes_requested_review_id(ordered, state, voids=None, positions=None):
+    """Return the ``request-changes`` comment id blocking a same-commit ``contribute``, or ``None``."""
+    return active_changes_requested_review(ordered, state, voids, positions)[0]
 
 
 def project(issue, operators=None, journal=None, reverts=None, invalid_reverts=None):
@@ -3297,9 +3310,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
                          assignee=issue.get('assignee'))
     if payload['operation'] == 'contribute' and state.get('contribution') is not None:
         if payload['commit'].lower() == state['contribution']['commit'].lower():
-            blocking_review = active_changes_requested_review_id(ordered, state, voids, positions)
+            blocking_review, review_answered = active_changes_requested_review(ordered, state, voids, positions)
             if blocking_review is not None:
-                raise SameCommitChangesRequested(task, blocking_review, payload['commit'])
+                raise SameCommitChangesRequested(
+                    task, blocking_review, payload['commit'], answered=review_answered
+                )
     # A follow-on may only base itself on a prior revision approved by a distinct
     # native author and genuinely integrated. Resolve the approving record from the
     # chain and the integration evidence from the shared review-state projection

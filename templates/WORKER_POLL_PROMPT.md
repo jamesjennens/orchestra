@@ -24,10 +24,10 @@ Each run, in this order:
 2. Resume your saved actor (session resume), then run wait; act on what it returns; run wait again. Review requests and newer comments on your own tasks come before anything else.
 3. Only if none of your own tasks needs action: ready --json, and claim exactly one task nobody holds (update TASK --claim --json). A task assigned to somebody else is held. A parent or coordination task is background, not an inbox.
 Before claiming: fetch and push the project's repository with code-host git access (ssh -T git@github.com, ssh -T git@bitbucket.org, ssh -T git@gitlab.com, ssh -T git@<office-host>; git ls-remote <repository URL>), not the Orchestra server; without it, record a checkpoint and claim nothing.
-4. Before you stop, write what you need to continue into the task's checkpoint (checkpoint TASK --file FILE), and declare the wait state beside it in the same payload's lane_state key (state; waiting_on, a role or an actor id; optional expect_by) at claim, at every checkpoint and when a wait begins.
+4. Before you stop, checkpoint what you need to continue (checkpoint TASK --file FILE) with lane_state (state; waiting_on role or actor; optional expect_by) at claim, checkpoint and wait.
 
-A task of yours with changes requested is your work until you deliver a revision: "nothing changed" never applies to it. Otherwise, if nothing changed since your last run, say so in one line and stop; stop without acting only when every task of yours is with the reviewer or the coordinator.
-If you are waiting for a person, say so in a blocked checkpoint on the task and tell that person in one line at every run.
+A task of yours with changes requested is your work (respond to each item; where an item needs a code change, deliver a new commit that supersedes this contribution; the same commit is refused): "nothing changed" never applies to it. Otherwise, if nothing changed since your last run, say so in one line and stop; stop without acting only when every task of yours is with the reviewer or the coordinator.
+If waiting for a person, say so in a blocked checkpoint on the task and tell them in one line at every run.
 Never edit this prompt and never add status to it. The rules are served: docs start, docs finding-work, docs reviews, docs briefings.
 Run again every REPLACE_INTERVAL.
 ```

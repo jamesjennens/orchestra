@@ -161,8 +161,9 @@ class ServedTextTests(unittest.TestCase):
                 self.assertIn('Never edit this prompt and never add status to it.', prompt)
                 # kittrial-5bb.249: "nothing changed" is scoped, never a stop rule for a
                 # task of the worker's own with changes requested.
-                self.assertIn('A task of yours with changes requested is your work until you deliver a revision: '
-                              '"nothing changed" never applies to it.', prompt)
+                self.assertIn('A task of yours with changes requested is your work (respond to each item; where an '
+                              'item needs a code change, deliver a new commit that supersedes this contribution; '
+                              'the same commit is refused): "nothing changed" never applies to it.', prompt)
                 self.assertIn('stop without acting only when every task of yours is with the reviewer or the '
                               'coordinator.', prompt)
                 self.assertNotIn('If nothing changed since your last run, say so in one line and stop.', prompt)

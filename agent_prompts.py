@@ -309,7 +309,8 @@ def _recommended(item):
 
 #: class -> (heading, line builder, waiting-since field)
 CLASSES = [
-    ('changes', 'Changes requested on your tasks: address every pending item, then deliver a new revision',
+    ('changes', 'Changes requested on your tasks: respond to each item; where an item needs a code change, '
+                'deliver a new commit that supersedes this contribution; the same commit is refused',
      lambda i: 'state changes-requested; %s; %s' % (_requests(i), _revision(i)), 'waiting_since'),
     ('review', 'Contributions awaiting your review: approve, or request changes with item ids',
      lambda i: 'state %s; %s%s; delivered by%s%s' % (

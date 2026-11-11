@@ -4068,6 +4068,7 @@ def main():
             answer['stderr']=f'ValueError: {e}\n'
             answer['review_status']=409
             answer['review_id']=e.review_id
+            answer['review_answered']=bool(e.answered)
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
             # The export could not be read (bd failed, or answered something that is not

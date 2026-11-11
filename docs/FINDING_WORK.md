@@ -120,12 +120,13 @@ The wait logic is part of `client.py` itself: a `client.py` copied on its own, w
 other kit file beside it, runs `wait` (only the `capability` commands also need
 `capabilities.py` from the same kit).
 
-A task of yours with changes requested is your work until you deliver a revision, whatever
-else has or has not changed. Each item of `work --mine` carries `whose_move` and one plain
-sentence `next` saying whose move it is, and the tasks where the move is yours come first,
-with their count at the top of the answer. "Nothing changed" never applies to a task of
-yours with changes requested; stop without acting only when every task of yours is with the
-reviewer or the coordinator.
+A task of yours with changes requested is your work (respond to each item; where an item
+needs a code change, deliver a new commit that supersedes this contribution; the same commit
+is refused), whatever else has or has not changed. Each item of `work --mine` carries
+`whose_move` and one plain sentence `next` saying whose move it is, and the tasks where the
+move is yours come first, with their count at the top of the answer. "Nothing changed" never
+applies to a task of yours with changes requested; stop without acting only when every task
+of yours is with the reviewer or the coordinator.
 
 ### What each item also tells you: the role, the state and claimability
 
