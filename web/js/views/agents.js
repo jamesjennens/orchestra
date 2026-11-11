@@ -76,6 +76,30 @@ function manages(ctx, raw) {
   return Boolean(ctx.me && (ctx.me.superuser || owner === ctx.me.id));
 }
 
+// Only “Mine” when a superuser could also see other owners' agents, or when this
+// list already shows more than one owner (kittrial-5bb.561): a plain account with
+// one owner sees no filter, and never guesses.
+export function ownersOf(agents) {
+  return [...new Set((agents || []).map((a) => ownerId(a)).filter(Boolean))];
+}
+
+export function showMineFilter(ctx, agents) {
+  return Boolean(ctx.me && (agents || []).length && (ctx.me.superuser || ownersOf(agents).length > 1));
+}
+
+function ownerLine(agent) {
+  const name = agent.owner_display_name || ownerId(agent) || 'unknown owner';
+  return `${name} · ${agent.id || 'no id'}`;
+}
+
+function hasActed(raw) {
+  // The cheapest existing fact that means “has acted” (kittrial-5bb.561): an agent
+  // that has called in even once carries last_seen_at (http_auth.py agent_view,
+  // stamped on each successful credential call). actor is always present (it names
+  // the attribution label) so it cannot mean this; agent_history would.
+  return Boolean(raw && raw.last_seen_at);
+}
+
 // What an agent may do (kittrial-5bb.208). The server keeps it on the agent record: `scopes`, and in
 // `scopes_source` where that is known from (`set`, `inferred` from its working credentials for an agent
 // made before the record kept it, or `unknown`: scopes is null and a new secret needs a choice).
@@ -167,7 +191,8 @@ export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
   const rest = agent.items && agent.items.length ? agent.items.slice(1) : [];
   return h('article', { class: 'agent-card' + (agent.attention === 'feedback' ? ' needs' : '') },
     h('div', { class: 'agent-head' },
-      h('div', null, h('h3', null, agent.display_name), h('div', { class: 'small muted' }, agent.tool || 'Agent', agent.last_seen_at ? [' · last active ', time(agent.last_seen_at)] : ' · not connected yet')),
+      h('div', null, h('h3', null, agent.display_name), h('div', { class: 'small muted' }, agent.tool || 'Agent', agent.last_seen_at ? [' · last active ', time(agent.last_seen_at)] : ' · not connected yet'),
+        h('div', { class: 'small muted', 'data-agent-owner': raw.id || agent.id || '' }, ownerLine(raw))),
       attentionChip(agent.attention)),
     next,
     rest.length ? h('ul', { class: 'agent-items' }, rest.map((i) => h('li', null,
@@ -177,12 +202,35 @@ export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
       agent.attention === 'idle' && !nextText ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
     lean ? null : resumeBlock(agent, folder, compact),
     lean ? null : createdByNote(raw),
+    manages(ctx, raw) ? disableNotDeleteHint(raw) : null,
     credentialsOf(raw).some((c) => c.expires_soon && works(c)) ? h('div', { class: 'banner warn', role: 'status' }, 'A credential expires within seven days. Extend it under What it may do; its existing secret keeps working.') : null,
     compact || lean ? null : scopesLine(raw),
     compact ? null : credentialCountLine(raw),
     manages(ctx, raw) ? h('div', { class: 'copy-row' },
       h('button', { type: 'button', 'aria-label': 'Set up the folder for ' + agent.display_name, onclick: (event) => reopenSetup(ctx, raw.id, event.currentTarget) }, 'Set up folder')) : null,
     compact || lean ? null : projectsLine(agent));
+}
+
+// Only shown on an agent that has acted: it says deletion loses history, so prefer
+// disabling. An agent that never called in (no last_seen_at) gets no hint.
+export function disableNotDeleteHint(raw) {
+  return hasActed(raw) ? h('p', { class: 'small muted', 'data-disable-not-delete': raw.id || '' },
+    'Its contributions and reviews stay attributed to it; disable it instead of deleting it.') : null;
+}
+
+// A same-spelling, case-insensitive match among the LOADED agents (kittrial-5bb.561):
+// cross-owner reuse stays allowed, so it only warns (with the owner named) plus a
+// confirm — never refuses. The server's own 409 (secret-file clash) stays the backstop.
+export function duplicateNamed(agents, name) {
+  const clean = String(name || '').trim().toLowerCase();
+  if (!clean) return null;
+  return (agents || []).find((a) => String(a.name || '').toLowerCase() === clean) || null;
+}
+
+export function duplicateWarning(dup) {
+  const who = dup.owner_display_name || ownerId(dup) || 'another account';
+  const id = dup.id ? ` (${dup.id})` : '';
+  return `“${dup.name}” is already used by ${who}${id}. Reusing the name is allowed, but creates confusion in reviews and attribution. Create “${dup.name}” anyway?`;
 }
 
 // Open by itself when the agent has something the owner must see: more than one working credential
@@ -199,21 +247,40 @@ export async function list(ctx) {
     h('div', { class: 'panel', 'data-agents-loading': '', role: 'status', style: 'min-height: 6rem' }, h('div', { class: 'panel-body muted' }, 'Loading your agents…')));
   let unconfirmedOnly = false;
   let cursor = null;
+  let mineOnly = true;
   const previous = [];
   const pendingReleases = new Map();
-  const filter = ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
-    h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
+  const loaded = { items: [] };
+  function mineFilter(items) {
+    return h('div', { class: 'copy-row', role: 'group', 'aria-label': 'Whose agents to show', 'data-mine-filter': '' },
+      mineButton('Mine', mineOnly), mineButton('All', !mineOnly));
+  }
+  function mineButton(label, active) {
+    const showingMine = label === 'Mine';
+    return h('button', { type: 'button', class: active ? 'primary' : 'ghost', 'aria-pressed': String(Boolean(active)),
+      'data-mine-choice': label, onclick: () => { mineOnly = showingMine; load(); } }, label);
+  }
+  function visibleItems() {
+    return mineOnly && showMineFilter(ctx, loaded.items) && ctx.me
+      ? loaded.items.filter((a) => ownerId(a) === ctx.me.id) : loaded.items;
+  }
+  const filter = h('div', { class: 'stack' },
+    ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
+      h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
       unconfirmedOnly = event.target.checked;
       cursor = null;
       previous.length = 0;
       load();
-    } }), 'Show agents with inferred or unknown scopes') : null;
+    } }), 'Show agents with inferred or unknown scopes') : null);
   async function load() {
     let data;
     try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
     const items = data.items;
+    loaded.items = items;
     host.removeAttribute('aria-busy');
-    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
+    const shown = visibleItems();
+    const mineShown = showMineFilter(ctx, loaded.items);
+    host.replaceChildren(mineShown ? mineFilter(loaded.items) : null, shown.length ? h('div', { class: 'agent-grid' }, shown.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
       h('details', { class: 'agent-details', 'data-agent-details': a.id, open: needsDetails(a) || pendingReleases.has(a.id) ? true : null },
         h('summary', null, 'Details and settings'),
         h('div', { class: 'stack' }, ...agentCardMore(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
@@ -221,7 +288,7 @@ export async function list(ctx) {
           manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
-      h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
+      h('span', { class: 'small muted' }, `${shown.length} shown of ${data.total} agents`),
       previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
       data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
   }
@@ -493,6 +560,8 @@ export async function list(ctx) {
     if (name.length < 2) return setFieldError(form, 'a-name', 'Give the agent a name of at least 2 characters.');
     setFieldError(form, 'a-name', '');
     const chosen = [...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value);
+    const dup = duplicateNamed(loaded.items, name);
+    if (dup && !(await confirmDialog({ title: 'An agent already has this name', body: duplicateWarning(dup), confirmLabel: 'Create anyway' }))) return;
     // A name whose secret file would clash with another of your agents (409), or an
     // invalid name (422), is explained next to the name field in the server's words.
     const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen, ...(ownerField ? { owner: v['a-owner'] } : {}) }), {

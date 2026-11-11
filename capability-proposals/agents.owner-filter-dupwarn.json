@@ -1,0 +1,39 @@
+{
+  "aliases": [
+    "my agents owner",
+    "my agents filter",
+    "duplicate agent name",
+    "owner filter dupwarn",
+    "agent owner label"
+  ],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#personal-agents"
+  ],
+  "code": [
+    "http_auth.py::Service.agent_view",
+    "http_auth.py::Service.list_agents",
+    "http_auth.py::Service.agent_page",
+    "http_service.py::ApiHandler._agent_items",
+    "web/js/views/agents.js::ownersOf",
+    "web/js/views/agents.js::showMineFilter",
+    "web/js/views/agents.js::duplicateNamed",
+    "web/js/views/agents.js::duplicateWarning",
+    "web/js/views/agents.js::disableNotDeleteHint",
+    "web/js/views/agents.js::list"
+  ],
+  "key": "agents.owner-filter-dupwarn",
+  "name": "My agents: owner, filter and duplicate-name warning",
+  "operation_id": "capnew-5bb561-agents-owner-filter-0001",
+  "owner": "person:orchestra-coordinator",
+  "requirements": [],
+  "schema_version": 1,
+  "summary": "Each My agents row shows its owner account plus the agent id from the loaded agent_view (owner, owner_display_name, id); a Mine/All filter (default Mine, client-side on the loaded list) renders only for a superuser or when more than one owner is present; creating an agent whose name matches a loaded row warns with the existing name, owner and id plus a confirm (cross-owner reuse stays allowed; the server 409 on secret-file clash stays the backstop); an agent that has acted (last_seen_at set) carries a disable-not-delete hint naming attribution. No visibility change: the server scopes the list as before.",
+  "tags": [
+    "agents",
+    "web"
+  ],
+  "tests": [
+    "tests/test_http_agents.py",
+    "tests/test_agent_create_form_page.py"
+  ]
+}

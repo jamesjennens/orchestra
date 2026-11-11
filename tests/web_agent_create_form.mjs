@@ -73,9 +73,32 @@ Object.assign(out, {
   dirHint: page.querySelector('#a-dir-hint').textContent,
   pageText: page.textContent,
 });
+// kittrial-5bb.561: rows show owner+id; the Mine/All filter (client-only) is hidden with one
+// owner, and the duplicate-name check is a confirm on the loaded list — cross-owner reuse allowed.
+out.ownerLabelsShowOwnerPlusId = sample.every((a) => row(a.id).all((e) => e.attributes['data-agent-owner'] !== undefined).length === 1 && row(a.id).textContent.includes(a.id));
+out.mineFilterShownToSuperuser = early.all((e) => e.attributes['data-mine-filter'] !== undefined).length === 1;
+out.mineFilterHiddenWithOneOwner = agents.showMineFilter({ me: { id: 'u1', superuser: false } }, sample) === false
+  && agents.showMineFilter({ me: { id: 'u1', superuser: false } }, [...sample, { ...sample[0], owner: 'u2' }]) === true
+  && agents.showMineFilter({ me: { id: 'u1', superuser: true } }, sample) === true;
+out.duplicateWarnsWithOwnerAndConfirm = (() => {
+  const dup = agents.duplicateNamed(sample, 'kestrel');
+  return dup && dup.id === 'agent_one' && /already used by/.test(agents.duplicateWarning(dup)) && /u1/.test(agents.duplicateWarning(dup)) && /agent_one/.test(agents.duplicateWarning(dup)) && /Create/.test(agents.duplicateWarning(dup));
+})();
+out.noHintForFreshAgent = agents.disableNotDeleteHint(sample[0]) === null;
+out.hintForActedAgent = (() => {
+  const hint = agents.disableNotDeleteHint({ ...sample[0], last_seen_at: '2026-01-01T00:00:00Z' });
+  return hint !== null && /disable it instead/.test(hint.textContent);
+})();
 page.querySelector('#a-name').value = 'Kestrel';
 const form = page.all((e) => e.tagName === 'FORM' && e.querySelector('#a-name'))[0];
-await form.dispatch('submit');
+const pendingSubmit = form.dispatch('submit');
+for (let i = 0; i < 200 && document.body.all((e) => e.tagName === 'DIALOG').length === 0; i += 1) await new Promise((r) => setTimeout(r, 25));
+out.duplicateNameAsksFirst = /already used by/.test((document.body.all((e) => e.tagName === 'DIALOG')[0] || {}).textContent || '');
+for (const d of document.body.all((e) => e.tagName === 'DIALOG')) {
+  const yes = d.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Create anyway')[0];
+  if (yes) await yes.dispatch('click');
+}
+await pendingSubmit;
 await new Promise((r) => setTimeout(r, 300));
 out.sentTool = created.length ? created[0].tool : null;
 const dialog = document.body.all((e) => e.tagName === 'DIALOG')[0];

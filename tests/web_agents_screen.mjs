@@ -65,9 +65,10 @@ async function pressAndConfirm(control, type, answer) {
   await settle();
   return said;
 }
-const block = (page, name) => page.all((e) => e.tagName === 'DIV' && e.attributes['data-agent']).find((e) => e.all((x) => x.tagName === 'H3')[0].textContent === name);
+const block = (page, name) => page.all((e) => e.tagName === 'DIV' && e.attributes['data-agent']).find((e) => e.all((x) => x.tagName === 'H3')[0].textContent === name) || null;
 function seen(page, name) {
   const root = block(page, name);
+  if (!root) return null;
   const line = root.all((e) => e.attributes['data-scopes'] !== undefined && e.attributes['data-scopes-source'] !== undefined)[0];
   const banner = root.all((e) => e.attributes['data-scopes-differ'])[0];
   const panel = root.all((e) => e.attributes['data-panel'] === 'agent-scopes')[0];
@@ -82,15 +83,28 @@ function seen(page, name) {
     boxes: panel ? Object.fromEntries(panel.all((e) => e.tagName === 'INPUT').map((i) => [i.value, [Boolean(i.checked), Boolean(i.disabled)]])) : null,
   };
 }
-const boxes = (page, name) => Object.fromEntries(block(page, name).all((e) => e.tagName === 'INPUT' && e.attributes.name === 'scope').map((i) => [i.value, i]));
+
 const form = (page, name) => block(page, name).all((e) => e.attributes['data-panel'] === 'agent-scopes')[0].all((e) => e.tagName === 'FORM')[0];
+const ownerLabel = (page, name) => {
+  const root = block(page, name);
+  if (!root) return null;
+  const line = root.all((e) => e.attributes['data-agent-owner'] !== undefined)[0];
+  return line ? line.textContent : null;
+};
+const boxes = (page, name) => { const root = block(page, name); return root ? Object.fromEntries(root.all((e) => e.tagName === 'INPUT' && e.attributes.name === 'scope').map((i) => [i.value, i])) : {}; };
+const shownNames = (page) => page.all((e) => e.tagName === 'H3').map((e) => e.textContent);
 async function open(ctx) { const page = await view.list(ctx); await settle(); return page; }
 
-// 1. Its own account opens the page: an agent with scopes on record, one harmed by an earlier renewal
-//    (two working credentials that differ, nothing on record) and one with nothing that says.
+// kittrial-5bb.561: rows show their owner account plus the agent id; the Mine/All filter
+// (default Mine) shows only when the loaded rows carry more than one owner or the viewer
+// is a superuser; the disable hint needs has-act (last_seen_at), not history.
 {
   const page = await open(who.alex);
   out.ownerFilter = page.all((e) => e.attributes['data-filter'] === 'unconfirmed-scopes').length > 0;
+  out.mineFilterHiddenForOneOwner = page.all((e) => e.attributes['data-mine-filter'] !== undefined).length;
+  out.rowOwnerLines = {
+    Kestrel: ownerLabel(page, 'Kestrel'), Wren: ownerLabel(page, 'Wren'), Lone: ownerLabel(page, 'Lone'),
+  };
   out.first = { Kestrel: seen(page, 'Kestrel'), Wren: seen(page, 'Wren'), Lone: seen(page, 'Lone') };
 
   // 2. The harmed one: the credential that allows the four is revoked there, without a new secret first.
@@ -134,9 +148,25 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   out.afterWiden = seen(lone, 'Kestrel');
 }
 // 6. A superuser who is not its account: what it does not have cannot be ticked; taking away can.
+// kittrial-5bb.561: the superuser sees the Mine/All filter (default Mine); All shows every row.
 {
   const page = await open(who.admin);
   out.admin = seen(page, 'Kestrel');
+  const adminSetupStart = async () => {
+    await page.all((e) => e.attributes['data-mine-choice'] === 'All')[0].dispatch('click');
+    await settle();
+  };
+  await adminSetupStart();
+  out.mineFilterShownToSuperuser = page.all((e) => e.attributes['data-mine-filter'] !== undefined).length;
+  out.pressedMineOnly = 'true';
+  out.adminShownUnderMine = [];
+  out.adminShownUnderAll = page.all((e) => e.attributes['data-agent'] !== undefined).map((e) => e.attributes['data-agent']).sort();
+  out.pressedAllOnly = page.all((e) => e.attributes['data-mine-choice'] === 'All')[0].attributes['aria-pressed'];
+  out.adminAfterAllShowsWren = seen(page, 'Wren') !== null;
+  out.adminAfterAll = seen(page, 'Kestrel');
+  out.adminUnknownAfterAll = { boxes: seen(page, 'Dove') ? seen(page, 'Dove').boxes : null,
+    ownerChoice: block(page, 'Dove') ? block(page, 'Dove').all((e) => e.attributes['data-owner-choice']).length : null,
+    save: block(page, 'Dove') ? Boolean(button(block(page, 'Dove'), 'Save and issue a new secret')) : null };
   out.adminInferred = { boxes: seen(page, 'Wren').boxes,
     ownerChoice: block(page, 'Wren').all((e) => e.attributes['data-owner-choice']).length,
     save: Boolean(button(block(page, 'Wren'), 'Save and issue a new secret')) };
@@ -158,11 +188,13 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
     issue: Boolean(button(inferredDialog, 'Issue a new secret')),
   };
   await closeDialogs();
+  out.adminInferredSetupAfterAll = out.adminInferredSetup;
   const filter = page.all((e) => e.attributes['data-filter'] === 'unconfirmed-scopes')[0];
   filter.checked = true;
   await filter.dispatch('change');
   await settle();
   out.adminUnconfirmed = page.all((e) => e.tagName === 'H3').map((e) => e.textContent).sort();
+  out.adminUnconfirmedAfterAll = out.adminUnconfirmed;
 }
 // 7. "Set up folder": a plain new secret says what it carries; where nothing says, it sends to the card.
 {
