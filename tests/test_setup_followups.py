@@ -110,6 +110,7 @@ console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),proxyGui
         example = self.value['example']
         bodies = [json.loads(example[i+1]) for i, line in enumerate(example) if line == '~~~json']
         self.assertEqual(5, len(bodies))
+        self.assertIn('2. POST https://example.org/v1/projects/PROJECT/merge-slot/acquire', example)
         web_merge_slot.validate(dict(operation='acquire', task=bodies[0]['task_id'], target=bodies[0]['target']))
         self.assertEqual({'task_id', 'target'}, set(bodies[0]))
         self.assertEqual({}, bodies[-1])
@@ -133,6 +134,9 @@ console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),proxyGui
         header = 'header = "Authorization: Bearer SECRET"\n'
         self.assertEqual(header, v['bodyOff'])
         self.assertIn('the noproxy option for the server you chose', v['proxyGuide'])
+        for guide in ('worker', 'bridge', 'proxyGuide'):
+            self.assertIn('including any you added yourself', v[guide])
+            self.assertIn('only when proxy bypass is selected', v[guide])
         self.assertNotIn('It holds three lines:', v['proxyGuide'])
         self.assertIn('It holds three lines:', v['bridge'])
         for text in (v['body'], v['lines']):

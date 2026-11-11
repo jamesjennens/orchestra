@@ -1040,16 +1040,25 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       commandLine(setupText.testCommands(payload).posixChmod, 'chmod command'),
     ],
     rewrite: () => {
-      const meta = PAYLOAD_META.get(payload) || {};
-      const comments = setupText.credentialCommentLines(meta.bridgeServer || payload.server, (certificate && certificate.sha256) || null);
-      const rewrite = setupText.credentialFileCommand(payload.secretFile, comments, { certFile: payload.certificateFile, hasCertificate, noproxy: state.noproxy, server: meta.bridgeServer || payload.server });
-      const posix = setupText.osKind(state.os) === 'posix';
-      return [
-        h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It rewrites the managed options in your credential file for the choices you made.`),
-        commandLine(posix ? rewrite.posix : rewrite.powershell, 'rewrite command'),
-        more(h('p', { class: 'small muted' }, 'It rewrites only that one file, in place, and prints nothing; the secret stays where it is. Running it twice leaves the same content. If you cannot run it, type your own full path instead of <your-name>:'),
-          h('pre', { class: 'json' }, setupText.credentialFileBody(null, payload.certificateFile, { windows: !posix, hasCertificate, noproxy: state.noproxy, server: meta.bridgeServer || payload.server }).trimEnd())),
-      ];
+      try {
+        const meta = PAYLOAD_META.get(payload) || {};
+        const server = meta.bridgeServer || payload.server;
+        const comments = setupText.credentialCommentLines(server, (certificate && certificate.sha256) || null);
+        const options = { hasCertificate, noproxy: state.noproxy, server };
+        const rewrite = setupText.credentialFileCommand(payload.secretFile, comments, { ...options, certFile: payload.certificateFile });
+        const posix = setupText.osKind(state.os) === 'posix';
+        const body = setupText.credentialFileBody(null, payload.certificateFile, { ...options, windows: !posix }).trimEnd();
+        return [
+          h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It rewrites the managed options in your credential file for the choices you made.`),
+          h('p', { class: 'small', 'data-noproxy-rewrite-notice': 'true' }, setupText.NOPROXY_REWRITE_NOTICE),
+          commandLine(posix ? rewrite.posix : rewrite.powershell, 'rewrite command'),
+          more(h('p', { class: 'small muted' }, 'It rewrites only that one file, in place, and prints nothing; the secret stays where it is. Running it twice leaves the same content. If you cannot run it, type your own full path instead of <your-name>:'),
+            h('pre', { class: 'json' }, body)),
+        ];
+      } catch (error) {
+        return [h('p', { class: 'small error-text', role: 'alert', 'data-rewrite-error': 'true' },
+          'Could not prepare the credential rewrite. ' + ((error && error.message) || 'Check the server address and try again.'))];
+      }
     },
     test: () => {
       const posix = setupText.osKind(state.os) === 'posix';

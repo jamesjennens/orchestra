@@ -440,6 +440,8 @@ export function workerWaitLoop(server, file) {
   ];
 }
 
+export const NOPROXY_REWRITE_NOTICE = 'The rewrite removes every existing noproxy or --noproxy line, including any you added yourself; it adds one for this server only when proxy bypass is selected.';
+
 export function integrationExample(server) {
   const scope = { source_commit: '1'.repeat(40), integration_commit: '2'.repeat(40), release_id: '', environment: '' };
   const evidence = ['https://example.org/reviews/REVIEW'];
@@ -447,7 +449,7 @@ export function integrationExample(server) {
     '', '### Worked integration without a release', '',
     'Replace PROJECT, TASK, BRANCH, the example commits, evidence pointers, and EXPECTED_SCOPE_TOKEN with the actual integration-check/lifecycle read. The source is the approved commit; the integration commit is the merge commit you actually push. Use null for expected_scope_token only when the read says no scope exists; otherwise use its current token. All bodies below are JSON, sent with curl -K, Content-Type: application/json, and a different stable Idempotency-Key for each write. Reuse the same key and exact body after an uncertain answer.',
     `1. GET ${server}/v1/projects/PROJECT/tasks/TASK/integration-check?target=BRANCH; stop on refusal.`,
-    `2. POST ${server}/v1/projects/PROJECT/merge-slot`,
+    `2. POST ${server}/v1/projects/PROJECT/merge-slot/acquire`,
     '~~~json', JSON.stringify({ task_id: 'TASK', target: 'BRANCH' }), '~~~',
     '3. Fetch, check out BRANCH and merge the approved source commit as a merge commit. Run the project’s tests and retain their actual evidence. Push that merge with your own repository-scoped credential. Stop if any step fails; record tested evidence as tested, not integrated.',
     `4. GET ${server}/v1/projects/PROJECT/tasks/TASK/lifecycle for the current scope_token. POST ${server}/v1/projects/PROJECT/tasks/TASK/lifecycle/scope`,
@@ -488,6 +490,8 @@ export function agentGuide(payload, { hasCertificate = false, bridge = true, nop
     '## Your secret',
     '',
     `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. ${holds} Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file. ${PASTED_SECRET_RULE}`,
+    '',
+    NOPROXY_REWRITE_NOTICE,
     '',
     '## Every call',
     '',

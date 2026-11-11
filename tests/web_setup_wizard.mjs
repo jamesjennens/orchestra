@@ -461,6 +461,7 @@ out.proxyChoiceStoredWithoutSecret = JSON.parse(store.get(WIZARD_STORAGE_KEY)).n
   && !store.get(WIZARD_STORAGE_KEY).includes(SECRET);
 d.wizard.show('rewrite');
 out.proxyChoiceReachesRewrite = commandText(d, 'rewrite command').includes('noproxy = "127.0.0.1"');
+out.proxyRewriteExplainsRemoval = attr(d, 'data-noproxy-rewrite-notice', 'true')[0].textContent === setupText.NOPROXY_REWRITE_NOTICE;
 d.wizard.show('files');
 out.proxyChoiceReachesGuide = d.textContent.includes('the noproxy option for the server you chose')
   && !d.textContent.includes('It holds three lines:');
@@ -476,6 +477,25 @@ d.wizard.show('system');
 out.noBridgeWalkSkipsVsCode = !(await walk(d)).includes('vscode');
 out.noBridgeResumeSaysPasteIntoTheChat = /Paste this into the agent’s chat/.test(shownText(d)) && /never the secret/.test(shownText(d));
 out.olderRouteStillHasVsCode = setupText.screenPlan({ bridge: false, os: 'windows', vscode: true }).includes('vscode');
+// Invalid bridgeServer reaches the rewrite via its own metadata, while the payload
+// retains its valid configured server. Proxy validation must show an error, not throw.
+store.clear();
+const savedOrigin = location.origin;
+location.origin = 'not-a-server';
+d = await openWizard();
+await windowsChoice(d, 'setup-bridge', 'none').dispatch('change');
+const invalidProxy = attr(d, 'data-noproxy-choice', 'true')[0];
+invalidProxy.checked = true;
+await invalidProxy.dispatch('change');
+let rewriteErrorEscaped = false;
+try { d.wizard.show('rewrite'); } catch { rewriteErrorEscaped = true; }
+out.invalidProxyServerShowsRewriteError = !rewriteErrorEscaped && attr(d, 'data-rewrite-error', 'true').length === 1
+  && d.textContent.includes('A valid server address is required for proxy bypass')
+  && !commands(d).includes('rewrite command');
+d.wizard.show('system');
+out.invalidProxyServerKeepsNavigation = screenOf(d) === 'system';
+location.origin = savedOrigin;
+
 // An older stored state (only the boolean) maps to a route: true to Bridge, false to older.
 store.clear();
 store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'role', bridge: false, os: 'windows', role: 'worker' }));
