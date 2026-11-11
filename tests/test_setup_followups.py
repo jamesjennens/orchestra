@@ -89,6 +89,23 @@ console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),bridge:s
                 exec(self.watch_code(), {})
             self.assertEqual(1, curl.call_count)
 
+    @unittest.skipUnless(os.name == 'nt', 'PowerShell watch executes on Windows CI')
+    def test_powershell_watch_parses_multiline_replies_and_exits_on_change(self):
+        shell = shutil.which('powershell') or shutil.which('pwsh')
+        self.assertIsNotNone(shell, 'Windows qualification requires PowerShell')
+        command = next(x for x in self.value['watch'] if x.startswith('- Windows'))
+        command = command.split(': ', 1)[1]
+        # A PowerShell function shadows curl.exe: no real credential or connection is used.
+        first = json.dumps(dict(form='worker', fingerprint='wait1:'+'a'*64, changed=False), indent=2)
+        second = json.dumps(dict(form='worker', fingerprint='wait1:'+'b'*64, changed=True), indent=2)
+        prelude = "$global:watchCalls=0; function Start-Sleep { param($Seconds) if ($Seconds -ne 60) { throw 'wrong cadence' } }; "
+        prelude += "function curl.exe { $global:LASTEXITCODE=0; $global:watchCalls++; if ($global:watchCalls -gt 2) { throw 'watch failed to exit' }; if ($global:watchCalls -eq 1) { '" + first + "' } else { '" + second + "' } }; "
+        done = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command',
+                               prelude + command + "; if ($global:watchCalls -ne 2) { throw 'wrong calls' }"],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual('wait1:'+'b'*64, json.loads(done.stdout)['fingerprint'])
+
     def test_worked_bodies_match_closed_adapters(self):
         example = self.value['example']
         bodies = [json.loads(example[i+1]) for i, line in enumerate(example) if line == '~~~json']
