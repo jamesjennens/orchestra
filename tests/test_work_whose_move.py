@@ -359,6 +359,15 @@ class ServedRuleTests(unittest.TestCase):
                 self.assertIn('whose_move', text)
                 self.assertIn('next', text)
 
+    def test_worker_guide_pins_review_task_changes_requested_action_sentence(self):
+        guide = ' '.join((KIT / 'docs/WORKER_GUIDE.md').read_text(encoding='utf-8').split())
+        self.assertIn(
+            '"Nothing changed" never applies to a task of yours with changes requested: '
+            'read `review TASK` and respond to each item; where an item needs a code change, '
+            'deliver a new commit that supersedes this contribution; the same commit is refused.',
+            guide,
+        )
+
     def test_the_five_texts_that_used_to_read_as_a_refusal_state_the_three_facts(self):
         # kittrial-5bb.249 review item 4: the five served texts must say (i) who authorizes
         # checking again, (ii) that awaiting review or integration is not a reason to stop

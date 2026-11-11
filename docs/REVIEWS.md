@@ -799,7 +799,7 @@ this commit was already reviewed and its requested changes were answered; wait f
 
 - **CLI / SSH endpoint**: prints `ValueError: <sentence>` on stderr, writes nothing and exits with status `2`. The structured exception (`SameCommitChangesRequested`) carries `detail` with `code` `"same-commit-changes-requested"`, `http_status` `409`, `task`, `review_id`, `commit` and `answered`, and the endpoint envelope adds `review_status: 409`, `review_id: "<id>"` and `review_answered` (`false` or `true`).
 - **HTTP (`POST /v1/projects/{id}/tasks/{task}/reviews`)**: returns HTTP status `409` (`error.code` `"conflict"`) with `error.message` set to the same sentence and `error.detail` `{"review_id": "<id>"}` on both the endpoint and disposable in-process backends, writing nothing.
-- **Exact retries**: an exact `operation_id` retry of the original `contribute` (or a repeat with the same `Idempotency-Key`) still reconciles (`201`, `reconciled: true`) instead of hitting this `409`.
+- **Exact retries**: an exact `operation_id` retry of the original `contribute` (with a new or omitted `Idempotency-Key`) still reconciles (`201`, `reconciled: true`) instead of hitting this `409`; a repeat with the same `Idempotency-Key` replays the stored first `201` answer (`reconciled: false` on the endpoint backend, no `reconciled` key in-process) without duplicating the contribution.
 
 ## Discover current work
 

@@ -3780,8 +3780,10 @@ line separately and unconfined.
   once every blocking item is answered with `respond` and awaits re-review, `error.message` is
   `this commit was already reviewed and its requested changes were answered; wait for the
   reviewer to review it again, or deliver a new commit (review <id>)`. An exact `operation_id`
-  retry of the original `contribute` (or a repeat with the same `Idempotency-Key`) still
-  reconciles (`201`, `reconciled: true`) on both backends without duplicating the contribution.
+  retry of the original `contribute` (with a new or omitted `Idempotency-Key`) still reconciles
+  (`201`, `reconciled: true`) on both backends without duplicating the contribution; a repeat
+  with the same `Idempotency-Key` replays the stored first `201` answer (`reconciled: false` on
+  the endpoint backend, no `reconciled` key on the in-process backend) without duplicating it.
 - **Account lookup residual risk.** `GET /v1/accounts/lookup` answers exact usernames
   for a project administrator. With the in-process backend any account may create a
   project and so become one; with the endpoint backend only a superuser registers projects
