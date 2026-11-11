@@ -260,13 +260,32 @@ class HttpContractCase(ServerHarness):
                                            token=secret).status)
 
     def test_a_session_answers_the_password_rule(self):
-        # kittrial-5bb.363: the pages read the installation's minimum from the same answer
-        # they already fetch, on sign-in and on the authenticated session read.
+        # kittrial-5bb.363 / kittrial-5bb.547: the pages read the installation's minimum from the
+        # same answer they already fetch, on sign-in and on the authenticated session read.
         token, _, user = self.login(ADMIN, ADMIN_PASSWORD)
-        self.assertEqual(12, user['password_min_length'])      # the default since kittrial-5bb.501
+        self.assertEqual(5, user['password_min_length'])       # the default since kittrial-5bb.547
         who = self.request('GET', '/v1/sessions/current', token=token)
         self.assertEqual(200, who.status)
-        self.assertEqual(12, who.data['user']['password_min_length'])
+        self.assertEqual(5, who.data['user']['password_min_length'])
+        created = self.request('POST', '/v1/accounts', {'username': 'alex'}, token=token)
+        self.assertEqual(201, created.status, created.data)
+        uid = created.data['id']
+        refused = self.request('POST', '/v1/accounts/%s/password' % uid,
+                               {'new_password': 'abcd'}, token=token)
+        self.assertEqual(422, refused.status)
+        self.assertEqual('Password must be 5-1024 characters', refused.data['error']['message'])
+        accepted = self.request('POST', '/v1/accounts/%s/password' % uid,
+                                {'new_password': 'abcde'}, token=token)
+        self.assertEqual(200, accepted.status, accepted.data)
+        reset = self.request('POST', '/v1/accounts/%s/reset' % uid, token=token)
+        self.assertEqual(201, reset.status, reset.data)
+        short_redeem = self.request('POST', '/v1/accounts/%s/reset/redeem' % uid,
+                                    {'reset_value': reset.data['reset_value'], 'new_password': 'abcd'})
+        self.assertEqual(422, short_redeem.status)
+        self.assertEqual('Password must be 5-1024 characters', short_redeem.data['error']['message'])
+        ok_redeem = self.request('POST', '/v1/accounts/%s/reset/redeem' % uid,
+                                 {'reset_value': reset.data['reset_value'], 'new_password': 'fghij'})
+        self.assertEqual(200, ok_redeem.status, ok_redeem.data)
 
     def test_expired_session_and_logout(self):
         self.create_account(self.admin_token(), 'alex', 'alex-password-1')
