@@ -292,6 +292,7 @@ out.testScreenChecksBeforeNext = screenOf(d) === 'test'
   && /Run the command above, then click Next again\./.test(attr(d, 'data-wizard-check-status', 'true')[0].textContent);
 d.wizard.show('files');
 const beside = attr(d, 'data-folder-beside', 'true')[0];
+out.olderBridgeGuideHasNoExtraWatch = !d.textContent.includes('## Waiting for work (without Orchestra Bridge)');
 out.folderPathBesideTheSaveButton = Boolean(beside) && beside.all((e) => e.getAttribute('data-action') === 'save-files').length === 1
   && beside.all((e) => e.getAttribute('data-folder-path') === 'C:\\Users\\olive\\kestrel').length === 1;
 d.wizard.show('vscode');

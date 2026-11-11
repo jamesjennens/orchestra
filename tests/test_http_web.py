@@ -2309,6 +2309,7 @@ console.log(JSON.stringify({
         for name, value in observed.items():
             self.assertIs(True, value, 'the wizard reported %s=%r' % (name, value))
         self.assertEqual({
+            'olderBridgeGuideHasNoExtraWatch',
             'noBridgeChoiceExplainsWatch',
             'noBridgeSavedGuideHasWatch',
             'proxyChoiceIsOffByDefault',

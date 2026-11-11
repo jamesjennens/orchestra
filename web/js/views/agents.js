@@ -895,7 +895,7 @@ function issueBlock(ctx, agent, payload, wizard) {
 function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
   const payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
-  const files = () => [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate, bridge: state.bridge, noproxy: state.noproxy })]];
+  const files = () => [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate, bridge: state.runs !== 'none', noproxy: state.noproxy })]];
   const folder = payload.workingDirectory;
   // The address the extension must use is the one this page is connected to, not the configured
   // public address, which may be a name that does not resolve from this person's network.
@@ -920,7 +920,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     issued,
   };
   if (!setupText.OS_CHOICES.some(([v]) => v === state.os)) state.os = 'windows';
-  const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.bridge, noproxy: state.noproxy });
+  const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
   const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate, noproxy: state.noproxy });
   if (state.secretValue) {
     // A fresh secret exists only while this dialog is open: open where it is saved (Back reaches the
@@ -1067,7 +1067,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       h('p', { class: 'small' }, 'Pick the agent’s folder. Two small files are written there; neither holds the secret.'),
       saveFilesRow(),
       more(h('p', { class: 'small muted' }, 'It writes .orchestra/agent.json and .orchestra/AGENT.md and adds .orchestra/ to an existing .gitignore. Or paste this prompt into the agent’s own chat, opened in its folder; it does the same and puts the server address into your credential file:'),
-        h('div', { class: 'copy-row' }, copyButton(SETUP_PROMPT_LABEL, () => setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.bridge, noproxy: state.noproxy }), { what: 'Setup prompt' })),
+        h('div', { class: 'copy-row' }, copyButton(SETUP_PROMPT_LABEL, () => setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy }), { what: 'Setup prompt' })),
         fileBlock(setupText.CONFIG_PATH, files()[0][1], folder, setupText.CONFIG_PATH),
         fileBlock(setupText.GUIDE_PATH, files()[1][1], folder, setupText.GUIDE_PATH)),
     ],
