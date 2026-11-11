@@ -138,6 +138,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import namedtuple
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -565,6 +566,197 @@ def actor_parties(state, actor, project_id=None):
                and project_id is not None and credential.get('project_id') == project_id
                and namespace_holds(credential.get('actor'), actor)}
     return issuers or {person}
+
+
+# ------------------------------------------------- by-agent approval (kittrial-5bb.438/.519/.560)
+#
+# The one decision of whether a project's ``agent_approval`` setting lets a coordinator agent
+# approve work its PARTY rule refused. Pure functions over the service state document: the HTTP
+# service calls them under ``store.lock``, the endpoint under the live-authority lock, so both
+# sides of the process seam answer from one source. Callers hold the lock.
+
+#: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438).
+#: ``by-agent``, the default: it may approve the work of ANOTHER personal agent of the same
+#: person; its own work, its person's own work and its person's worker credentials stay refused.
+#: ``by-person``: the strict rule of kittrial-5bb.209, every agent of a person is one party.
+AGENT_APPROVAL_MODES = ('by-agent', 'by-person')
+AGENT_APPROVAL_DEFAULT = 'by-agent'
+
+#: The answer of :func:`by_agent_approval`. ``refusal`` is None when ``allowed``, otherwise one of
+#: :data:`BY_AGENT_REFUSALS`. ``basis`` is ``'agent'``, ``'worker-credential'`` or None. ``target`` is
+#: the name that decided a refusal and ``role`` whether it was the ``'author'`` or the
+#: ``'assignee'`` (both None for ``strict`` and ``no-grant``). ``sub_worker``: a ``same-agent``
+#: target is a sub-label of the agent (``agent/x``).
+ByAgentDecision = namedtuple('ByAgentDecision', 'allowed basis refusal target role sub_worker')
+BY_AGENT_REFUSALS = ('strict', 'no-grant', 'same-agent', 'held-assignee', 'shared-name', 'account-id',
+                     'own-party')
+
+
+def agent_approval_mode(state, project_id):
+    """The project's agent-approval setting: ``{'mode', 'set_by', 'set_at', 'set_by_display_name'}``.
+
+    Absent is the default (``by-agent``, nobody set it). A record of any other shape reads as the
+    strict ``by-person`` with ``damaged`` true: a damaged setting never lets more through.
+    """
+    stored = state.get('agent_approval')
+    entry = stored.get(project_id) if isinstance(stored, dict) else None
+    if 'agent_approval' not in state or (isinstance(stored, dict) and project_id not in stored):
+        return {'mode': AGENT_APPROVAL_DEFAULT, 'set_by': None, 'set_at': None,
+                'set_by_display_name': None}
+    if not isinstance(entry, dict) or entry.get('mode') not in AGENT_APPROVAL_MODES:
+        return {'mode': 'by-person', 'set_by': None, 'set_at': None, 'set_by_display_name': None,
+                'damaged': True}
+    set_by = entry.get('set_by') if isinstance(entry.get('set_by'), str) else None
+    if set_by:
+        user = state['users'].get(set_by) or {}
+        display = user.get('display_name') or set_by
+    else:
+        display = None
+    return {'mode': entry['mode'], 'set_by': set_by,
+            'set_at': entry.get('set_at') if isinstance(entry.get('set_at'), str) else None,
+            'set_by_display_name': display}
+
+
+def agent_grant_effective(state, agent_id, project_id, now):
+    """Whether a live credential of the agent may approve in the project at ``now``: it holds the
+    coordinator grant there and its account is a coordinator or an owner (kittrial-5bb.209).
+
+    ``now`` is the caller's expiry clock (the service's ``_expiry_now``).
+    """
+    agent = state['agents'].get(agent_id)
+    if not isinstance(agent, dict) or not agent.get('enabled') or \
+            project_id not in (agent.get('projects') or []):
+        return False
+    owner = state['users'].get(agent.get('owner'))
+    if not isinstance(owner, dict) or owner.get('disabled'):
+        return False
+    for credential in state.get('credentials', {}).values():
+        if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
+                credential.get('revoked') or credential.get('expires_at', 0) <= now:
+            continue
+        try:
+            if CAP_APPROVE in credential_capabilities(state, credential, owner, project_id):
+                return True
+        except AuthorityDenied:
+            continue
+    return False
+
+
+def other_agent_of_same_person(state, agent_id, name):
+    """Whether ``name`` was written by ANOTHER personal agent of the account that owns ``agent_id``.
+
+    A name belongs to an agent when its first segment is that agent's id (``agent`` and ``agent/x``
+    are one actor). The approving agent itself, its account, a worker credential's name and any
+    name of no agent record are not another agent: they answer False, and stay judged by party.
+    """
+    if not isinstance(name, str) or not name or not isinstance(agent_id, str) or not agent_id:
+        return False
+    head = name.split('/', 1)[0]
+    agents = state.get('agents') if isinstance(state.get('agents'), dict) else {}
+    mine, other = agents.get(agent_id), agents.get(head)
+    return (head.casefold() != agent_id.casefold() and isinstance(mine, dict) and isinstance(other, dict)
+            and isinstance(mine.get('owner'), str) and other.get('owner') == mine['owner'])
+
+
+def worker_credential_of_same_person(state, agent_id, name, project_id):
+    """Whether ``name`` was written under a WORKER CREDENTIAL of the account that owns ``agent_id`` (kittrial-5bb.519).
+
+    True only when the record shows the name is a worker credential's of that one account O, and
+    nothing else could have written it:
+
+    * a name whose head is neither an account nor an agent id: the issuers of the project's worker
+      credentials whose namespace holds the name are exactly {O}. The set is the one
+      :func:`actor_parties` computes, working, revoked or expired credentials alike, so a name O
+      revoked and issued again stays one issuer, and a name another account held once stays
+      shared (False);
+    * ``O/label`` with a non-empty label: a session writes exactly its account id, an agent only
+      its own id, and a worker credential only inside its namespace, so only O's own credential
+      issued with no name can write below O's account id.
+
+    False for everything else: the bare account id (O's own session writes it too), a shared name,
+    the agent itself or any agent id, another account's names, and a name no credential record holds
+    (a name of the host route).
+    """
+    if not all(isinstance(value, str) and value for value in (agent_id, name, project_id)):
+        return False
+    head, _, label = name.partition('/')
+    agents = state.get('agents') if isinstance(state.get('agents'), dict) else {}
+    users = state.get('users') if isinstance(state.get('users'), dict) else {}
+    mine = agents.get(agent_id)
+    owner = mine.get('owner') if isinstance(mine, dict) else None
+    if not isinstance(owner, str) or not owner or head in agents or head.casefold() == agent_id.casefold():
+        return False
+    if head == owner:
+        return bool(label)
+    if head in users:
+        return False
+    return actor_parties(state, name, project_id) == {owner}
+
+
+def independent_of(state, names, target, project_id):
+    """Whether EVERY one of ``names`` is of another party than ``target``, by full attribution.
+
+    The service's ``_independent_all(names, [target], project, True)``: ``full`` makes the
+    service's ``actor_parties`` this module's :func:`actor_parties` whatever the installation
+    setting says. Names that are not non-empty text are left out; an empty or non-text target
+    takes no party, so every name is independent of it.
+    """
+    names = [name for name in names if isinstance(name, str) and name]
+    taken = actor_parties(state, target, project_id) if isinstance(target, str) and target else set()
+    return all(not (actor_parties(state, name, project_id) & taken) for name in names)
+
+
+def by_agent_approval(state, project_id, approver, author, assignee, now, names=None):
+    """Whether the project's by-agent setting lets agent ``approver`` approve work its party rule refused.
+
+    Asked only once the plain party rule has refused an agent approver. In order:
+
+    1. the setting is not ``by-agent`` (``by-person``, or a damaged record): ``strict``;
+    2. ``approver`` is not an agent whose coordinator grant is effective at ``now``: ``no-grant``;
+    3. the author, then the assignee. One that is not text, or that every one of ``names`` (the
+       names the approver acts under; default just ``approver``) is independent of, is skipped.
+       Another agent of the same person passes with basis ``agent``; a worker credential only that
+       person held passes with basis ``worker-credential``. Otherwise the refusal says why:
+       ``same-agent`` (the agent or a sub-label of it), ``held-assignee``, ``shared-name``,
+       ``account-id`` (the person's bare account id) or ``own-party``;
+    4. allowed, with the basis (None when neither target needed one).
+    """
+    if agent_approval_mode(state, project_id)['mode'] != 'by-agent':
+        return ByAgentDecision(False, None, 'strict', None, None, False)
+    agent_id = approver if isinstance(approver, str) else ''
+    if not agent_id or not agent_grant_effective(state, agent_id, project_id, now):
+        return ByAgentDecision(False, None, 'no-grant', None, None, False)
+    names = [approver] if names is None else list(names)
+    basis = None
+    for target, role in ((author, 'author'), (assignee, 'assignee')):
+        if not isinstance(target, str) or not target or independent_of(state, names, target, project_id):
+            continue
+        if other_agent_of_same_person(state, agent_id, target):
+            basis = basis or 'agent'
+            continue
+        if worker_credential_of_same_person(state, agent_id, target, project_id):
+            basis = 'worker-credential'
+            continue
+        head = target.split('/', 1)[0]
+        if head.casefold() == agent_id.casefold():
+            return ByAgentDecision(False, None, 'same-agent', target, role, '/' in target)
+        if role == 'assignee':
+            kind = 'held-assignee'
+        elif len(actor_parties(state, target, project_id)) > 1:
+            kind = 'shared-name'
+        elif _bare_account_id_of(state, agent_id, target):
+            kind = 'account-id'
+        else:
+            kind = 'own-party'
+        return ByAgentDecision(False, None, kind, target, role, False)
+    return ByAgentDecision(True, basis, None, None, None, False)
+
+
+def _bare_account_id_of(state, agent_id, name):
+    """Whether ``name`` is exactly the account id of the person who owns ``agent_id``."""
+    agents = state.get('agents')
+    mine = agents.get(agent_id) if isinstance(agents, dict) else None
+    return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
 
 
 def authority_request(principal, project_id, capability, *, now=None):
