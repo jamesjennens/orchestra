@@ -77,8 +77,8 @@ function manages(ctx, raw) {
 }
 
 // Only “Mine” when a superuser could also see other owners' agents, or when this
-// list already shows more than one owner (kittrial-5bb.561): a plain account with
-// one owner sees no filter, and never guesses.
+// list already shows more than one owner (kittrial-5bb.561; kept for unit checks — the
+// page itself now decides caller-level in mineShown(), stable across pages).
 export function ownersOf(agents) {
   return [...new Set((agents || []).map((a) => ownerId(a)).filter(Boolean))];
 }
@@ -88,8 +88,13 @@ export function showMineFilter(ctx, agents) {
 }
 
 function ownerLine(agent) {
-  const name = agent.owner_display_name || ownerId(agent) || 'unknown owner';
-  return `${name} · ${agent.id || 'no id'}`;
+  // n1(a) (kittrial-5bb.561 r2): the agent_view payload (http_auth.py agent_view) always
+  // carries owner/owner_display_name, so the shared card never prints 'unknown owner · no id'
+  // from a real My work payload; the fallback stays for payloads that lack them
+  // (the demo mock agentView uses owner_id/owner_name only).
+  const name = agent.owner_display_name || agent.owner_name || ownerId(agent) || 'unknown owner';
+  const id = ownerId(agent);
+  return id && id !== name ? `${name} (${id}) · ${agent.id || 'no id'}` : `${name} · ${agent.id || 'no id'}`;
 }
 
 function hasActed(raw) {
@@ -192,7 +197,7 @@ export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
   return h('article', { class: 'agent-card' + (agent.attention === 'feedback' ? ' needs' : '') },
     h('div', { class: 'agent-head' },
       h('div', null, h('h3', null, agent.display_name), h('div', { class: 'small muted' }, agent.tool || 'Agent', agent.last_seen_at ? [' · last active ', time(agent.last_seen_at)] : ' · not connected yet'),
-        h('div', { class: 'small muted', 'data-agent-owner': raw.id || agent.id || '' }, ownerLine(raw))),
+        h('div', { class: 'small muted', 'data-agent-owner': ownerId(raw) || '', 'data-agent-id': raw.id || agent.id || '' }, ownerLine(raw))),
       attentionChip(agent.attention)),
     next,
     rest.length ? h('ul', { class: 'agent-items' }, rest.map((i) => h('li', null,
@@ -250,7 +255,7 @@ export async function list(ctx) {
   let mineOnly = true;
   const previous = [];
   const pendingReleases = new Map();
-  const loaded = { items: [] };
+  const loaded = { items: [], total: 0, owners: [], probed: false };
   function mineFilter(items) {
     return h('div', { class: 'copy-row', role: 'group', 'aria-label': 'Whose agents to show', 'data-mine-filter': '' },
       mineButton('Mine', mineOnly), mineButton('All', !mineOnly));
@@ -261,8 +266,29 @@ export async function list(ctx) {
       'data-mine-choice': label, onclick: () => { mineOnly = showingMine; load(); } }, label);
   }
   function visibleItems() {
-    return mineOnly && showMineFilter(ctx, loaded.items) && ctx.me
+    // Mine is a caller-level view, not a page-level one (kittrial-5bb.561 r2): an audit view
+    // (superuser + inferred/unknown-scopes box ticked) shows every loaded row, and Mine
+    // itself is stable across pages (decided from all owners the caller may see, not the page).
+    if (unconfirmedOnly && ctx.me && ctx.me.superuser) return loaded.items;
+    return mineOnly && mineShown() && ctx.me
       ? loaded.items.filter((a) => ownerId(a) === ctx.me.id) : loaded.items;
+  }
+  function mineShown() {
+    if (!ctx.me || !loaded.items.length) return false;
+    if (ctx.me.superuser) return true;
+    if (loaded.owners.length > 1) return true;
+    // Caller-level, not page-level: with more agents than fit on this page, another
+    // page may carry another owner — probe the whole list once (kittrial-5bb.561 r2).
+    // A slow or failed probe keeps the page's own answer (owners of this page).
+    if (loaded.total > loaded.items.length && !loaded.probed) {
+      loaded.probed = true;
+      ctx.api.agents().then((listed) => {
+        if (!listed || !Array.isArray(listed.items)) return;
+        for (const owner of ownersOf(listed.items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
+        load();
+      }).catch(() => {});
+    }
+    return ownersOf(loaded.items).length > 1;
   }
   const filter = h('div', { class: 'stack' },
     ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
@@ -277,10 +303,16 @@ export async function list(ctx) {
     try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
     const items = data.items;
     loaded.items = items;
+    loaded.total = data.total || items.length;
+    // The filter is caller-level: keep every owner the caller may see, across pages, so the
+    // Mine/All choice never appears on one page and vanishes on the next (kittrial-5bb.561 r2).
+    for (const owner of ownersOf(items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
     host.removeAttribute('aria-busy');
+    const showFilter = mineShown();
     const shown = visibleItems();
-    const mineShown = showMineFilter(ctx, loaded.items);
-    host.replaceChildren(mineShown ? mineFilter(loaded.items) : null, shown.length ? h('div', { class: 'agent-grid' }, shown.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
+    const scopeNote = (ctx.me && ctx.me.superuser && unconfirmedOnly)
+      ? h('p', { class: 'small muted', 'data-audit-note': 'true' }, 'Showing every loaded agent (audit view): the Mine filter is off while this box is ticked.') : null;
+    host.replaceChildren(showFilter ? mineFilter(loaded.items) : null, scopeNote, shown.length ? h('div', { class: 'agent-grid' }, shown.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
       h('details', { class: 'agent-details', 'data-agent-details': a.id, open: needsDetails(a) || pendingReleases.has(a.id) ? true : null },
         h('summary', null, 'Details and settings'),
         h('div', { class: 'stack' }, ...agentCardMore(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
@@ -288,7 +320,7 @@ export async function list(ctx) {
           manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
-      h('span', { class: 'small muted' }, `${shown.length} shown of ${data.total} agents`),
+      h('span', { class: 'small muted' }, mineOnly && showFilter && !(ctx.me && ctx.me.superuser && unconfirmedOnly) ? `${shown.length} shown on this page of ${data.total} agents` : `${shown.length} shown of ${data.total} agents`),
       previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
       data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
   }
@@ -560,8 +592,24 @@ export async function list(ctx) {
     if (name.length < 2) return setFieldError(form, 'a-name', 'Give the agent a name of at least 2 characters.');
     setFieldError(form, 'a-name', '');
     const chosen = [...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value);
-    const dup = duplicateNamed(loaded.items, name);
-    if (dup && !(await confirmDialog({ title: 'An agent already has this name', body: duplicateWarning(dup), confirmLabel: 'Create anyway' }))) return;
+    // The duplicate-name check sees every name the new agent's account already uses
+    // (kittrial-5bb.561 r2): the new agent's owner is the chosen account for a superuser,
+    // else the caller. Falls back to the loaded page when that read fails.
+    const targetOwner = ownerField ? v['a-owner'] : (ctx.me && ctx.me.id);
+    let pool = loaded.items;
+    let poolNote = 'among the agents shown';
+    try {
+      const listed = await ctx.api.agents();
+      if (listed && Array.isArray(listed.items)) {
+        pool = listed.items.filter((a) => !targetOwner || ownerId(a) === targetOwner);
+        poolNote = 'among every agent name that account uses';
+      }
+    } catch { pool = loaded.items; }
+    const dup = duplicateNamed(pool, name);
+    if (dup) {
+      const warned = await confirmDialog({ title: 'An agent already has this name', body: duplicateWarning(dup) + ` (checked ${poolNote}).`, confirmLabel: 'Create anyway' });
+      if (!warned) return;
+    }
     // A name whose secret file would clash with another of your agents (409), or an
     // invalid name (422), is explained next to the name field in the server's words.
     const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen, ...(ownerField ? { owner: v['a-owner'] } : {}) }), {

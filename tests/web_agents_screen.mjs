@@ -148,18 +148,26 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   out.afterWiden = seen(lone, 'Kestrel');
 }
 // 6. A superuser who is not its account: what it does not have cannot be ticked; taking away can.
-// kittrial-5bb.561: the superuser sees the Mine/All filter (default Mine); All shows every row.
+// kittrial-5bb.561 r2: the superuser lands on Mine (default); Mine hides another owner's
+// rows, All shows every row. Both are read from the DOM — never hard-coded.
 {
   const page = await open(who.admin);
+  const pressedMine = (page.all((e) => e.attributes['data-mine-choice'] === 'Mine')[0] || {}).attributes || {};
+  out.mineFilterShownToSuperuser = page.all((e) => e.attributes['data-mine-filter'] !== undefined).length;
+  out.pressedMineOnly = pressedMine['aria-pressed'];
+  out.mineDefaultChoice = (page.all((e) => e.attributes['data-mine-choice'] === 'Mine')[0] || {}).textContent
+    || (page.all((e) => e.attributes['data-mine-choice'] === 'All')[0] || {}).textContent || null;
+  out.adminShownUnderMine = page.all((e) => e.attributes['data-agent'] !== undefined).map((e) => e.attributes['data-agent']).sort();
+  out.mineShownUnderMine = [...out.adminShownUnderMine];
+  out.mineCountLine = (page.all((e) => e.attributes['data-agent-pages'] !== undefined)[0] || {}).textContent || null;
   out.admin = seen(page, 'Kestrel');
+  out.kestrelHiddenUnderMine = block(page, 'Kestrel') === null;
+  out.wrenHiddenUnderMine = block(page, 'Wren') === null;
   const adminSetupStart = async () => {
     await page.all((e) => e.attributes['data-mine-choice'] === 'All')[0].dispatch('click');
     await settle();
   };
   await adminSetupStart();
-  out.mineFilterShownToSuperuser = page.all((e) => e.attributes['data-mine-filter'] !== undefined).length;
-  out.pressedMineOnly = 'true';
-  out.adminShownUnderMine = [];
   out.adminShownUnderAll = page.all((e) => e.attributes['data-agent'] !== undefined).map((e) => e.attributes['data-agent']).sort();
   out.pressedAllOnly = page.all((e) => e.attributes['data-mine-choice'] === 'All')[0].attributes['aria-pressed'];
   out.adminAfterAllShowsWren = seen(page, 'Wren') !== null;
@@ -194,6 +202,7 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   await filter.dispatch('change');
   await settle();
   out.adminUnconfirmed = page.all((e) => e.tagName === 'H3').map((e) => e.textContent).sort();
+  out.adminUnconfirmedNote = (page.all((e) => e.attributes['data-audit-note'] !== undefined)[0] || {}).textContent || null;
   out.adminUnconfirmedAfterAll = out.adminUnconfirmed;
 }
 // 7. "Set up folder": a plain new secret says what it carries; where nothing says, it sends to the card.

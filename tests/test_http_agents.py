@@ -2250,9 +2250,20 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual((seen['afterWiden']['scopes'], seen['afterWiden']['differ']), ('read tasks', '1'))
         self.assertIn('1 working credential allows something else than that.', seen['afterWiden']['line'])
         # 6. A superuser: what the agent does not have cannot be ticked, and is not sent when it is.
-        # kittrial-5bb.561: the superuser comparison uses the panel captured up front, before
-        # the test presses All (the later `seen['admin']` is under Mine, where Kestrel is hidden).
-        admin_panel = seen['admin'] if seen['admin'] is not None else seen['adminAfterAll']
+        # kittrial-5bb.561 r2: Mine is the default (read from the DOM, not hard-coded): under
+        # Mine the other owner's row is hidden; All shows every row. The scope checks run
+        # on the All view, so they see the rows.
+        self.assertEqual(seen['mineFilterShownToSuperuser'], 1)
+        self.assertEqual(seen['pressedMineOnly'], 'true')
+        self.assertEqual(seen['pressedAllOnly'], 'true')
+        self.assertTrue(seen['kestrelHiddenUnderMine'])
+        self.assertTrue(seen['wrenHiddenUnderMine'])
+        self.assertEqual(seen['mineShownUnderMine'], [])
+        self.assertIn('on this page of', seen['mineCountLine'])
+        self.assertEqual(seen['mineDefaultChoice'], 'Mine')
+        self.assertTrue(seen['adminAfterAllShowsWren'])
+        self.assertTrue(any(name.startswith('agent_') for name in seen['adminShownUnderAll']))
+        admin_panel = seen['adminAfterAll']
         self.assertIsNotNone(admin_panel)
         self.assertEqual({name: disabled for name, (_, disabled) in admin_panel['boxes'].items()},
                          {'read': True, 'tasks': False, 'records': True, 'checkpoints': True, 'reviews': True, 'feedback': True,
@@ -2261,14 +2272,11 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(seen['adminUnknownAfterAll'], {'boxes': {}, 'ownerChoice': 1, 'save': False})
         self.assertEqual(seen['adminInferredSetupAfterAll'], {'needed': 1, 'issue': False})
         self.assertEqual(seen['adminUnconfirmedAfterAll'], ['Dove', 'Wren'])
+        self.assertIn('audit view', seen['adminUnconfirmedNote'])
         self.assertFalse(seen['ownerFilter'])
-        # kittrial-5bb.561 (2): the superuser sees the Mine/All filter, presses All, sees
-        # every row (the named rows below all act on the All view).
+        # kittrial-5bb.561 r2 (filters are caller-level): the Mine/All choice is stable
+        # across pages, and Mine says which page it counts.
         self.assertEqual(seen['mineFilterShownToSuperuser'], 1)
-        self.assertEqual(seen['pressedMineOnly'], 'true')
-        self.assertEqual(seen['pressedAllOnly'], 'true')
-        self.assertTrue(seen['adminAfterAllShowsWren'])
-        self.assertTrue(any(name.startswith('agent_') for name in seen['adminShownUnderAll']))
         # 7. Set up folder.
         self.assertEqual((seen['setupKestrel']['needed'], seen['setupKestrel']['issue']), (0, True))
         self.assertIn('It carries what the agent has now: read.', seen['setupKestrel']['asked'])
