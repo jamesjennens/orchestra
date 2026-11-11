@@ -218,5 +218,42 @@ class Moved(unittest.TestCase):
         self.assertTrue(ha.independent_of(state, [None, ''], 'cora', P))
 
 
+
+class Recorded(unittest.TestCase):
+    """kittrial-5bb.560 part B: the decision for an approval already recorded under a name."""
+
+    def test_the_agent_is_the_record_of_the_first_segment_judged_with_its_owner(self):
+        self.assertEqual(ha.ByAgentDecision(True, 'agent', None, None, None, False),
+                         ha.recorded_by_agent_approval(base_state(), P, 'heron', 'egret', 'egret', NOW))
+        self.assertEqual('worker-credential',
+                         ha.recorded_by_agent_approval(base_state(), P, 'heron', 'builder', None, NOW).basis)
+        # Under a sub-label of its own the agent is the same agent, judged as the route judges it.
+        self.assertTrue(ha.recorded_by_agent_approval(base_state(), P, 'heron/x', 'egret', None, NOW).allowed)
+
+    def test_each_refusal_reaches_the_recorded_approval(self):
+        for author, assignee, kind in (('heron', None, 'same-agent'), ('heron/w1', None, 'same-agent'),
+                                       ('cora', None, 'account-id'), ('shared', None, 'shared-name'),
+                                       ('egret', 'cora', 'held-assignee')):
+            self.assertEqual(kind, ha.recorded_by_agent_approval(base_state(), P, 'heron', author, assignee,
+                                                                 NOW).refusal, author)
+
+    def test_a_person_or_a_name_of_no_agent_is_no_grant(self):
+        for approver in ('cora', 'builder', '', None, 'nobody/x'):
+            self.assertEqual('no-grant', ha.recorded_by_agent_approval(base_state(), P, approver, 'egret', None,
+                                                                       NOW).refusal, approver)
+
+    def test_without_a_clock_it_is_strict(self):
+        for now in (None, 'later', True, [NOW]):
+            self.assertEqual(ha.ByAgentDecision(False, None, 'strict', None, None, False),
+                             ha.recorded_by_agent_approval(base_state(), P, 'heron', 'egret', None, now), now)
+
+    def test_the_setting_and_the_grant_are_read_now(self):
+        state = base_state()
+        state['agent_approval'] = {P: {'mode': 'by-person', 'set_by': 'olly', 'set_at': 'then'}}
+        self.assertEqual('strict', ha.recorded_by_agent_approval(state, P, 'heron', 'egret', None, NOW).refusal)
+        self.assertEqual('no-grant', ha.recorded_by_agent_approval(base_state(), P, 'heron', 'egret', None,
+                                                                   NOW + 3600).refusal)
+
+
 if __name__ == '__main__':
     unittest.main()

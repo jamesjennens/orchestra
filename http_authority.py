@@ -752,6 +752,26 @@ def by_agent_approval(state, project_id, approver, author, assignee, now, names=
     return ByAgentDecision(True, basis, None, None, None, False)
 
 
+def recorded_by_agent_approval(state, project_id, approver, author, assignee, now):
+    """:func:`by_agent_approval` for an approval already RECORDED under the name ``approver`` (kittrial-5bb.560).
+
+    What integration asks, from the present state: the approve route judged the agent
+    ``principal.agent_id`` under the names ``[actor, account]``; a recorded approval carries only
+    the actor name, so the agent is the record of its first segment and the account is that
+    agent's owner, the account its credential is issued to. A name of no agent record, or a
+    ``now`` that is not a number, is refused (``no-grant``/``strict``): never a guessed clock.
+    """
+    if type(now) is bool or not isinstance(now, (int, float)):
+        return ByAgentDecision(False, None, 'strict', None, None, False)
+    head = approver.split('/', 1)[0] if isinstance(approver, str) and approver else ''
+    agents = state.get('agents') if isinstance(state.get('agents'), dict) else {}
+    agent = agents.get(head) if head else None
+    if not isinstance(agent, dict):
+        return ByAgentDecision(False, None, 'no-grant', None, None, False)
+    names = [approver] + ([agent['owner']] if isinstance(agent.get('owner'), str) and agent['owner'] else [])
+    return by_agent_approval(state, project_id, head, author, assignee, now, names=names)
+
+
 def _bare_account_id_of(state, agent_id, name):
     """Whether ``name`` is exactly the account id of the person who owns ``agent_id``."""
     agents = state.get('agents')

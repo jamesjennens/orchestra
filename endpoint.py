@@ -2784,7 +2784,8 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','assignment_status':422}
     if action=='web-lifecycle':
         from http_authority import (CAP_READ, CAP_COORDINATE, AuthorityDenied,
-                                    actor_parties, decide, file_lock, read_state)
+                                    actor_parties, decide, file_lock, read_state,
+                                    recorded_by_agent_approval)
         from admin import web_lifecycle_mark_writes
         import web_lifecycle
         args=request.get('args',[])
@@ -2828,6 +2829,13 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                 # Same full party policy as HTTP approval, from the configured
                 # store under its held lock. No descriptor supplies this state.
                 return actor_parties(read_state(authority_config.store),label,name)
+            def lifecycle_by_agent(approver,author,assignee):
+                # kittrial-5bb.560: the approve route's by-agent decision, asked again from the
+                # present state when the party sets meet, against the descriptor's decision
+                # clock (the web service's _expiry_now). No clock in the descriptor: strict.
+                descriptor=request.get('authority')
+                now=descriptor.get('now') if isinstance(descriptor,dict) else None
+                return recorded_by_agent_approval(read_state(authority_config.store),name,approver,author,assignee,now)
             def lifecycle_effect():
                 # The integration check needs the same operators, owners and mark family
                 # read as the writers whose decisions it reports (kittrial-5bb.374).
@@ -2851,16 +2859,17 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                         coordinate=False
                     result=web_lifecycle.read(body['task'],actor,runner,path,coordinate=coordinate,
                                               mark_writes=enabled,operators=operators,owners=owners,
-                                              parties=lifecycle_parties)
+                                              parties=lifecycle_parties,by_agent=lifecycle_by_agent)
                 elif operation=='check':
                     result=web_lifecycle.integration_check(body['task'],actor,runner,path,
                                                            target=body.get('target'),project_name=name,
                                                            operators=operators,owners=owners,
-                                                           parties=lifecycle_parties)
+                                                           parties=lifecycle_parties,by_agent=lifecycle_by_agent)
                 else:
                     result=web_lifecycle.apply(body,actor,runner,path,name,request['operation_id'],
                                                authority=lifecycle_authority,parties=lifecycle_parties,
-                                               mark_writes=enabled,operators=operators,owners=owners)
+                                               mark_writes=enabled,operators=operators,owners=owners,
+                                               by_agent=lifecycle_by_agent)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
                         'stderr':warning_text(run_warnings)}
             with held_coordination_lock(path,shared=coordination_lock_shared(request,'web-lifecycle',args,operation)):
