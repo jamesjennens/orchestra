@@ -460,6 +460,9 @@ out.proxyChoiceStoredWithoutSecret = JSON.parse(store.get(WIZARD_STORAGE_KEY)).n
   && !store.get(WIZARD_STORAGE_KEY).includes(SECRET);
 d.wizard.show('rewrite');
 out.proxyChoiceReachesRewrite = commandText(d, 'rewrite command').includes('noproxy = "127.0.0.1"');
+d.wizard.show('files');
+out.proxyChoiceReachesGuide = d.textContent.includes('the noproxy option for the server you chose')
+  && !d.textContent.includes('It holds three lines:');
 d.wizard.show('system');
 const proxyOff = attr(d, 'data-noproxy-choice', 'true')[0];
 proxyOff.checked = false;

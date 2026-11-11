@@ -464,7 +464,7 @@ export function integrationExample(server) {
   ];
 }
 
-export function agentGuide(payload, { hasCertificate = false, bridge = true } = {}) {
+export function agentGuide(payload, { hasCertificate = false, bridge = true, noproxy = false } = {}) {
   const file = payload.secretFile;
   const server = payload.server;
   // kittrial-5bb.348: the agent's own calls bypass a command-line proxy for this server only and stop
@@ -475,7 +475,9 @@ export function agentGuide(payload, { hasCertificate = false, bridge = true } = 
   // curl options that make every curl -K accept the service's own certificate (when there is
   // one), and the header line. The commands stay curl -K FILE only -- the options travel in the
   // file, never on the command line (kittrial-5bb.275).
-  const holds = hasCertificate
+  const holds = noproxy
+    ? `It holds the server comment lines, the noproxy option for the server you chose${hasCertificate ? ", the saved certificate’s cacert path (and on Windows ssl-no-revoke)" : ""}, and then ${headerLine()}.`
+    : hasCertificate
     ? `It holds the comment lines set-up put on top, the curl options that make every curl -K work (cacert = the saved certificate's real path, written by the set-up rewrite; and on Windows ssl-no-revoke), and then ${headerLine()}.`
     : `It holds three lines: two comment lines (the server address and the certificate fingerprint) and then ${headerLine()}.`;
   return [
@@ -731,7 +733,7 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
     '~~~',
     `3. Create ${GUIDE_PATH} with exactly this content:`,
     '~~~markdown',
-    agentGuide(payload, { hasCertificate, bridge }).trimEnd(),
+    agentGuide(payload, { hasCertificate, bridge, noproxy }).trimEnd(),
     '~~~',
     `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file in this folder.`,
     `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing. ${PASTED_SECRET_RULE}`,

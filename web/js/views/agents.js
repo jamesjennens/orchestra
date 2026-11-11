@@ -895,7 +895,7 @@ function issueBlock(ctx, agent, payload, wizard) {
 function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
   const payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
-  const files = () => [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate, bridge: state.bridge })]];
+  const files = () => [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate, bridge: state.bridge, noproxy: state.noproxy })]];
   const folder = payload.workingDirectory;
   // The address the extension must use is the one this page is connected to, not the configured
   // public address, which may be a name that does not resolve from this person's network.

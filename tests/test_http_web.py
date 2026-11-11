@@ -2314,6 +2314,7 @@ console.log(JSON.stringify({
             'proxyChoiceIsOffByDefault',
             'proxyChoiceStoredWithoutSecret',
             'proxyChoiceReachesRewrite',
+            'proxyChoiceReachesGuide',
             'proxyOffStillOffersCleanup',
             'atMostTwoSentencesPerScreen',
             'backHiddenOnTheFirstScreen',

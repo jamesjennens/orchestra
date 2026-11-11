@@ -29,7 +29,7 @@ const s = await import(process.argv[1]);
 const payload = {name:'worker',owner:'person',server:'https://example.org',projects:['p'],secretFile:{windows:'%USERPROFILE%\\a',powershell:'$env:USERPROFILE\\a',posix:'~/a'},certificateFile:s.certificateFile('worker')};
 const comments=s.credentialCommentLines(payload.server,null);
 const command=(noproxy,server='https://example.org')=>s.credentialFileCommand(payload.secretFile, comments,{noproxy,server});
-console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),bridge:s.agentGuide(payload,{bridge:true}),coordinator:s.agentGuide({...payload,coordinates:['p']},{bridge:false}),sentence:s.WAITING_ON_SENTENCE,watch:s.workerWaitLoop(payload.server,payload.secretFile),on:command(true),off:command(false),ipv6:command(true,'https://[::1]:443'),body:s.credentialFileBody('SECRET',null,{server:payload.server,noproxy:true}),bodyOff:s.credentialFileBody('SECRET',null),lines:s.credentialFileLines(payload.server,null,'SECRET',{noproxy:true}),example:s.integrationExample(payload.server),invalid:['https://*.example.org','https://example.org\nheader = bad','https://u:p@example.org'].map(server=>{try{s.noproxyLine(server);return false}catch{return true}})}));
+console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),proxyGuide:s.agentGuide(payload,{noproxy:true}),bridge:s.agentGuide(payload,{bridge:true}),coordinator:s.agentGuide({...payload,coordinates:['p']},{bridge:false}),sentence:s.WAITING_ON_SENTENCE,watch:s.workerWaitLoop(payload.server,payload.secretFile),on:command(true),off:command(false),ipv6:command(true,'https://[::1]:443'),body:s.credentialFileBody('SECRET',null,{server:payload.server,noproxy:true}),bodyOff:s.credentialFileBody('SECRET',null),lines:s.credentialFileLines(payload.server,null,'SECRET',{noproxy:true}),example:s.integrationExample(payload.server),invalid:['https://*.example.org','https://example.org\nheader = bad','https://u:p@example.org'].map(server=>{try{s.noproxyLine(server);return false}catch{return true}})}));
 '''
         done = subprocess.run([node, '--input-type=module', '-e', script,
                                (ROOT/'web/js/agentSetup.js').as_uri()],
@@ -99,7 +99,7 @@ console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),bridge:s
         first = json.dumps(dict(form='worker', fingerprint='wait1:'+'a'*64, changed=False), indent=2)
         second = json.dumps(dict(form='worker', fingerprint='wait1:'+'b'*64, changed=True), indent=2)
         prelude = "$global:watchCalls=0; function Start-Sleep { param($Seconds) if ($Seconds -ne 60) { throw 'wrong cadence' } }; "
-        prelude += "function curl.exe { $global:LASTEXITCODE=0; $global:watchCalls++; if ($global:watchCalls -gt 2) { throw 'watch failed to exit' }; if ($global:watchCalls -eq 1) { '" + first + "' } else { '" + second + "' } }; "
+        prelude += "function curl.exe { $global:LASTEXITCODE=0; $global:watchCalls++; if ($global:watchCalls -gt 2) { throw 'watch failed to exit' }; if ($global:watchCalls -eq 1) { ('" + first + "') -split \"`n\" } else { ('" + second + "') -split \"`n\" } }; "
         done = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command',
                                prelude + command + "; if ($global:watchCalls -ne 2) { throw 'wrong calls' }"],
                               capture_output=True, text=True, timeout=30)
@@ -132,6 +132,9 @@ console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),bridge:s
         v = self.value
         header = 'header = "Authorization: Bearer SECRET"\n'
         self.assertEqual(header, v['bodyOff'])
+        self.assertIn('the noproxy option for the server you chose', v['proxyGuide'])
+        self.assertNotIn('It holds three lines:', v['proxyGuide'])
+        self.assertIn('It holds three lines:', v['bridge'])
         for text in (v['body'], v['lines']):
             self.assertEqual(1, text.count('noproxy = "example.org"'))
             self.assertTrue(text.endswith(header))
@@ -139,6 +142,26 @@ console.log(JSON.stringify({worker:s.agentGuide(payload,{bridge:false}),bridge:s
         self.assertTrue(all(v['invalid']))
         self.assertIn('noproxy', v['on']['powershell'])
         self.assertNotIn('noproxy = "example.org"', v['off']['powershell'])
+
+    @unittest.skipUnless(os.name == 'nt', 'PowerShell rewrite executes on Windows CI')
+    def test_powershell_rewrite_deduplicates_and_preserves_header(self):
+        shell = shutil.which('powershell') or shutil.which('pwsh')
+        self.assertIsNotNone(shell, 'Windows qualification requires PowerShell')
+        with tempfile.TemporaryDirectory() as root:
+            file = Path(root)/'a'
+            header = b'header = "Authorization: Bearer SECRET"\r\n'
+            file.write_bytes(b'noproxy = "old"\r\n--noproxy "other"\r\n'+header)
+            env = dict(os.environ, USERPROFILE=root)
+            for variant in ('on', 'on', 'ipv6', 'off', 'off'):
+                done = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command', self.value[variant]['powershell']],
+                                      env=env, capture_output=True, timeout=30)
+                self.assertEqual(0, done.returncode, done.stderr)
+                content = file.read_bytes()
+                self.assertTrue(content.endswith(header))
+                self.assertEqual(1 if variant != 'off' else 0, content.count(b'noproxy ='))
+                self.assertNotIn(b'old', content)
+                self.assertNotIn(b'other', content)
+                self.assertEqual(b'', done.stdout)
 
     @unittest.skipIf(os.name == 'nt', 'POSIX rewrite executes in a POSIX shell')
     def test_posix_rewrite_deduplicates_changes_host_disables_and_preserves_header(self):
