@@ -225,7 +225,8 @@ class EndpointTests(unittest.TestCase):
         # Every one goes through guarded_write, so every one reads the configuration
         # before it reserves.
         # The fifteenth (kittrial-5bb.454 r2): `decision-attest`, an attestation of a decision's exact text.
-        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 15)
+        # The sixteenth (kittrial-5bb.570): `standards` (`draft-propose`, `std_effect`).
+        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 16)
 
     def test_an_action_that_needs_nothing_from_the_file_is_not_stopped_by_its_damage(self):
         """Review of kittrial-5bb.156: the file was read before EVERY action, so the onboarding text could

@@ -267,10 +267,22 @@ class BlockMatchesRequestTests(EndpointHarness):
         super().setUp()
         import briefing
         import proposal_records
+        import review_standards
         import work
         self.reached = []
         for module, name in ((work, 'execute'), (briefing, 'execute'), (proposal_records, 'write')):
             patcher = mock.patch.object(module, name, side_effect=self.library(module.__name__))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, rv in (
+            ('endpoint_standards_action', ({'carried_out': 'review_standards'}, True)),
+            ('web_standards_action', {'returncode': 0, 'stdout': '{"carried_out": "review_standards"}\n', 'stderr': ''}),
+        ):
+            patcher = mock.patch.object(
+                review_standards,
+                name,
+                side_effect=lambda *a, _rv=rv, **kw: (self.reached.append('review_standards'), _rv)[1],
+            )
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -310,6 +322,23 @@ class BlockMatchesRequestTests(EndpointHarness):
             ('proposal revise', proposal('revise'), 'proposals.write', 'proposal_records'),
             ('proposal triage', proposal('review'), 'reviews.approve', 'proposal_records'),
             ('proposal decide', proposal('decide'), 'project.admin', 'proposal_records'),
+            ('standards draft-propose', lambda: self.payload_request('standards', ['draft-propose'], {'reason': 'r'}),
+             'reviews.write', 'review_standards'),
+            ('web-standards set-gate', lambda: {
+                'project': PROJECT, 'actor': OWNER, 'action': 'web-standards',
+                'args': [json.dumps({'operation': 'set-gate', 'payload': {'mode': 'block', 'reason': 'r'}})],
+                'operation_id': 'request-ws-%d' % (self.count + 1),
+            }, 'coordinate', 'review_standards'),
+            ('web-standards draft-propose', lambda: {
+                'project': PROJECT, 'actor': OWNER, 'action': 'web-standards',
+                'args': [json.dumps({'operation': 'draft-propose', 'payload': {'reason': 'r'}})],
+                'operation_id': 'request-wsd-%d' % (self.count + 1),
+            }, 'reviews.write', 'review_standards'),
+            ('web-standards draft-propose-tasks', lambda: {
+                'project': PROJECT, 'actor': OWNER, 'action': 'web-standards',
+                'args': [json.dumps({'operation': 'draft-propose-tasks', 'payload': {'reason': 'r'}})],
+                'operation_id': 'request-wsdt-%d' % (self.count + 1),
+            }, 'tasks.write', 'review_standards'),
         )
 
     def test_the_table_is_what_the_service_asks_for_each_route(self):

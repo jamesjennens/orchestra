@@ -155,10 +155,27 @@ def _positions(issue):
             if isinstance(comment, dict)}
 
 
-def _view(payload, comment):
-    return {'comment_id': str(comment['id']), 'author': comment['author'], 'timestamp': comment.get('created_at'),
+def _view(payload, comment, journal=None):
+    view = {'comment_id': str(comment['id']), 'author': comment['author'], 'timestamp': comment.get('created_at'),
             'contribution': payload['contribution'], 'commit': payload['commit'], 'verdict': payload['verdict'],
             'summary': payload['summary'], 'items': [dict(item) for item in payload['items']]}
+    if journal is not None:
+        from pathlib import Path
+        import review_standards
+        jpath = Path(journal)
+        store = review_standards.HostStandardsStore(jpath, jpath.name)
+        if store.inspect_register_raw()[0] != 'none':
+            chk_state, rec_std = store.read_recommendation_checks(str(comment['id']), payload.get('operation_id'))
+            if chk_state == 'ok' and isinstance(rec_std, dict):
+                if isinstance(rec_std.get('checks'), list):
+                    view['checks'] = [dict(c) for c in rec_std['checks']]
+                if rec_std.get('register_version') is not None:
+                    view['register_version'] = rec_std['register_version']
+                if rec_std.get('declared_tool') is not None:
+                    view['declared_tool'] = rec_std['declared_tool']
+                if rec_std.get('declared_model') is not None:
+                    view['declared_model'] = rec_std['declared_model']
+    return view
 
 
 #: Said to an actor who has a standing recommendation for the contribution and sends another.
@@ -168,9 +185,9 @@ ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that r
                        'recommendation then stops counting. A recommendation cannot be withdrawn.')
 
 
-def standing(issue, state):
+def standing(issue, state, journal=None):
     """The recommendations a read shows for the task's current contribution: the newest READ_MAX."""
-    return [_view(payload, comment) for _, payload, comment in _standing(issue, state)[:READ_MAX]]
+    return [_view(payload, comment, journal=journal) for _, payload, comment in _standing(issue, state)[:READ_MAX]]
 
 
 def _standing(issue, state):
@@ -227,10 +244,10 @@ def _standing(issue, state):
     return sorted(newest.values(), key=lambda entry: entry[0], reverse=True)
 
 
-def block(issue, state):
+def block(issue, state, journal=None):
     """The additive reader fields: the newest standing recommendation and who recommends."""
     every = _standing(issue, state)
-    views = [_view(payload, comment) for _, payload, comment in every[:READ_MAX]]
+    views = [_view(payload, comment, journal=journal) for _, payload, comment in every[:READ_MAX]]
     # Every entry names who and when. The newest FULL_MAX also carry their whole content
     # (additive): the web service leaves out a recommendation by the author's own person,
     # and then shows the next one, which it could not do from a name and a time.
@@ -268,7 +285,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None):
     for _, stored, comment in records:
         if stored['operation_id'] == payload['operation_id']:
             if stored == payload and comment['author'] == actor:
-                return dict(comment_id=str(comment['id']), reconciled=True, **block(issue, state))
+                return dict(comment_id=str(comment['id']), reconciled=True, **block(issue, state, journal=journal))
             raise ValueError('Operation ID already used with different payload or actor')
     check_plain_text(payload)
     if issue.get('status') == 'closed':
@@ -299,4 +316,4 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None):
     comment = {'id': result['id'], 'text': PREFIX + canonical_bytes(payload).decode(), 'author': actor,
                'created_at': result.get('created_at')}
     preview = dict(issue, comments=list(issue.get('comments') or []) + [comment])
-    return dict(comment_id=str(result['id']), reconciled=False, **block(preview, state))
+    return dict(comment_id=str(result['id']), reconciled=False, **block(preview, state, journal=journal))

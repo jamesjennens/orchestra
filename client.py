@@ -1749,6 +1749,7 @@ CONTRIBUTOR_COMMANDS = (
      "the program view of a program project: its areas, interfaces and requirements' coverage"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
+    ('standards ...', 'review standards register, drafts, waivers, and delivery sign-offs'),
     ('coordinator ...', 'the coordinator reads for this project'),
     ('refresh', 'refresh the cached export the reads are answered from'),
     ('view [NAME]', 'render one of the project views'),
@@ -1785,7 +1786,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
                   'wait','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
-                  'coordinator')
+                  'standards','coordinator')
 
 
 def contributor_command_names():
@@ -1860,6 +1861,13 @@ _COMMAND_HELP_USAGE = {
                   'checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | '
                   'checkpoint TASK --directions [--offset N] [--limit N]',
     'docs': 'docs [NAME] | docs --status',
+    'standards': 'standards show [--version N] [--effective] [--json] | standards history [--json] | '
+                 'standards lint [--json] | standards draft-propose --file FILE [--reason TEXT] [--json] | '
+                 'standards draft-list [--status pending|accepted|rejected] [--json] | '
+                 'standards waivers TASK [--json] | '
+                 'standards sign-off TASK [--contribution ID] [--format text|json|markdown] [--out PATH] | '
+                 'standards notifications [--json] | '
+                 'standards inspect-commit --repo DIR --commit SHA [--target-ref REF]',
 }
 
 
@@ -2085,6 +2093,67 @@ def _files_get(a, config, header):
             except OSError:
                 pass
 
+def _standards_inspect_commit(args, out_path=None):
+    parser = argparse.ArgumentParser(prog='standards inspect-commit', add_help=True)
+    parser.add_argument('--repo', default='.')
+    parser.add_argument('--commit', required=True)
+    parser.add_argument('--target-ref', dest='target_ref', default='refs/heads/main')
+    parser.add_argument('--out', dest='sub_out')
+    parsed = parser.parse_args(args)
+    commit = parsed.commit.strip().lower()
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit):
+        raise ValueError('commit must be a 40- or 64-character hex SHA')
+    repo = parsed.repo
+
+    def git_cmd(*gargs):
+        done = subprocess.run(
+            ['git', '--no-optional-locks', '-c', 'protocol.allow=never', '-C', repo, *gargs],
+            capture_output=True, timeout=60, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        if done.returncode:
+            err = (done.stderr or b'').decode('utf-8', 'replace').strip()
+            raise ValueError('git %s failed: %s' % (' '.join(gargs[:2]), err or done.returncode))
+        return done.stdout
+
+    resolved = git_cmd('rev-parse', '--verify', commit + '^{commit}').decode('ascii', 'replace').strip().lower()
+    target_sha = git_cmd('rev-parse', '--verify', parsed.target_ref + '^{commit}').decode('ascii', 'replace').strip().lower()
+    merge_base = git_cmd('merge-base', target_sha, resolved).decode('ascii', 'replace').strip().lower()
+    raw_diff = git_cmd('diff', '--name-only', '-z', '--no-renames', merge_base, resolved)
+    changed = sorted({p.decode('utf-8', 'replace') for p in raw_diff.split(b'\0') if p})
+    tree_files = {}
+    for rel in changed:
+        listing = git_cmd('ls-tree', '-z', '--full-tree', resolved, '--', rel)
+        for entry in listing.split(b'\0'):
+            meta, _, name = entry.partition(b'\t')
+            parts = meta.split()
+            if entry and name.decode('utf-8', 'replace') == rel and len(parts) == 3:
+                mode, kind, obj = (x.decode('ascii', 'replace') for x in parts)
+                if kind == 'blob' and mode in ('100644', '100755'):
+                    blob = git_cmd('cat-file', 'blob', obj)
+                    is_text = len(blob) <= 10_485_760 and b'\x00' not in blob[:8192]
+                    lines = (0 if not blob else blob.count(b'\n') + (0 if blob.endswith(b'\n') else 1)) if is_text else None
+                    tree_files[rel] = {'regular_text': is_text, 'line_count': lines}
+                else:
+                    tree_files[rel] = {'regular_text': False, 'line_count': None}
+    payload = {
+        'schema_version': 1,
+        'commit': resolved,
+        'target_ref': parsed.target_ref,
+        'merge_base': merge_base,
+        'changed_files': changed,
+        'tree_files': tree_files,
+        'ci_checks': [],
+    }
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + '\n'
+    dest = parsed.sub_out or out_path
+    if dest:
+        with open(dest, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def main():
     p=argparse.ArgumentParser(epilog=contributor_help_text(),
                               formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2121,6 +2190,8 @@ def main():
                 return _capability_validate(args[2:],local_config,a.project,a.actor,a.out)
             return _capability_check(args[2:],local_config,a.project,a.actor,a.out)
         return _capability(args[1:],a.out)
+    if args[:2]==['standards','inspect-commit']:
+        return _standards_inspect_commit(args[2:],a.out)
     if ((not a.config or not a.project) and args[0] in contributor_command_names()
             and help_requested(args[1:])):
         sys.stdout.write(contributor_command_help(args[0]))
@@ -2152,6 +2223,11 @@ def main():
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
     elif args[0] in CLIENT_ACTIONS:action=args.pop(0)
+    if action=='standards' and '--out' in args:
+        idx=args.index('--out')
+        if idx+1>=len(args):raise ValueError('--out requires a path')
+        a.out=args[idx+1]
+        args=args[:idx]+args[idx+2:]
     document=temporary=None
     if action=='ref':
         args,document,temporary=_design_document_args(args)

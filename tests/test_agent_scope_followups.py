@@ -709,6 +709,9 @@ class AgentScopePinTests(unittest.TestCase):
         offered = self.web_scopes()
         names = [scope for scope, _ in offered]
         self.assertEqual(len(names), len(set(names)))
-        expected = set(http_authority.SCOPE_CAPABILITIES) - {http_authority.NUDGES_SCOPE}
+        expected = set(http_authority.SCOPE_CAPABILITIES) - {
+            http_authority.NUDGES_SCOPE,
+            http_authority.VERIFY_SCOPE,
+        }
         self.assertEqual(expected, set(names))
         self.assertIn(['records', 'File and change records'], [list(item) for item in offered])
