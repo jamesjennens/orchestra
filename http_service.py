@@ -3998,7 +3998,7 @@ class EndpointBackend:
         from admin import ConfigurationUnreadable
         try:
             return fn(Path(self.root))
-        except ConfigurationUnreadable as exc:
+        except (ConfigurationUnreadable, OSError) as exc:
             print(
                 'configuration: the service could not read the deployment configuration: %s'
                 % ascii(str(exc)[:600]),
@@ -8405,14 +8405,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     def invites_create(self, ctx):
         """Make one invite link. The token is in this answer only; an exact retry answers 200 without it."""
         payload = dict(ctx.payload or {})
+        # The committed event names the invite (never the username), so a create can be linked to its
+        # redeem (``invites.redeemed`` carries the same id) from the audit alone.
+        metadata = {}
 
         def create():
             invites.require_enabled(self._invites_enabled())
             refuse_unknown_fields(payload, invites.CREATE_FIELDS, 'An invite')
-            return invites.create(self.service, ctx.principal, payload, usable=self._require_usable,
-                                  request_id=ctx.request_id)
+            public, stored = invites.create(self.service, ctx.principal, payload, usable=self._require_usable,
+                                            request_id=ctx.request_id)
+            metadata.update(reason='invite=%s' % public['invite']['id'], invite_id=public['invite']['id'])
+            return public, stored
         return self._mutate(ctx, 'invites.create', None, create, status=201, capability=CAP_AGENTS,
-                            replay_status=200)
+                            replay_status=200, audit_metadata=metadata)
 
     @route('POST', r'/v1/invites/(?P<iid>' + ID + r')/revoke')
     def invites_revoke(self, ctx):

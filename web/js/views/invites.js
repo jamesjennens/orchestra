@@ -1,6 +1,6 @@
 // Invite links (kittrial-5bb.578). Two parts:
 //  * invitePanel: on a project's Members & settings page, for a person who may invite to at least one
-//    project (a coordinator, an owner or a superuser) while the installation's switch is on. It makes an
+//    project (an owner of it, or a superuser) while the installation's switch is on. It makes an
 //    invite, shows its link ONCE, and lists the person's invites with their status and a Withdraw button.
 //  * invitePage: the signed-out page the link opens (#/invite/TOKEN). It shows who invited whom, the
 //    projects and the pre-approved agent, takes the password, and then offers the agent's files once.

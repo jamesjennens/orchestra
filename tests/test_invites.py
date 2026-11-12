@@ -467,6 +467,78 @@ class RateLimitTests(InviteCase):
         self.assertEqual(self.redeem(token)[0], 201)
 
 
+class SecondReviewPinTests(InviteCase):
+    """The second review of 4b622a50: rules that held but that no test pinned (X1-X4, X11) and S3."""
+
+    def test_x1_an_archived_project_is_refused_at_redeem_with_nothing_made(self):
+        token = self.invite(projects=['north'])['token']
+        self.assertEqual(self.call('POST', '/v1/projects/north/archive', {}, self.admin)[0], 200)
+        before = self.snapshot()
+        status, body = self.redeem(token)
+        self.assertEqual((status, body['error']['code']), (409, 'invite_stale'), body)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_x2_a_disabled_inviter_is_refused_at_redeem(self):
+        token = self.invite(projects=['north'])['token']
+        cora = self.service.state['usernames']['cora']
+        status, body = self.call('POST', '/v1/accounts/%s/disable' % cora, {}, self.admin)
+        self.assertEqual(status, 200, body)
+        before = self.snapshot()
+        status, body = self.redeem(token)
+        self.assertEqual((status, body['error']['code']), (409, 'invite_stale'), body)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_x3_the_backends_usability_check_is_run_again_at_redeem(self):
+        token = self.invite(projects=['north'])['token']
+        asked = []
+
+        def unusable(handler, project_id):
+            asked.append(project_id)
+            raise http_auth.HttpError(409, 'conflict', 'This record cannot be served')
+        before = self.snapshot()
+        with mock.patch.object(http_service.ApiHandler, '_require_usable', unusable):
+            status, body = self.redeem(token)
+        self.assertEqual((status, body['error']['code']), (409, 'invite_stale'), body)
+        self.assertEqual(asked, ['north'])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.redeem(token)[0], 201)
+
+    def test_x4_the_signed_out_view_does_not_carry_the_inviters_account_id(self):
+        token = self.invite()['token']
+        status, shown = self.view(token)
+        self.assertEqual(status, 200, shown)
+        self.assertNotIn(self.service.state['usernames']['cora'], json.dumps(shown))
+        self.assertNotIn('invited_by', shown)
+        self.assertNotIn('id', shown)
+        self.assertEqual(shown['invited_by_name'], 'cora')
+
+    def test_x11_the_raw_clock_half_of_the_expiry_holds_while_the_monotone_floor_is_ahead(self):
+        """The record store's high-water mark is pinned 10000 s ahead before the invite is made, so its
+        monotone expiry is 10000 s late; one real hour later the raw half alone must expire it."""
+        self.service.store.records.monotonic_now(now=self.clock() + 10000)
+        owner = self.session('cora', 'cora-password-1')           # a session stamped on the pinned clock
+        token = self.invite(token=owner, expires_hours=1)['token']
+        record = self.record(token)
+        self.assertGreater(record['expires_at'], self.clock() + 10000)
+        self.clock.advance(3600 - 1)
+        self.assertEqual(self.view(token)[0], 200)
+        self.clock.advance(1)
+        self.assertLess(self.service._expiry_now(), record['expires_at'])   # the monotone half alone says live
+        self.assertEqual(self.generic(*self.view(token)), self.UNUSABLE)
+        self.assertEqual(self.generic(*self.redeem(token)), self.UNUSABLE)
+
+    def test_s3_the_create_event_names_the_invite_and_not_the_username(self):
+        made = self.invite(username='nina')
+        created = [e for e in self.service.state['audit'] if e['action'] == 'invites.create' and e['outcome'] == 'committed']
+        self.assertEqual(len(created), 1)
+        self.assertEqual((created[0]['reason'], created[0]['invite_id']),
+                         ('invite=%s' % made['invite']['id'], made['invite']['id']))
+        self.assertNotIn('nina', json.dumps(created[0]))
+        self.assertEqual(self.redeem(made['token'])[0], 201)
+        redeemed = [e for e in self.service.state['audit'] if e['action'] == 'invites.redeemed']
+        self.assertTrue(redeemed and all(e['invite_id'] == made['invite']['id'] for e in redeemed))
+
+
 class ReviewHardeningTests(InviteCase):
     """The Opus review of 4b622a50: S1 timing, S2 audit flooding, S3 username probing."""
 
@@ -633,6 +705,14 @@ class EndpointSwitchTests(unittest.TestCase):
             self.assertFalse(admin.invites_enabled(root, warnings=warnings))
             self.assertIn('invites_enabled is "true" (str), not the JSON value true or false', warnings[0])
 
+    def test_a_configuration_that_cannot_be_opened_is_the_usual_503(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'deployment.private.json').write_text('{}', encoding='utf-8')
+            with mock.patch.object(admin, 'deployment_document', side_effect=PermissionError(13, 'Permission denied')):
+                with self.assertRaises(http_auth.HttpError) as refused:
+                    self.backend(Path(tmp))()
+            self.assertEqual(refused.exception.status, 503)
+
     def test_an_unreadable_configuration_is_the_usual_503(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / 'deployment.private.json').write_text('{not json', encoding='utf-8')
@@ -658,6 +738,11 @@ class WebPageTests(unittest.TestCase):
         # Review N2: the page drops the token from the address bar first thing.
         page = source[source.index('export function invitePage'):]
         self.assertIn("history.replaceState(null, '', '#/')", page[:400])
+        # Second review S1: the credential download says plainly that it holds a secret and what to do.
+        agents_js = (web / 'views' / 'agents.js').read_text(encoding='utf-8')
+        self.assertIn('This file holds a secret. Run Orchestra Bridge: Set up in VS Code next: it moves this file out of '
+                      'Downloads and deletes the copy. If you don’t use the Bridge, move it yourself and empty it from '
+                      'Downloads.', agents_js)
         start = source.index('export function inviteLink')
         body = source[start:source.index('\n}\n', start) + 3].replace('export ', '')
         script = body + ("console.log(JSON.stringify([inviteLink({token: 'T'}, 'https://here'), "

@@ -4319,7 +4319,8 @@ While it is off the create form is hidden and `POST /v1/invites`, `POST /v1/invi
 Listing and withdrawing stay open, so an invite made while it was on can still be withdrawn. Switching
 off withdraws nothing: a pending link that has not expired works again once the switch is back on. If
 that is not wanted, withdraw the pending invites (Members & settings, or `POST /v1/invites/{id}/revoke`)
-before switching off. To turn it
+before switching off. A withdrawal whose save fails still holds in memory and is written by the next
+save; a service stopped before that save brings the invite back, so withdraw it again. To turn it
 on, stop nothing: add `"invites_enabled": true` to the top-level object of
 `<runtime root>/deployment.private.json` (keep it a regular file, mode 600, owned by the service
 account) and save. The service-local (disposable) backend has no deployment file; there it is the
