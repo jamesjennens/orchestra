@@ -2,7 +2,7 @@
 import { h, mount, brandMark, initials, confirmDialog, toast } from './dom.js';
 import { createApi, fetchTransport } from './api.js';
 import { describe } from './ui.js';
-import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage } from './routes.js';
+import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage, SECTION_LABELS, searchLeftMessage, rememberProject, rememberedProject, forgetProject } from './routes.js';
 import * as auth from './views/auth.js';
 import * as work from './views/work.js';
 import * as project from './views/project.js';
@@ -53,25 +53,68 @@ export async function start(root, options = {}) {
     render();
   };
   ctx.href = (route) => '#' + route;
+  // kittrial-5bb.522 slice 1: the browser storage that keeps the last project (options.storage in tests).
+  const storage = (() => {
+    if ('storage' in options) return options.storage;
+    try { return window.localStorage; } catch { return null; }
+  })();
+  // A view writes its filters into the URL's query without a new history entry or a re-render, so a filtered
+  // list is shareable, reload-safe and survives a project switch (kittrial-5bb.522 slice 1, .502 §1.9).
+  // `view` is the render that asks (ctx.currentView(), taken when the view starts): a write from a render that
+  // is no longer current, or while another page's navigation is pending, writes nothing, so a late timer of a
+  // page already left (the search box's 250 ms) never puts its filters on the next page.
+  ctx.currentView = () => token;
+  ctx.setQuery = (params, view) => {
+    if (view !== token || !rendered) return;
+    const path = rendered.split('?')[0];
+    if (currentRoute().split('?')[0] !== path) return;
+    const text = new URLSearchParams(params).toString();
+    const route = path + (text ? '?' + text : '');
+    memoryRoute = route;
+    rendered = route;
+    try {
+      history.replaceState(null, '', '#' + route);
+      lastHash = location.hash;
+    } catch { /* hash unavailable: the route stays in memory */ }
+    ctx.query = new URLSearchParams(text);
+  };
   ctx.setDirty = (value) => { ctx.dirty = value; };
 
+  // projectsRead is false when the list could not be read: that says nothing about access (kittrial-5bb.522).
   ctx.refreshProjects = async () => {
-    try { ctx.projects = (await api.projects()).items || []; } catch { ctx.projects = []; }
+    try { ctx.projects = (await api.projects()).items || []; ctx.projectsRead = true; } catch { ctx.projects = []; ctx.projectsRead = false; }
   };
+  // Who was signed in when the page now in the address bar was opened, once that person is gone (sign-out or a
+  // lost session): only they return to it. null: nobody was, so whoever signs in does (a deep link opened cold).
+  let pendingUser = null;
 
   ctx.signedIn = async (user) => {
     ctx.me = user;
     await ctx.refreshProjects();
-    ctx.go(ctx.projects.length ? '/' : '/welcome');
+    // A deep link opened before signing in is where the person goes once signed in (kittrial-5bb.522 Q4).
+    // Only for the person it was opened for: the next person to sign in does not land on the last one's page.
+    const wanted = pendingUser === null || pendingUser === user.id ? currentRoute() : '/';
+    pendingUser = null;
+    ctx.go(wanted && wanted !== '/' && wanted !== '/welcome' ? wanted : (ctx.projects.length ? '/' : '/welcome'));
   };
   ctx.signOut = async () => {
     try { await api.logout(); } catch { /* the session is gone either way */ }
     agents.clearWizardStorage();
+    forgetProject(storage, ctx.me && ctx.me.id);
+    if (ctx.me) pendingUser = ctx.me.id;   // a second click finds nobody signed in and must not clear it
+    token += 1;
     ctx.me = null; ctx.projects = [];
+    // The next person to sign in on this browser starts at home, not on this person's last page.
+    memoryRoute = '/';
+    try { history.replaceState(null, '', '#/'); } catch { /* ignore */ }
     showLogin();
   };
   ctx.sessionLost = () => {
     agents.clearWizardStorage();
+    // Another tab signed out: nothing of this person's is kept, and no late write comes from the page left.
+    forgetProject(storage, ctx.me && ctx.me.id);
+    if (ctx.me) pendingUser = ctx.me.id;
+    token += 1;
     ctx.me = null;
     showLogin('Your session has ended. Sign in again to continue.');
   };
@@ -105,22 +148,30 @@ export async function start(root, options = {}) {
   function switchProject(targetPid) {
     // Read the current route and its project's sections before ctx.go changes location.hash.
     const route = currentRoute();
-    const here = ctx.projects.find((p) => p.id === projectOf(route));
+    const here = ctx.projects.find((p) => p.id === projectOf(route.split('?')[0]));
     const hereSections = here ? projectSections(here) : [];
     const target = ctx.projects.find((p) => p.id === targetPid);
     const sections = target ? projectSections(target) : [];
-    const t = switchTarget(route, targetPid, sections.map(([seg]) => seg));
+    // Handover and Notes are not rail entries; the target is kept on them. Handover opens for every member; Notes
+    // can answer "No access" to a viewer, which its page says (the section is still the one asked for).
+    const t = switchTarget(route, targetPid, sections.map(([seg]) => seg).concat(target ? ['handover', 'notes'] : []));
     ctx.go(t.path);
+    const lines = [];
     if (t.fellBack) {
       const name = target ? target.name : 'that project';
-      const label = t.section && (hereSections.find(([seg]) => seg === t.section) || [])[1];
-      toast(fallbackMessage(name, label));
+      const label = t.section && ((hereSections.find(([seg]) => seg === t.section) || [])[1] || (Object.hasOwn(SECTION_LABELS, t.section) ? SECTION_LABELS[t.section] : ''));
+      // An unknown section (a hand-written URL) has no name to give: the page-level sentence, not the task one.
+      lines.push(t.section && !label ? fallbackMessage(name, '', 'other') : fallbackMessage(name, label, t.page));
     }
+    if (t.qDropped) lines.push(searchLeftMessage(here ? here.name : 'the project you left'));
+    if (lines.length) toast(lines.join(' '));
   }
 
   function buildShell(route) {
     route = route.split('?')[0];
-    const pid = projectOf(route);
+    // The project the rail shows: the URL's on a project page (the URL always wins), else the last project this
+    // person opened (kittrial-5bb.522 slice 1), so the switcher is orthogonal to the other menu entries.
+    const pid = projectOf(route) || rememberedProject(storage, ctx.me && ctx.me.id, ctx.projectsRead ? ctx.projects : null);
     const active = ctx.projects.filter((p) => !p.archived);
     const current = pid && ctx.projects.find((p) => p.id === pid);
     const link = (href, label, count) => h('a', { class: 'nav-link', href: ctx.href(href), 'aria-current': route === href ? 'page' : null },
@@ -178,6 +229,10 @@ export async function start(root, options = {}) {
       try {
         const node = await view(ctx, match.params);
         if (mine !== token) return;
+        // kittrial-5bb.522 slice 1: a project page that opened selects that project for the rail's other pages
+        // (after the view answered, so a session that has ended writes nothing).
+        const opened = projectOf(path);
+        if (opened && ctx.projects.some((p) => p.id === opened && !p.archived)) rememberProject(storage, ctx.me.id, opened);
         mount(main, node);
       } catch (error) {
         if (mine !== token) return;

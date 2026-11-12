@@ -198,6 +198,9 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .toolbar input[type="search"] { max-width: 280px; }
 .toolbar select { width: auto; }
+/* A row of filters (Reviews' "Show" select); wraps on the phone. */
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.filters select { width: auto; }
 .seg { display: inline-flex; border: 1px solid var(--field-line); border-radius: var(--radius); overflow: hidden; }
 .seg button { border: 0; border-radius: 0; min-height: 30px; font-weight: 500; }
 .seg button + button { border-left: 1px solid var(--line-strong); }
@@ -486,6 +489,7 @@ th.task-updated-column, td.task-updated-column { text-align: right; }
 @media (max-width: 760px) {
   .summary { grid-template-columns: minmax(0, 1fr); }
   .tools { grid-template-columns: minmax(0, 1fr); }
+  .filters select { flex: 1 1 180px; }
   table.stack-narrow thead { display: none; }
   table.stack-narrow tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px;
     padding: 10px 12px; border-bottom: 1px solid var(--line); }
