@@ -2517,6 +2517,20 @@ credential approved anything; this is the one place where that is lifted.
   - Storage: it lives in this service's state and only the web route applies it. The host route
     compares actor names, so over ssh an agent of the same person was never refused, and a
     project set to `by-person` here is not strict over ssh.
+- **What an agent sees, and agents set up before this release (kittrial-5bb.518).**
+  - The brief (`GET .../tasks/{task}/brief`) answers `review.approval_permission` for a delivery awaiting
+    review: `may_approve`, a `case` (`another-agent`, `worker-credential`, `own-work`, `own-person`,
+    `own-worker-credential`, `independent`), a sentence (a refusal's is the approve route's own 403 text, word for word), and the setting (`mode`, `set_by`, `set_by_display_name`, `set_at`,
+    `damaged`). The queue rows, My work and `GET /v1/agents/me/next` carry the same. It is informational
+    and is worked out by the functions the approve route calls, so it never disagrees with the route and
+    grants nothing. `waiting_for_approval` says someone else must approve only when a coordinator agent
+    may not.
+  - `.orchestra/AGENT.md` is written once, at set-up, and the server never changes it. A file written
+    before this release has no first line "AGENT.md version 2 (kittrial-5bb.518)" and a rule 9 that does not
+    mention the setting. `GET /v1/agents/me` answers `agent_md` (`version`, `note`) so an agent can tell its
+    copy is old; the server's reads are authoritative over the file. To refresh it, the agent's owner
+    re-runs set-up from My agents, which writes the current file. Nothing is lost by not doing so: who may
+    approve is unchanged by this release.
 - **An approval only this setting let through says so.**
   - The web service appends to its summary: "Approved by a coordinator agent of the same person
     as the agent that delivered it (project setting agent_approval: by-agent)."

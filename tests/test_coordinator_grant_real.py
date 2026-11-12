@@ -121,6 +121,27 @@ class RealStackTests(held.RealStackTests):
         self.assertEqual((403, OWN_PARTY_AGENT), (refused.status, held.message(refused)), refused.data)
         self.assertEqual(before, self.comments(task))
 
+    def test_the_brief_says_what_the_approve_does_through_the_real_stack(self):
+        """kittrial-5bb.518: approval_permission in the brief agrees with the approve, with the real endpoint and bd."""
+        self.assertEqual(200, self.grant().status)
+        made = self.request('POST', '/v1/agents', {'name': 'Egret', 'working_directory': '/home/x/egret', 'projects': ['pp']},
+                            token=self.tokens['cora'])
+        self.assertEqual(201, made.status, made.data)
+        self.tokens['egret'] = made.data['credential']['secret']
+        task, contribution = self.deliver('egret')
+        seen = self.request('GET', '%s/%s/brief' % (self.tasks, task), token=self.agent).data['review']
+        permission = seen['approval_permission']
+        self.assertEqual((True, 'another-agent', 'by-agent'),
+                         (permission['may_approve'], permission['case'], permission['setting']['mode']))
+        self.assertNotEqual('Waiting for somebody else\'s approval of the current contribution.', seen['waiting_for_approval'])
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/pp/agent-approval', {'agent_approval': 'by-person'},
+                                           token=self.tokens['alex']).status)
+        task, contribution = self.deliver('egret')
+        permission = self.request('GET', '%s/%s/brief' % (self.tasks, task), token=self.agent).data['review']['approval_permission']
+        refused = self.approve(self.agent, task, contribution)
+        self.assertEqual((False, 403, held.message(refused)), (permission['may_approve'], refused.status, permission['reason']))
+
     def test_its_own_accounts_work_and_the_grant_removed(self):
         self.assertEqual(200, self.grant().status)
         # cora's own contribution: her agent is refused though the installation's setting is off.
@@ -181,6 +202,56 @@ class RealStackTests(held.RealStackTests):
         other, second = self.deliver('drew')
         self.assertEqual(201, self.approve(self.tokens['alex'], other, second).status)
 
+    def test_the_gate_refuses_an_over_long_summary_exactly_as_the_canonical_write_does(self):
+        """kittrial-5bb.485 R5: with the gate's length refusal switched off the real endpoint and bd answer for an
+        over-long approve and recommend; with it on, the gate answers with the very same status, code, message and
+        detail. tests/test_agent_approval.py pins that the gate gives it before any normalization."""
+        import unittest.mock
+        task, contribution = self.deliver('casey')
+        text = 'x' * (http_service.ApiHandler.SUMMARY_MAX + 1)
+        before = self.comments(task)
+
+        def asked():
+            self.count += 1
+            approve = self.request('POST', '%s/%s/reviews' % (self.tasks, task), dict(
+                operation='approve', schema_version=1, operation_id='op-long-a-%d' % self.count, previous=contribution,
+                contribution=contribution, summary=text), token=self.tokens['alex'])
+            recommend = self.request('POST', '%s/%s/reviews' % (self.tasks, task), dict(
+                operation='recommend', schema_version=1, operation_id='op-long-r-%d' % self.count,
+                contribution=contribution, commit=fixes.CONTRIBUTION['commit'], verdict='approve', summary=text,
+                items=[]), token=self.agent)
+            return [(a.status, a.data['error']['code'], a.data['error']['message'], a.data['error'].get('detail'))
+                    for a in (approve, recommend)]
+
+        with unittest.mock.patch.object(http_service.ApiHandler, '_refuse_overlong_summary', lambda *a: None):
+            canonical = asked()
+        gate = asked()
+        self.assertEqual(canonical, gate)
+        self.assertEqual([(422, 'invalid_payload', 'Canonical command rejected the request',
+                           'ValueError: summary: 1201 characters, the limit is 1200'),
+                          (422, 'invalid_payload', 'summary: 1201 characters, the limit is 1200',
+                           'ValueError: summary: 1201 characters, the limit is 1200')], gate)
+        self.assertEqual(before, self.comments(task))
+        self.assertEqual('awaiting-review', self.review(task)['state'])
+
+    def test_the_endpoint_refuses_an_empty_or_control_character_approve_summary_as_the_in_process_backend_does(self):
+        """kittrial-5bb.516: what the real endpoint and bd answer for an approve whose summary is missing, empty,
+        blank or carries a control character. tests/test_agent_approval.py asserts the in-process backend gives the
+        very same answers (CANONICAL_SUMMARY_REFUSALS)."""
+        import test_agent_approval
+        task, contribution = self.deliver('casey')
+        before = self.comments(task)
+        seen = {}
+        for name, body in test_agent_approval.SUMMARY_CASES.items():
+            self.count += 1
+            payload = dict(operation='approve', schema_version=1, operation_id='op-sum-%d' % self.count,
+                           previous=contribution, contribution=contribution, **body)
+            answer = self.request('POST', '%s/%s/reviews' % (self.tasks, task), payload, token=self.tokens['alex'])
+            seen[name] = (answer.status, answer.data['error']['code'], answer.data['error']['message'],
+                          answer.data['error'].get('detail'))
+        self.assertEqual(test_agent_approval.CANONICAL_SUMMARY_REFUSALS, seen)
+        self.assertEqual(before, self.comments(task))
+        self.assertEqual('awaiting-review', self.review(task)['state'])
 
 if __name__ == '__main__':
     unittest.main()

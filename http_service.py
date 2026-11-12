@@ -52,7 +52,7 @@ import actor_names
 import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
-from review_workflow import TEXT_LIMITS
+from review_workflow import TEXT_LIMITS, limited
 import claim_limit
 import handover_steps
 import project_setup
@@ -63,7 +63,7 @@ import rooms
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
-from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+from http_auth import (Principal, AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_NUDGE_CARRY, NUDGES_SCOPE,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
@@ -1263,6 +1263,20 @@ class InProcessBackend:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
+        if operation == 'approve':
+            # kittrial-5bb.516: an approve summary is checked as the canonical write checks it
+            # (review_workflow.validate's ``limited`` and execute's ``check_plain_text``), with the endpoint
+            # backend's own answer for a refusal, so this backend never stores what bd would refuse: no empty
+            # summary (a same-person approval would then carry no basis sentence) and no control characters.
+            from review_workflow import check_plain_text
+            if 'summary' not in payload:
+                # The endpoint backend's own field check (EndpointBackend, 'payload is missing fields').
+                raise invalid('Canonical review payload is missing fields: summary')
+            try:
+                limited(payload.get('summary'), 'summary')
+                check_plain_text({'summary': payload.get('summary')})
+            except ValueError as error:
+                raise invalid('Canonical command rejected the request', 'ValueError: %s' % error) from None
         summary = (payload.get('summary') or '')[:1200]
         operation_id = payload.get('operation_id')
         items, resolutions = [], []
@@ -6985,6 +6999,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                      'approvals: by agent), but never its own work (its own sub-workers count as its own work) or its '
                      'person\'s own work: somebody of another party who may approve here must approve it (another '
                      'coordinator or owner of this project, or a superuser).')
+    #: The cases approval_permission names (kittrial-5bb.518, with the worker-credential case of .519).
+    APPROVAL_CASES = ('another-agent', 'worker-credential', 'own-work', 'own-person', 'own-worker-credential',
+                      'independent')
     #: Added to the summary of an approval that only this setting let through, so the record says so.
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
@@ -7005,17 +7022,43 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _normalize_basis_text(text):
-        folded = unicodedata.normalize('NFKC', text).casefold()
-        stripped = ''.join(
+        """The form two texts are compared in for the basis sentence (kittrial-5bb.485).
+
+        NFKD, so a precomposed letter and a letter with a combining mark meet, and so do fullwidth letters;
+        case folded; then every format character (Cf), mark (M*), punctuation (P*), symbol (S*) and bracket
+        is dropped and ALL whitespace removed, so that 'same-person', 'same person' and 'sameperson' are one.
+        """
+        folded = unicodedata.normalize('NFKD', unicodedata.normalize('NFKD', text).casefold())
+        return ''.join(
             ch for ch in folded
             if unicodedata.category(ch) != 'Cf'
-            and not unicodedata.category(ch).startswith('P')
+            and unicodedata.category(ch)[0] not in 'MPS'
+            and not ch.isspace()
             and ch not in '[](){}<>'
         )
-        return ' '.join(stripped.split())
 
-    def _basis_sentence_in(self, summary):
-        """The fixed approval sentence a caller's text contains (either one), or None."""
+    def _refuse_overlong_summary(self, summary, recommending):
+        """Refuse a summary over the field limit with what the canonical write says, before any normalization.
+
+        The text is the one review_workflow.limited (the canonical check) gives; an approve is wrapped as the
+        canonical command's refusal is (``Canonical command rejected the request`` with the ValueError as
+        detail), a recommendation carries it as its message; both 422 ``invalid_payload``.
+        """
+        if not isinstance(summary, str) or len(summary) <= self.SUMMARY_MAX:
+            return
+        try:
+            limited(summary, 'summary')
+        except ValueError as error:
+            detail = 'ValueError: %s' % error
+            raise invalid(str(error) if recommending else 'Canonical command rejected the request', detail) from None
+
+    def _basis_sentence_in(self, summary, recommending=False):
+        """The fixed approval sentence a caller's text contains (either one), or None (kittrial-5bb.519).
+
+        A summary over the field limit is refused first, in the canonical write's words and before any
+        normalization (:meth:`_refuse_overlong_summary`, kittrial-5bb.516), on approve and on recommend.
+        """
+        self._refuse_overlong_summary(summary, recommending)
         if not isinstance(summary, str):
             return None
         text = self._normalize_basis_text(summary)
@@ -7025,8 +7068,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return sentence
         return None
 
-    def _contains_same_person_approval(self, summary):
-        return self._basis_sentence_in(summary) is not None
+    def _contains_same_person_approval(self, summary, recommending=False):
+        return self._basis_sentence_in(summary, recommending) is not None
 
     def _another_agent_only(self, agent_id, names, parties, project):
         """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
@@ -7051,7 +7094,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                    and self.service.worker_credential_of_same_person(agent_id, target, project)
                    for target in parties)
 
-    def _agent_approval_refusal(self, principal, names, assignee, author, project):
+    def _agent_approval_refusal(self, principal, names, assignee, author, project, setting=None):
         """``(refusal or None, setting)`` for an agent approver the party rule refused (kittrial-5bb.438).
 
         Only asked once :meth:`_own_party_refusal` has refused an AGENT, which holds an effective
@@ -7061,8 +7104,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         the same person, or a worker credential of that person that the record shows is that person's alone
         (:meth:`Service.worker_credential_of_same_person`, kittrial-5bb.519); the agent itself and its sub-labels,
         its person's bare account id and a name shared with another account still refuse.
+
+        ``setting`` is the project's setting when the caller already holds it (a list of rows reads it once,
+        kittrial-5bb.518); the approve route passes none and reads it here, inside the mutation, every time.
         """
-        setting = self.service.agent_approval(project)
+        if setting is None:
+            setting = self.service.agent_approval(project)
         if setting['mode'] != 'by-agent':
             return self._own_party_refusal(names, assignee, author, project, True), setting
         own, shared_name, held, _ = self.OWN_PARTY_AGENT
@@ -7097,6 +7144,76 @@ class ApiHandler(BaseHTTPRequestHandler):
             agents = self.service.state.get('agents')
             mine = agents.get(agent_id) if isinstance(agents, dict) else None
             return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
+
+    def _approval_permission(self, principal, pid, author, assignee, setting=None, can_approve=None):
+        """Whether ``principal`` may approve a delivery now, and why (kittrial-5bb.518). Informational: it grants nothing.
+
+        The answer is the approve route's own, because it asks the functions the route asks and decides
+        nothing itself: :meth:`_own_party_refusal`, then, for an agent it refused, :meth:`_agent_approval_refusal`
+        (the project's agent-approval setting), and the installation's ``approval_by_another_party`` through
+        the same independence check. ``setting`` and ``can_approve`` are given by a caller that answers many rows
+        and reads them once; absent, they are read here. The case is a label for the sentence and is derived
+        from who delivered, never used to decide.
+        """
+        by_agent = principal.via == 'credential'
+        if setting is None:
+            setting = self.service.agent_approval(pid)
+        if can_approve is None:
+            can_approve = CAP_APPROVE in self.service.capabilities_for(principal, pid)
+        names = [principal.actor or principal.user_id, principal.user_id]
+        refusal = None
+        if by_agent or self.service.approval_by_another_party:
+            refusal = self._own_party_refusal(names, assignee, author, pid, by_agent)
+            if refusal and by_agent:
+                refusal, setting = self._agent_approval_refusal(principal, names, assignee, author, pid, setting)
+        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        # The case is a LABEL, read with the service functions the route reads, in the route's order. It decides
+        # nothing: may_approve and the refusal above come from the route's functions alone.
+        cases = []
+        for target in (author, assignee):
+            if not isinstance(target, str) or not target or self._independent_all(names, [target], pid, True):
+                continue
+            if not by_agent:
+                cases.append('own-person')
+            elif self.service.other_agent_of_same_person(agent_id, target):
+                cases.append('another-agent')
+            elif self.service.worker_credential_of_same_person(agent_id, target, pid):
+                # Refused under by-person and damaged, where it is a name of the party like any other.
+                cases.append('worker-credential' if setting['mode'] == 'by-agent' else 'own-worker-credential')
+            elif agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
+                cases.append('own-work')
+            elif self._bare_account_id_of(agent_id, target):
+                cases.append('own-person')
+            else:
+                cases.append('own-worker-credential')
+        allowed = ('another-agent', 'worker-credential') if by_agent and setting['mode'] == 'by-agent' else ()
+        if refusal:
+            case = next((c for c in cases if c not in allowed), cases[0] if cases else 'own-person')
+        else:
+            case = cases[0] if cases else 'independent'
+        shown = {'mode': setting['mode'], 'set_by': setting.get('set_by'),
+                 'set_by_display_name': setting.get('set_by_display_name'), 'set_at': setting.get('set_at'),
+                 'damaged': setting.get('damaged') is True}
+        may = bool(can_approve) and not refusal
+        who = ('set by %s at %s' % (shown['set_by_display_name'] or shown['set_by'], shown['set_at'])
+               if shown['set_by'] else 'the default; nobody has set it')
+        if not can_approve:
+            reason = 'You do not hold the approval capability in this project, so you cannot approve this.'
+        elif refusal:
+            reason = refusal                  # the route's own 403 sentence, word for word
+        elif case == 'another-agent':
+            reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
+                      '(%s), so a coordinator agent may approve another agent of its own person.' % who)
+        elif case == 'worker-credential':
+            reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
+                      '(%s), so a coordinator agent may approve a worker credential of its own person issued with '
+                      'a name no other account has held.' % who)
+        elif case == 'independent':
+            reason = 'You may approve this: it was delivered by another party.'
+        else:
+            reason = ('You may approve this: this installation does not ask for another party to approve work '
+                      'for people.')
+        return {'may_approve': may, 'case': case, 'reason': reason, 'setting': shown}
 
     def _own_party_refusal(self, names, assignee, author, project, agent=False):
         """The sentence for an approver whose party the work is, or None when it is not.
@@ -9811,6 +9928,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     # The agent's own API is registered before ``/v1/agents/{aid}`` so the literal
     # ``me`` path always wins. Every route here returns stable JSON; the browser
     # screens are the separate task kittrial-5bb.20 and are not built here.
+    #: The version of the AGENT.md text the set-up page writes (web/js/agentSetup.js; its first line says it too),
+    #: and what an agent with an older copy is told (kittrial-5bb.518). The server never touches the agent's file.
+    AGENT_MD_VERSION = 2
+    AGENT_MD_NOTE = ('If your .orchestra/AGENT.md has no version line or an older one, it predates current guidance. '
+                     'The server\'s reads are authoritative over it: the brief\'s approval_permission decides whether '
+                     'you may approve. Ask your owner to re-run set-up from My agents to refresh the file.')
+
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
@@ -9825,6 +9949,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'agent': agent,
                 'setup': self.service.agent_setup(agent, None),
                 'claim_limit': self._agent_claim_limit_record_view(agent),
+                'agent_md': {'version': self.AGENT_MD_VERSION, 'note': self.AGENT_MD_NOTE},
                 'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
                 'generated_at': now_iso(self.service._now())}
         # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
@@ -11103,7 +11228,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             return []
         # kittrial-5bb.438: under the project's default agent-approval setting a granted agent may approve the
         # work of ANOTHER agent of its person, so that work is offered to it too (and only to it, for approval).
-        by_agent = approves and self.service.agent_approval(project_id)['mode'] == 'by-agent'
+        setting = self.service.agent_approval(project_id) if approves else None
+        by_agent = approves and setting['mode'] == 'by-agent'
+        # kittrial-5bb.518: the reason names the setting and the case, from the approve route's own answer.
+        asker = Principal(principal.user_id, principal.display_name, False, 'credential', actor,
+                          agent_id=agent_id) if approves else None
         actions = []
         for row in rows:
             if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
@@ -11128,6 +11257,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'A contribution by another account awaits review. ')
                           + 'You hold the coordinator grant in this project: review it, then approve it or request '
                             'changes.')
+                permission = self._approval_permission(asker, project_id, row.get('contribution_author'),
+                                                       row.get('assignee'), setting, True)
+                reason += ' %s (agent_approval: %s; case: %s)' % (permission['reason'], permission['setting']['mode'],
+                                                                  permission['case'])
             elif recommended_by and owner_approves:
                 kind, count, who = 'review-recommended', 'review_recommended', 'owner'
                 reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
@@ -14314,9 +14447,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         required=bool(review.get('approval_requires_other_party') or self.service.approval_by_another_party)
         named=any(r.get('reviewer')==caller for r in review.get('pending_review_requests') or [])
         text=approval_wait(review.get('state'),tid,caller,assignee,author,required,named_reviewer=named)
+        # kittrial-5bb.518: the same answer the approve route would give this caller, for an awaiting delivery.
+        permission = (self._approval_permission(ctx.principal, pid, author, assignee)
+                      if review.get('state') == 'awaiting-review' and author else None)
+        review['approval_permission'] = permission
         if (required and review.get('state')=='awaiting-review' and author
                 and not self._independent_all([caller],[author,assignee],pid)):
-            text=APPROVAL_WAIT
+            # Waiting for somebody else, unless the approve route itself would let THIS caller through: only an
+            # agent can be (a coordinator agent under the project's by-agent setting, for another agent of its
+            # person). A person is never told otherwise than before, under either setting.
+            if not (ctx.principal.via == 'credential' and permission and permission['may_approve']):
+                text=APPROVAL_WAIT
         review['waiting_for_approval']=text
         actors = [brief['task'].get('assignee')]
         actors += [checkpoint.get('author', {}).get('text') if checkpoint and isinstance(checkpoint.get('author'), dict)
@@ -14696,7 +14837,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
                     raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
                                     else self.NOT_INDEPENDENT)
-                typed = self._basis_sentence_in(payload.get('summary'))
+                typed = self._basis_sentence_in(payload.get('summary'), True)
                 if typed is not None:
                     raise invalid('The recommendation summary may not contain %r; the server adds that sentence itself'
                                   % typed)
@@ -15276,8 +15417,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                      item['review_state'] in ACTIVE_REVIEW_STATES)]
         body = self._paged(ctx, items, limit, state, complete=bool(read.get('complete')),
                            generated_at=now_iso(self.service._now()))
-        body['items'] = self._task_views(body['items'], ctx.params['pid'])
+        rows = body['items']
+        views = self._task_views(rows, ctx.params['pid'])
+        self._add_approval_permissions(ctx.principal, ctx.params['pid'], rows, views)
+        body['items'] = views
         return 200, body
+
+    def _add_approval_permissions(self, principal, pid, rows, views, setting=None, can_approve=None):
+        """Put ``approval_permission`` on each awaiting-review row of ``views`` (kittrial-5bb.518).
+
+        ``rows`` are the queue rows the views were made from, in the same order. The project's setting and the
+        caller's capability are read ONCE for the request, not once per row, and only when a row awaits review.
+        """
+        for row, view in zip(rows, views):
+            if row.get('review_state') != 'awaiting-review' or not row.get('contribution_author'):
+                continue
+            if setting is None:
+                setting = self.service.agent_approval(pid)
+            if can_approve is None:
+                can_approve = CAP_APPROVE in self.service.capabilities_for(principal, pid)
+            view['approval_permission'] = self._approval_permission(
+                principal, pid, row.get('contribution_author'), row.get('assignee'), setting, can_approve)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/lanes')
     def project_lanes(self, ctx):
@@ -15637,6 +15797,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             truncated = truncated or not read.get('complete')
             reads.append((project, capabilities, read))
         details = self._me_work_details(reads, actor)
+        settings = {}                      # each project's agent-approval setting, read at most once a request
         for project, capabilities, read in reads:
             items = [dict(item, **details[(project['id'], item.get('id'))])
                      if (project['id'], item.get('id')) in details else item
@@ -15677,6 +15838,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                             [actor, principal.user_id],
                             [item.get('assignee'), item.get('contribution_author')],
                             project['id']):
+                        if item['review_state'] == 'awaiting-review' and item.get('contribution_author'):
+                            # kittrial-5bb.518: what the approve route would answer this person, per row; the
+                            # project's setting and the capability are read once for the project, not per row.
+                            if project['id'] not in settings:
+                                settings[project['id']] = self.service.agent_approval(project['id'])
+                            row['approval_permission'] = self._approval_permission(
+                                principal, project['id'], item.get('contribution_author'), item.get('assignee'),
+                                settings[project['id']], True)
                         to_review.append(row)
         if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
             truncated = True
@@ -15693,7 +15862,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Each agent's prompt covers only the projects that agent is granted.
         prompts = [agent_prompts.build_prompt(
             agent, owner_name,
-            [p for p in classified if p['id'] in set(agent.get('projects') or [])],
+            self._agent_prompt_projects(agent, principal, classified, settings),
             generated_at, server)
             for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
@@ -15703,6 +15872,37 @@ class ApiHandler(BaseHTTPRequestHandler):
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}
+
+    def _agent_prompt_projects(self, agent, owner, classified, settings):
+        """The projects of one agent's prompt, its review rows carrying what THE AGENT may do (kittrial-5bb.518).
+
+        ``classified`` is the owner's own sort of each project's queue. An agent that holds the coordinator
+        grant in a project is judged as the approve route judges it (``_approval_permission``): a sibling agent's
+        delivery is a row it may approve under by-agent and one it may not under by-person. An agent with no
+        grant is judged by nothing here and its rows stay as they were. ``settings`` is the request's per-project
+        cache of the agent-approval setting.
+        """
+        mine = set(agent.get('projects') or [])
+        agent_id = agent.get('id')
+        out = []
+        for entry in classified:
+            if entry['id'] not in mine:
+                continue
+            rows = entry['classes'].get('review') or []
+            if not rows or not self.service.agent_approves(agent_id, entry['id']):
+                out.append(entry)
+                continue
+            if entry['id'] not in settings:
+                settings[entry['id']] = self.service.agent_approval(entry['id'])
+            agent_principal = Principal(owner.user_id, owner.display_name, False, 'credential',
+                                        agent.get('actor') or agent_id, agent_id=agent_id)
+            marked = [dict(row, approval_permission=self._approval_permission(
+                          agent_principal, entry['id'], row.get('contribution_author'), row.get('assignee'),
+                          settings[entry['id']], True))
+                      if row.get('review_state') == 'awaiting-review' and row.get('contribution_author') else row
+                      for row in rows]
+            out.append(dict(entry, classes=dict(entry['classes'], review=marked)))
+        return out
 
     def _me_work_details(self, reads, actor):
         """Fill the canonical queue's gaps for the rows that matter most, within a bound.

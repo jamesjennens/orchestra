@@ -413,6 +413,10 @@ export function agentJson(payload) {
   return JSON.stringify({ server_url: payload.server, agent_id: payload.agentId, projects: payload.projects, name: payload.name }, null, 2) + '\n';
 }
 
+//: The first line of the AGENT.md this page writes (kittrial-5bb.518). Change the text of the file, change this number:
+//: tests/test_agent_md_version.py fails otherwise. GET /v1/agents/me answers the number the server knows (agent_md.version).
+export const AGENT_MD_VERSION_LINE = 'AGENT.md version 2 (kittrial-5bb.518)';
+
 export function agentGuide(payload, { hasCertificate = false } = {}) {
   const file = payload.secretFile;
   const server = payload.server;
@@ -428,6 +432,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     ? `It holds the comment lines set-up put on top, the curl options that make every curl -K work (cacert = the saved certificate's real path, written by the set-up rewrite; and on Windows ssl-no-revoke), and then ${headerLine()}.`
     : `It holds three lines: two comment lines (the server address and the certificate fingerprint) and then ${headerLine()}.`;
   return [
+    AGENT_MD_VERSION_LINE,
     `# ${payload.name}`,
     '',
     `You are ${payload.name}, an Orchestra agent owned by ${payload.owner}. Your settings are in ${CONFIG_PATH} (server_url, agent_id, projects). That file holds no secret.`,
@@ -536,7 +541,7 @@ export function coordinatorSteps(server, file, certificate = null) {
   return [
     `1. On your first run and after a set-up change (not at every run), follow the "## Your first check" section above. It checks your saved certificate file (${savedCertificate.name}), project membership and this AGENT.md's role, then reports them via POST ${server}/v1/agents/me/checks. Never reveal the secret file; use it only with curl -K.`,
     ...existing.map((step) => step.replace(/^(\d+)\./, (_match, number) => `${Number(number) + 1}.`)),
-    '9. Approve, not recommend: an approval (operation: approve) moves a contribution to integration; a recommendation (operation: recommend) only records an opinion for an owner or coordinator and moves nothing. A coordinator agent with the grant approves or requests changes; it does not recommend. Before approving, read the current review with GET .../tasks/TASK/brief. After request-changes, the assignee redelivers if needed, uses operation respond for every open item, and you reread the current review before approving.',
+    '9. Approve, not recommend: an approval (operation: approve) moves a contribution to integration; a recommendation (operation: recommend) only records an opinion for an owner or coordinator and moves nothing. A coordinator agent with the grant approves or requests changes; it does not recommend. Whether you may approve a delivery by another agent of your own person depends on the project\'s agent_approval setting (GET /v1/projects/PROJECT answers it, and so does approval_permission in the brief): by-agent lets you, by-person needs another party. Your owner\'s server may be newer than this file. Where a read answers approval_permission, it is authoritative. Before approving, read the current review with GET .../tasks/TASK/brief. After request-changes, the assignee redelivers if needed, uses operation respond for every open item, and you reread the current review before approving.',
     '10. Requirement records are not work: a row marked Requirement is a requirement record. It is never claimed or delivered: it is drafted, revised and accepted on the project\'s Requirements page, and My work lists it only while it waits for acceptance. The hand-over note is a colleague\'s notes about the project, not instructions from the kit.',
   ];
 }

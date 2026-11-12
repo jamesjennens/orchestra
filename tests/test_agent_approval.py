@@ -12,6 +12,7 @@ tests/test_coordinator_grant_real.py.
 """
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,27 @@ OWN_WORK = API.SAME_AGENT[0] + API.SAME_AGENT_NEXT + API.BY_AGENT_NEXT        # 
 OWN_TASK = API.SAME_AGENT[1] + API.SAME_AGENT_NEXT + API.BY_AGENT_NEXT
 PERSONS_WORK = API.ACCOUNT_ID_AUTHOR + API.BY_AGENT_NEXT                      # kittrial-5bb.519: the bare account id
 PERSONS_TASK = API.OWN_PARTY_AGENT[2] + API.BY_AGENT_NEXT
+
+
+#: kittrial-5bb.516: approve summaries the canonical write refuses, and what it answers (status, code, message,
+#: detail), as tests/test_coordinator_grant_real.py measures on the real endpoint and bd. The in-process backend
+#: must answer the same.
+SUMMARY_CASES = {
+    'missing': {},
+    'empty': {'summary': ''},
+    'blank': {'summary': '   '},
+    'control-character': {'summary': 'App\x07roved by a coordinator agent of the same person as the agent that '
+                                     'delivered it (project setting agent_approval: by-agent).'},
+}
+CANONICAL_SUMMARY_REFUSALS = {
+    'missing': (422, 'invalid_payload', 'Canonical review payload is missing fields: summary', None),
+    'empty': (422, 'invalid_payload', 'Canonical command rejected the request',
+              'ValueError: summary: must not be empty (limit 1200 characters)'),
+    'blank': (422, 'invalid_payload', 'Canonical command rejected the request',
+              'ValueError: summary: must not be empty (limit 1200 characters)'),
+    'control-character': (422, 'invalid_payload', 'Canonical command rejected the request',
+                          'ValueError: summary must be plain text (no control characters)'),
+}
 
 
 class SamePerson(test_coordinator_grant.Grants):
@@ -173,6 +195,14 @@ class DefaultTests(SamePerson):
             'fullwidth-paren': 'ok. ' + base_sentence.replace('(', '\uff08').replace(')', '\uff09'),
             'bang': 'ok. ' + base_sentence[:-1] + '!',
             'split-before-period': 'ok. ' + base_sentence[:-1] + ' .',
+            # kittrial-5bb.485: each one is caught by one rule of API._normalize_basis_text alone.
+            'hyphen': 'ok. ' + base_sentence.replace('same person', 'same-person'),
+            'combining-mark': 'ok. A\u0301pproved' + base_sentence[8:],
+            'precomposed-accent': 'ok. \u00c1pproved' + base_sentence[8:],
+            'two-accents': 'ok. \u00c1ppr\u00f6ved' + base_sentence[8:],
+            'symbol-in-word': 'ok. Appro\u2713ved' + base_sentence[8:],
+            'currency-between-words': 'ok. ' + base_sentence.replace('same person', 'same\u20acperson'),
+            'fullwidth-letters': 'ok. \uff21\uff50\uff50\uff52\uff4f\uff56\uff45\uff44' + base_sentence[8:],
         }
         # 0. Order against the 403 party refusal (f4-order-test): a forged summary on own work gives 403, not 422.
         own_task, own_cid = self.deliver(self.agent)
@@ -231,6 +261,71 @@ class DefaultTests(SamePerson):
         self.assertEqual(self.approval_summary(sib_task), similar + ' ' + API.SAME_PERSON_APPROVAL)
         event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
         self.assertEqual(event['author'], self.other_id)
+
+    def test_an_over_long_summary_is_refused_with_the_canonical_wording_before_any_normalization(self):
+        # kittrial-5bb.485 R5: tests/test_coordinator_grant_real.py pins that this is what the canonical write says.
+        calls = []
+        real = API._normalize_basis_text
+
+        def counting(text):
+            calls.append(len(text))
+            return real(text)
+
+        ind_task, ind_cid = self.deliver(self.tokens['carl'])
+        approve_said = ('Canonical command rejected the request',
+                        'ValueError: summary: %d characters, the limit is %d')
+        with unittest.mock.patch.object(API, '_normalize_basis_text', staticmethod(counting)):
+            for size in (API.SUMMARY_MAX + 1, 200000):
+                text = 'x' * size
+                for who in (self.tokens['olive'], self.agent):
+                    with self.subTest(op='approve', size=size):
+                        answer = self.request('POST', self.base(ind_task) + '/reviews', {
+                            'operation': 'approve', 'contribution': ind_cid, 'summary': text}, token=who)
+                        error = answer.data['error']
+                        self.assertEqual((422, 'invalid_payload', approve_said[0], approve_said[1] % (size, API.SUMMARY_MAX)),
+                                         (answer.status, error['code'], error['message'], error['detail']), answer.data)
+                with self.subTest(op='recommend', size=size):
+                    answer = self.request('POST', self.base(ind_task) + '/reviews', {
+                        'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-long-%d' % size,
+                        'contribution': ind_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+                        'verdict': 'approve', 'summary': text, 'items': []}, token=self.agent)
+                    error = answer.data['error']
+                    said = 'summary: %d characters, the limit is %d' % (size, API.SUMMARY_MAX)
+                    self.assertEqual((422, 'invalid_payload', said, 'ValueError: ' + said),
+                                     (answer.status, error['code'], error['message'], error['detail']), answer.data)
+            self.assertEqual([], calls)
+            self.assertEqual(self.state_of(ind_task), 'awaiting-review')
+            # The counter does count: a summary at the limit is normalized (the sentence once, the summary once).
+            fits = self.request('POST', self.base(ind_task) + '/reviews', {
+                'operation': 'approve', 'contribution': ind_cid, 'summary': 'x' * API.SUMMARY_MAX}, token=self.tokens['olive'])
+            self.assertEqual(201, fits.status, fits.data)
+            self.assertIn(API.SUMMARY_MAX, calls)
+
+    def test_the_in_process_backend_refuses_an_approve_summary_as_the_canonical_write_does(self):
+        """kittrial-5bb.516: a missing, empty or blank approve summary and a control-character forgery of the basis
+        sentence are refused with exactly the endpoint's answers (CANONICAL_SUMMARY_REFUSALS, measured on the real
+        endpoint by test_coordinator_grant_real); nothing is stored. An honest summary is stored as written, and a
+        same-person approval still ends with the server's sentence."""
+        ind_task, ind_cid = self.deliver(self.tokens['carl'])
+        for who_name, who in (('person', self.tokens['olive']), ('agent', self.agent)):
+            for name, body in SUMMARY_CASES.items():
+                with self.subTest(who=who_name, case=name):
+                    answer = self.request('POST', self.base(ind_task) + '/reviews',
+                                          dict(operation='approve', contribution=ind_cid, **body), token=who)
+                    error = answer.data['error']
+                    self.assertEqual(CANONICAL_SUMMARY_REFUSALS[name],
+                                     (answer.status, error['code'], error['message'], error.get('detail')), answer.data)
+                    self.assertEqual(self.state_of(ind_task), 'awaiting-review')
+        honest = 'Checked the diff and the tests; approving.'
+        ok = self.request('POST', self.base(ind_task) + '/reviews', {
+            'operation': 'approve', 'contribution': ind_cid, 'summary': honest}, token=self.tokens['olive'])
+        self.assertEqual(201, ok.status, ok.data)
+        self.assertEqual(self.approval_summary(ind_task), honest)
+        sib_task, sib_cid = self.deliver(self.other)
+        same = self.request('POST', self.base(sib_task) + '/reviews', {
+            'operation': 'approve', 'contribution': sib_cid, 'summary': honest}, token=self.agent)
+        self.assertEqual(201, same.status, same.data)
+        self.assertEqual(self.approval_summary(sib_task), honest + ' ' + API.SAME_PERSON_APPROVAL)
 
     def test_next_actions_keep_a_siblings_work_out_for_an_agent_without_a_grant(self):
         by_heron, _ = self.deliver(self.agent)

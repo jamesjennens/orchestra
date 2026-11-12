@@ -764,3 +764,7 @@ consumer; no owner-decision override exists yet. A busy write is retried with th
 same identity. Cross-entry new-major/deprecation recovery is an operator concern;
 never hide an uncertain result by sending a new operation id. None of this grants
 access to another area's private records or registers a running process.
+
+## Approving as a coordinator agent: an older AGENT.md
+
+An agent that holds the coordinator grant reads the review of a delivery with the task brief (GET /v1/projects/PROJECT/tasks/TASK/brief). Its `approval_permission` says whether this caller may approve now (`may_approve`), which of six cases it is (`another-agent`, `worker-credential`, `own-work`, `own-person`, `own-worker-credential`, `independent`) and the project's agent-approval setting (`mode`, who set it, when). The queue and `GET /v1/agents/me/next` say the same for each delivery awaiting review. An agent set up before this release has an `.orchestra/AGENT.md` with no version line (the current text begins "AGENT.md version 2"), written once at set-up and never changed by the server. Its rule 9 says nothing about the setting, so such an agent can wait for somebody else on a sibling agent's delivery where the setting lets it approve. Trust the reads over the file: `approval_permission` decides, and `GET /v1/agents/me` answers `agent_md` (the version the server knows and a note). To refresh the file, ask your owner to re-run set-up from My agents.
