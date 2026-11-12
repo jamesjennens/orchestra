@@ -1650,7 +1650,12 @@ class InProcessBackend:
                     if so is not None:
                         if so.get('status') == 'staged':
                             so = dict(so, status='committed', approval_comment_id=stored['id'])
-                            std_w.commit_signoff(stored['contribution_id'], operation_id, so)
+                            try:
+                                std_w.commit_signoff(stored['contribution_id'], operation_id, so)
+                            except (review_standards.SignoffCommitError, review_standards.StandardsDamagedError, OSError) as err:
+                                raise UncertainOutcome(
+                                    'Approval committed, but sign-off could not be finalized: %s' % err
+                                ) from None
                         ans['sign_off'] = so
                         if so.get('would_have_refused'):
                             ans['warnings'] = [
@@ -1844,7 +1849,12 @@ class InProcessBackend:
         if staged_signoff is not None:
             std_w = self._standards_store(project_id, writable=True)
             final_so = dict(staged_signoff, status='committed', approval_comment_id=record['id'])
-            std_w.commit_signoff(current[-1]['id'], eff_op_id, final_so)
+            try:
+                std_w.commit_signoff(current[-1]['id'], eff_op_id, final_so)
+            except (review_standards.SignoffCommitError, review_standards.StandardsDamagedError, OSError) as err:
+                raise UncertainOutcome(
+                    'Approval committed, but sign-off could not be finalized: %s' % err
+                ) from None
             answer['sign_off'] = final_so
             if final_so.get('would_have_refused'):
                 answer['warnings'] = [

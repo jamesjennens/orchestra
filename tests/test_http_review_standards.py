@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -144,6 +145,7 @@ class EndpointProjectTracker:
         }
         self.seq = 0
         self.cseq = 0
+        self.uuid_comments = False
 
     def run_argv(self, argv):
         cmd = list(argv)
@@ -213,7 +215,11 @@ class EndpointProjectTracker:
             else:
                 text = cmd[3]
             self.cseq += 1
-            cid = str(self.cseq)
+            cid = (
+                '01a1cfb5-7594-750b-b717-%012x' % self.cseq
+                if self.uuid_comments
+                else str(self.cseq)
+            )
             ts = '2026-11-11T12:%02d:%02dZ' % ((self.cseq // 60) % 60, self.cseq % 60)
             self.rows[tid]['comments'].append({
                 'id': cid,
@@ -1630,10 +1636,22 @@ class _HttpStandardsMixin:
             token=oscar_tok, headers={'Idempotency-Key': 'idem-oscar-retry-new-key'},
         )
         self.assertIn(retry1.status, (200, 201), retry1.data)
+        self.assertEqual(
+            app1.data.get('comment_id') or app1.data['review']['id'],
+            retry1.data.get('comment_id') or retry1.data['review']['id'],
+        )
         self.assertEqual('op-http-s1-first', retry1.data['sign_off']['operation_id'])
         self.assertEqual(oscar_uid, retry1.data['sign_off']['reviewer']['actor'])
         self.assertEqual('not_applicable', retry1.data['sign_off']['checks'][0]['result'])
         self.assertEqual(1, retry1.data['sign_off']['reviewer_must_not_applicable_total'])
+
+        # Fable NOTE-5 (X-M7): re-using the same operation_id with a different summary is refused, never re-executed!
+        tampered_retry = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1),
+            dict(app1_body, summary='Tampered summary on same operation_id.'),
+            token=oscar_tok, headers={'Idempotency-Key': 'idem-oscar-tampered-key'},
+        )
+        self.assertIn(tampered_retry.status, (400, 409, 422), tampered_retry.data)
 
         # GET sign-off & sign-off.md return Olga as latest + Oscar in earlier_sign_offs!
         so_get = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid1), token=oscar_tok).data
@@ -1656,6 +1674,239 @@ class _HttpStandardsMixin:
         }, token=oscar_tok)
         self.assertEqual(201, app_t2.status, app_t2.data)
         self.assertEqual(2, app_t2.data['sign_off']['reviewer_must_not_applicable_total'])
+
+    def test_r4_m1b_byte_floods_fail_reserve_s1b_s2b_and_n1b_pins_on_both_http_backends(self):
+        # Covers m1b-byte-budget (Opus RB1/B1/B2 single-party flood + 8-party 4 MiB flood + PM fail-only reserve),
+        # s1b-signoff-store (503 + preserved staged copy + recovery), s2b-reconcile-names (152..161 op_id),
+        # and n1b-citations-pins (X-M2 newest-wins CI ordering, X-M3 byte cap)!
+        pid = self.pid
+        alice_uid, alice_tok = self.create_person('alice_r4', 'contributor', pid)
+        olga_uid, olga_tok = self.create_person('olga_r4', 'coordinator', pid)
+        oscar_uid, oscar_tok = self.create_person('oscar_r4', 'coordinator', pid)
+        verifiers = [self.create_person('ver_r4_%d' % i, 'coordinator', pid) for i in range(10)]
+
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'reason': 'Init r4 HTTP',
+            'rules': [_rule(
+                'STD-50', owner=self.owner_uid, severity='must',
+                check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'},
+            )],
+        }, token=self.owner_tok).status)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {
+            'mode': 'block', 'reason': 'Block gate for r4',
+        }, token=self.owner_tok).status)
+
+        # 1) Opus RB1/B1/B2: single party (olga before approving) floods large diff-only observations -> stopped at 512 KiB (409)!
+        tid1, cid1, prev1, commit1 = self.deliver_task_bundle(pid, alice_tok, {'app.py': 'x = 1\n'}, title='R4 HTTP Flood 1')
+        big_paths = ['pkg/mod_%04d_%s.py' % (i, 'x' * 22) for i in range(4096)]
+        olga_ok = 0
+        olga_409 = None
+        for idx in range(6):
+            r = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+                'changed_files': big_paths + ['olga_%d.py' % idx],
+            }, token=olga_tok)
+            if r.status == 201:
+                olga_ok += 1
+            else:
+                olga_409 = r
+                break
+        self.assertEqual(3, olga_ok)
+        self.assertIsNotNone(olga_409)
+        self.assertEqual(409, olga_409.status, olga_409.data)
+        self.assertEqual(
+            rs.refusal_commit_observation_party_bytes_cap(commit1, rs.COMMIT_OBSERVATIONS_PER_PARTY_MAX_BYTES),
+            olga_409.data['error']['message'],
+        )
+
+        # Independent verifier's FAIL lands 201, and olga's N/A in block mode is refused 422!
+        fail1 = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'changed_files': ['app.py'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        }, token=verifiers[0][1])
+        self.assertEqual(201, fail1.status, fail1.data)
+
+        na1 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-http-na1',
+            'previous': prev1, 'contribution': cid1, 'summary': 'Olga tries N/A after single-party flood.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Claiming N/A.'}],
+        }, token=olga_tok)
+        self.assertEqual(422, na1.status, na1.data)
+        self.assertEqual(rs.refusal_na_over_mechanical_fail('STD-50', commit1), na1.data['error']['message'])
+
+        # 2) Multi-party 4 MiB ordinary byte flood (X-M3) + PM RULE compact fail-only reserve!
+        tid2, cid2, prev2, commit2 = self.deliver_task_bundle(pid, alice_tok, {'app2.py': 'y = 2\n'}, title='R4 HTTP 4MiB Flood')
+        chunk_paths = ['pkg/heavy_%04d_%s.py' % (i, 'z' * 20) for i in range(4096)]
+        doc_409 = None
+        for p_idx in range(9):
+            _, v_tok = verifiers[p_idx]
+            for sub in range(3):
+                r = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+                    'changed_files': chunk_paths + ['p%d_%d.py' % (p_idx, sub)],
+                }, token=v_tok)
+                if r.status != 201:
+                    doc_409 = r
+                    break
+            if doc_409 is not None:
+                break
+        self.assertIsNotNone(doc_409)
+        self.assertEqual(409, doc_409.status, doc_409.data)
+        self.assertEqual(
+            rs.refusal_commit_observation_size_cap(commit2, rs.MAX_COMMIT_OBSERVATION_BYTES),
+            doc_409.data['error']['message'],
+        )
+        # Top off in ~18 KB steps so < 18 KB of ordinary room remains before MAX_COMMIT_OBSERVATION_BYTES!
+        step_ci = [
+            {'tool': 'pad', 'command': 'pad-%d' % i, 'exit_code': 0, 'summary': 'p' * 350}
+            for i in range(18)
+        ]
+        for step_idx in range(25):
+            r_step = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+                'ci_checks': [dict(it, run_id='s%d' % step_idx) for it in step_ci],
+            }, token=verifiers[8][1])
+            if r_step.status != 201:
+                break
+
+        # Ordinary PASS entry on full commit is refused 409, while compact fail-only entry lands 201!
+        pass_full = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+            'ci_checks': [dict(it, run_id='v9') for it in step_ci],
+        }, token=verifiers[9][1])
+        self.assertEqual(409, pass_full.status, pass_full.data)
+
+        # Compact fail-only entry (~9.5 KB > pass_full's ~8 KB, <= 16 KiB) cannot fit in ordinary room
+        # and lands 201 exclusively via the PM compact fail-only reserve!
+        compact_fail = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+            'ci_checks': [
+                {'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1, 'summary': 'f' * 380},
+            ] + [
+                {'tool': 'padfail', 'command': 'pf-%d' % i, 'exit_code': 1, 'summary': 'f' * 380}
+                for i in range(19)
+            ],
+        }, token=verifiers[9][1])
+        self.assertEqual(201, compact_fail.status, compact_fail.data)
+
+        na2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-http-na2',
+            'previous': prev2, 'contribution': cid2, 'summary': 'Olga tries N/A after 4 MiB flood.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Claiming N/A.'}],
+        }, token=olga_tok)
+        self.assertEqual(422, na2.status, na2.data)
+        self.assertEqual(rs.refusal_na_over_mechanical_fail('STD-50', commit2), na2.data['error']['message'])
+
+        # 3) Fable NOTE-4 (X-M2): newest-wins CI ordering (PASS -> FAIL blocks; subsequent PASS allows)!
+        tid3, cid3, prev3, commit3 = self.deliver_task_bundle(pid, alice_tok, {'app3.py': 'z = 3\n'}, title='R4 HTTP CI Order')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit3), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=verifiers[0][1]).status)
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit3), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        }, token=verifiers[1][1]).status)
+        blocked_pf = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid3), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-http-pf',
+            'previous': prev3, 'contribution': cid3, 'summary': 'Approve when latest CI is fail.',
+        }, token=olga_tok)
+        self.assertEqual(422, blocked_pf.status, blocked_pf.data)
+        self.assertIn('fail without waiver', blocked_pf.data['error']['message'])
+
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit3), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=verifiers[0][1]).status)
+        ok_fp = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid3), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-http-fp',
+            'previous': prev3, 'contribution': cid3, 'summary': 'Approve when latest CI is pass.',
+        }, token=olga_tok)
+        self.assertEqual(201, ok_fp.status, ok_fp.data)
+
+        # 4) s1b-signoff-store: obstructed committed sign-off answers 503, preserves staged copy, and recovers on retry!
+        tid4, cid4, prev4, commit4 = self.deliver_task_bundle(pid, alice_tok, {'app4.py': 'w = 4\n'}, title='R4 HTTP S1b 503')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit4), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=verifiers[0][1]).status)
+        op_s1b = 'op-r4-http-s1b-503'
+        if self.is_endpoint_backend:
+            so_dir = self.canonical_root / 'projects' / pid / '.standards' / 'signoffs'
+            so_dir.mkdir(parents=True, exist_ok=True)
+            (so_dir / rs._signoff_committed_filename(cid4, op_s1b)).mkdir()
+        else:
+            self.backend.state.setdefault('standards', {}).setdefault(pid, {}).setdefault('signoffs', {})[
+                '%s:%s' % (cid4, op_s1b)
+            ] = 'corrupt-non-dict'
+
+        app4_body = {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': op_s1b,
+            'previous': prev4, 'contribution': cid4, 'summary': 'Approve hitting obstructed sign-off.',
+        }
+        res_503 = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid4), app4_body,
+            token=oscar_tok, headers={'Idempotency-Key': 'idem-r4-s1b-initial'},
+        )
+        self.assertEqual(503, res_503.status, res_503.data)
+
+        # Staged sign-off is preserved and readable!
+        so_staged = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid4), token=oscar_tok)
+        self.assertEqual(200, so_staged.status, so_staged.data)
+        self.assertEqual('staged', so_staged.data['status'])
+        self.assertEqual(op_s1b, so_staged.data['operation_id'])
+
+        # Remove obstruction and retry -> commits sign-off cleanly!
+        if self.is_endpoint_backend:
+            so_dir = self.canonical_root / 'projects' / pid / '.standards' / 'signoffs'
+            (so_dir / rs._signoff_committed_filename(cid4, op_s1b)).rmdir()
+            for jf in (self.canonical_root / 'projects' / pid).glob('.http-operations*'):
+                jf.unlink()
+        else:
+            self.backend.state['standards'][pid]['signoffs'].pop('%s:%s' % (cid4, op_s1b), None)
+
+        res_rec = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid4), app4_body,
+            token=oscar_tok, headers={'Idempotency-Key': 'idem-r4-s1b-recover'},
+        )
+        self.assertIn(res_rec.status, (200, 201), res_rec.data)
+        self.assertEqual('committed', res_rec.data['sign_off']['status'])
+
+        # 5) s2b-reconcile-names: 36-char UUID contribution + 156-char operation_id (>200 chars -> ._sha256-)!
+        if self.is_endpoint_backend:
+            self.trackers[pid].uuid_comments = True
+        tid5, cid5, prev5, commit5 = self.deliver_task_bundle(pid, alice_tok, {'app5.py': 'q = 5\n'}, title='R4 HTTP S2b Long Op')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit5), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=verifiers[0][1]).status)
+        op_156 = 'h' * 156
+        if self.is_endpoint_backend:
+            self.assertEqual(36, len(cid5))
+            with mock.patch.object(rs.HostStandardsStore, 'commit_signoff', side_effect=rs.SignoffCommitError('crash')):
+                r_crash = self.request(
+                    'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid5),
+                    {
+                        'schema_version': 1, 'operation': 'approve', 'operation_id': op_156,
+                        'previous': prev5, 'contribution': cid5, 'summary': 'Long op crash.',
+                    },
+                    token=oscar_tok, headers={'Idempotency-Key': 'idem-r4-s2b-crash'},
+                )
+            self.assertEqual(503, r_crash.status, r_crash.data)
+            so_dir = self.canonical_root / 'projects' / pid / '.standards' / 'signoffs'
+            staged_long_path = so_dir / rs._signoff_staged_filename(cid5, op_156)
+            self.assertTrue(staged_long_path.is_file())
+            old_t = time.time() - (25 * 3600)
+            os.utime(str(staged_long_path), (old_t, old_t))
+            # Trigger 24h reconcile via a real review write on the project:
+            self.deliver_task_bundle(pid, alice_tok, {'trig.py': 't = 1\n'}, title='Trigger Reconcile')
+            self.assertFalse(staged_long_path.exists())
+            self.assertTrue((so_dir / rs._signoff_committed_filename(cid5, op_156)).is_file())
+            so5 = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid5), token=oscar_tok)
+            self.assertEqual(200, so5.status, so5.data)
+            self.assertEqual('committed', so5.data['status'])
+            self.assertEqual(op_156, so5.data['operation_id'])
+        else:
+            r_ok5 = self.request(
+                'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid5),
+                {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': op_156,
+                    'previous': prev5, 'contribution': cid5, 'summary': 'Long op approve.',
+                },
+                token=oscar_tok, headers={'Idempotency-Key': 'idem-r4-s2b-inproc'},
+            )
+            self.assertEqual(201, r_ok5.status, r_ok5.data)
+            self.assertEqual(op_156, r_ok5.data['sign_off']['operation_id'])
 
 
 class HttpStandardsInProcessSuite(_HttpStandardsMixin, Harness):

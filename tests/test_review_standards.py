@@ -48,6 +48,7 @@ class HostTracker:
         self.rows = {}
         self.seq = 0
         self.cseq = 0
+        self.uuid_comments = False
 
     def create_task(self, title='Implement feature', assignee='worker-bob', labels=None, issue_type='task'):
         self.seq += 1
@@ -97,7 +98,11 @@ class HostTracker:
             if tid not in self.rows:
                 raise ValueError('task not found: %s' % tid)
             self.cseq += 1
-            cid = '%s-c%04d' % (tid, self.cseq)
+            cid = (
+                '01a1cfb5-7594-750b-b717-%012x' % self.cseq
+                if self.uuid_comments
+                else '%s-c%04d' % (tid, self.cseq)
+            )
             ts = '2026-11-11T12:%02d:%02dZ' % ((self.cseq // 60) % 60, self.cseq % 60)
             self.rows[tid]['comments'].append({
                 'id': cid,
@@ -281,17 +286,38 @@ class ReviewStandardsHostCase(unittest.TestCase):
 
         return rs.HostStandardsStore(p_dir, target_pid, shared_loader=_shared)
 
-    def admin_std(self, op, *rest, project=None):
+    def init_git_repo(self, repo_path, files):
+        repo = Path(repo_path)
+        repo.mkdir(parents=True, exist_ok=True)
+        _git(repo, 'init')
+        for rel, content in files.items():
+            fp = repo / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content, encoding='utf-8')
+            _git(repo, 'add', rel)
+        _git(repo, 'commit', '-m', 'init')
+
+    def admin_std(self, op, *rest, project=None, data=None, actor=None):
         target_pid = project or self.pid
         p_dir = self.root / 'projects' / target_pid
         tr = self.trackers[target_pid]
-        parsed = _ADMIN_STD_PARSER.parse_args([op, '--project', target_pid] + [str(x) for x in rest])
+        argv = [op, '--project', target_pid] + [str(x) for x in rest]
+        if data is not None:
+            self._admin_tmp_seq = getattr(self, '_admin_tmp_seq', 0) + 1
+            tf = Path(self.tmp.name) / ('admin-data-%d.json' % self._admin_tmp_seq)
+            tf.write_text(json.dumps(data), encoding='utf-8')
+            argv.extend(['--file', str(tf)])
+        if actor is not None:
+            argv.extend(['--actor', actor])
+        elif '--actor' not in argv and op in rs.PERSON_ONLY_SUBCOMMANDS:
+            argv.extend(['--actor', 'cora-op'])
+        parsed = _ADMIN_STD_PARSER.parse_args(argv)
         return rs.admin_standards_command(
             self.root,
             p_dir,
             target_pid,
             parsed,
-            lambda _r, _p, argv: tr.run_argv(argv),
+            lambda _r, _p, argv_in: tr.run_argv(argv_in),
             list(self.operators),
             list(self.verifiers),
         )
@@ -2448,6 +2474,536 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
             })
         self.assertEqual('committed', h_store.read_signoff('c-parity', approve_operation_id='op-a2')['status'])
         self.assertEqual('committed', d_store.read_signoff('c-parity', approve_operation_id='op-a2')['status'])
+
+    def test_r4_m1b_party_byte_budget_document_byte_cap_and_fail_reserve(self):
+        # m1b-byte-budget + Fable NOTE-3 (X-M3) + Fable NOTE-6 + Opus Q1e/Q1f + PM RULE!
+        extra_verifiers = ['ver-b%d' % i for i in range(10)]
+        self.verifiers.extend(extra_verifiers)
+        self._write_deployment()
+
+        self.admin_std('put', data={
+            'expected_version': 0, 'reason': 'Init r4 m1b',
+            'rules': [_sample_rule(
+                'STD-50', owner='person:cora', severity='must',
+                check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'},
+            )],
+        })
+        self.admin_std('set-gate', '--mode', 'block', '--reason', 'Block mode')
+
+        repo = Path(self.tmp.name) / 'repo_r4_m1b'
+        self.init_git_repo(repo, {'app.py': 'x = 1\n'})
+        tid1 = self.trackers[self.pid].create_task('R4 m1b single-party flood')
+        ans1, commit1, _ = self.contribute_bundle(tid1, repo, op_id='op-r4-m1b-c1')
+        cid1 = json.loads(ans1['stdout'])['comment_id']
+
+        # 1) Opus RH1: one party (olive-op before approving) posts large diff-only observations (~140 KB each).
+        #    Capped at 512 KiB (COMMIT_OBSERVATIONS_PER_PARTY_MAX_BYTES) on record #4; independent FAIL lands;
+        #    olive-op's N/A in block mode is refused 422!
+        big_paths = ['pkg/mod_%04d_%s.py' % (i, 'x' * 22) for i in range(4096)]
+        accepted_single = 0
+        for idx in range(6):
+            try:
+                self.admin_std(
+                    'record-commit', '--commit', commit1, actor='olive-op',
+                    data={'changed_files': big_paths + ['run_%d.py' % idx]},
+                )
+                accepted_single += 1
+            except rs.StandardsRefusal as exc:
+                self.assertEqual(409, exc.status)
+                self.assertIn(
+                    rs.refusal_commit_observation_party_bytes_cap(
+                        commit1, rs.COMMIT_OBSERVATIONS_PER_PARTY_MAX_BYTES
+                    ),
+                    str(exc),
+                )
+                break
+        self.assertEqual(3, accepted_single)
+
+        # Independent verifier records FAIL -> succeeds cleanly!
+        self.admin_std('record-commit', '--commit', commit1, actor='ci-verifier', data={
+            'changed_files': ['app.py'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        })
+        na1 = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-m1b-na1',
+            'task': tid1, 'previous': cid1, 'contribution': cid1, 'summary': 'Try N/A after flood.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'No tests.'}],
+        }, actor='olive-op')
+        self.assertEqual(2, na1['returncode'])
+        self.assertIn(rs.refusal_na_over_mechanical_fail('STD-50', commit1), na1['stderr'])
+
+        # 2) Multi-party 4 MiB ordinary byte flood (kills X-M3 & Q1e/Q1f) + compact fail-only reserve!
+        _git(repo, 'commit', '--allow-empty', '-m', 'second commit for 4 MiB flood')
+        tid2 = self.trackers[self.pid].create_task('R4 m1b 4 MiB flood')
+        ans2, commit2, _ = self.contribute_bundle(tid2, repo, op_id='op-r4-m1b-c2')
+        cid2 = json.loads(ans2['stdout'])['comment_id']
+
+        chunk_paths = ['pkg/heavy_%04d_%s.py' % (i, 'z' * 20) for i in range(4096)]
+        hit_doc_cap = False
+        for p_idx in range(9):
+            actor_name = 'ver-b%d' % p_idx
+            for sub in range(3):
+                try:
+                    self.admin_std(
+                        'record-commit', '--commit', commit2, actor=actor_name,
+                        data={'changed_files': chunk_paths + ['p%d_%d.py' % (p_idx, sub)]},
+                    )
+                except rs.StandardsRefusal as exc:
+                    if rs.refusal_commit_observation_size_cap(commit2, rs.MAX_COMMIT_OBSERVATION_BYTES) in str(exc):
+                        self.assertEqual(409, exc.status)
+                        hit_doc_cap = True
+                        break
+                    raise
+            if hit_doc_cap:
+                break
+        self.assertTrue(hit_doc_cap, 'Expected 4 MiB ordinary byte cap to refuse')
+        # Top off within ~60 bytes of MAX_COMMIT_OBSERVATION_BYTES (like Opus's 4,194,255-byte doc)
+        # so even a 250-byte ordinary pass entry exceeds 4 MiB!
+        # Top off in ~18 KB steps so < 18 KB of ordinary room remains before MAX_COMMIT_OBSERVATION_BYTES!
+        step_ci = [
+            {'tool': 'pad', 'command': 'pad-%d' % i, 'exit_code': 0, 'summary': 'p' * 350}
+            for i in range(18)
+        ]
+        for step_idx in range(25):
+            try:
+                self.admin_std('record-commit', '--commit', commit2, actor='ver-b8', data={
+                    'ci_checks': [dict(it, run_id='s%d' % step_idx) for it in step_ci],
+                })
+            except rs.StandardsRefusal:
+                break
+
+        # Ordinary pass entry OR fail+file-list entry from a fresh party ver-b9 is refused 409 (ordinary cap full)!
+        with self.assertRaises(rs.StandardsRefusal) as cm_pass_full:
+            self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
+                'ci_checks': [dict(it, run_id='v9') for it in step_ci],
+            })
+        self.assertEqual(409, cm_pass_full.exception.status)
+        self.assertIn(
+            rs.refusal_commit_observation_size_cap(commit2, rs.MAX_COMMIT_OBSERVATION_BYTES),
+            str(cm_pass_full.exception),
+        )
+        with self.assertRaises(rs.StandardsRefusal) as cm_with_files:
+            self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
+                'tree_files': {'app.py': {'exists': True, 'regular_text': True, 'line_count': 5}},
+                'ci_checks': [dict(it, exit_code=1, run_id='wf') for it in step_ci],
+            })
+        self.assertEqual(409, cm_with_files.exception.status)
+        self.assertIn(
+            rs.refusal_commit_observation_size_cap(commit2, rs.MAX_COMMIT_OBSERVATION_BYTES),
+            str(cm_with_files.exception),
+        )
+
+        # PM RULE: compact fail-only entries (failing CI items, no file lists) succeed OUTSIDE the byte cap
+        # both for ver-b0 (whose own party byte budget is full) and for ver-b9 (up to 8 per party)!
+        self.admin_std('record-commit', '--commit', commit2, actor='ver-b0', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        })
+        for r_idx in range(rs.COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX):
+            self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
+                'ci_checks': [{
+                    'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q',
+                    'exit_code': 1, 'run_id': 'fail-reserve-%d' % r_idx, 'summary': 'f' * 350,
+                } for _ in range(8)],
+            })
+        # 9th compact fail-only entry from ver-b9 on the full commit hits the per-party fail reserve cap!
+        with self.assertRaises(rs.StandardsRefusal) as cm_reserve_cap:
+            self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
+                'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+            })
+        self.assertEqual(409, cm_reserve_cap.exception.status)
+        self.assertIn(
+            rs.refusal_commit_fail_allowance_cap(commit2, rs.COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX),
+            str(cm_reserve_cap.exception),
+        )
+
+        # On-disk file is > 4 MiB and HostStandardsStore.read_commit_observation reads it cleanly (kills Q1f)!
+        commit2_file = self.project_path / '.standards' / 'commits' / ('%s.json' % commit2)
+        self.assertGreater(commit2_file.stat().st_size, rs.MAX_COMMIT_OBSERVATION_BYTES)
+        read_back = self.store().read_commit_observation(commit2)
+        self.assertEqual(1, read_back['ci_checks'][-1]['exit_code'])
+
+        # Approver N/A in block mode is refused 422 because the compact fail landed!
+        na2 = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-m1b-na2',
+            'task': tid2, 'previous': cid2, 'contribution': cid2, 'summary': 'Try N/A over reserve fail.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'No tests.'}],
+        }, actor='olive-op')
+        self.assertEqual(2, na2['returncode'])
+        self.assertIn(rs.refusal_na_over_mechanical_fail('STD-50', commit2), na2['stderr'])
+
+        # 3) Fable NOTE-6: 8 parties fill all 256 ordinary slots; 9th party's ordinary pass is refused 409,
+        #    while its compact fail-only entry STILL lands and blocks N/A approval!
+        _git(repo, 'commit', '--allow-empty', '-m', 'third commit for 256-slot fail reserve')
+        tid3 = self.trackers[self.pid].create_task('R4 m1b 256-slot flood')
+        ans3, commit3, _ = self.contribute_bundle(tid3, repo, op_id='op-r4-m1b-c3')
+        cid3 = json.loads(ans3['stdout'])['comment_id']
+        for p_idx in range(8):
+            for _ in range(rs.COMMIT_OBSERVATIONS_PER_RECORDER_MAX):
+                self.admin_std('record-commit', '--commit', commit3, actor='ver-b%d' % p_idx, data={
+                    'changed_files': ['app.py'],
+                })
+        with self.assertRaises(rs.StandardsRefusal) as cm_slot_cap:
+            self.admin_std('record-commit', '--commit', commit3, actor='ver-b8', data={
+                'changed_files': ['app.py'],
+            })
+        self.assertEqual(409, cm_slot_cap.exception.status)
+        self.assertIn(
+            rs.refusal_commit_observation_cap(commit3, rs.COMMIT_OBSERVATIONS_MAX),
+            str(cm_slot_cap.exception),
+        )
+        # Compact fail-only entry from ver-b8 succeeds despite 256 ordinary slots being full!
+        self.admin_std('record-commit', '--commit', commit3, actor='ver-b8', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 2}],
+        })
+        na3 = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-m1b-na3',
+            'task': tid3, 'previous': cid3, 'contribution': cid3, 'summary': 'Try N/A after 256 slots.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'No tests.'}],
+        }, actor='olive-op')
+        self.assertEqual(2, na3['returncode'])
+        self.assertIn(rs.refusal_na_over_mechanical_fail('STD-50', commit3), na3['stderr'])
+
+    def test_r4_s1b_nonregular_committed_signoff_503_and_never_overwrite_guard(self):
+        # s1b-signoff-store + Opus NOTE-2 Q3b (host) & Q3c (in-process) never-overwrite guards!
+        self.admin_std('put', data={
+            'expected_version': 0, 'reason': 'Init r4 s1b',
+            'rules': [_sample_rule('STD-1', owner='person:cora', severity='must')],
+        })
+        repo = Path(self.tmp.name) / 'repo_r4_s1b'
+        self.init_git_repo(repo, {'f.py': 'a = 1\n'})
+
+        # 1) Directory sitting at committed sign-off filename -> rc=124 (503), staged copy KEPT,
+        #    and retry after removing directory promotes staged to committed!
+        tid1 = self.trackers[self.pid].create_task('R4 s1b dir collision')
+        ans1, commit1, _ = self.contribute_bundle(tid1, repo, op_id='op-r4-s1b-c1')
+        cid1 = json.loads(ans1['stdout'])['comment_id']
+
+        so_dir = self.project_path / '.standards' / 'signoffs'
+        so_dir.mkdir(parents=True, exist_ok=True)
+        op_dir = 'op-r4-s1b-dir'
+        committed_dir_path = so_dir / rs._signoff_committed_filename(cid1, op_dir)
+        staged_dir_path = so_dir / rs._signoff_staged_filename(cid1, op_dir)
+        committed_dir_path.mkdir()
+
+        app_payload = {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': op_dir,
+            'task': tid1, 'previous': cid1, 'contribution': cid1, 'summary': 'Approve blocked by dir.',
+            'checks': [{'rule_id': 'STD-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['f.py:1']}}],
+        }
+        res_blocked = self.review_op(app_payload, actor='cora-op')
+        self.assertEqual(124, res_blocked['returncode'], res_blocked)
+        self.assertTrue(committed_dir_path.is_dir())
+        self.assertTrue(staged_dir_path.is_file(), 'Staged sign-off must be preserved on commit_signoff failure')
+
+        # Staged sign-off remains readable while committed_name is a directory!
+        so_while_blocked = json.loads(self.endpoint_call('standards', ['sign-off', tid1])['stdout'])
+        self.assertEqual('staged', so_while_blocked['status'])
+        self.assertEqual(op_dir, so_while_blocked['operation_id'])
+
+        # Remove the rogue directory and clear the unknown journal reservation -> retry promotes staged to committed!
+        committed_dir_path.rmdir()
+        for jf in self.project_path.glob('.http-operations*'):
+            jf.unlink()
+        res_recovered = self.review_op(app_payload, actor='cora-op')
+        self.assertEqual(0, res_recovered['returncode'], res_recovered['stderr'])
+        rec_body = json.loads(res_recovered['stdout'])
+        self.assertTrue(rec_body['reconciled'])
+        self.assertEqual('committed', rec_body['sign_off']['status'])
+        self.assertTrue(committed_dir_path.is_file())
+        self.assertFalse(staged_dir_path.exists())
+
+        # 2) Symlink sitting at committed sign-off filename -> rc=124, symlink target untouched, staged kept!
+        tid2 = self.trackers[self.pid].create_task('R4 s1b symlink collision')
+        ans2, _, _ = self.contribute_bundle(tid2, repo, op_id='op-r4-s1b-c2')
+        cid2 = json.loads(ans2['stdout'])['comment_id']
+        op_sym = 'op-r4-s1b-sym'
+        decoy = Path(self.tmp.name) / 'decoy_target.json'
+        decoy.write_text('{"untouched": true}\n', encoding='utf-8')
+        committed_sym_path = so_dir / rs._signoff_committed_filename(cid2, op_sym)
+        staged_sym_path = so_dir / rs._signoff_staged_filename(cid2, op_sym)
+        os.symlink(str(decoy), str(committed_sym_path))
+
+        sym_payload = {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': op_sym,
+            'task': tid2, 'previous': cid2, 'contribution': cid2, 'summary': 'Approve blocked by symlink.',
+            'checks': [{'rule_id': 'STD-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['f.py:1']}}],
+        }
+        res_sym = self.review_op(sym_payload, actor='cora-op')
+        self.assertEqual(124, res_sym['returncode'], res_sym)
+        self.assertEqual('{"untouched": true}\n', decoy.read_text(encoding='utf-8'))
+        self.assertTrue(staged_sym_path.is_file())
+        os.unlink(str(committed_sym_path))
+        for jf in self.project_path.glob('.http-operations*'):
+            jf.unlink()
+        res_sym_ok = self.review_op(sym_payload, actor='cora-op')
+        self.assertEqual(0, res_sym_ok['returncode'], res_sym_ok['stderr'])
+        self.assertTrue(committed_sym_path.is_file())
+        self.assertFalse(staged_sym_path.exists())
+
+        # 3) Pin 'never overwrite' guard in HostStandardsStore.commit_signoff (Q3b) and DictStandardsStore.commit_signoff (Q3c)!
+        h_store = self.store()
+        d_store = rs.DictStandardsStore({}, self.pid)
+        orig_obj = {
+            'schema_version': 1, 'status': 'committed', 'contribution_id': 'c-immut',
+            'commit': commit1, 'operation_id': 'op-immut',
+            'created_at': '2026-11-12T01:00:00Z', 'approval_comment_id': 'cmt-original',
+            'reviewer': {'actor': 'cora-op'}, 'checks': [],
+        }
+        overwrite_attempt = dict(
+            orig_obj,
+            created_at='2099-12-31T23:59:59Z',
+            approval_comment_id='cmt-OVERWRITTEN',
+            reviewer={'actor': 'attacker'},
+        )
+        for st in (h_store, d_store):
+            st.stage_signoff('c-immut', 'op-immut', dict(orig_obj, status='staged'))
+            st.commit_signoff('c-immut', 'op-immut', orig_obj)
+            st.stage_signoff('c-immut', 'op-immut', dict(overwrite_attempt, status='staged'))
+            st.commit_signoff('c-immut', 'op-immut', overwrite_attempt)
+            stored = st.read_signoff('c-immut', approve_operation_id='op-immut')
+            self.assertEqual('2026-11-12T01:00:00Z', stored['created_at'])
+            self.assertEqual('cmt-original', stored['approval_comment_id'])
+            self.assertEqual('cora-op', stored['reviewer']['actor'])
+
+    def test_r4_s2b_signoff_filename_codec_roundtrips_and_24h_reconcile_edge_lengths(self):
+        # s2b-reconcile-names: single producer+parser codec round-trips at 151, 152..161, >200, and literal 'sha256-'!
+        uuid_cid = '01a1cfb5-7594-750b-b717-a0fd0aa170f8'
+        op_151 = 'a' * 151
+        staged_151 = rs._signoff_staged_filename(uuid_cid, op_151)
+        self.assertEqual(200, len(staged_151))
+        self.assertNotIn('_sha256-', staged_151)
+        self.assertEqual(('ok', uuid_cid, op_151), rs._signoff_filename(stage='staged', parse_name=staged_151))
+
+        for length in range(152, 162):
+            op_edge = 'b' * length
+            staged_edge = rs._signoff_staged_filename(uuid_cid, op_edge)
+            committed_edge = rs._signoff_committed_filename(uuid_cid, op_edge)
+            self.assertIn('._sha256-', staged_edge)
+            self.assertIn('._sha256-', committed_edge)
+            self.assertLessEqual(len(staged_edge), 200)
+            self.assertLessEqual(len(committed_edge), 200)
+            self.assertIsNotNone(rs._SAFE_BACKUP_FILENAME_RE.fullmatch(staged_edge))
+            self.assertIsNotNone(rs._SAFE_BACKUP_FILENAME_RE.fullmatch(committed_edge))
+            self.assertEqual(
+                ('ok', uuid_cid, op_edge),
+                rs._signoff_filename(
+                    stage='staged',
+                    parse_name=staged_edge,
+                    staged_payload={'contribution_id': uuid_cid, 'operation_id': op_edge},
+                ),
+            )
+
+        long_cid = 'c' * 64
+        long_op = 'd' * 161
+        staged_long = rs._signoff_staged_filename(long_cid, long_op)
+        self.assertLessEqual(len(staged_long), 200)
+        self.assertEqual(
+            ('ok', long_cid, long_op),
+            rs._signoff_filename(
+                stage='staged',
+                parse_name=staged_long,
+                staged_payload={'contribution_id': long_cid, 'operation_id': long_op},
+            ),
+        )
+
+        # Literal op_id starting with 'sha256-' never collides with '._sha256-'!
+        literal_op = 'sha256-' + ('e' * 24)
+        staged_lit = rs._signoff_staged_filename(uuid_cid, literal_op)
+        self.assertNotIn('._sha256-', staged_lit)
+        self.assertEqual(('ok', uuid_cid, literal_op), rs._signoff_filename(stage='staged', parse_name=staged_lit))
+
+        # End-to-end 25h reconcile test with real 36-char UUID comment IDs and 152-char & 161-char op_ids!
+        self.trackers[self.pid].uuid_comments = True
+        self.admin_std('put', data={
+            'expected_version': 0, 'reason': 'Init r4 s2b',
+            'rules': [_sample_rule('STD-1', owner='person:cora', severity='must')],
+        })
+        repo = Path(self.tmp.name) / 'repo_r4_s2b'
+        self.init_git_repo(repo, {'m.py': 'v = 1\n'})
+
+        op_152 = 'r' * 152
+        op_161 = 's' * 161
+        crashed = []
+        for op_long in (op_152, op_161):
+            tid = self.trackers[self.pid].create_task('Reconcile %d' % len(op_long))
+            ans, commit_sha, _ = self.contribute_bundle(tid, repo, op_id='contrib-%d' % len(op_long))
+            cid = json.loads(ans['stdout'])['comment_id']
+            self.assertEqual(36, len(cid))
+            with mock.patch.object(rs.HostStandardsStore, 'commit_signoff', side_effect=rs.SignoffCommitError('crash')):
+                res = self.review_op({
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': op_long,
+                    'task': tid, 'previous': cid, 'contribution': cid, 'summary': 'Long op approve.',
+                    'checks': [{'rule_id': 'STD-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['m.py:1']}}],
+                }, actor='cora-op')
+            self.assertEqual(124, res['returncode'])
+            crashed.append((tid, cid, commit_sha, op_long))
+
+        # Also stage an unreferenced 160-char hashed orphan!
+        orphan_op = 'z' * 160
+        self.store().stage_signoff(uuid_cid, orphan_op, {
+            'schema_version': 1, 'status': 'staged', 'contribution_id': uuid_cid,
+            'commit': crashed[0][2], 'operation_id': orphan_op, 'checks': [],
+        })
+
+        so_dir = self.project_path / '.standards' / 'signoffs'
+        past_mtime = time.time() - (25 * 3600)
+        for p in so_dir.glob('*.staged.*'):
+            os.utime(str(p), (past_mtime, past_mtime))
+
+        # Trigger reconcile_or_clean_staged via a real review write on the project after 25 hours!
+        tid_trigger = self.trackers[self.pid].create_task('Trigger reconcile')
+        self.contribute_bundle(tid_trigger, repo, op_id='contrib-trigger-reconcile')
+
+        # Both landed 152-char and 161-char approvals MUST be promoted to committed (NEVER deleted!),
+        # while the unreferenced 160-char orphan IS deleted!
+        for tid, cid, _, op_long in crashed:
+            staged_p = so_dir / rs._signoff_staged_filename(cid, op_long)
+            committed_p = so_dir / rs._signoff_committed_filename(cid, op_long)
+            self.assertFalse(staged_p.exists(), 'Landed staged file must be promoted & unlinked')
+            self.assertTrue(committed_p.is_file(), 'Landed >200-char approval must be promoted, not deleted!')
+            so_out = json.loads(self.endpoint_call('standards', ['sign-off', tid])['stdout'])
+            self.assertEqual('committed', so_out['status'])
+            self.assertEqual(op_long, so_out['operation_id'])
+
+        self.assertFalse((so_dir / rs._signoff_staged_filename(uuid_cid, orphan_op)).exists())
+
+    def test_r4_n1b_newest_wins_ci_ordering_tree_exclusion_and_extra_committed_pins(self):
+        # Fable NOTE-4 (X-M2 newest-wins CI ordering), Opus Q2d (tree_files exclusion),
+        # Opus Q3e (extra_committed sign-offs), and Opus NOTE-1 (bounded citation path scan)!
+        self.verifiers.append('ver-ci-2')
+        self._write_deployment()
+
+        self.admin_std('put', data={
+            'expected_version': 0, 'reason': 'Init r4 n1b',
+            'rules': [
+                _sample_rule('STD-50', owner='person:cora', severity='must',
+                      check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'}),
+                _sample_rule('STD-10', owner='person:cora', severity='must', check={'kind': 'judgement'}),
+            ],
+        })
+        self.admin_std('set-gate', '--mode', 'block', '--reason', 'Block')
+
+        repo = Path(self.tmp.name) / 'repo_r4_n1b'
+        self.init_git_repo(repo, {'app.py': 'line1 = 1\nline2 = 2\n'})
+
+        # 1) X-M2a: independent verifier records PASS first, then independent verifier records FAIL second -> FAIL wins!
+        tid_pf = self.trackers[self.pid].create_task('CI pass then fail')
+        ans_pf, commit_pf, _ = self.contribute_bundle(tid_pf, repo, op_id='op-r4-pf')
+        cid_pf = json.loads(ans_pf['stdout'])['comment_id']
+        self.admin_std('record-commit', '--commit', commit_pf, actor='ci-verifier', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        })
+        self.admin_std('record-commit', '--commit', commit_pf, actor='ver-ci-2', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        })
+        res_pf = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-pf-app',
+            'task': tid_pf, 'previous': cid_pf, 'contribution': cid_pf, 'summary': 'Approve after pass->fail.',
+            'checks': [{'rule_id': 'STD-10', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['app.py:1']}}],
+        }, actor='olive-op')
+        self.assertEqual(2, res_pf['returncode'])
+        self.assertIn('fail without waiver', res_pf['stderr'])
+
+        # 2) X-M2b: independent verifier records FAIL first, then independent verifier re-runs and records PASS second -> PASS wins!
+        _git(repo, 'commit', '--allow-empty', '-m', 'fail then pass commit')
+        tid_fp = self.trackers[self.pid].create_task('CI fail then pass')
+        ans_fp, commit_fp, _ = self.contribute_bundle(tid_fp, repo, op_id='op-r4-fp')
+        cid_fp = json.loads(ans_fp['stdout'])['comment_id']
+        self.admin_std('record-commit', '--commit', commit_fp, actor='ci-verifier', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        })
+        self.admin_std('record-commit', '--commit', commit_fp, actor='ver-ci-2', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        })
+        res_fp = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-fp-app',
+            'task': tid_fp, 'previous': cid_fp, 'contribution': cid_fp, 'summary': 'Approve after fail->pass.',
+            'checks': [{'rule_id': 'STD-10', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['app.py:1']}}],
+        }, actor='olive-op')
+        self.assertEqual(0, res_fp['returncode'], res_fp['stderr'])
+        fp_so = json.loads(res_fp['stdout'])['sign_off']
+        std50_row = [c for c in fp_so['checks'] if c['rule_id'] == 'STD-50'][0]
+        self.assertEqual('pass', std50_row['result'])
+        self.assertEqual(0, std50_row['ci_evidence']['exit_code'])
+
+        # Direct pin on _resolve_mechanical_rule_from_ci newest-first scan (kills Fable X-M2 on both loops):
+        mech_rule = {'id': 'STD-50', 'check': {'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'}}
+        direct_by_rule = rs._resolve_mechanical_rule_from_ci(mech_rule, commit_fp, {'ci_checks': [
+            {'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0, 'status': 'pass'},
+            {'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1, 'status': 'fail'},
+        ]})
+        self.assertEqual('fail', direct_by_rule['result'])
+        direct_by_cmd = rs._resolve_mechanical_rule_from_ci(mech_rule, commit_fp, {'ci_checks': [
+            {'rule_id': None, 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0, 'status': 'pass'},
+            {'rule_id': None, 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1, 'status': 'fail'},
+        ]})
+        self.assertEqual('fail', direct_by_cmd['result'])
+
+        # 3) Opus Q2d: excluded participant party's tree_files is ignored when validating file:line citations!
+        _git(repo, 'commit', '--allow-empty', '-m', 'remote tree exclusion commit')
+        tid_tree = self.trackers[self.pid].create_task('Remote tree exclusion')
+        contrib_remote, remote_commit, remote_bpath = self.contribute_bundle(tid_tree, repo, op_id='op-r4-remote-c')
+        self.assertEqual(0, contrib_remote['returncode'], contrib_remote['stderr'])
+        cid_tree = json.loads(contrib_remote['stdout'])['comment_id']
+        # Remove bundle file so local git tree is unavailable; only commit_obs['tree_files'] can satisfy citations!
+        remote_bpath.unlink()
+
+        # olive-op records tree_files BEFORE becoming the approver on remote_commit:
+        self.admin_std('record-commit', '--commit', remote_commit, actor='olive-op', data={
+            'tree_files': {'remote_only.py': {'exists': True, 'regular_text': True, 'line_count': 20}},
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        })
+        # Independent verifier records PASS for STD-50, NOT tree_files:
+        self.admin_std('record-commit', '--commit', remote_commit, actor='ci-verifier', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        })
+
+        # olive-op tries to approve citing remote_only.py:5 -> refused because olive-op's own tree_files is excluded!
+        res_self_tree = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-self-tree',
+            'task': tid_tree, 'previous': cid_tree, 'contribution': cid_tree, 'summary': 'Self tree cite.',
+            'checks': [{'rule_id': 'STD-10', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['remote_only.py:5']}}],
+        }, actor='olive-op')
+        self.assertEqual(2, res_self_tree['returncode'])
+        self.assertIn('delivered commit tree is not available', res_self_tree['stderr'])
+
+        # Once independent ci-verifier records tree_files, olive-op's citation succeeds!
+        self.admin_std('record-commit', '--commit', remote_commit, actor='ci-verifier', data={
+            'tree_files': {'remote_only.py': {'exists': True, 'regular_text': True, 'line_count': 20}},
+        })
+        res_indep_tree = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r4-indep-tree',
+            'task': tid_tree, 'previous': cid_tree, 'contribution': cid_tree, 'summary': 'Indep tree cite.',
+            'checks': [{'rule_id': 'STD-10', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['remote_only.py:5']}}],
+        }, actor='olive-op')
+        self.assertEqual(0, res_indep_tree['returncode'], res_indep_tree['stderr'])
+
+        # 4) Opus Q3e: read_signoff_for_contribution returns extra_committed sign-offs when issue=None!
+        for st in (self.store(), rs.DictStandardsStore({}, self.pid)):
+            st.commit_signoff('cid-q3e', 'op-q3e-1', {
+                'schema_version': 1, 'status': 'committed', 'contribution_id': 'cid-q3e',
+                'commit': commit_fp, 'operation_id': 'op-q3e-1',
+                'created_at': '2026-11-12T01:00:00Z', 'approval_comment_id': 'c1',
+                'reviewer': {'actor': 'cora-op'}, 'checks': [],
+            })
+            st.commit_signoff('cid-q3e', 'op-q3e-2', {
+                'schema_version': 1, 'status': 'committed', 'contribution_id': 'cid-q3e',
+                'commit': commit_fp, 'operation_id': 'op-q3e-2',
+                'created_at': '2026-11-12T02:00:00Z', 'approval_comment_id': 'c2',
+                'reviewer': {'actor': 'olive-op'}, 'checks': [],
+            })
+            so_q3e = rs.read_signoff_for_contribution(st, 'cid-q3e', expected_commit=commit_fp, issue=None)
+            self.assertEqual('op-q3e-2', so_q3e['operation_id'])
+            self.assertEqual(1, len(so_q3e['earlier_sign_offs']))
+            self.assertEqual('op-q3e-1', so_q3e['earlier_sign_offs'][0]['operation_id'])
+
+        # 5) Opus NOTE-1: collect_citation_paths_from_checks is O(n) and bounded by CHECKS_MAX * CITATIONS_MAX!
+        many_checks = [
+            {'evidence': {'citations': ['pkg/f_%d_%d.py:1' % (i, j) for j in range(60)]}}
+            for i in range(300)
+        ]
+        collected = rs.collect_citation_paths_from_checks(many_checks)
+        self.assertEqual(rs.CHECKS_MAX * rs.CITATIONS_MAX, len(collected))
 
 
 if __name__ == '__main__':
