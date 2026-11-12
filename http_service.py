@@ -112,6 +112,8 @@ def service_identity():
     return dict(_SERVICE_IDENTITY)
 
 
+#: kittrial-5bb.581: the response header naming the installed build (service_identity()'s build_id).
+BUILD_HEADER = 'X-Orchestra-Build'
 MAX_BODY_BYTES = 262144
 #: kittrial-5bb.418: the body a design.<scope> reference propose or revise may send, its document inside it
 #: (1 MiB of Markdown, design_documents.DOCUMENT_MAX_BYTES, plus the JSON escaping). Only those two routes, and
@@ -6367,6 +6369,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self._send_hsts()
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        # kittrial-5bb.581: the installed build on every answer (what /healthz already says to anyone), so an
+        # open page can offer a reload when the installation was upgraded under it.
+        self.send_header(BUILD_HEADER, str(service_identity().get('build_id') or ''))
         if getattr(self, '_written_at', None):
             # Set only for the answer of a write that was carried out; _dispatch clears it for the next request.
             self.send_header(SERVER_TIME_HEADER, self._written_at)
@@ -8704,8 +8709,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         the projects the caller may invite people to. A person's session only."""
         enabled = self._invites_enabled()
         items = invites.list_for(self.service, ctx.principal)
-        return 200, {'enabled': enabled, 'items': items,
-                     'projects': invites.invitable_projects(self.service, ctx.principal) if enabled else [],
+        # kittrial-5bb.581: the projects are listed while the switch is off too, so an owner sees the panel
+        # with the off sentence rather than nothing; ``may_invite`` says whether there is any.
+        projects = invites.invitable_projects(self.service, ctx.principal)
+        return 200, {'enabled': enabled, 'items': items, 'projects': projects, 'may_invite': bool(projects),
                      'default_hours': invites.DEFAULT_HOURS, 'max_hours': invites.MAX_HOURS,
                      'off_sentence': None if enabled else invites.INVITES_OFF,
                      'generated_at': now_iso(self.service._now())}
@@ -8770,6 +8777,32 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._invite_refused(ctx, 'invites.redeem', error)
             raise
         return 201, result
+
+    @route('POST', r'/v1/invites/accept')
+    def invites_accept(self, ctx):
+        """kittrial-5bb.581: accept an invite for an existing account, as that account's own session.
+
+        Not anonymous and CSRF-checked, as every web write is. The token is in the body only. The
+        secret of the pre-approved agent's credential is in this answer only; an exact retry answers
+        200 without it. A token for anyone else, or of the new-person kind, gets the unknown-token 404."""
+        payload = dict(ctx.payload or {})
+
+        def accept():
+            invites.require_enabled(self._invites_enabled())
+            refuse_unknown_fields(payload, invites.ACCEPT_FIELDS, 'Accepting an invite')
+            try:
+                return invites.accept(self.service, ctx.principal, payload.get('token'), source=self._source(),
+                                      shared_source=self._source_is_shared(), usable=self._require_usable,
+                                      request_id=ctx.request_id)
+            except HttpError as error:
+                # A 429 is audited once per address in the sign-in window, as on the anonymous routes
+                # (_invite_refused); _mutate audits every other refusal itself.
+                if error.status == 429 and invites.quiet_throttle(self.service, self._source(),
+                                                                  self._source_is_shared()):
+                    error.quiet_audit = True
+                raise
+        return self._mutate(ctx, 'invites.accept', None, accept, status=201, capability=CAP_AGENTS,
+                            replay_status=200)
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/disable')
     def account_disable(self, ctx):

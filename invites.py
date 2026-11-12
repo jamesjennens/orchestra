@@ -25,15 +25,26 @@ The switch is the installation setting ``invites_enabled`` (``deployment.private
 endpoint backend, read on every request; an attribute on the service-local backend). Off by
 default; while off, creating, viewing and redeeming are refused with :data:`INVITES_OFF`.
 Listing and revoking stay open, so an invite made while it was on can still be withdrawn.
+
+Two kinds of invite (kittrial-5bb.581), one record type told apart by ``person``:
+
+* ``"new"`` (and every record made before the field existed): exactly the above. It is redeemed
+  anonymously at ``/v1/invites/redeem`` with the new account's password.
+* ``"existing"``: names an active account by its id. It adds any membership the account lacks (the
+  role named, contributor by default), never lowering one it has, and makes the pre-approved agent
+  under that account with its first credential. It is accepted only at ``/v1/invites/accept`` by
+  that account's own signed-in session (CSRF and the operation journal as every web write);
+  anyone else, and the anonymous redeem route, gets the same 404 as an unknown token
+  (:func:`_lookup` decides it in one place). No password is ever set on an existing account.
 """
 import re
 import secrets
 
 import claim_limit
-from http_auth import (AGENT_DEFAULT_SCOPES, LOGIN_WINDOW_SECONDS, THROTTLE_KEY_CAP, HttpError, Principal, Service,
-                       _validate_password, conflict, forbidden, hash_password, invalid, new_token, not_found,
-                       now_iso, throttled, token_hash)
-from http_authority import CAP_PROJECT_ADMIN, ROLE_CAPABILITIES
+from http_auth import (AGENT_DEFAULT_SCOPES, AGENT_MAX_PER_OWNER, LOGIN_WINDOW_SECONDS, THROTTLE_KEY_CAP, HttpError,
+                       Principal, Service, _validate_password, agent_slug, conflict, forbidden, hash_password, invalid,
+                       new_token, not_found, now_iso, throttled, token_hash)
+from http_authority import CAP_PROJECT_ADMIN, ROLE_CAPABILITIES, ROLES
 
 #: How long an invite lives: 72 hours unless the inviter asks for less or more, at most 7 days.
 DEFAULT_HOURS = 72
@@ -41,8 +52,13 @@ MIN_HOURS = 1
 MAX_HOURS = 7 * 24
 #: The role an invite gives in every project it names: the ordinary member role. Never chosen.
 MEMBER_ROLE = 'contributor'
-#: The role of the one agent an invite may pre-approve. There is no coordinator grant.
+#: The default role of the one agent an invite may pre-approve; a reviewer may be asked instead
+#: (kittrial-5bb.581). There is never a coordinator grant or a scope list.
 AGENT_ROLE = 'worker'
+AGENT_INVITE_ROLES = ('worker', 'reviewer')
+#: The two kinds of invite (kittrial-5bb.581): a new account, or an account that already exists.
+PERSON_NEW = 'new'
+PERSON_EXISTING = 'existing'
 DISPLAY_NAME_MAX = 100
 PROJECTS_MAX = 20
 #: Bounds on what the state keeps: pending invites per inviter and in all; finished ones kept.
@@ -57,19 +73,36 @@ THROTTLE_PREFIX = '(invite)'
 PROJECT_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 INVITE_ID = re.compile(r'inv_[0-9a-f]{16}')
 
-CREATE_FIELDS = ('display_name', 'username', 'projects', 'expires_hours', 'agent')
+CREATE_FIELDS = ('person', 'display_name', 'username', 'role', 'projects', 'expires_hours', 'agent')
 AGENT_FIELDS = ('name', 'project', 'claim_limit', 'role')
 VIEW_FIELDS = ('token',)
 REDEEM_FIELDS = ('token', 'password')
+ACCEPT_FIELDS = ('token',)
 
 #: The one sentence every invite route answers while the switch is off (pinned by the tests).
 INVITES_OFF = ('Invite links are switched off on this installation. An operator turns them on with '
                '"invites_enabled": true in deployment.private.json.')
 #: The one answer to a token that is unknown, expired, used or withdrawn: nobody can tell which.
 UNUSABLE = 'This invite link cannot be used. Ask the person who sent it for a new one.'
-PERSON_ONLY = 'Only a person signed in to the web page can make or withdraw an invite; an agent or worker credential cannot.'
-WORKER_ONLY = ('An invite can pre-approve one worker agent only. A coordinator grant is given on the '
-               "project's Members & settings page after the person has signed in.")
+PERSON_ONLY = ('Only a person signed in to the web page can make, withdraw or accept an invite; an agent or '
+               'worker credential cannot.')
+WORKER_ONLY = ('An invite can pre-approve one worker or reviewer agent. A coordinator grant is given on the '
+               "project's Agents page after the person has signed in.")
+#: kittrial-5bb.581: the refusals of an invite for an account that already exists.
+ROLE_OWNER = 'Only a superuser may invite someone as a project owner.'
+ROLE_NEW_PERSON = ('A new person joins as a contributor; choose a role for them on People after they sign in.')
+EXISTING_NO_DISPLAY_NAME = 'An invite for an existing account takes no display_name; it keeps its own.'
+NO_ACCOUNT = 'No active account with that username'
+SELF = 'To add an agent for yourself use New agent on My agents; an invite is for someone else.'
+NOTHING_TO_DO = ('@%s already has that role or a higher one in every project named, and no agent was asked; '
+                 'there is nothing to invite them to.')
+AGENT_NAME_TAKEN = ('@%s already has an agent whose secret file would have this name; choose another agent name.')
+AGENT_NAME_TAKEN_NOW = ('You already have an agent whose secret file would have the name of this invite\'s agent. '
+                        'Ask the person who sent it for a new invite; nothing was changed.')
+AGENT_LIMIT = '@%s already has the most agents an account may have (%d).'
+AGENT_LIMIT_NOW = ('You already have the most agents an account may have (%d). Ask the person who sent it for '
+                   'a new invite; nothing was changed.')
+PERSON_FIELD = 'person must be "new" or "existing"'
 AGENT_PROJECT = "The pre-approved agent's project must be one of the invite's projects."
 STALE = ('This invite can no longer be used as it was made: the person who sent it can no longer add '
          'people to one of its projects, or a project is archived. Ask them for a new one.')
@@ -149,7 +182,7 @@ def _agent_request(value, projects):
         raise invalid('agent must be an object with name, project and an optional claim_limit')
     # Anything that would make it more than a worker is refused by name, before the field list.
     if any(key in value for key in ('coordinator', 'coordinator_grant', 'grant', 'grants', 'scopes')) or \
-            ('role' in value and value.get('role') != AGENT_ROLE):
+            ('role' in value and value.get('role') not in AGENT_INVITE_ROLES):
         raise forbidden(WORKER_ONLY)
     unknown = sorted(str(key) for key in set(value) - set(AGENT_FIELDS))
     if unknown:
@@ -164,7 +197,7 @@ def _agent_request(value, projects):
             limit = claim_limit.validate_limit(value['claim_limit'])
         except ValueError as error:
             raise invalid(str(error)) from None
-    return {'name': name, 'project': project, 'claim_limit': limit, 'role': AGENT_ROLE}
+    return {'name': name, 'project': project, 'claim_limit': limit, 'role': value.get('role') or AGENT_ROLE}
 
 
 def _holds(state, user_id, project_id):
@@ -199,6 +232,48 @@ def invitable_projects(service, principal):
                 if _holds(state, principal.user_id, pid)]
 
 
+def kind_of(record):
+    """``"new"`` or ``"existing"``; a record made before kittrial-5bb.581 has no field and is new."""
+    return PERSON_EXISTING if record.get('person') == PERSON_EXISTING else PERSON_NEW
+
+
+def _person_kind(value):
+    if value is None or value == PERSON_NEW:
+        return PERSON_NEW
+    if value == PERSON_EXISTING:
+        return PERSON_EXISTING
+    raise invalid(PERSON_FIELD)
+
+
+def _member_role(value, principal):
+    """The role an existing-account invite names: contributor unless asked; owner only from a superuser."""
+    if value is None:
+        return MEMBER_ROLE
+    if not isinstance(value, str) or value not in ROLES:
+        raise invalid('role must be one of %s' % ', '.join(ROLES))
+    if value == 'owner' and not principal.superuser:
+        raise forbidden(ROLE_OWNER)
+    return value
+
+
+def _rank(role):
+    """A membership role's place in ROLES; anything unknown ranks below viewer."""
+    return ROLES.index(role) if role in ROLES else -1
+
+
+def _agent_name_clash(state, owner_id, name):
+    """Whether one of ``owner_id``'s agents would share the secret file of an agent named ``name``
+    (the rule of ``Service._check_agent_file_name``, without its sentence, which names the other agent)."""
+    slug = agent_slug(name)
+    return any(isinstance(other, dict) and other.get('owner') == owner_id and agent_slug(other.get('name')) == slug
+               for other in (state.get('agents') or {}).values())
+
+
+def _agent_count(state, owner_id):
+    return sum(1 for other in (state.get('agents') or {}).values()
+               if isinstance(other, dict) and other.get('owner') == owner_id)
+
+
 def _person(service, principal):
     if principal is None or principal.via != 'session' or principal.agent_id or principal.credential_id:
         raise forbidden(PERSON_ONLY)
@@ -214,6 +289,7 @@ def view(service, record, moment=None, *, for_inviter=True):
     state = service.state
     out = {
         'id': record['id'],
+        'person': kind_of(record),
         'status': status(service, record, moment),
         'display_name': record['display_name'],
         'username': record['username'],
@@ -230,6 +306,7 @@ def view(service, record, moment=None, *, for_inviter=True):
         out.update(used_at=record.get('used_at'), used_by=record.get('used_by'),
                    used_by_name=_name_of(service, record['used_by']) if record.get('used_by') else None,
                    used_from=record.get('used_from'), agent_id=record.get('agent_id'),
+                   user_id=record.get('user_id'), memberships=record.get('memberships'),
                    revoked_at=record.get('revoked_at'), revoked_by=record.get('revoked_by'),
                    revoked_by_name=_name_of(service, record['revoked_by']) if record.get('revoked_by') else None)
     return out
@@ -253,7 +330,18 @@ def create(service, principal, payload, *, usable=None, request_id=None):
     The caller has checked the switch and refused unknown top-level fields.
     """
     _person(service, principal)
-    display_name = _text(payload.get('display_name'), 'display_name', DISPLAY_NAME_MAX)
+    person = _person_kind(payload.get('person'))
+    if person == PERSON_NEW:
+        # A new person: exactly kittrial-5bb.578. They join as a contributor (kittrial-5bb.581 Q1).
+        if payload.get('role') is not None:
+            raise invalid(ROLE_NEW_PERSON)
+        display_name = _text(payload.get('display_name'), 'display_name', DISPLAY_NAME_MAX)
+        role = MEMBER_ROLE
+    else:
+        if payload.get('display_name') is not None:
+            raise invalid(EXISTING_NO_DISPLAY_NAME)
+        display_name = None
+        role = _member_role(payload.get('role'), principal)
     username = service._username(payload.get('username'))
     projects = _projects(payload.get('projects'))
     hours = _hours(payload.get('expires_hours'))
@@ -271,9 +359,33 @@ def create(service, principal, payload, *, usable=None, request_id=None):
             if usable is not None:
                 usable(pid)
         _charge_username_check(service, principal, username, projects[0], request_id)
-        holder = state['users'].get(state['usernames'].get(username.lower()) or '')
-        if isinstance(holder, dict) and not holder.get('disabled'):
-            raise conflict('Username already exists')
+        holder_id = state['usernames'].get(username.lower()) or ''
+        holder = state['users'].get(holder_id)
+        active = isinstance(holder, dict) and not holder.get('disabled')
+        if person == PERSON_NEW:
+            if active:
+                raise conflict('Username already exists')
+            user_id = None
+        else:
+            # The lookup's own answer for an unknown or disabled account (Service.lookup_account), so
+            # an invite tells an owner nothing the Members lookup does not.
+            if not active:
+                raise not_found(NO_ACCOUNT)
+            if holder_id == principal.user_id:
+                raise invalid(SELF)
+            user_id = holder_id
+            username = holder.get('username') or username
+            display_name = holder.get('display_name') or holder.get('username') or holder_id
+            members = state.get('memberships') or {}
+            if agent is None and all(_rank((members.get(pid) or {}).get(user_id)) >= _rank(role)
+                                     for pid in projects):
+                raise conflict(NOTHING_TO_DO % username)
+            if agent is not None:
+                # Said now so the inviter hears it before sending; judged again at acceptance.
+                if _agent_count(state, user_id) >= AGENT_MAX_PER_OWNER:
+                    raise conflict(AGENT_LIMIT % (username, AGENT_MAX_PER_OWNER))
+                if _agent_name_clash(state, user_id, agent['name']):
+                    raise conflict(AGENT_NAME_TAKEN % username)
         moment = service._expiry_now()
         invites = _invites(service)
         pending = [record for record in invites.values() if status(service, record, moment) == 'pending']
@@ -288,10 +400,12 @@ def create(service, principal, payload, *, usable=None, request_id=None):
         raw = service._raw_now()
         record = {
             'id': 'inv_' + secrets.token_hex(8),
+            'person': person,
+            'user_id': user_id,
             'display_name': display_name,
             'username': username,
             'projects': projects,
-            'role': MEMBER_ROLE,
+            'role': role,
             'agent': agent,
             'invited_by': principal.user_id,
             'created_at': now_iso(service._now()),
@@ -300,7 +414,7 @@ def create(service, principal, payload, *, usable=None, request_id=None):
             'issued_raw': raw,
             'ttl': hours * 3600,
             'expires_at': moment + hours * 3600,
-            'used_at': None, 'used_by': None, 'used_from': None, 'agent_id': None,
+            'used_at': None, 'used_by': None, 'used_from': None, 'agent_id': None, 'memberships': None,
             'revoked_at': None, 'revoked_by': None,
         }
         _prune(service)
@@ -385,8 +499,13 @@ def _throttle_name(service, source, shared_source):
     return '%s%s' % (THROTTLE_PREFIX, service._source_key(source, shared_source))
 
 
-def _lookup(service, token, source, shared_source):
+def _lookup(service, token, source, shared_source, *, person=None, user_id=None):
     """The pending record ``token`` names, or the one refusal. Caller holds ``store.lock``.
+
+    ``person`` (kittrial-5bb.581), when given, is the kind the route serves: a token of the other
+    kind is answered exactly as an unknown one, so the anonymous redeem can never set a password on
+    an existing account, and acceptance can never make a new one. ``user_id`` is the signed-in
+    account accepting: an existing-account invite for anyone else is also the unknown-token answer.
 
     The sign-in counts are checked first and fed by every miss, so an address that guesses is
     answered 429 exactly as one that guesses passwords. The expiry clock is read once, before the
@@ -397,7 +516,9 @@ def _lookup(service, token, source, shared_source):
     service._check_throttle(name, source, shared_source)
     moment = service._expiry_now()
     record = _invites(service).get(token_hash(token)) if isinstance(token, str) and token else None
-    if record is None or status(service, record, moment) != 'pending':
+    if record is None or status(service, record, moment) != 'pending' or \
+            (person is not None and kind_of(record) != person) or \
+            (person == PERSON_EXISTING and (not user_id or record.get('user_id') != user_id)):
         service._record_failure(name, source, shared_source)
         raise unusable()
     return record, moment
@@ -437,7 +558,9 @@ def public_view(service, token, *, source='local', shared_source=False):
         shown = view(service, record, moment, for_inviter=False)
         shown.pop('invited_by', None)
         shown.pop('id', None)
-        shown['password_min_length'] = service.password_min_length
+        # kittrial-5bb.581: for an existing account the page says whom it is for and nothing about that
+        # account (not whether it is already a member anywhere): the holder of the link may not be them.
+        shown['password_min_length'] = service.password_min_length if kind_of(record) == PERSON_NEW else None
         return shown
 
 
@@ -449,7 +572,7 @@ def redeem(service, token, password, *, source='local', shared_source=False, usa
     the set-up payload New agent gives.
     """
     with service.store.lock:
-        record, _moment = _lookup(service, token, source, shared_source)
+        record, _moment = _lookup(service, token, source, shared_source, person=PERSON_NEW)
         _validate_password(password, service.password_min_length)
         state = service.state
         inviter = record['invited_by']
@@ -500,7 +623,7 @@ def redeem(service, token, password, *, source='local', shared_source=False, usa
                     'enabled': True, 'projects': granted, 'created_at': now_iso(service._now()),
                     'claim_limit': asked.get('claim_limit', claim_limit.DEFAULT_LIMIT),
                     'last_seen_at': None, 'scopes': list(AGENT_DEFAULT_SCOPES), 'scopes_source': 'set',
-                    'role': AGENT_ROLE, 'invite_id': record['id'],
+                    'role': asked.get('role') or AGENT_ROLE, 'invite_id': record['id'],
                 }
                 change.created(state['agents'], agent_id)
                 state['agents'][agent_id] = agent
@@ -540,3 +663,127 @@ def redeem(service, token, password, *, source='local', shared_source=False, usa
                                           secret_available=True),
                           setup=service.agent_setup(agent, secret), secret_available=True)
         return answer
+
+
+def accept(service, principal, token, *, source='local', shared_source=False, usable=None, request_id=None):
+    """Accept an invite for an existing account, as that account's own signed-in session (kittrial-5bb.581).
+
+    One transaction under ``store.lock``, from the token lookup to the save, like :func:`redeem`:
+
+    * the token must name a pending invite of kind ``existing`` for exactly ``principal``'s account,
+      or the answer is the unknown-token 404 (:func:`_lookup`), counted as a miss;
+    * the inviter's right is judged again from present state (``_holds`` and the route's ``usable``
+      for every project; for the owner role, that the inviter is still a superuser): 409 invite_stale;
+    * each membership the account lacks, or holds below the named role, is set to the named role;
+      one it holds at or above it is kept. Nothing is ever lowered;
+    * the pre-approved agent is made under the account, as ``Service.create_agent`` makes one, with
+      its first credential.
+
+    Everything written is inside one ``Service._widening``, so any refusal or failure before the save
+    takes all of it back. Returns ``(public, stored)``: the credential's secret and the set-up files
+    are in ``public`` only; an exact retry is answered from ``stored``, without them.
+    """
+    if principal is None or principal.via != 'session' or principal.agent_id or principal.credential_id:
+        raise forbidden(PERSON_ONLY)
+    with service.store.lock:
+        service._refresh_authority(principal)
+        record, _moment = _lookup(service, token, source, shared_source, person=PERSON_EXISTING,
+                                  user_id=principal.user_id)
+        state = service.state
+        user_id = record['user_id']
+        user = state['users'].get(user_id)
+        if not isinstance(user, dict) or user.get('disabled'):
+            service._record_failure(_throttle_name(service, source, shared_source), source, shared_source)
+            raise unusable()
+        inviter = record['invited_by']
+        inviter_user = state['users'].get(inviter)
+        if record['role'] == 'owner' and not (isinstance(inviter_user, dict) and inviter_user.get('superuser')
+                                              and not inviter_user.get('disabled')):
+            raise HttpError(409, 'invite_stale', STALE)
+        for pid in record['projects']:
+            if not _holds(state, inviter, pid):
+                raise HttpError(409, 'invite_stale', STALE)
+            if usable is not None:
+                try:
+                    usable(pid)
+                except HttpError:
+                    raise HttpError(409, 'invite_stale', STALE) from None
+        asked = record.get('agent')
+        if asked:
+            if _agent_count(state, user_id) >= AGENT_MAX_PER_OWNER:
+                raise conflict(AGENT_LIMIT_NOW % AGENT_MAX_PER_OWNER)
+            if _agent_name_clash(state, user_id, asked['name']):
+                raise conflict(AGENT_NAME_TAKEN_NOW)
+        digest = token_hash(token)
+        agent = credential = secret = None
+        changed = {}
+        with service._widening() as change:
+            change.remember(state['invites'], digest)
+            for pid in record['projects']:
+                if not isinstance(state['memberships'].get(pid), dict):
+                    change.remember(state['memberships'], pid)
+                    state['memberships'][pid] = {}
+                members = state['memberships'][pid]
+                before = members.get(user_id)
+                after = before
+                # Never lower: a role at or above the named one is kept as it is (an owner is never touched).
+                if before is None or _rank(before) < _rank(record['role']):
+                    change.remember(members, user_id)
+                    members[user_id] = after = record['role']
+                changed[pid] = {'before': before, 'after': after}
+            if asked:
+                service._check_agent_file_name(user_id, asked['name'])
+                granted = service._agent_projects(principal, [asked['project']], owner_id=user_id)
+                expiry = service._agent_expiry_metadata()
+                agent_id = 'agent_' + secrets.token_hex(8)
+                agent = {
+                    'id': agent_id, 'name': asked['name'], 'owner': user_id, 'created_by': inviter,
+                    'tool': None, 'working_directory': None, 'machine': None, 'notes': None,
+                    'enabled': True, 'projects': granted, 'created_at': now_iso(service._now()),
+                    'claim_limit': asked.get('claim_limit', claim_limit.DEFAULT_LIMIT),
+                    'last_seen_at': None, 'scopes': list(AGENT_DEFAULT_SCOPES), 'scopes_source': 'set',
+                    'role': asked.get('role') or AGENT_ROLE, 'invite_id': record['id'],
+                }
+                change.created(state['agents'], agent_id)
+                state['agents'][agent_id] = agent
+                service._audit_project_grants(principal, agent, list(granted), request_id)
+                # Issued exactly as New agent issues the first credential (Service.create_agent).
+                credential, secret = service._issue_agent_credential_locked(principal, agent, expiry=expiry)
+                change.created(state['credentials'], credential['id'])
+                change.created(state['credential_tokens'], credential['token_hash'])
+                service._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
+                                                service.agent_scopes(agent), request_id)
+                event = service.audit(request_id, principal, 'agents.created', 'committed',
+                                      actor=service.agent_actor(agent))
+                event.update(agent_id=agent_id, owner_id=user_id, created_by=inviter)
+            record['used_at'] = now_iso(service._now())
+            record['used_by'] = user_id
+            record['used_from'] = str(source or 'unknown')[:64]
+            record['agent_id'] = agent['id'] if agent else None
+            record['memberships'] = changed
+            for pid in record['projects']:
+                event = service.audit(request_id, principal, 'invites.redeemed', 'committed', project_id=pid,
+                                      reason='invite=%s by=%s' % (record['id'], inviter))
+                event.update(invite_id=record['id'], invited_by=inviter, existing_user=user_id,
+                             role_before=changed[pid]['before'], role_after=changed[pid]['after'],
+                             used_from=record['used_from'], agent_id=record['agent_id'])
+            change.save()
+        public = {
+            'operation': 'invites.accept',
+            'user': {'id': user_id, 'username': user.get('username'),
+                     'display_name': user.get('display_name') or user.get('username')},
+            'projects': [{'id': pid, 'name': (state['projects'].get(pid) or {}).get('name') or pid,
+                          'role': changed[pid]['after'], 'role_before': changed[pid]['before']}
+                         for pid in record['projects']],
+            'invited_by_name': _name_of(service, inviter),
+            'agent': None, 'credential': None, 'setup': None, 'secret_available': False,
+        }
+        if agent is not None:
+            public.update(agent=service.agent_view(agent, principal),
+                          credential=dict(service.credential_view(credential), secret=secret, secret_available=True),
+                          setup=service.agent_setup(agent, secret), secret_available=True)
+        stored = dict(public, credential=dict(service.credential_view(credential), secret_available=False)
+                      if credential is not None else None, setup=None, secret_available=False,
+                      note='The secret was shown once, when the invite was accepted; it cannot be shown again. '
+                           'Issue a new credential on the agent\'s card if it was lost.')
+        return public, stored
