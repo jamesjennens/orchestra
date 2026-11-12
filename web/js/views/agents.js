@@ -1291,7 +1291,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   async function saveRole(role) {
     state.role = role;
     if (dialog.wizard) {
-      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
     }
     persist();
     wizard.clearError();
@@ -1352,10 +1352,10 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     Object.assign(agent, freshAgent);
     payload = setupText.secretlessPayload({ ...(source || {}), agent }, location.origin);
     PAYLOAD_META.set(payload, { certificate, bridgeServer });
-    files[0][1] = setupText.agentJson(payload);
-    files[1][1] = setupText.agentGuide(payload, { hasCertificate });
+    // Candidate 1112a: files() reads the current payload (kittrial-5bb.559), so the re-read agent's
+    // agent.json and AGENT.md follow from the reassignment above; nothing to patch in place.
     if (dialog.wizard) {
-      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
     }
     if (!payload.coordinates.includes(pid)) {
       if (!(payload.coordinateGrantableProjects || []).includes(pid)) {

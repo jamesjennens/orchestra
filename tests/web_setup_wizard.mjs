@@ -775,6 +775,8 @@ out.clickingMakeCoordinatorUpdatesGuideAndPromptFromStart = Boolean(copiedText)
   && filesScreenText.includes('## You coordinate')
   && filesScreenText.includes('You hold the coordinator grant for p1.');
 server.coordinateGrantableProjects = undefined;
+// Candidate 1112a: the grant above left p1 in server.coordinates; the sections below (kittrial-5bb.456/.559) set up a worker.
+server.coordinates = undefined;
 for (const open of openDialogs()) await open.close();
 
 // ---- kittrial-5bb.456: what the agent runs in, the secret screens and the credentials -------------
