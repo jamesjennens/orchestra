@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb578-deployment-invites-enabled-0001",
+  "key": "deployment.invites-enabled",
+  "name": "The invites_enabled installation switch: invite links off unless deployment.private.json says true",
+  "aliases": [
+    "invites_enabled",
+    "turn invite links on",
+    "invite links switched off",
+    "invites_disabled"
+  ],
+  "summary": "admin.invites_enabled reads invites_enabled from deployment.private.json: absent or false is off, true is on, anything else is off with a warning naming the setting. EndpointBackend.get_invites_enabled reads it on every invite request through _read_deployment_setting (an unreadable file is the usual 503); the service-local InProcessBackend has the attribute invites_enabled, False. While off, POST /v1/invites, /v1/invites/view and /v1/invites/redeem answer 403 invites_disabled with the one pinned sentence invites.INVITES_OFF and the create form is hidden; listing and withdrawing stay open. A restore of the HTTP state withdraws the backup's pending invites.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#invite-links"
+  ],
+  "code": [
+    "admin.py::invites_enabled",
+    "admin.py::_restore_http_state",
+    "http_service.py::EndpointBackend.get_invites_enabled",
+    "http_service.py::InProcessBackend.get_invites_enabled",
+    "invites.py::require_enabled"
+  ],
+  "tests": [
+    "tests/test_invites.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "deployment",
+    "configuration",
+    "security"
+  ]
+}

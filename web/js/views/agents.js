@@ -752,6 +752,54 @@ function fileBlock(title, text, folder, relative) {
     h('pre', { class: 'json' }, text));
 }
 
+// kittrial-5bb.578: one text as a file the browser saves (the credential file, agent.json, AGENT.md).
+function downloadText(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  const link = h('a', { href: url, download: name });
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// kittrial-5bb.578: what the signed-out invite page offers ONCE, straight after the invite made the
+// account's pre-approved agent: the same credential lines and folder files New agent's dialog gives
+// (the certificate too, when the service has one), without the wizard, which needs a session. The
+// secret lives in this node only; the page keeps it nowhere else.
+export async function inviteSetupBlock(ctx, created, secret) {
+  const certificate = await agentCertificate(ctx);
+  const payload = setupText.secretlessPayload(created, location.origin);
+  PAYLOAD_META.set(payload, { certificate, bridgeServer: location.origin });
+  const os = setupText.detectOs();
+  const files = [['agent.json', setupText.agentJson(payload)],
+    ['AGENT.md', setupText.agentGuide(payload, { hasCertificate: Boolean(certificate) })]];
+  const lines = setupText.credentialFileLines(location.origin, certificate ? certificate.sha256 : null, secret);
+  const saveStatus = h('p', { class: 'small', role: 'status', hidden: true });
+  const folderButton = canSaveToFolder() ? h('button', { type: 'button', 'data-action': 'save-files', onclick: async () => {
+    try {
+      const result = await saveSetupFiles(files);
+      if (!result.cancelled) { saveStatus.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.`; saveStatus.hidden = false; }
+    } catch (error) { saveStatus.textContent = 'Could not save the files: ' + ((error && error.message) || 'unknown error'); saveStatus.hidden = false; }
+  } }, 'Save .orchestra files to the agent folder…') : null;
+  return h('section', { class: 'stack', 'data-invite-setup': 'true' },
+    h('h2', { class: 'small' }, `Your agent ${payload.name}`),
+    secretNotice(false),
+    secretLinesBlock(payload, secret, os),
+    h('div', { class: 'copy-row' },
+      h('button', { type: 'button', class: 'primary', 'data-action': 'download-credential',
+        onclick: () => downloadText(payload.secretFile.name, lines) }, 'Download the credential file'),
+      certificate ? h('button', { type: 'button', 'data-action': 'save-certificate',
+        onclick: () => saveCertificate(certificate, payload.certificateFile) }, 'Save the certificate') : null),
+    h('p', { class: 'small', 'data-download-warning': 'true' }, 'This file holds a secret. Run Orchestra Bridge: Set up in VS Code next: it moves this file out of Downloads and deletes the copy. If you don’t use the Bridge, move it yourself and empty it from Downloads.'),
+    h('p', { class: 'small muted' }, 'The two files below hold no secret; they go in the agent’s folder under .orchestra/.'),
+    h('div', { class: 'copy-row' }, folderButton,
+      ...files.map(([name, text]) => h('button', { type: 'button', 'data-action': 'download-' + name,
+        onclick: () => downloadText(name, text) }, 'Download ' + name))),
+    saveStatus,
+    more(fileBlock(setupText.CONFIG_PATH, files[0][1], null, setupText.CONFIG_PATH),
+      fileBlock(setupText.GUIDE_PATH, files[1][1], null, setupText.GUIDE_PATH)));
+}
+
 // One line per curl error the person may see when the test fails (kittrial-5bb.275 & .328).
 export const CURL_ERROR_LINES = Object.freeze({
   2: 'curl exit 2 / cacert does not exist: either <your-name> was left in the credential file (run the command on “Add the certificate path”) or the certificate is still in Downloads without its leading dot (run the command on “Move the certificate”).',

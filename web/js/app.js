@@ -20,6 +20,7 @@ import * as rooms from './views/rooms.js';
 import * as releases from './views/releases.js';
 import * as designs from './views/designs.js';
 import * as trace from './views/trace.js';
+import * as invites from './views/invites.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
@@ -120,7 +121,19 @@ export async function start(root, options = {}) {
   };
 
   function showLogin(message) {
+    // Nothing is rendered from the route now, so opening any route (an invite link included) renders again.
+    rendered = null;
     mount(root, auth.login(ctx, message));
+  }
+
+  // kittrial-5bb.578: an invite link (#/invite/TOKEN) opens its own signed-out page, whoever is signed in.
+  const INVITE_PREFIX = '/invite/';
+  function showInvite() {
+    const route = currentRoute();
+    if (!route.startsWith(INVITE_PREFIX)) return false;
+    rendered = route;
+    mount(root, invites.invitePage(ctx, route.slice(INVITE_PREFIX.length)));
+    return true;
   }
 
   let shell;
@@ -213,6 +226,7 @@ export async function start(root, options = {}) {
 
   let token = 0;
   async function render() {
+    if (showInvite()) return;
     if (!ctx.me) return showLogin();
     const route = currentRoute();
     rendered = route;
@@ -275,7 +289,7 @@ export async function start(root, options = {}) {
     if (!api.hasCsrf()) toast('Signed in, but changes need a fresh sign-in (the server did not provide a CSRF token).', 'crit');
     render();
   } catch (error) {
-    showLogin(error && error.status && error.status !== 401 ? describe(error) : null);
+    if (!showInvite()) showLogin(error && error.status && error.status !== 401 ? describe(error) : null);
   }
   return ctx;
 }

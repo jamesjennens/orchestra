@@ -84,6 +84,7 @@ from http_auth import (Principal, AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_fi
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
                        validate_claim_limit, validate_password_min_length)
 from version import report as version_report
+import invites
 import program_links
 #: kittrial-5bb.449: a requirement key with `/` is kept, and said how it is cited (PROGRAM_DESIGN §3.1).
 QUALIFY_KEY_WARNING = ('The key %(key)s contains "/": cite it as req:%(project)s/%(key)s, even in this project, '
@@ -675,6 +676,9 @@ class InProcessBackend:
     #: one folder per project under it. None (the default) keeps no log, exactly as it
     #: keeps no project directory today.
     wake_root = None
+    #: The installation switch for invite links (kittrial-5bb.578): OFF. This service-local backend has
+    #: no deployment configuration, so a test or a local trial sets it; nothing else does.
+    invites_enabled = False
 
     def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None):
         import actor_names
@@ -695,6 +699,9 @@ class InProcessBackend:
 
     def get_delivery_roots(self):
         return tuple(self.delivery_roots or ())
+
+    def get_invites_enabled(self):
+        return self.invites_enabled is True
 
     def get_delivery_serve_max_bytes(self):
         return int(self.delivery_serve_max_bytes)
@@ -4173,7 +4180,7 @@ class EndpointBackend:
         from admin import ConfigurationUnreadable
         try:
             return fn(Path(self.root))
-        except ConfigurationUnreadable as exc:
+        except (ConfigurationUnreadable, OSError) as exc:
             print(
                 'configuration: the service could not read the deployment configuration: %s'
                 % ascii(str(exc)[:600]),
@@ -4191,6 +4198,16 @@ class EndpointBackend:
     def get_delivery_serve_max_bytes(self):
         from admin import delivery_serve_max_bytes
         return self._read_deployment_setting(delivery_serve_max_bytes)
+
+    def get_invites_enabled(self):
+        """kittrial-5bb.578: ``invites_enabled`` from this installation's deployment.private.json, read
+        on every invite request (absent or not true: off; unreadable: the usual 503)."""
+        from admin import invites_enabled
+        warnings = []
+        value = self._read_deployment_setting(lambda root: invites_enabled(root, warnings=warnings))
+        for line in warnings[:1]:
+            print('configuration: ' + ascii(line[:300]), file=sys.stderr, flush=True)
+        return value is True
 
     def task_delivery_record(self, project_id, task_id, contribution_id=None):
         reply = self._endpoint(
@@ -8656,6 +8673,103 @@ class ApiHandler(BaseHTTPRequestHandler):
                            reason='account=%s' % ctx.params['uid'])
         self.service.store.save()
         return 200, result
+
+    # -- invite links (kittrial-5bb.578; invites.py) --------------------------------------------------------
+    #
+    # Accounts, memberships, agents and credentials are all the web service's own state, so these routes are
+    # the same for both backends: neither is asked to do anything except say whether the switch is on
+    # (``get_invites_enabled``) and whether a project's record may be granted access (``_require_usable``).
+
+    def _invites_enabled(self):
+        read = getattr(self.backend, 'get_invites_enabled', None)
+        return read is not None and read() is True
+
+    def _invite_refused(self, ctx, action, error):
+        """One audit line for an anonymous invite route's refusal (never the token or the password).
+
+        A 429 is audited and saved once per address in the sign-in window; repeats are answered with
+        neither (review S2 of kittrial-5bb.578), so a flood cannot roll the audit over."""
+        if isinstance(error, HttpError) and error.status == 429 and \
+                invites.quiet_throttle(self.service, self._source(), self._source_is_shared()):
+            error.quiet_audit = True
+            return
+        if isinstance(error, HttpError):
+            self.service.audit(ctx.request_id, None, action, 'denied' if error.status in (401, 403, 404, 429)
+                               else 'rejected', reason=error.code)
+            self.service.store.save_soon('the audit entry of a refusal')
+
+    @route('GET', r'/v1/invites')
+    def invites_list(self, ctx):
+        """The caller's invites with their status (a superuser: everyone's), whether the switch is on, and
+        the projects the caller may invite people to. A person's session only."""
+        enabled = self._invites_enabled()
+        items = invites.list_for(self.service, ctx.principal)
+        return 200, {'enabled': enabled, 'items': items,
+                     'projects': invites.invitable_projects(self.service, ctx.principal) if enabled else [],
+                     'default_hours': invites.DEFAULT_HOURS, 'max_hours': invites.MAX_HOURS,
+                     'off_sentence': None if enabled else invites.INVITES_OFF,
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('POST', r'/v1/invites')
+    def invites_create(self, ctx):
+        """Make one invite link. The token is in this answer only; an exact retry answers 200 without it."""
+        payload = dict(ctx.payload or {})
+        # The committed event names the invite (never the username), so a create can be linked to its
+        # redeem (``invites.redeemed`` carries the same id) from the audit alone.
+        metadata = {}
+
+        def create():
+            invites.require_enabled(self._invites_enabled())
+            refuse_unknown_fields(payload, invites.CREATE_FIELDS, 'An invite')
+            public, stored = invites.create(self.service, ctx.principal, payload, usable=self._require_usable,
+                                            request_id=ctx.request_id)
+            metadata.update(reason='invite=%s' % public['invite']['id'], invite_id=public['invite']['id'])
+            return public, stored
+        return self._mutate(ctx, 'invites.create', None, create, status=201, capability=CAP_AGENTS,
+                            replay_status=200, audit_metadata=metadata)
+
+    @route('POST', r'/v1/invites/(?P<iid>' + ID + r')/revoke')
+    def invites_revoke(self, ctx):
+        """Withdraw a pending invite: its inviter or a superuser. Open while the switch is off."""
+        payload = ctx.payload if ctx.payload is not None else {}
+
+        def revoke():
+            refuse_unknown_fields(payload, (), 'Withdrawing an invite')
+            result = invites.revoke(self.service, ctx.principal, ctx.params['iid'], request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'invites.revoke', None, revoke, capability=CAP_AGENTS,
+                            reason='invite=%s' % ctx.params['iid'][:40])
+
+    @route('POST', r'/v1/invites/view', anonymous=True, csrf=False)
+    def invites_view(self, ctx):
+        """What the signed-out invite page shows. The token is sent in the body, never in a URL, so it
+        is not in an access log; a token that cannot be used gets the one answer, and the misses of an
+        address are counted as sign-in failures are."""
+        try:
+            invites.require_enabled(self._invites_enabled())
+            payload = ctx.payload or {}
+            refuse_unknown_fields(payload, invites.VIEW_FIELDS, 'An invite read')
+            shown = invites.public_view(self.service, payload.get('token'), source=self._source(),
+                                        shared_source=self._source_is_shared())
+        except Exception as error:
+            self._invite_refused(ctx, 'invites.view', error)
+            raise
+        return 200, dict(shown, generated_at=now_iso(self.service._now()))
+
+    @route('POST', r'/v1/invites/redeem', anonymous=True, csrf=False)
+    def invites_redeem(self, ctx):
+        """Claim the invite: set the password; the account, memberships and agent are made at once."""
+        try:
+            invites.require_enabled(self._invites_enabled())
+            payload = ctx.payload or {}
+            refuse_unknown_fields(payload, invites.REDEEM_FIELDS, 'An invite redemption')
+            result = invites.redeem(self.service, payload.get('token'), payload.get('password'),
+                                    source=self._source(), shared_source=self._source_is_shared(),
+                                    usable=self._require_usable, request_id=ctx.request_id)
+        except Exception as error:
+            self._invite_refused(ctx, 'invites.redeem', error)
+            raise
+        return 201, result
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/disable')
     def account_disable(self, ctx):

@@ -1757,7 +1757,13 @@ class AgentSetupDialogCase(unittest.TestCase):
                           '? secretLinesBlock(payload, state.secretValue, state.os, state.noproxy)'],
                          [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
                           and not line.strip().startswith('secretValue:')])
-        self.assertEqual(2, code.count('secretLinesBlock('))          # the definition and the one call
+        # The definition, the dialog's one call, and the invite page's (kittrial-5bb.578), which shows the
+        # secret its redemption has just issued, once, and builds every file from the secretless payload.
+        self.assertEqual(3, code.count('secretLinesBlock('))
+        invite = self.function_body(code, 'inviteSetupBlock')
+        self.assertIn('secretLinesBlock(payload, secret, os)', invite)
+        self.assertIn("['agent.json', setupText.agentJson(payload)]", invite)
+        self.assertNotIn('Storage', invite)
         block = self.function_body(code, 'secretLinesBlock')
         self.assertIn('setupText.credentialFileLines(address, fingerprint, secretValue, { noproxy })', block)
         self.assertIn("copyButton('Copy', lines, { ariaLabel: 'Copy the credential file text with the secret'", block)

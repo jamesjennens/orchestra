@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb578-accounts-invite-links-0001",
+  "key": "accounts.invite-links",
+  "name": "Invite links: a single-use link that makes an account, its memberships and one pre-approved worker agent",
+  "aliases": [
+    "invite link",
+    "invite someone",
+    "invitation",
+    "redeem an invite",
+    "claim an account",
+    "pre-approved agent",
+    "POST /v1/invites",
+    "POST /v1/invites/redeem",
+    "#/invite/"
+  ],
+  "summary": "A person's session (never an agent or worker credential) that is a superuser or an owner (project.admin, the Members table's rule) of every named project makes an invite, checked at create and again at redeem; a coordinator who is not an owner may not. Routes: GET/POST /v1/invites, POST /v1/invites/{id}/revoke (inviter or superuser). The token is secrets.token_urlsafe(32); state['invites'] keeps only its SHA-256, the projects, the optional worker agent (no coordinator grant, no scopes) and an expiry of 72 hours by default, at most 7 days. The signed-out page (#/invite/TOKEN) reads POST /v1/invites/view and redeems with POST /v1/invites/redeem: in one Service._widening under the state lock it creates the account, the contributor memberships, the agent and its credential (as create_agent issues it) and marks the invite used with the address; any failure takes all of it back. Unknown, expired, used and revoked tokens get one 404 answer and count as failed sign-ins do. Each use writes invites.redeemed into each named project's audit. Off unless invites_enabled.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#invite-links"
+  ],
+  "code": [
+    "invites.py::create",
+    "invites.py::redeem",
+    "invites.py::revoke",
+    "invites.py::public_view",
+    "invites.py::status",
+    "invites.py::_holds",
+    "invites.py::_lookup",
+    "http_service.py::ApiHandler.invites_list",
+    "http_service.py::ApiHandler.invites_create",
+    "http_service.py::ApiHandler.invites_revoke",
+    "http_service.py::ApiHandler.invites_view",
+    "http_service.py::ApiHandler.invites_redeem"
+  ],
+  "tests": [
+    "tests/test_invites.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "accounts",
+    "agents",
+    "http",
+    "security",
+    "web"
+  ]
+}
