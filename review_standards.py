@@ -13,6 +13,7 @@ import hashlib
 import os
 import posixpath
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -49,10 +50,12 @@ SCHEMA_VERSION = 1
 STANDARDS_DIRNAME = '.standards'
 BUNDLE_FETCH_LOCK_NAME = '.standards-bundle-fetch.lock'
 BUNDLE_LOCK_WAIT_SECONDS = 15.0
+BUNDLE_INSPECT_MAX_SECONDS = 8.0
 BUNDLE_INSPECT_SEMAPHORE = threading.BoundedSemaphore(1)
 STAGED_TTL_SECONDS = 24 * 3600
 
 MAX_FILE_BYTES = 512 * 1024
+MAX_SIGNOFF_FILE_BYTES = 4 * 1024 * 1024
 MAX_COMMIT_OBSERVATION_BYTES = 4 * 1024 * 1024
 MAX_COMMIT_OBSERVATION_FILE_BYTES = 8 * 1024 * 1024
 COMMIT_OBSERVATIONS_PER_PARTY_MAX_BYTES = 512 * 1024
@@ -193,6 +196,10 @@ class StandardsDamagedError(ValueError):
 
 class BundleLockTimeoutError(RuntimeError):
     """Raised when the installation-wide bundle fetch lock wait times out."""
+
+
+class BundleInspectTimeoutError(ValueError):
+    """Raised when pre-lock git inspection exceeds its bounded time budget."""
 
 
 class SignoffCommitError(RuntimeError):
@@ -480,6 +487,22 @@ def refusal_commit_fail_allowance_cap(commit, limit):
     )
 
 
+def refusal_commit_fail_allowance_total_cap(commit, limit):
+    return (
+        "Commit standards observation refused for %s: commit has reached the total reserve of "
+        "%d compact failing CI observations; existing observations are never evicted."
+        % (commit, limit)
+    )
+
+
+def refusal_git_inspection_timeout(commit):
+    return (
+        "Standards git inspection for delivered commit %s timed out before completing; "
+        "nothing was changed, retry shortly or record a verifier commit observation."
+        % commit
+    )
+
+
 # -- Time & Digest Helpers ----------------------------------------------------
 
 def utc_now_iso(now=None):
@@ -573,6 +596,35 @@ def _list_regular_names(dir_path, label):
     return names
 
 
+def _scan_regular_names_tolerant(dir_path, label):
+    """Scan ``dir_path`` keeping regular files and collecting warnings for non-regular entries."""
+    info = _lstat_or_none(dir_path)
+    if info is None:
+        return [], []
+    if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info) or not stat.S_ISDIR(info.st_mode):
+        return [], ['%s is not a regular directory' % label]
+    names = []
+    warnings = []
+    try:
+        with os.scandir(str(dir_path)) as it:
+            entries = sorted(list(it), key=lambda e: e.name)
+    except OSError as exc:
+        return [], ['cannot scan %s: %s' % (label, exc)]
+    for entry in entries:
+        if entry.name.startswith('.tmp-'):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            warnings.append('%s/%s cannot be stat-checked: %s' % (label, entry.name, exc))
+            continue
+        if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode):
+            warnings.append('%s/%s is not a regular file' % (label, entry.name))
+            continue
+        names.append((entry.name, st))
+    return names, warnings
+
+
 def _read_json_file(file_path, label, *, limit=MAX_FILE_BYTES):
     st = _lstat_or_none(file_path)
     if st is None:
@@ -599,26 +651,29 @@ def _signoff_filename(
 ):
     """Produce or parse a sign-off filename for ``(contribution_id, operation_id)``.
 
-    Inline names (``<= 200`` chars) use ``<cid>.<stage>.<op_id>.json``. Longer names use
-    ``<cid[:64]>.<stage>._sha256-<24hex>.json``; the leading ``_`` on ``_sha256-`` is
-    disjoint from every valid ``identity()`` (which starts with ``[A-Za-z0-9]``), and one
-    function both emits and parses names so ``reconcile_or_clean_staged`` cannot drift.
+    Dotless inline names (``<= 200`` chars, no ``'.'`` in ``cid`` or ``op_id``) use
+    ``<cid>.<stage>.<op_id>.json``. Any id containing ``'.'`` or exceeding 200 chars uses
+    ``<cid[:64].replace('.', '_')>.<stage>._sha256-<24hex>.json``. Every filename ever
+    emitted has **exactly 4 dot-separated tokens** (``[prefix, stage, op_or_hash, 'json']``),
+    so no committed name ever contains ``.staged.`` and no staged name ever contains
+    ``.committed.``, regardless of dots in ``identity()`` values.
     """
     if stage not in ('staged', 'committed'):
         raise ValueError('Invalid sign-off filename stage: %r' % (stage,))
-    marker = '.%s.' % stage
     if parse_name is not None:
-        if (
-            not isinstance(parse_name, str)
-            or not parse_name.endswith('.json')
-            or marker not in parse_name
-        ):
+        if not isinstance(parse_name, str):
             return None
-        stem = parse_name[:-5]
-        cid_part, _, op_part = stem.partition(marker)
+        parts = parse_name.split('.')
+        if len(parts) != 4 or parts[1] != stage or parts[3] != 'json':
+            return None
+        cid_part, _, op_part, _ = parts
         if not cid_part or not op_part:
             return None
         if op_part.startswith('_sha256-'):
+            if not re.fullmatch(r'_sha256-[0-9a-f]{24}', op_part):
+                return None
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', cid_part):
+                return None
             if not isinstance(staged_payload, dict):
                 return ('hashed_unverified', None, None)
             cid = str(staged_payload.get('contribution_id') or '')
@@ -637,17 +692,24 @@ def _signoff_filename(
             return None
         if _signoff_filename(cid_part, op_part, stage=stage) != parse_name:
             return None
+        if isinstance(staged_payload, dict):
+            p_cid = str(staged_payload.get('contribution_id') or '')
+            p_op = str(staged_payload.get('operation_id') or '')
+            if p_cid != cid_part or p_op != op_part:
+                return ('hashed_invalid', None, None)
         return ('ok', cid_part, op_part)
 
     cid = str(contribution_id)
     op_id = str(operation_id)
     identity(cid)
     identity(op_id)
-    name = '%s%s%s.json' % (cid, marker, op_id)
-    if len(name) <= 200:
-        return name
+    if '.' not in cid and '.' not in op_id:
+        name = '%s.%s.%s.json' % (cid, stage, op_id)
+        if len(name) <= 200:
+            return name
+    safe_prefix = cid[:64].replace('.', '_')
     digest = hashlib.sha256(('%s\0%s' % (cid, op_id)).encode('utf-8')).hexdigest()[:24]
-    return '%s%s_sha256-%s.json' % (cid[:64], marker, digest)
+    return '%s.%s._sha256-%s.json' % (safe_prefix, stage, digest)
 
 
 def _signoff_staged_filename(contribution_id, operation_id):
@@ -1045,7 +1107,9 @@ class HostStandardsStore:
             so_dir = self._ensure_subdir('signoffs')
             committed_path = so_dir / committed_name
             if _lstat_or_none(committed_path) is not None:
-                existing = _read_json_file(committed_path, 'signoffs/%s' % committed_name)
+                existing = _read_json_file(
+                    committed_path, 'signoffs/%s' % committed_name, limit=MAX_SIGNOFF_FILE_BYTES
+                )
                 if (
                     not isinstance(existing, dict)
                     or str(existing.get('contribution_id') or '') != cid
@@ -1086,7 +1150,9 @@ class HostStandardsStore:
             committed_path = so_dir / committed_name
             if _lstat_or_none(committed_path) is not None:
                 try:
-                    so = _read_json_file(committed_path, 'signoffs/%s' % committed_name)
+                    so = _read_json_file(
+                        committed_path, 'signoffs/%s' % committed_name, limit=MAX_SIGNOFF_FILE_BYTES
+                    )
                     if (
                         isinstance(so, dict)
                         and str(so.get('contribution_id') or '') == cid
@@ -1098,7 +1164,9 @@ class HostStandardsStore:
             staged_path = so_dir / staged_name
             if _lstat_or_none(staged_path) is not None:
                 try:
-                    so = _read_json_file(staged_path, 'signoffs/%s' % staged_name)
+                    so = _read_json_file(
+                        staged_path, 'signoffs/%s' % staged_name, limit=MAX_SIGNOFF_FILE_BYTES
+                    )
                     if (
                         isinstance(so, dict)
                         and str(so.get('contribution_id') or '') == cid
@@ -1110,7 +1178,9 @@ class HostStandardsStore:
             legacy_path = so_dir / ('%s.json' % cid)
             if _lstat_or_none(legacy_path) is not None:
                 try:
-                    legacy = _read_json_file(legacy_path, 'signoffs/%s.json' % cid)
+                    legacy = _read_json_file(
+                        legacy_path, 'signoffs/%s.json' % cid, limit=MAX_SIGNOFF_FILE_BYTES
+                    )
                     if (
                         isinstance(legacy, dict)
                         and str(legacy.get('contribution_id') or '') == cid
@@ -1135,51 +1205,88 @@ class HostStandardsStore:
         )
         return for_cid[-1]
 
-    def list_committed_signoffs(self):
+    def scan_committed_signoffs(self):
+        """Return ``(committed_signoffs, bad_entry_warnings)`` without aborting on one bad entry."""
         try:
             if not _require_real_dir(self.root, '.standards'):
-                return []
-            so_dir = self.root / 'signoffs'
-            entries = _list_regular_names(so_dir, 'signoffs')
-        except (StandardsDamagedError, OSError):
-            return []
+                return [], []
+        except (StandardsDamagedError, OSError) as exc:
+            return [], [str(exc)]
+        so_dir = self.root / 'signoffs'
+        entries, warnings = _scan_regular_names_tolerant(so_dir, 'signoffs')
         items = []
         for name, _ in entries:
-            if not name.endswith('.json') or '.staged.' in name:
+            parts = name.split('.')
+            if len(parts) == 4 and parts[1] == 'staged' and parts[3] == 'json':
+                continue
+            if not name.endswith('.json'):
+                warnings.append('signoffs/%s is not a sign-off JSON file' % name)
                 continue
             try:
-                items.append(_read_json_file(so_dir / name, 'signoffs/%s' % name))
-            except StandardsDamagedError:
+                so = _read_json_file(
+                    so_dir / name, 'signoffs/%s' % name, limit=MAX_SIGNOFF_FILE_BYTES
+                )
+            except StandardsDamagedError as exc:
+                warnings.append(str(exc))
                 continue
-        return items
+            parsed_c = _signoff_filename(stage='committed', parse_name=name, staged_payload=so)
+            if parsed_c is not None and parsed_c[0] == 'ok':
+                items.append(so)
+                continue
+            # Also honor legacy <cid>.json non-staged sign-off files
+            cid_val = str(so.get('contribution_id') or '')
+            if (
+                cid_val
+                and name == ('%s.json' % cid_val)
+                and so.get('status') != 'staged'
+            ):
+                items.append(so)
+                continue
+            warnings.append('signoffs/%s does not match its sign-off payload' % name)
+        return items, warnings
+
+    def list_committed_signoffs(self):
+        return self.scan_committed_signoffs()[0]
+
+    def list_signoff_warnings(self):
+        return self.scan_committed_signoffs()[1]
 
     def reconcile_or_clean_staged(self, rows, now_epoch=None):
         """Promote staged sign-offs/recommendations whose bd comment landed; delete >24h orphans."""
         try:
             if not _require_real_dir(self.root, '.standards'):
-                return
-        except StandardsDamagedError:
-            return
+                return []
+        except StandardsDamagedError as exc:
+            return [str(exc)]
         now_val = time.time() if now_epoch is None else float(now_epoch)
         approve_ops, rec_ops = _extract_tracker_operation_maps(rows)
+        landed_staged_names = set()
+        for l_op, (l_cid, _) in approve_ops.items():
+            try:
+                landed_staged_names.add(_signoff_staged_filename(l_cid, l_op))
+            except ValueError:
+                pass
 
         so_dir = self.root / 'signoffs'
-        try:
-            so_entries = _list_regular_names(so_dir, 'signoffs')
-        except (StandardsDamagedError, OSError):
-            so_entries = ()
+        so_entries, warnings = _scan_regular_names_tolerant(so_dir, 'signoffs')
         for name, st in so_entries:
-            if '.staged.' not in name or not name.endswith('.json'):
+            parts = name.split('.')
+            if not (len(parts) == 4 and parts[1] == 'staged' and parts[3] == 'json'):
                 continue
             try:
-                staged = _read_json_file(so_dir / name, 'signoffs/%s' % name)
-            except StandardsDamagedError:
+                staged = _read_json_file(
+                    so_dir / name, 'signoffs/%s' % name, limit=MAX_SIGNOFF_FILE_BYTES
+                )
+            except StandardsDamagedError as exc:
+                warnings.append(str(exc))
                 staged = None
             parsed = _signoff_filename(stage='staged', parse_name=name, staged_payload=staged)
             if parsed is None:
                 continue
             pstatus, cid, op_id = parsed
             if pstatus != 'ok':
+                if pstatus == 'hashed_unverified' and name in landed_staged_names:
+                    continue
                 if now_val - st.st_mtime >= STAGED_TTL_SECONDS:
                     _safe_unlink(so_dir, name)
                 continue
@@ -1190,16 +1297,14 @@ class HostStandardsStore:
                     self.commit_signoff(cid, op_id, promoted)
                     if _lstat_or_none(so_dir / name) is not None:
                         _safe_unlink(so_dir, name)
-                except (StandardsDamagedError, StandardsRefusal, SignoffCommitError, OSError):
-                    pass
+                except (StandardsDamagedError, StandardsRefusal, SignoffCommitError, OSError) as exc:
+                    warnings.append(str(exc))
             elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in approve_ops:
                 _safe_unlink(so_dir, name)
 
         rec_dir = self.root / 'recommendations'
-        try:
-            rec_entries = _list_regular_names(rec_dir, 'recommendations')
-        except (StandardsDamagedError, OSError):
-            rec_entries = ()
+        rec_entries, rec_warnings = _scan_regular_names_tolerant(rec_dir, 'recommendations')
+        warnings.extend(rec_warnings)
         for name, st in rec_entries:
             if not (name.startswith('op-') and name.endswith('.staged.json')):
                 continue
@@ -1214,10 +1319,16 @@ class HostStandardsStore:
                     staged = _read_json_file(rec_dir / name, 'recommendations/%s' % name)
                     promoted = dict(staged, status='committed', recommendation_id=comment_id)
                     self.commit_recommendation(op_id, comment_id, promoted)
-                except (StandardsDamagedError, StandardsRefusal, OSError):
-                    pass
+                except (StandardsDamagedError, StandardsRefusal, OSError) as exc:
+                    warnings.append(str(exc))
             elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in rec_ops:
-                _safe_unlink(rec_dir, name)
+                try:
+                    rec_doc = _read_json_file(rec_dir / name, 'recommendations/%s' % name)
+                except StandardsDamagedError:
+                    rec_doc = None
+                if not (isinstance(rec_doc, dict) and rec_doc.get('status') == 'committed'):
+                    _safe_unlink(rec_dir, name)
+        return warnings
 
     def read_departed_owners(self):
         if not _require_real_dir(self.root, '.standards'):
@@ -1624,7 +1735,25 @@ class DictStandardsStore:
         bucket = self._bucket(write=False)
         if not isinstance(bucket, dict):
             return []
-        return [dict(v) for v in (bucket.get('signoffs') or {}).values() if isinstance(v, dict)]
+        so_map = bucket.get('signoffs')
+        if not isinstance(so_map, dict):
+            return []
+        return [dict(v) for v in so_map.values() if isinstance(v, dict)]
+
+    def list_signoff_warnings(self):
+        bucket = self._bucket(write=False)
+        if not isinstance(bucket, dict):
+            return []
+        so_map = bucket.get('signoffs')
+        if so_map is None:
+            return []
+        if not isinstance(so_map, dict):
+            return ['signoffs store is not a mapping']
+        return [
+            'signoffs/%s is not a JSON object' % k
+            for k in sorted(so_map, key=str)
+            if not isinstance(so_map[k], dict)
+        ]
 
     def read_departed_owners(self):
         bucket = self._bucket(write=False)
@@ -2244,6 +2373,13 @@ def resolve_effective_register(
                 % (len(all_changes_must), ', '.join(all_changes_must), limit)
             ),
         })
+
+    if hasattr(store, 'list_signoff_warnings'):
+        for bad_so in store.list_signoff_warnings():
+            lint_warnings.append({
+                'code': 'damaged_signoff_entry',
+                'message': bad_so,
+            })
 
     local_rules_out = []
     for lrule in ver_obj['rules']:
@@ -3280,10 +3416,44 @@ def list_waivers_view(store, task_id, current_contribution=None, now=None):
 
 # -- Git Bundle & Branch Inspection + Citation Validator (R4, R6) -------------
 
-def run_confined_git(args, *, cwd=None, timeout=BUNDLE_GIT_TIMEOUT, raw=False):
+def _cleanup_temp_git_dir(tmpdir):
+    """Best-effort cleanup of a temporary bare git directory (clearing Windows read-only .pack bits)."""
+    if not tmpdir:
+        return
+
+    def _on_rm_error(func, path, _exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            func(path)
+        except OSError:
+            pass
+
+    try:
+        shutil.rmtree(str(tmpdir), onerror=_on_rm_error)
+    except OSError:
+        pass
+
+
+def run_confined_git(
+    args,
+    *,
+    cwd=None,
+    timeout=BUNDLE_GIT_TIMEOUT,
+    raw=False,
+    stdin_bytes=None,
+    deadline=None,
+):
     """Run git with all remote transports disabled and only local file transport allowed."""
+    eff_timeout = float(timeout)
+    if deadline is not None:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise BundleInspectTimeoutError('git inspection exceeded time budget')
+        eff_timeout = min(eff_timeout, rem)
     cmd = [
         'git',
+        '--no-optional-locks',
+        '--literal-pathspecs',
         '-c',
         'protocol.allow=never',
         '-c',
@@ -3295,11 +3465,14 @@ def run_confined_git(args, *, cwd=None, timeout=BUNDLE_GIT_TIMEOUT, raw=False):
         proc = subprocess.run(
             cmd,
             cwd=str(cwd) if cwd is not None else None,
+            input=stdin_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            timeout=eff_timeout,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise BundleInspectTimeoutError('git timed out: %s' % exc) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError('git failed: %s' % exc) from exc
     if proc.returncode != 0:
@@ -3315,28 +3488,117 @@ def _count_blob_lines(raw_bytes):
     return raw_bytes.count(b'\n') + (0 if raw_bytes.endswith(b'\n') else 1)
 
 
-def _inspect_repo_tree_paths(repo_dir, commit, paths):
-    """Inspect specific repo-relative paths in ``commit``'s tree."""
-    result = {}
-    for rel_path in paths:
+def _inspect_repo_tree_paths(repo_dir, commit, paths, *, deadline=None):
+    """Inspect specific repo-relative paths in ``commit``'s tree using batched git calls."""
+    if not paths:
+        return {}
+    path_list = list(paths)
+    wanted = set(path_list)
+    matched = {}
+    chunks = []
+    cur_chunk = []
+    cur_chars = 0
+    for rel_path in path_list:
+        if cur_chunk and (len(cur_chunk) >= 200 or cur_chars + len(rel_path) > 12000):
+            chunks.append(cur_chunk)
+            cur_chunk = []
+            cur_chars = 0
+        cur_chunk.append(rel_path)
+        cur_chars += len(rel_path) + 1
+    if cur_chunk:
+        chunks.append(cur_chunk)
+
+    for ch in chunks:
         out = run_confined_git(
-            ['ls-tree', '-z', '--full-tree', commit, '--', rel_path],
+            ['ls-tree', '-t', '-z', '--full-tree', commit, '--'] + ch,
             cwd=repo_dir,
             raw=True,
+            deadline=deadline,
         )
-        entries = [chunk for chunk in out.split(b'\x00') if chunk]
-        matched = None
-        for entry in entries:
+        for entry in out.split(b'\x00'):
+            if not entry:
+                continue
             meta, sep, name_bytes = entry.partition(b'\t')
             if not sep:
                 continue
             name = name_bytes.decode('utf-8', errors='surrogateescape')
-            if name == rel_path:
+            if name in wanted:
                 parts = meta.decode('ascii', errors='replace').split()
                 if len(parts) >= 3:
-                    matched = (parts[0], parts[1], parts[2])
-                break
-        if matched is None:
+                    matched[name] = (parts[0], parts[1], parts[2])
+
+    blob_shas = sorted({
+        m[2]
+        for m in matched.values()
+        if m[0] in ('100644', '100755') and m[1] == 'blob'
+    })
+    sizes = {}
+    if blob_shas:
+        bc_out = run_confined_git(
+            ['cat-file', '--batch-check'],
+            cwd=repo_dir,
+            raw=True,
+            stdin_bytes=('\n'.join(blob_shas) + '\n').encode('ascii'),
+            deadline=deadline,
+        )
+        for line in bc_out.splitlines():
+            sp = line.decode('ascii', errors='replace').split()
+            if len(sp) >= 3 and sp[1] == 'blob':
+                try:
+                    sizes[sp[0]] = int(sp[2])
+                except ValueError:
+                    pass
+
+    small_shas = [sha for sha in blob_shas if sha in sizes and sizes[sha] <= MAX_BLOB_BYTES]
+    blob_meta = {}
+    if small_shas:
+        batch_groups = []
+        b_group = []
+        b_bytes = 0
+        for sha in small_shas:
+            sz = sizes[sha]
+            if b_group and (len(b_group) >= 500 or b_bytes + sz > 16 * 1024 * 1024):
+                batch_groups.append(b_group)
+                b_group = []
+                b_bytes = 0
+            b_group.append(sha)
+            b_bytes += sz
+        if b_group:
+            batch_groups.append(b_group)
+
+        for grp in batch_groups:
+            raw_out = run_confined_git(
+                ['cat-file', '--batch'],
+                cwd=repo_dir,
+                raw=True,
+                stdin_bytes=('\n'.join(grp) + '\n').encode('ascii'),
+                deadline=deadline,
+            )
+            pos = 0
+            n_out = len(raw_out)
+            while pos < n_out:
+                nl = raw_out.find(b'\n', pos)
+                if nl < 0:
+                    break
+                hdr = raw_out[pos:nl].decode('ascii', errors='replace').split()
+                if len(hdr) < 3 or hdr[1] != 'blob':
+                    pos = nl + 1
+                    continue
+                bsha = hdr[0]
+                bsize = int(hdr[2])
+                body_start = nl + 1
+                body_end = body_start + bsize
+                raw_blob = raw_out[body_start:body_end]
+                if b'\x00' in raw_blob[:BINARY_SNIFF_BYTES]:
+                    blob_meta[bsha] = (False, None, 'path is not a regular text file')
+                else:
+                    blob_meta[bsha] = (True, _count_blob_lines(raw_blob), None)
+                pos = body_end + 1
+
+    result = {}
+    for rel_path in path_list:
+        m_info = matched.get(rel_path)
+        if m_info is None:
             result[rel_path] = {
                 'exists': False,
                 'regular_text': False,
@@ -3344,7 +3606,7 @@ def _inspect_repo_tree_paths(repo_dir, commit, paths):
                 'detail': 'file not found in commit tree',
             }
             continue
-        mode, obj_type, blob_sha = matched
+        mode, obj_type, blob_sha = m_info
         if mode not in ('100644', '100755') or obj_type != 'blob':
             result[rel_path] = {
                 'exists': True,
@@ -3353,18 +3615,8 @@ def _inspect_repo_tree_paths(repo_dir, commit, paths):
                 'detail': 'path is not a regular text file',
             }
             continue
-        size_str = run_confined_git(['cat-file', '-s', blob_sha], cwd=repo_dir).strip()
-        size = int(size_str)
-        if size > MAX_BLOB_BYTES:
-            result[rel_path] = {
-                'exists': True,
-                'regular_text': False,
-                'line_count': None,
-                'detail': 'path is not a regular text file',
-            }
-            continue
-        raw_blob = run_confined_git(['cat-file', 'blob', blob_sha], cwd=repo_dir, raw=True)
-        if b'\x00' in raw_blob[:BINARY_SNIFF_BYTES]:
+        b_res = blob_meta.get(blob_sha)
+        if b_res is None:
             result[rel_path] = {
                 'exists': True,
                 'regular_text': False,
@@ -3374,24 +3626,28 @@ def _inspect_repo_tree_paths(repo_dir, commit, paths):
             continue
         result[rel_path] = {
             'exists': True,
-            'regular_text': True,
-            'line_count': _count_blob_lines(raw_blob),
-            'detail': None,
+            'regular_text': b_res[0],
+            'line_count': b_res[1],
+            'detail': b_res[2],
         }
     return result
 
 
-def _extract_merge_base_diff(repo_dir, target_repo_dir, target_ref, commit):
+def _extract_merge_base_diff(repo_dir, target_repo_dir, target_ref, commit, *, deadline=None):
     """Compute ``changed_files`` from ``merge_base(target_ref, commit)..commit`` with ``--no-renames``."""
     target_sha = run_confined_git(
         ['rev-parse', '--verify', '%s^{commit}' % target_ref],
         cwd=target_repo_dir,
+        deadline=deadline,
     ).strip()
-    merge_base = run_confined_git(['merge-base', target_sha, commit], cwd=repo_dir).strip()
+    merge_base = run_confined_git(
+        ['merge-base', target_sha, commit], cwd=repo_dir, deadline=deadline
+    ).strip()
     raw = run_confined_git(
         ['diff', '--name-only', '-z', '--no-renames', merge_base, commit],
         cwd=repo_dir,
         raw=True,
+        deadline=deadline,
     )
     files = []
     for item in raw.split(b'\x00'):
@@ -3432,13 +3688,16 @@ def inspect_delivery_git(
     max_bundle_bytes=DELIVERY_SERVE_MAX_BYTES,
     lock_dir=None,
     needed_paths=(),
-    lock_wait_seconds=BUNDLE_LOCK_WAIT_SECONDS,
+    lock_wait_seconds=None,
+    max_inspect_seconds=None,
 ):
     """Inspect a bundle or branch delivery outside ``.coordination.lock``.
 
     NEVER uses ``contribution.base_commit`` for ``changed_files``: without ``serving_repo``
     (or a later verifier commit observation), ``diff_status`` is ``'diff_unverified'``.
     """
+    eff_lock_wait = BUNDLE_LOCK_WAIT_SECONDS if lock_wait_seconds is None else lock_wait_seconds
+    eff_max_inspect = BUNDLE_INSPECT_MAX_SECONDS if max_inspect_seconds is None else max_inspect_seconds
     unavailable = {
         'tree_available': False,
         'tree_source': None,
@@ -3448,6 +3707,7 @@ def inspect_delivery_git(
         'changed_files': None,
         'merge_base': None,
         'lock_timed_out': False,
+        'inspect_timed_out': False,
     }
     if not isinstance(contribution, dict):
         return unavailable
@@ -3467,8 +3727,22 @@ def inspect_delivery_git(
         expected_sha256 = delivery.get('sha256')
         if not isinstance(recorded_path, str) or not isinstance(expected_sha256, str):
             return unavailable
+        tmpdir = None
         try:
-            with held_bundle_fetch_lock(lock_dir, wait_seconds=lock_wait_seconds):
+            changed_files = None
+            diff_status = 'diff_unverified'
+            diff_source = None
+            merge_base = None
+            with held_bundle_fetch_lock(lock_dir, wait_seconds=eff_lock_wait):
+                now_m = time.monotonic()
+                eff_max = max(0.05, float(eff_max_inspect))
+                if float(eff_lock_wait) >= 1.0:
+                    lock_budget = min(eff_max, float(eff_lock_wait) * 0.6)
+                else:
+                    lock_budget = eff_max
+                lock_deadline = now_m + lock_budget
+                total_deadline = now_m + eff_max
+
                 resolved_path, handle_fd, size = resolve_delivery_bundle_path(
                     recorded_path, delivery_roots
                 )
@@ -3480,54 +3754,72 @@ def inspect_delivery_git(
                         expected_sha256,
                         commit,
                         max_bytes=max_bundle_bytes,
+                        git=lambda g_args: run_confined_git(g_args, deadline=lock_deadline),
                     )
                 finally:
                     try:
                         os.close(handle_fd)
                     except OSError:
                         pass
-                with tempfile.TemporaryDirectory(prefix='std-bundle-') as tmpdir:
-                    run_confined_git(['init', '--bare', '--quiet', tmpdir])
-                    if serving_info is not None:
-                        alt_file = Path(tmpdir) / 'objects' / 'info' / 'alternates'
-                        alt_file.parent.mkdir(parents=True, exist_ok=True)
-                        alt_file.write_text(str(serving_info[1]) + '\n', encoding='utf-8')
-                    run_confined_git(
-                        ['fetch', '--no-tags', '--', resolved_path, commit],
-                        cwd=tmpdir,
+                tmpdir = tempfile.mkdtemp(prefix='std-bundle-')
+                run_confined_git(['init', '--bare', '--quiet', tmpdir], deadline=lock_deadline)
+                if serving_info is not None:
+                    alt_file = Path(tmpdir) / 'objects' / 'info' / 'alternates'
+                    alt_file.parent.mkdir(parents=True, exist_ok=True)
+                    alt_file.write_text(
+                        serving_info[1].as_posix() + '\n', encoding='utf-8', newline='\n'
                     )
-                    tree_files = (
-                        _inspect_repo_tree_paths(tmpdir, commit, dedup_paths)
-                        if dedup_paths
-                        else {}
-                    )
-                    changed_files = None
-                    diff_status = 'diff_unverified'
-                    diff_source = None
-                    merge_base = None
-                    if serving_info is not None:
-                        try:
-                            changed_files, merge_base = _extract_merge_base_diff(
-                                tmpdir, serving_info[0], target_ref, commit
-                            )
-                            diff_status = 'verified'
-                            diff_source = 'serving_repo'
-                        except ValueError:
-                            changed_files = None
-                            diff_status = 'diff_unverified'
-                    return {
-                        'tree_available': True,
-                        'tree_source': 'bundle',
-                        'tree_files': tree_files,
-                        'diff_status': diff_status,
-                        'diff_source': diff_source,
-                        'changed_files': changed_files,
-                        'merge_base': merge_base,
-                        'lock_timed_out': False,
-                    }
+                run_confined_git(
+                    ['bundle', 'unbundle', '--', str(resolved_path)],
+                    cwd=tmpdir,
+                    deadline=lock_deadline,
+                )
+                run_confined_git(
+                    ['cat-file', '-e', '%s^{commit}' % commit],
+                    cwd=tmpdir,
+                    deadline=lock_deadline,
+                )
+                if serving_info is not None:
+                    try:
+                        changed_files, merge_base = _extract_merge_base_diff(
+                            tmpdir,
+                            serving_info[0],
+                            target_ref,
+                            commit,
+                            deadline=lock_deadline,
+                        )
+                        diff_status = 'verified'
+                        diff_source = 'serving_repo'
+                    except BundleInspectTimeoutError:
+                        raise
+                    except ValueError:
+                        changed_files = None
+                        diff_status = 'diff_unverified'
+
+            # Bundle fetch lock is now released; inspect private tmpdir tree paths within total_deadline!
+            tree_files = (
+                _inspect_repo_tree_paths(tmpdir, commit, dedup_paths, deadline=total_deadline)
+                if dedup_paths
+                else {}
+            )
+            return {
+                'tree_available': True,
+                'tree_source': 'bundle',
+                'tree_files': tree_files,
+                'diff_status': diff_status,
+                'diff_source': diff_source,
+                'changed_files': changed_files,
+                'merge_base': merge_base,
+                'lock_timed_out': False,
+                'inspect_timed_out': False,
+            }
         except BundleLockTimeoutError:
             out = dict(unavailable)
             out['lock_timed_out'] = True
+            return out
+        except BundleInspectTimeoutError:
+            out = dict(unavailable)
+            out['inspect_timed_out'] = True
             return out
         except (
             DeliveryUnavailableError,
@@ -3537,18 +3829,25 @@ def inspect_delivery_git(
             OSError,
         ):
             return unavailable
+        finally:
+            _cleanup_temp_git_dir(tmpdir)
 
     if kind == 'remote' and serving_info is not None:
         repo_git_dir = serving_info[0]
+        rem_deadline = time.monotonic() + max(0.05, float(eff_max_inspect))
         try:
-            run_confined_git(['cat-file', '-e', '%s^{commit}' % commit], cwd=repo_git_dir)
+            run_confined_git(
+                ['cat-file', '-e', '%s^{commit}' % commit],
+                cwd=repo_git_dir,
+                deadline=rem_deadline,
+            )
             tree_files = (
-                _inspect_repo_tree_paths(repo_git_dir, commit, dedup_paths)
+                _inspect_repo_tree_paths(repo_git_dir, commit, dedup_paths, deadline=rem_deadline)
                 if dedup_paths
                 else {}
             )
             changed_files, merge_base = _extract_merge_base_diff(
-                repo_git_dir, repo_git_dir, target_ref, commit
+                repo_git_dir, repo_git_dir, target_ref, commit, deadline=rem_deadline
             )
             return {
                 'tree_available': True,
@@ -3559,7 +3858,12 @@ def inspect_delivery_git(
                 'changed_files': changed_files,
                 'merge_base': merge_base,
                 'lock_timed_out': False,
+                'inspect_timed_out': False,
             }
+        except BundleInspectTimeoutError:
+            out = dict(unavailable)
+            out['inspect_timed_out'] = True
+            return out
         except ValueError:
             return unavailable
 
@@ -3661,10 +3965,14 @@ def collect_citation_paths_from_checks(checks):
     return paths
 
 
-def validate_citation_against_tree(citation, rule_id, commit, tree_available, tree_files):
+def validate_citation_against_tree(
+    citation, rule_id, commit, tree_available, tree_files, *, git_timed_out=False
+):
     """Validate one ``file:line`` citation against ``commit``'s resolved tree."""
     raw, norm_path, start_line, end_line = parse_citation(citation, rule_id, commit)
     if not tree_available:
+        if git_timed_out:
+            raise StandardsRefusal(refusal_git_inspection_timeout(commit), status=503)
         raise StandardsRefusal(
             refusal_citation_unresolved(
                 raw,
@@ -3675,6 +3983,8 @@ def validate_citation_against_tree(citation, rule_id, commit, tree_available, tr
             status=422,
         )
     meta = (tree_files or {}).get(norm_path)
+    if meta is None and git_timed_out:
+        raise StandardsRefusal(refusal_git_inspection_timeout(commit), status=503)
     if meta is None or meta.get('exists') is False:
         raise StandardsRefusal(
             refusal_citation_unresolved(raw, rule_id, commit, 'file not found in commit tree'),
@@ -4149,6 +4459,18 @@ def _is_compact_fail_only_entry(entry):
     return len(canonical_bytes(entry)) <= COMMIT_FAIL_ONLY_ENTRY_MAX_BYTES
 
 
+def _write_reserved_fail_observation(store, commit_lower, prev_observations, entry):
+    reserved_entry = dict(entry, reserved_fail=True)
+    obs = _fold_commit_observations(commit_lower, prev_observations + [reserved_entry])
+    if len(canonical_bytes(obs)) + 1 > MAX_COMMIT_OBSERVATION_FILE_BYTES:
+        raise StandardsRefusal(
+            refusal_commit_observation_size_cap(commit_lower, MAX_COMMIT_OBSERVATION_FILE_BYTES),
+            status=409,
+        )
+    store.write_commit_observation(commit_lower, obs)
+    return obs
+
+
 def record_commit_observation(
     store,
     commit,
@@ -4344,15 +4666,7 @@ def record_commit_observation(
         and party_reserved_fail_count < COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX
         and len(reserved_fail_prev) < COMMIT_FAIL_ALLOWANCE_TOTAL_MAX
     ):
-        reserved_entry = dict(new_entry, reserved_fail=True)
-        obs = _fold_commit_observations(commit_lower, prev_observations + [reserved_entry])
-        if len(canonical_bytes(obs)) + 1 > MAX_COMMIT_OBSERVATION_FILE_BYTES:
-            raise StandardsRefusal(
-                refusal_commit_observation_size_cap(commit_lower, MAX_COMMIT_OBSERVATION_FILE_BYTES),
-                status=409,
-            )
-        store.write_commit_observation(commit_lower, obs)
-        return obs
+        return _write_reserved_fail_observation(store, commit_lower, prev_observations, new_entry)
 
     ordinary_refusal = None
     if len(ordinary_prev) >= COMMIT_OBSERVATIONS_MAX:
@@ -4376,17 +4690,71 @@ def record_commit_observation(
             )
 
     if ordinary_refusal is not None:
-        if (
-            _is_compact_fail_only_entry(new_entry)
-            and party_reserved_fail_count >= COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX
-        ):
+        failing_ci = [dict(it) for it in (ci_checks or ()) if it.get('exit_code') != 0]
+        if not failing_ci:
+            raise StandardsRefusal(ordinary_refusal, status=409)
+        fallback_entry = {
+            'changed_files': None,
+            'tree_files': None,
+            'ci_checks': failing_ci,
+            'recorded_by': actor,
+            'recorded_by_user_id': recorded_by_user_id,
+            'recorded_by_principal': recorded_by_principal,
+            'recorded_at': ts,
+        }
+        if not _is_compact_fail_only_entry(fallback_entry):
+            raise StandardsRefusal(
+                '%s Failing ci_checks (%d bytes) also exceed the %d-byte compact fail-reserve entry limit; '
+                'submit compact failing ci_checks (<= %d bytes).'
+                % (
+                    ordinary_refusal,
+                    len(canonical_bytes(fallback_entry)),
+                    COMMIT_FAIL_ONLY_ENTRY_MAX_BYTES,
+                    COMMIT_FAIL_ONLY_ENTRY_MAX_BYTES,
+                ),
+                status=409,
+            )
+        if party_reserved_fail_count >= COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX:
             raise StandardsRefusal(
                 refusal_commit_fail_allowance_cap(
                     commit_lower, COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX
                 ),
                 status=409,
             )
-        raise StandardsRefusal(ordinary_refusal, status=409)
+        if len(reserved_fail_prev) >= COMMIT_FAIL_ALLOWANCE_TOTAL_MAX:
+            raise StandardsRefusal(
+                refusal_commit_fail_allowance_total_cap(
+                    commit_lower, COMMIT_FAIL_ALLOWANCE_TOTAL_MAX
+                ),
+                status=409,
+            )
+        obs = _write_reserved_fail_observation(store, commit_lower, prev_observations, fallback_entry)
+        dropped = []
+        dropped_counts = {}
+        if changed_files is not None:
+            dropped.append('changed_files')
+            dropped_counts['changed_files'] = len(changed_files)
+        if tree_files is not None:
+            dropped.append('tree_files')
+            dropped_counts['tree_files'] = len(tree_files)
+        passing_count = len(ci_checks or ()) - len(failing_ci)
+        if passing_count > 0:
+            dropped.append('passing_ci_checks')
+            dropped_counts['passing_ci_checks'] = passing_count
+        out = dict(obs)
+        out['stored_in_fail_reserve'] = True
+        out['stored'] = {
+            'failing_ci_checks': len(failing_ci),
+            'rule_ids': [it['rule_id'] for it in failing_ci if it.get('rule_id')],
+        }
+        out['dropped'] = dropped
+        out['dropped_counts'] = dropped_counts
+        out['reserve_notice'] = (
+            'Ordinary commit-observation storage was full (%s); stored %d failing ci_checks item(s) '
+            'in the fail-only reserve and dropped %s.'
+            % (ordinary_refusal, len(failing_ci), ', '.join(dropped) if dropped else 'nothing')
+        )
+        return out
 
     obs = _fold_commit_observations(commit_lower, prev_observations + [new_entry])
     if len(canonical_bytes(obs)) + 1 > MAX_COMMIT_OBSERVATION_FILE_BYTES:
@@ -4596,6 +4964,7 @@ def validate_reviewer_checks(
     tree_files,
     commit_obs=None,
     tree_recorders=None,
+    git_timed_out=False,
 ):
     """Validate reviewer-supplied check records against R6 rules and ``commit``'s tree."""
     if checks_raw is None:
@@ -4655,7 +5024,12 @@ def validate_reviewer_checks(
                 cited_paths = []
                 for c in cites_raw:
                     rc = validate_citation_against_tree(
-                        c, rid, commit, tree_available, tree_files
+                        c,
+                        rid,
+                        commit,
+                        tree_available,
+                        tree_files,
+                        git_timed_out=git_timed_out,
                     )
                     resolved_cites.append(rc['citation'])
                     cited_paths.append(rc['path'])
@@ -4994,7 +5368,9 @@ def evaluate_approval_signoff(
 
     # Merge git observation and verifier commit observation.
     git_obs = git_observation or {}
-    tree_available = bool(git_obs.get('tree_available'))
+    git_tree_available = bool(git_obs.get('tree_available'))
+    git_timed_out = bool(git_obs.get('inspect_timed_out') or git_obs.get('lock_timed_out'))
+    tree_available = git_tree_available
     tree_files = dict(git_obs.get('tree_files') or {})
     tree_recorders = None
     if not tree_available and commit_obs and isinstance(commit_obs.get('tree_files'), dict):
@@ -5015,6 +5391,8 @@ def evaluate_approval_signoff(
         changed_files = None
         diff_recorded_by = None
 
+    cite_git_timed_out = git_timed_out and not git_tree_available
+
     # Validate adopted checks + direct approver checks.
     combined_checks = {}
     if adopted_checks_list is not None:
@@ -5028,6 +5406,7 @@ def evaluate_approval_signoff(
             tree_files=tree_files,
             commit_obs=commit_obs,
             tree_recorders=tree_recorders,
+            git_timed_out=cite_git_timed_out,
         )
         for rid, val in adopted_map.items():
             val_copy = dict(val, source='adopted-recommendation', recommendation_id=adopt_id)
@@ -5043,8 +5422,15 @@ def evaluate_approval_signoff(
         tree_files=tree_files,
         commit_obs=commit_obs,
         tree_recorders=tree_recorders,
+        git_timed_out=cite_git_timed_out,
     )
     combined_checks.update(direct_checks)
+
+    if git_timed_out and diff_status != 'verified' and any(
+        bool(r['applicability'].get('paths') or r['applicability'].get('languages'))
+        for r in reg['effective_rules']
+    ):
+        raise StandardsRefusal(refusal_git_inspection_timeout(commit), status=503)
 
     # Evaluate R4 applicability and waivers.
     app_entries = evaluate_applicability(
@@ -5275,7 +5661,9 @@ def validate_and_stage_recommendation_checks(
         return None
 
     git_obs = git_observation or {}
-    tree_available = bool(git_obs.get('tree_available'))
+    git_tree_available = bool(git_obs.get('tree_available'))
+    git_timed_out = bool(git_obs.get('inspect_timed_out') or git_obs.get('lock_timed_out'))
+    tree_available = git_tree_available
     tree_files = dict(git_obs.get('tree_files') or {})
     tree_recorders = None
     if not tree_available and commit_obs and isinstance(commit_obs.get('tree_files'), dict):
@@ -5296,6 +5684,7 @@ def validate_and_stage_recommendation_checks(
             tree_files=tree_files,
             commit_obs=commit_obs,
             tree_recorders=tree_recorders,
+            git_timed_out=git_timed_out and not git_tree_available,
         )
         # Preserve canonical raw-compatible check shape for adopt_recommendation re-validation
         validated_list = []
@@ -5442,6 +5831,12 @@ def _refresh_signoff_view(store, so, status_and_head=None):
     tally_actor = rev.get('recommended_by') or rev.get('actor')
     if tally_actor:
         out['reviewer_must_not_applicable_total'] = derive_reviewer_must_na_counts(store, tally_actor)
+    if hasattr(store, 'list_signoff_warnings'):
+        so_warnings = store.list_signoff_warnings()
+        if so_warnings:
+            out['store_warnings'] = so_warnings
+        else:
+            out.pop('store_warnings', None)
     return out
 
 
@@ -5656,6 +6051,16 @@ def render_signoff_markdown(signoff):
         for item in would:
             lines.append('- %s' % item)
 
+    store_warns = signoff.get('store_warnings') or []
+    if store_warns:
+        lines.extend([
+            '',
+            '## Sign-Off Store Warnings',
+            '',
+        ])
+        for item in store_warns:
+            lines.append('- %s' % item)
+
     lines.extend([
         '',
         '## Rule-by-Rule Check Results',
@@ -5746,6 +6151,8 @@ def render_signoff_text(signoff):
     )
     for item in signoff.get('would_have_refused') or ():
         lines.append('  would_have_refused: %s' % item)
+    for item in signoff.get('store_warnings') or ():
+        lines.append('  store_warning: %s' % item)
     for chk in signoff.get('checks') or ():
         w = chk.get('waiver')
         w_suffix = ' [WAIVED by %s: %s]' % (w.get('granted_by'), w.get('reason')) if w else ''
@@ -6224,7 +6631,20 @@ def _collect_known_ref_keys(rows):
     return keys or None
 
 
-def inspect_review_git_prelock(root, path, name, args, attachments, run_single_show_fn):
+def inspect_review_git_prelock(
+    root,
+    path,
+    name,
+    args,
+    attachments,
+    run_single_show_fn,
+    *,
+    actor=None,
+    operators=None,
+    coordinator_writes=False,
+    owners=None,
+    verified_web_authority=False,
+):
     """Inspect verified bundle / serving_repo OUTSIDE ``.coordination.lock`` before ``review`` write."""
     clean_args = [tok for tok in (args or []) if tok != '--json']
     if len(clean_args) != 2 or not clean_args[1].startswith('@attachment:'):
@@ -6241,6 +6661,16 @@ def inspect_review_git_prelock(root, path, name, args, attachments, run_single_s
         return None
     op = payload.get('operation')
     if op not in ('approve', 'request-changes', 'recommend'):
+        return None
+    if (
+        op == 'approve'
+        and coordinator_writes
+        and not verified_web_authority
+        and actor is not None
+        and not review_workflow.listed_operator_actor(actor, operators, owners)
+    ):
+        return None
+    if isinstance(payload.get('checks'), list) and len(payload['checks']) > CHECKS_MAX:
         return None
 
     store = HostStandardsStore(path, name, shared_loader=host_shared_loader_for(path))
@@ -6261,6 +6691,8 @@ def inspect_review_git_prelock(root, path, name, args, attachments, run_single_s
         if chk_st == 'ok' and isinstance(rec_bundle, dict) and isinstance(rec_bundle.get('checks'), list):
             needed_checks.extend(rec_bundle['checks'])
     needed_paths = collect_citation_paths_from_checks(needed_checks)
+    if op in ('request-changes', 'recommend') and not needed_paths:
+        return None
 
     contrib_doc = None
     try:

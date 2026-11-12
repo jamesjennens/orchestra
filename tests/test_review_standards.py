@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -205,6 +207,11 @@ def _make_bundle(repo_dir, out_path, ref='HEAD'):
     return commit, sha256
 
 
+def _bundle_delivery_path(bpath):
+    s = str(bpath)
+    return 'server:' + s if s.startswith('/') else s
+
+
 def _sample_rule(
     rule_id='STD-1',
     owner='person:alice',
@@ -397,7 +404,7 @@ class ReviewStandardsHostCase(unittest.TestCase):
             'base_commit': base_commit or commit,
             'delivery': {
                 'kind': 'bundle',
-                'path': 'server:' + str(bpath),
+                'path': _bundle_delivery_path(bpath),
                 'sha256': sha,
             },
             'summary': summary,
@@ -949,7 +956,7 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
             {
                 'commit': c2,
                 'base_commit': c1,
-                'delivery': {'kind': 'bundle', 'path': 'server:' + str(self.delivery_root / 'm21.bundle'), 'sha256': sha},
+                'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(self.delivery_root / 'm21.bundle'), 'sha256': sha},
             },
             delivery_roots=[str(self.delivery_root)],
             serving_repo=None,
@@ -992,7 +999,7 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
         os.symlink(str(victim), str(lock_file))
         try:
             res_sym = rs.inspect_delivery_git(
-                {'commit': commit, 'delivery': {'kind': 'bundle', 'path': 'server:' + str(self.delivery_root / 'proto.bundle'), 'sha256': sha}},
+                {'commit': commit, 'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(self.delivery_root / 'proto.bundle'), 'sha256': sha}},
                 delivery_roots=[str(self.delivery_root)],
                 lock_dir=self.root,
                 needed_paths=['hello.py'],
@@ -1005,7 +1012,7 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
         rs.BUNDLE_INSPECT_SEMAPHORE.acquire()
         try:
             res_to = rs.inspect_delivery_git(
-                {'commit': commit, 'delivery': {'kind': 'bundle', 'path': 'server:' + str(self.delivery_root / 'proto.bundle'), 'sha256': sha}},
+                {'commit': commit, 'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(self.delivery_root / 'proto.bundle'), 'sha256': sha}},
                 delivery_roots=[str(self.delivery_root)],
                 lock_dir=self.root,
                 needed_paths=['hello.py'],
@@ -1030,7 +1037,7 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
         commit, sha = _make_bundle(repo, self.delivery_root / 'cite.bundle')
 
         info = rs.inspect_delivery_git(
-            {'commit': commit, 'delivery': {'kind': 'bundle', 'path': 'server:' + str(self.delivery_root / 'cite.bundle'), 'sha256': sha}},
+            {'commit': commit, 'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(self.delivery_root / 'cite.bundle'), 'sha256': sha}},
             delivery_roots=[str(self.delivery_root)],
             needed_paths=['mod.py', 'missing.py', 'link.py', 'asset.bin'],
             lock_dir=self.root,
@@ -2582,23 +2589,44 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
             rs.refusal_commit_observation_size_cap(commit2, rs.MAX_COMMIT_OBSERVATION_BYTES),
             str(cm_pass_full.exception),
         )
-        with self.assertRaises(rs.StandardsRefusal) as cm_with_files:
+        # Ordinary pass+tree_files entry OR >16 KiB fail entry from ver-b9 is refused 409 (ordinary cap full)!
+        with self.assertRaises(rs.StandardsRefusal) as cm_pass_files:
             self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
                 'tree_files': {'app.py': {'exists': True, 'regular_text': True, 'line_count': 5}},
-                'ci_checks': [dict(it, exit_code=1, run_id='wf') for it in step_ci],
+                'ci_checks': [dict(it, run_id='v9p') for it in step_ci],
             })
-        self.assertEqual(409, cm_with_files.exception.status)
+        self.assertEqual(409, cm_pass_files.exception.status)
         self.assertIn(
             rs.refusal_commit_observation_size_cap(commit2, rs.MAX_COMMIT_OBSERVATION_BYTES),
-            str(cm_with_files.exception),
+            str(cm_pass_files.exception),
         )
+        with self.assertRaises(rs.StandardsRefusal) as cm_huge_fail:
+            self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
+                'ci_checks': [
+                    {'tool': 'pytest', 'command': 'pytest -q %d' % i, 'exit_code': 1, 'summary': 'x' * 380}
+                    for i in range(45)
+                ],
+            })
+        self.assertEqual(409, cm_huge_fail.exception.status)
+        self.assertIn(str(rs.COMMIT_FAIL_ONLY_ENTRY_MAX_BYTES), str(cm_huge_fail.exception))
+
+        # r5 s1c-fail-with-lists: compact failing CI accompanied by tree_files/changed_files stores
+        # the failing items in the reserve and reports dropped=['tree_files']!
+        wf_res = self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
+            'tree_files': {'app.py': {'exists': True, 'regular_text': True, 'line_count': 5}},
+            'ci_checks': [dict(it, exit_code=1, run_id='wf') for it in step_ci[:8]],
+        })
+        self.assertTrue(wf_res.get('stored_in_fail_reserve'))
+        self.assertEqual(['tree_files'], wf_res.get('dropped'))
+        self.assertEqual({'failing_ci_checks': 8, 'rule_ids': []}, wf_res.get('stored'))
+        self.assertIsNone(wf_res['observations'][-1]['tree_files'])
 
         # PM RULE: compact fail-only entries (failing CI items, no file lists) succeed OUTSIDE the byte cap
-        # both for ver-b0 (whose own party byte budget is full) and for ver-b9 (up to 8 per party)!
+        # both for ver-b0 (whose own party byte budget is full) and for ver-b9 (up to 8 per party total)!
         self.admin_std('record-commit', '--commit', commit2, actor='ver-b0', data={
             'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
         })
-        for r_idx in range(rs.COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX):
+        for r_idx in range(rs.COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX - 1):
             self.admin_std('record-commit', '--commit', commit2, actor='ver-b9', data={
                 'ci_checks': [{
                     'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q',
@@ -3004,6 +3032,591 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
         ]
         collected = rs.collect_citation_paths_from_checks(many_checks)
         self.assertEqual(rs.CHECKS_MAX * rs.CITATIONS_MAX, len(collected))
+
+    def test_r5_host_dotted_ids_crash_window_fail_with_lists_prelock_bound_and_nonregular_signoffs(self):
+        """Pin r5 m1c-dotted-ids, s1c-fail-with-lists, and s2c-prelock-bound on the host stack."""
+        self.admin_std('put', data={
+            'expected_version': 0,
+            'reason': 'Create r5 host register.',
+            'rules': [
+                _sample_rule('JUDG-1', owner='person:alice', severity='must'),
+                _sample_rule(
+                    'STD-50',
+                    owner='person:alice',
+                    severity='must',
+                    check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'},
+                ),
+            ],
+        })
+        self.admin_std('set-gate', '--mode', 'block', '--reason', 'Enforce block.')
+
+        # 1) m1c-dotted-ids: approvals whose operation_id / contribution_id contain '.staged.',
+        #    '.committed.', and trailing dots survive 25h reconcile_or_clean_staged and count in N/A tally!
+        tracker = self.trackers[self.pid]
+        tid1 = tracker.create_task('Dotted IDs task', assignee='worker-bob')
+        repo1 = Path(self.tmp.name) / 'repo-r5-d1'
+        self.init_git_repo(repo1, {'app.py': 'x = 1\ny = 2\nz = 3\n'})
+        _, commit1, _ = self.contribute_bundle(tid1, repo1, op_id='op.staged.contrib1.')
+        cid1 = self.chain_info(tid1)['contribution']['comment_id']
+        self.admin_std('record-commit', '--commit', commit1, actor='ci-verifier', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        })
+
+        dotted_op1 = 'op.staged.alpha.committed.beta.'
+        app1 = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': dotted_op1,
+            'task': tid1, 'previous': cid1, 'contribution': cid1,
+            'summary': 'Approve with .staged. and .committed. and trailing dot.',
+            'checks': [{'rule_id': 'JUDG-1', 'result': 'not_applicable', 'reason': 'No slice ops.'}],
+        }, actor='cora-op')
+        self.assertEqual(0, app1['returncode'], app1['stderr'])
+
+        # Second task whose contribution_id ITSELF contains '.staged.' and crashes between bd write and commit_signoff!
+        tid2 = tracker.create_task('Dotted contribution_id crash task', assignee='worker-bob')
+        repo2 = Path(self.tmp.name) / 'repo-r5-d2'
+        self.init_git_repo(repo2, {'app.py': 'a = 10\nb = 20\n'})
+        bpath2 = self.delivery_root / 'r5-d2.bundle'
+        commit2, sha2 = _make_bundle(repo2, bpath2)
+        dotted_cid2 = '%s.staged.c1.' % tid2
+        tracker.rows[tid2]['comments'].append({
+            'id': dotted_cid2,
+            'author': 'worker-bob',
+            'created_at': '2026-11-12T01:00:00Z',
+            'text': rw.PREFIX + json.dumps({
+                'schema_version': 1,
+                'operation': 'contribute',
+                'operation_id': 'op-d2-c1',
+                'task': tid2,
+                'previous': None,
+                'supersedes': None,
+                'repository': 'https://example.invalid/repo.git',
+                'commit': commit2,
+                'base_commit': commit2,
+                'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath2), 'sha256': sha2},
+                'summary': 'Delivered with dotted comment id.',
+            }),
+        })
+        self.admin_std('record-commit', '--commit', commit2, actor='ci-verifier', data={
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        })
+
+        dotted_op2 = 'op.committed.crash.staged.two.'
+        orig_commit_so = rs.HostStandardsStore.commit_signoff
+        with mock.patch.object(
+            rs.HostStandardsStore,
+            'commit_signoff',
+            side_effect=rs.SignoffCommitError('simulated disk full after bd approve'),
+        ):
+            crash_ans = self.review_op({
+                'schema_version': 1, 'operation': 'approve', 'operation_id': dotted_op2,
+                'task': tid2, 'previous': dotted_cid2, 'contribution': dotted_cid2,
+                'summary': 'Approve dotted cid before simulated crash.',
+                'checks': [{'rule_id': 'JUDG-1', 'result': 'not_applicable', 'reason': 'Config only.'}],
+            }, actor='cora-op')
+        self.assertEqual(124, crash_ans['returncode'])
+        self.assertIn('SignoffCommitError', crash_ans['stderr'])
+        assert orig_commit_so is not None
+
+        # Advance 25 hours: reconcile_or_clean_staged promotes dotted_op2 AND keeps dotted_op1 committed!
+        store = self.store()
+        rows_now = list(tracker.rows.values())
+        store.reconcile_or_clean_staged(rows_now, now_epoch=time.time() + 90000)
+        store.reconcile_or_clean_staged(rows_now, now_epoch=time.time() + 180000)
+
+        so1 = self.admin_std('sign-off', '--task', tid1)
+        so2 = self.admin_std('sign-off', '--task', tid2)
+        self.assertEqual(dotted_op1, so1['operation_id'])
+        self.assertEqual(dotted_op2, so2['operation_id'])
+        self.assertEqual(2, so1['reviewer_must_not_applicable_total'])
+        self.assertEqual(2, so2['reviewer_must_not_applicable_total'])
+
+        # 2) s2c-prelock-bound (b): non-regular entry in signoffs/ does NOT wipe out list_committed_signoffs
+        #    or N/A tallies, and surfaces a clear warning in lint and sign-off!
+        rogue_dir = self.project_path / '.standards' / 'signoffs' / 'rogue-subdir'
+        rogue_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.assertEqual(2, len(store.list_committed_signoffs()))
+            so1_warn = self.admin_std('sign-off', '--task', tid1)
+            self.assertEqual(2, so1_warn['reviewer_must_not_applicable_total'])
+            self.assertTrue(
+                any('signoffs/rogue-subdir' in w for w in (so1_warn.get('store_warnings') or [])),
+                so1_warn,
+            )
+            lint_out = self.admin_std('lint')
+            self.assertTrue(
+                any('signoffs/rogue-subdir' in w.get('message', '') for w in lint_out.get('warnings', [])),
+                lint_out,
+            )
+        finally:
+            rogue_dir.rmdir()
+
+        # 3) s1c-fail-with-lists: documented inspect-commit -> add CI checks -> record-commit flow
+        #    when ordinary storage is full stores failing CI items in reserve and reports stored/dropped!
+        tid3 = tracker.create_task('Documented inspect-commit reserve flow', assignee='worker-bob')
+        repo3 = Path(self.tmp.name) / 'repo-r5-s1c'
+        self.init_git_repo(repo3, {'main.py': 'def run():\n    return 1\n'})
+        _git(repo3, 'checkout', '-b', 'feat')
+        (repo3 / 'added.py').write_text('val = 42\n', encoding='utf-8')
+        _git(repo3, 'add', 'added.py')
+        _git(repo3, 'commit', '-m', 'add file')
+        _, commit3, _ = self.contribute_bundle(tid3, repo3, op_id='op-s1c-deliv')
+        cid3 = self.chain_info(tid3)['contribution']['comment_id']
+
+        inspected_doc = rs.inspect_local_repo_commit(repo3, commit3, target_ref='refs/heads/main')
+        # Exhaust ci-verifier's 32 ordinary observation slots on commit3 first:
+        for idx in range(rs.COMMIT_OBSERVATIONS_PER_RECORDER_MAX):
+            self.admin_std('record-commit', '--commit', commit3, actor='ci-verifier', data={
+                'ci_checks': [{'tool': 'lint', 'command': 'lint-%d' % idx, 'exit_code': 0}],
+            })
+        # Now ci-verifier runs the documented single-observation flow with changed_files + tree_files + mixed CI!
+        combined_payload = dict(inspected_doc)
+        combined_payload['ci_checks'] = [
+            {'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1, 'summary': '1 failed'},
+            {'tool': 'ruff', 'command': 'ruff check', 'exit_code': 0},
+        ]
+        res_s1c = self.admin_std('record-commit', '--commit', commit3, actor='ci-verifier', data=combined_payload)
+        self.assertTrue(res_s1c.get('stored_in_fail_reserve'))
+        self.assertEqual({'failing_ci_checks': 1, 'rule_ids': ['STD-50']}, res_s1c.get('stored'))
+        self.assertEqual(['changed_files', 'tree_files', 'passing_ci_checks'], res_s1c.get('dropped'))
+        self.assertEqual(
+            {'changed_files': 1, 'tree_files': 1, 'passing_ci_checks': 1},
+            res_s1c.get('dropped_counts'),
+        )
+        # Approve trying to mark STD-50 not_applicable is refused 422 because the failing CI item landed!
+        bad_na = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-s1c-na',
+            'task': tid3, 'previous': cid3, 'contribution': cid3,
+            'summary': 'Attempt N/A over reserve fail from inspect-commit flow.',
+            'checks': [
+                {'rule_id': 'JUDG-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['added.py:1']}},
+                {'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Claim not applicable.'},
+            ],
+        }, actor='cora-op')
+        self.assertEqual(2, bad_na['returncode'])
+        self.assertIn(rs.refusal_na_over_mechanical_fail('STD-50', commit3), bad_na['stderr'])
+
+        # 4) s2c-prelock-bound (a):
+        #    - request-changes without citations & unauthorized SSH approve skip inspect_delivery_git (0 calls)!
+        with mock.patch.object(rs, 'inspect_delivery_git', wraps=rs.inspect_delivery_git) as spy_git:
+            rc_nocite = self.review_op({
+                'schema_version': 1, 'operation': 'request-changes', 'operation_id': 'op-nocite-rc',
+                'task': tid1, 'previous': app1 and self.chain_info(tid1)['latest_comment_id'],
+                'contribution': cid1, 'summary': 'Plain review item without standards citations.',
+                'items': [{'id': 'i-1', 'title': 'Fix x', 'Blocking': True, 'detail': 'Details.'}],
+            }, actor='cora-op')
+            # Note: 'Blocking' capitalized is invalid schema -> rejected later without pre-lock git;
+            # also test valid recommend without citations AND unauthorized approve with coordinator_writes!
+            rec_nocite = self.review_op({
+                'schema_version': 1, 'operation': 'recommend', 'operation_id': 'op-nocite-rec',
+                'task': tid3, 'contribution': cid3, 'commit': commit3, 'verdict': 'approve',
+                'summary': 'No citations here.', 'items': [],
+            }, actor='reviewer-sam')
+            self.assertEqual(0, rec_nocite['returncode'], rec_nocite['stderr'])
+            self.assertEqual(0, spy_git.call_count)
+            _ = rc_nocite
+
+        #    - Slow git fake is bounded strictly below BUNDLE_LOCK_WAIT_SECONDS and refuses cleanly with 503!
+        real_confined = rs.run_confined_git
+
+        def _slow_git(args, **kwargs):
+            time.sleep(0.12)
+            return real_confined(args, **kwargs)
+
+        t0 = time.monotonic()
+        with mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 0.25), \
+             mock.patch.object(rs, 'run_confined_git', side_effect=_slow_git):
+            # Re- call inspect_delivery_git through endpoint review with citation:
+            slow_ans = self.review_op({
+                'schema_version': 1, 'operation': 'recommend', 'operation_id': 'op-slow-rec',
+                'task': tid3, 'contribution': cid3, 'commit': commit3, 'verdict': 'approve',
+                'summary': 'Check citation under slow git.', 'items': [],
+                'checks': [{'rule_id': 'JUDG-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['added.py:1']}}],
+            }, actor='olive-op')
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(2, slow_ans['returncode'])
+        self.assertEqual(503, slow_ans.get('standards_status'))
+        self.assertIn(rs.refusal_git_inspection_timeout(commit3), slow_ans['stderr'])
+
+
+class PortableReviewStandardsUnitTests(unittest.TestCase):
+    """Cross-platform unit & git-bundle tests (run on both Linux and Windows CI)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+
+    def tearDown(self):
+        rs._cleanup_temp_git_dir(self.base)
+        try:
+            self.tmp.cleanup()
+        except OSError:
+            pass
+
+    def test_portable_bundle_delivery_git_inspection_and_readonly_pack_cleanup(self):
+        """Pin ci-windows: bundle unbundle, alternates path, batched tree read, and read-only .pack cleanup."""
+        repo = self.base / 'repo'
+        repo.mkdir()
+        _git(repo, 'init')
+        (repo / 'src').mkdir()
+        (repo / 'src' / 'app.py').write_text('alpha = 1\nbeta = 2\ngamma = 3\n', encoding='utf-8')
+        (repo / 'README.md').write_text('# Base\n', encoding='utf-8')
+        _git(repo, 'add', '.')
+        _git(repo, 'commit', '-m', 'base commit')
+
+        serving = self.base / 'serving.git'
+        _git(self.base, 'clone', '--bare', str(repo), str(serving))
+
+        (repo / 'src' / 'app.py').write_text('alpha = 1\nbeta = 2\ngamma = 3\ndelta = 4\n', encoding='utf-8')
+        (repo / 'bin.dat').write_bytes(b'\x00\x01\x02binary')
+        _git(repo, 'add', '.')
+        _git(repo, 'commit', '-m', 'feature commit')
+
+        bundles = self.base / 'bundles'
+        bpath = bundles / 'feat.bundle'
+        commit, sha = _make_bundle(repo, bpath)
+
+        obs = rs.inspect_delivery_git(
+            {
+                'commit': commit,
+                'delivery': {
+                    'kind': 'bundle',
+                    'path': _bundle_delivery_path(bpath),
+                    'sha256': sha,
+                },
+            },
+            delivery_roots=[str(bundles)],
+            serving_repo=str(serving),
+            target_ref='refs/heads/main',
+            needed_paths=['src/app.py', 'bin.dat', 'missing.py', 'src'],
+            lock_dir=self.base,
+        )
+        self.assertTrue(obs['tree_available'], obs)
+        self.assertEqual('bundle', obs['tree_source'])
+        self.assertEqual('verified', obs['diff_status'])
+        self.assertEqual(['bin.dat', 'src/app.py'], obs['changed_files'])
+        self.assertEqual(4, obs['tree_files']['src/app.py']['line_count'])
+        self.assertFalse(obs['tree_files']['bin.dat']['regular_text'])
+        self.assertFalse(obs['tree_files']['missing.py']['exists'])
+        self.assertTrue(obs['tree_files']['src']['exists'])
+        self.assertFalse(obs['tree_files']['src']['regular_text'])
+
+        cit = rs.validate_citation_against_tree('src/app.py:1-4', 'STD-1', commit, obs['tree_available'], obs['tree_files'])
+        self.assertEqual((1, 4), (cit['start_line'], cit['end_line']))
+
+        # Read-only .pack cleanup helper clears read-only bits cleanly on Windows & POSIX:
+        ro_dir = self.base / 'ro-pack-dir'
+        (ro_dir / 'objects' / 'pack').mkdir(parents=True)
+        ro_pack = ro_dir / 'objects' / 'pack' / 'pack-demo.pack'
+        ro_pack.write_bytes(b'PACK')
+        os.chmod(str(ro_pack), 0o444)
+        orig_unlink = os.unlink
+
+        def _win_like_unlink(path, *args, **kwargs):
+            dir_fd = kwargs.get('dir_fd')
+            st = os.stat(path, dir_fd=dir_fd, follow_symlinks=False) if dir_fd is not None else os.lstat(path)
+            if not (st.st_mode & stat.S_IWRITE):
+                raise PermissionError('read-only: %s' % path)
+            return orig_unlink(path, *args, **kwargs)
+
+        with mock.patch('os.unlink', side_effect=_win_like_unlink):
+            rs._cleanup_temp_git_dir(ro_dir)
+        self.assertFalse(ro_dir.exists())
+
+    def test_portable_m1c_dotted_and_boundary_signoff_filenames_and_nonregular_tolerance(self):
+        """Pin m1c-dotted-ids + non-regular signoffs/ tolerance + O24/O31/O32/O34."""
+        proj_dir = self.base / 'proj-m1c'
+        proj_dir.mkdir()
+        hstore = rs.HostStandardsStore(proj_dir, 'proj-m1c')
+        dstore = rs.DictStandardsStore({}, 'proj-m1c')
+        commit = 'a' * 40
+
+        tricky_pairs = [
+            ('cid-plain', 'op.staged.one'),
+            ('cid-plain', 'op.committed.two'),
+            ('cid-plain', 'op.staged.mid.committed.end.'),
+            ('cid-plain', 'op-trailing-dot.'),
+            ('cid-plain', 'op-ends-with.json'),
+            ('abc.staged.def', 'op1'),
+            ('abc', 'def.staged.op1'),
+            ('cid.committed.x.', 'op.staged.y.'),
+            ('c' * 95, 'o' * 96),
+            ('c' * 161, 'o' * 161),
+        ]
+        for idx, (cid, op_id) in enumerate(tricky_pairs):
+            staged_name = rs._signoff_staged_filename(cid, op_id)
+            committed_name = rs._signoff_committed_filename(cid, op_id)
+            self.assertNotEqual(staged_name, committed_name)
+            self.assertEqual(4, len(staged_name.split('.')), staged_name)
+            self.assertEqual(4, len(committed_name.split('.')), committed_name)
+            payload = {
+                'schema_version': 1,
+                'status': 'committed',
+                'contribution_id': cid,
+                'commit': commit,
+                'operation_id': op_id,
+                'created_at': '2026-11-12T00:%02d:00Z' % idx,
+                'approval_comment_id': 'cmt-%d' % idx,
+                'reviewer': {'actor': 'cora-op'},
+                'checks': [{'rule_id': 'STD-1', 'severity': 'must', 'result': 'not_applicable'}],
+            }
+            for st in (hstore, dstore):
+                st.stage_signoff(cid, op_id, dict(payload, status='staged'))
+                self.assertEqual(op_id, st.read_signoff(cid, approve_operation_id=op_id)['operation_id'])
+                st.commit_signoff(cid, op_id, payload)
+                self.assertEqual(op_id, st.read_signoff(cid, approve_operation_id=op_id)['operation_id'])
+
+        self.assertEqual(len(tricky_pairs), len(hstore.list_committed_signoffs()))
+        self.assertEqual(len(tricky_pairs), len(dstore.list_committed_signoffs()))
+
+        # O24: commit_signoff refuses SignoffCommitError if existing committed file has mismatched (cid, op_id)!
+        tampered_cid, tampered_op = tricky_pairs[0]
+        tampered_file = proj_dir / '.standards' / 'signoffs' / rs._signoff_committed_filename(tampered_cid, tampered_op)
+        orig_bytes = tampered_file.read_bytes()
+        tampered_file.write_text(json.dumps({
+            'schema_version': 1, 'status': 'committed', 'contribution_id': 'other-cid', 'operation_id': tampered_op,
+        }), encoding='utf-8')
+        with self.assertRaises(rs.SignoffCommitError):
+            hstore.commit_signoff(tampered_cid, tampered_op, {'contribution_id': tampered_cid, 'operation_id': tampered_op})
+        tampered_file.write_bytes(orig_bytes)
+
+        # O31/O32/O34: hashed staged file with damaged JSON whose approve landed in rows is KEPT past 24h,
+        # while an orphan damaged hashed staged file is kept <24h and cleaned >=24h!
+        so_dir = proj_dir / '.standards' / 'signoffs'
+        landed_cid, landed_op = 'cid.staged.landed', 'op.staged.landed.'
+        landed_staged = so_dir / rs._signoff_staged_filename(landed_cid, landed_op)
+        landed_staged.write_text('{corrupt', encoding='utf-8')
+        orphan_staged = so_dir / rs._signoff_staged_filename('cid.staged.orphan', 'op.staged.orphan.')
+        orphan_staged.write_text('{corrupt', encoding='utf-8')
+
+        fake_rows = [{
+            'id': 't-1',
+            'issue_type': 'task',
+            'comments': [{
+                'id': 'app-cmt-1',
+                'author': 'cora-op',
+                'text': rw.PREFIX + json.dumps({
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': landed_op, 'contribution': landed_cid,
+                }),
+            }],
+        }]
+        now_ep = time.time()
+        hstore.reconcile_or_clean_staged(fake_rows, now_epoch=now_ep + 60)
+        self.assertTrue(landed_staged.exists())
+        self.assertTrue(orphan_staged.exists())  # <24h grace preserved (kills X-R4-10)
+
+        hstore.reconcile_or_clean_staged(fake_rows, now_epoch=now_ep + 90000)
+        self.assertTrue(landed_staged.exists())   # landed approve is NEVER deleted at 25h!
+        self.assertFalse(orphan_staged.exists())  # orphan >24h is cleaned!
+        landed_staged.unlink()
+        # All 10 committed dotted/long sign-offs remain intact after 25h reconcile_or_clean_staged!
+        self.assertEqual(len(tricky_pairs), len(hstore.list_committed_signoffs()))
+
+        # Non-regular directory in signoffs/ does NOT hide valid committed sign-offs and reports warning!
+        bad_sub = so_dir / 'unexpected-dir'
+        bad_sub.mkdir()
+        try:
+            self.assertEqual(len(tricky_pairs), len(hstore.list_committed_signoffs()))
+            self.assertTrue(any('signoffs/unexpected-dir' in w for w in hstore.list_signoff_warnings()))
+        finally:
+            bad_sub.rmdir()
+
+    def test_portable_s1c_fail_with_lists_reserve_and_total_and_file_caps(self):
+        """Pin s1c-fail-with-lists + O5 (9th overflow when room), O8/X-R4-5 (256 reserve cap), O9/X-R4-6 (8 MiB cap)."""
+        proj_dir = self.base / 'proj-s1c'
+        proj_dir.mkdir()
+        store = rs.HostStandardsStore(proj_dir, 'proj-s1c')
+        commit_a = 'b' * 40
+
+        # O5: when ordinary room IS available, a party's 9th compact fail overflows cleanly into ordinary slots!
+        for i in range(9):
+            rs.record_commit_observation(
+                store,
+                commit_a,
+                {'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1, 'run_id': 'r%d' % i}]},
+                actor='ver-o5',
+                is_authorized_recorder=True,
+                same_party_checker=lambda other: other == 'ver-o5',
+            )
+        obs_a = store.read_commit_observation(commit_a)
+        self.assertEqual(9, len(obs_a['observations']))
+        self.assertEqual(8, sum(1 for e in obs_a['observations'] if e.get('reserved_fail')))
+
+        # O8 / X-R4-5: 32 parties * 8 compact fails = 256 total reserve cap; when ordinary slots are ALSO full,
+        # a 33rd party's compact fail or fail+lists is refused 409 with refusal_commit_fail_allowance_total_cap!
+        commit_b = 'c' * 40
+        seed_entries = []
+        for idx in range(rs.COMMIT_OBSERVATIONS_MAX):
+            p = 'ord-%d' % (idx // 32)
+            seed_entries.append({
+                'changed_files': None, 'tree_files': None,
+                'ci_checks': [{'rule_id': None, 'tool': 't', 'command': 'c', 'exit_code': 0, 'status': 'pass'}],
+                'recorded_by': p, 'recorded_by_user_id': p, 'recorded_by_principal': p,
+                'recorded_at': '2026-11-12T00:00:00Z',
+            })
+        for r_idx in range(rs.COMMIT_FAIL_ALLOWANCE_TOTAL_MAX):
+            rp = 'res-%d' % (r_idx // 8)
+            seed_entries.append({
+                'changed_files': None, 'tree_files': None,
+                'ci_checks': [{'rule_id': 'STD-50', 'tool': 't', 'command': 'c', 'exit_code': 1, 'status': 'fail'}],
+                'recorded_by': rp, 'recorded_by_user_id': rp, 'recorded_by_principal': rp,
+                'recorded_at': '2026-11-12T00:00:00Z',
+                'reserved_fail': True,
+            })
+        store.write_commit_observation(commit_b, rs._fold_commit_observations(commit_b, seed_entries))
+        for extra_payload in (
+            {'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}]},
+            {
+                'changed_files': ['a.py'],
+                'tree_files': {'a.py': {'exists': True, 'regular_text': True, 'line_count': 2}},
+                'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+            },
+        ):
+            with self.assertRaises(rs.StandardsRefusal) as cm_tot:
+                rs.record_commit_observation(
+                    store,
+                    commit_b,
+                    extra_payload,
+                    actor='ver-33',
+                    is_authorized_recorder=True,
+                    same_party_checker=lambda other: other == 'ver-33',
+                )
+            self.assertEqual(409, cm_tot.exception.status)
+            self.assertIn(
+                rs.refusal_commit_fail_allowance_total_cap(commit_b, rs.COMMIT_FAIL_ALLOWANCE_TOTAL_MAX),
+                str(cm_tot.exception),
+            )
+
+        # O9 / X-R4-6: MAX_COMMIT_OBSERVATION_FILE_BYTES ceiling on reserve path refuses 409 cleanly!
+        commit_c = 'd' * 40
+        with mock.patch.object(rs, 'MAX_COMMIT_OBSERVATION_BYTES', 1600), \
+             mock.patch.object(rs, 'MAX_COMMIT_OBSERVATION_FILE_BYTES', 2000):
+            rs.record_commit_observation(
+                store,
+                commit_c,
+                {'ci_checks': [{'tool': 'pad', 'command': 'pad', 'exit_code': 0, 'summary': 'p' * 300}]},
+                actor='ver-c1',
+                is_authorized_recorder=True,
+                same_party_checker=lambda other: other == 'ver-c1',
+            )
+            with self.assertRaises(rs.StandardsRefusal) as cm_file_cap:
+                rs.record_commit_observation(
+                    store,
+                    commit_c,
+                    {
+                        'changed_files': ['x.py'],
+                        'ci_checks': [{'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1, 'summary': 'f' * 380}],
+                    },
+                    actor='ver-c2',
+                    is_authorized_recorder=True,
+                    same_party_checker=lambda other: other == 'ver-c2',
+                )
+            self.assertEqual(409, cm_file_cap.exception.status)
+            self.assertIn(rs.refusal_commit_observation_size_cap(commit_c, 2000), str(cm_file_cap.exception))
+
+    def test_portable_s2c_batched_tree_paths_and_slow_git_bound(self):
+        """Pin batched _inspect_repo_tree_paths (<= 4 git calls for 250 paths) and slow-git 503 timeout."""
+        repo = self.base / 'repo-batch'
+        repo.mkdir()
+        _git(repo, 'init')
+        paths = []
+        for idx in range(240):
+            rel = 'pkg/mod_%03d.py' % idx
+            full = repo / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text('line1 = %d\nline2 = %d\n' % (idx, idx + 1), encoding='utf-8')
+            paths.append(rel)
+        _git(repo, 'add', '.')
+        _git(repo, 'commit', '-m', '240 files')
+        bpath = self.base / 'bundles' / 'batch.bundle'
+        commit, sha = _make_bundle(repo, bpath)
+
+        real_git = rs.run_confined_git
+        calls = []
+
+        def _counting_git(args, **kw):
+            calls.append(list(args))
+            return real_git(args, **kw)
+
+        with mock.patch.object(rs, 'run_confined_git', side_effect=_counting_git):
+            tree = rs._inspect_repo_tree_paths(repo, commit, paths + ['pkg/missing_%d.py' % i for i in range(10)])
+        self.assertEqual(250, len(tree))
+        self.assertEqual(2, tree['pkg/mod_000.py']['line_count'])
+        self.assertFalse(tree['pkg/missing_0.py']['exists'])
+        # 250 paths in 2 ls-tree chunks + 1 cat-file --batch-check + 1 cat-file --batch = 4 git calls (never 750!)
+        self.assertLessEqual(len(calls), 5, calls)
+
+        def _slow_git(args, **kw):
+            time.sleep(0.12)
+            return real_git(args, **kw)
+
+        t0 = time.monotonic()
+        with mock.patch.object(rs, 'run_confined_git', side_effect=_slow_git):
+            slow_obs = rs.inspect_delivery_git(
+                {'commit': commit, 'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath), 'sha256': sha}},
+                delivery_roots=[str(bpath.parent)],
+                needed_paths=['pkg/mod_000.py'],
+                lock_dir=self.base,
+                lock_wait_seconds=1.5,
+                max_inspect_seconds=0.25,
+            )
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(slow_obs['inspect_timed_out'])
+        self.assertFalse(slow_obs['tree_available'])
+
+        with self.assertRaises(rs.StandardsRefusal) as cm_503:
+            rs.validate_citation_against_tree(
+                'pkg/mod_000.py:1', 'STD-1', commit,
+                slow_obs['tree_available'], slow_obs['tree_files'],
+                git_timed_out=slow_obs['inspect_timed_out'],
+            )
+        self.assertEqual(503, cm_503.exception.status)
+        self.assertIn(rs.refusal_git_inspection_timeout(commit), str(cm_503.exception))
+
+        # Concurrent waiter succeeds because slow caller's lock hold is bounded strictly below lock_wait_seconds!
+        entered = threading.Event()
+        slow_holder_ids = set()
+        results = {}
+
+        def _selective_slow_git(args, **kw):
+            if threading.get_ident() in slow_holder_ids:
+                entered.set()
+                time.sleep(0.15)
+            return real_git(args, **kw)
+
+        def _run_slow():
+            slow_holder_ids.add(threading.get_ident())
+            results['slow'] = rs.inspect_delivery_git(
+                {'commit': commit, 'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath), 'sha256': sha}},
+                delivery_roots=[str(bpath.parent)],
+                needed_paths=['pkg/mod_000.py'],
+                lock_dir=self.base,
+                lock_wait_seconds=2.0,
+                max_inspect_seconds=0.25,
+            )
+
+        def _run_fast_waiter():
+            entered.wait(timeout=1.5)
+            results['waiter'] = rs.inspect_delivery_git(
+                {'commit': commit, 'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath), 'sha256': sha}},
+                delivery_roots=[str(bpath.parent)],
+                needed_paths=['pkg/mod_000.py'],
+                lock_dir=self.base,
+                lock_wait_seconds=2.0,
+                max_inspect_seconds=5.0,
+            )
+
+        with mock.patch.object(rs, 'run_confined_git', side_effect=_selective_slow_git):
+            t_slow = threading.Thread(target=_run_slow)
+            t_wait = threading.Thread(target=_run_fast_waiter)
+            t_slow.start()
+            t_wait.start()
+            t_slow.join(timeout=5.0)
+            t_wait.join(timeout=5.0)
+        self.assertTrue(results['slow']['inspect_timed_out'])
+        self.assertTrue(results['waiter']['tree_available'])
+        self.assertFalse(results['waiter']['lock_timed_out'])
 
 
 if __name__ == '__main__':
