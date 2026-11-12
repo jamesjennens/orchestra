@@ -4302,6 +4302,75 @@ The audit identifies creator and owner, and the owner's card says Created by NAM
 The owning account can issue a new secret and revoke that first key if the creator
 having seen it matters. Legacy agents have no invented creator attribution.
 
+## Invite links
+
+kittrial-5bb.578. A person makes a single-use link that, when the invited person opens it and sets a
+password, creates their account, adds it to named projects as a **contributor** and, optionally,
+creates one **worker** agent owned by it with its first credential, issued exactly as New agent issues
+one. Everything is the web service's own state (`http_auth.Store`), so the same routes serve both
+backends; the code is `invites.py` and the routes in `http_service.py`.
+
+**The switch.** `invites_enabled` in `deployment.private.json`, **off** unless it is `true`. It is read
+on every invite request, so turning it on or off needs no restart; a value that is not `true` or
+`false` reads as off with a warning in the service's log, and an unreadable file is the usual `503`.
+While it is off the create form is hidden and `POST /v1/invites`, `POST /v1/invites/view` and
+`POST /v1/invites/redeem` all answer `403` with the one sentence
+`Invite links are switched off on this installation. An operator turns them on with "invites_enabled": true in deployment.private.json.`
+Listing and withdrawing stay open, so an invite made while it was on can still be withdrawn. To turn it
+on, stop nothing: add `"invites_enabled": true` to the top-level object of
+`<runtime root>/deployment.private.json` (keep it a regular file, mode 600, owned by the service
+account) and save. The service-local (disposable) backend has no deployment file; there it is the
+backend attribute `invites_enabled`, which only a test or a local trial sets.
+
+**Who may invite.** A person signed in to the web page (a session, never an agent or worker credential,
+whatever grant the agent holds) who is a superuser, or whose role in **every** project the invite names
+carries `coordinate` (coordinator or owner): the rule `http_authority.decide` gives a session for
+`coordinate`. A project the inviter cannot see is `404`; one they only contribute to or view is `403`;
+an archived project, or one the backend will not serve, is refused. Note that this lets a project
+coordinator add a contributor by invite, which the Members table leaves to owners.
+
+| Route | Who | What |
+| --- | --- | --- |
+| `GET /v1/invites` | a person's session | `enabled`, the caller's invites (a superuser: everyone's) with `status` `pending`, `used` (`used_by`, `used_at`, `used_from`), `expired` or `revoked`, and `projects` the caller may invite to |
+| `POST /v1/invites` | as above, switch on | `{display_name, username, projects, expires_hours?, agent?: {name, project, claim_limit?}}`; `201` with `token`, `path` (`/#/invite/TOKEN`), `link` (with `--public-url`) and the warning that the link is a key, **once**; an exact retry under the same `Idempotency-Key` answers `200` without the token |
+| `POST /v1/invites/{id}/revoke` | its inviter or a superuser | withdraws a pending invite (anyone else: `404`) |
+| `POST /v1/invites/view` | anyone holding the token, switch on | `{token}`: who invites whom, the projects, the agent, the expiry and the password minimum |
+| `POST /v1/invites/redeem` | anyone holding the token, switch on | `{token, password}`; `201` with the account, the projects and, with an agent, the agent, its credential's secret and the set-up payload of New agent, **once** |
+
+The username is checked as an account's is (2-64 characters of letters, digits, `. _ @ -`), and must not
+belong to an account or to another pending invite. The expiry is 72 hours unless `expires_hours` says
+1 to 168 (7 days). The agent takes a name (the New agent rule, and the secret-file clash rule against
+the new account's other agents), a project that is one of the invite's, and a claim limit (default 1);
+it gets the default scopes and the `worker` role. A `role` other than `worker`, or any `coordinator`,
+`grant`, `grants` or `scopes` field, is refused with one sentence: there is no coordinator grant in an
+invite.
+
+**The token.** `secrets.token_urlsafe(32)` (32 random bytes); the state keeps only its SHA-256, as the
+key of `invites`, with the record of who invited whom, when, and the expiry on both clocks (as a reset
+value's). It goes in the link after `#`, so it never reaches a server log or a `Referer`, and the page
+sends it in a request body. Unknown, expired, used and withdrawn tokens all get one answer,
+`404 invite_unusable` `This invite link cannot be used. Ask the person who sent it for a new one.`, and
+every miss counts against the address exactly as a failed sign-in does (`Service._check_throttle`; ten
+in five minutes from one address answers `429`, and the shared tunnel address is slowed, not locked).
+
+**Redeeming** sets the password under the installation's password rule, then, in one transaction under
+the state lock (`Service._widening`): creates the account, adds the memberships, creates the agent and
+its credential, and marks the invite used, with the address it was used from. A refusal or a failure at
+any step, a failed save included, takes all of it back; the state file is replaced atomically, so a
+service that dies mid-way leaves it as it was. A username that was taken since the invite was made is
+`409 username_taken` with nothing created; an inviter who has lost the role, or a project archived
+since, is `409 invite_stale`. Each use writes `invites.redeemed` into every named project's audit
+(`invite_id`, `invited_by`, `new_user`, `used_from`), which is the inviter's notice beside the invite's
+status on their list. If the redemption answer is lost the secret is gone with it; the person signs in
+and issues a new one from the agent's card. A restore of the HTTP state withdraws the pending invites in
+the backup, as it spends unused reset values.
+
+**On the page.** Members & settings shows "Invite someone" to a person who may invite to at least one
+project while the switch is on (and the list of their invites at any time). The link opens a signed-out
+page (`#/invite/TOKEN`) that shows the invite, asks for the password twice, and then offers the agent's
+credential file, `.orchestra/agent.json` and `.orchestra/AGENT.md` (and the service certificate, when it
+has one) once.
+
 ## Files attached to a task over HTTP
 
 Slice 1 of the task files design, `docs/TASK_FILES_DESIGN.md` (kittrial-5bb.370; the design is

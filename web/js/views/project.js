@@ -11,6 +11,7 @@ import { delegationsPanel } from './delegations.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { historyPanel } from '../agentHistory.js';
 import { switchesPanel } from './switches.js';
+import { invitePanel } from './invites.js';
 import { coveragePanel } from './trace.js';
 
 const PAGE = 10;
@@ -994,7 +995,10 @@ export async function settings(ctx, { pid }) {
     // kittrial-5bb.447: notes between the coordinators of linked projects, in the same line (no new panel).
     h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator'),
       ' · ', h('a', { href: ctx.href(`/p/${pid}/notes`), 'data-link': 'notes' }, 'Notes between coordinators')),
-    membersHost, claimingPanel(ctx, project), agentApprovalPanel(ctx, project), coordination.node,
+    membersHost,
+    // kittrial-5bb.578: invite links, shown only while the installation's switch is on (or to list your own).
+    invitePanel(ctx, project),
+    claimingPanel(ctx, project), agentApprovalPanel(ctx, project), coordination.node,
     // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
     switchesPanel(ctx, project),
     delegated.node, agentsHost, credsHost, auditHost, danger);

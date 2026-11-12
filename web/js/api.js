@@ -451,6 +451,12 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     },
     redeemReset: (uid, reset_value, new_password) => call('POST', `/v1/accounts/${uid}/reset/redeem`, { body: { reset_value, new_password }, key: newKey() }),
     changePassword: (uid, current_password, new_password) => mutate('POST', `/v1/accounts/${uid}/password`, { current_password, new_password }),
+    // kittrial-5bb.578: invite links. The token travels in a request body, never in a URL a server logs.
+    invites: () => call('GET', '/v1/invites'),
+    createInvite: (body) => mutate('POST', '/v1/invites', body),
+    revokeInvite: (id) => mutate('POST', `/v1/invites/${encodeURIComponent(id)}/revoke`, {}),
+    viewInvite: (token) => call('POST', '/v1/invites/view', { body: { token } }),
+    redeemInvite: (token, password) => call('POST', '/v1/invites/redeem', { body: { token, password } }),
 
     // accounts (superuser)
     accounts: () => call('GET', '/v1/accounts'),
