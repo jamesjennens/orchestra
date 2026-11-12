@@ -53,10 +53,13 @@ BUNDLE_INSPECT_SEMAPHORE = threading.BoundedSemaphore(1)
 STAGED_TTL_SECONDS = 24 * 3600
 
 MAX_FILE_BYTES = 512 * 1024
+MAX_COMMIT_OBSERVATION_BYTES = 4 * 1024 * 1024
 MAX_BLOB_BYTES = 10 * 1024 * 1024
 BINARY_SNIFF_BYTES = 8192
 NOTIFICATIONS_MAX = 500
 GATE_HISTORY_MAX = 50
+COMMIT_OBSERVATIONS_MAX = 256
+COMMIT_OBSERVATIONS_PER_RECORDER_MAX = 32
 REVIEW_PREFIX = 'Kind: contribution-review-v1\n'
 ALL_CHANGES_MUST_DEFAULT = 5
 RULES_MAX = 200
@@ -409,15 +412,6 @@ def refusal_invalid_adopt_recommendation(rec_id, contribution_id, commit):
     )
 
 
-def refusal_self_recorded_commit_observation(contribution_id, commit):
-    # Sentence #24b
-    return (
-        "Review refused: the reviewer or approver of contribution %s cannot rely on a "
-        "commit or CI observation they or their party recorded for %s."
-        % (contribution_id, commit)
-    )
-
-
 def refusal_detach_inherited_must(pid, shared_pid, rule_ids):
     return (
         "Project %s cannot remove or change 'inherits' from shared project %s while %s defines "
@@ -438,6 +432,27 @@ def refusal_na_over_mechanical_fail(rule_id, commit):
         "Check record for mechanical 'must' rule %s cannot assert 'not_applicable' when a "
         "failing CI result is recorded for commit %s; fix the failure or request a single-delivery waiver."
         % (rule_id, commit)
+    )
+
+
+def refusal_commit_observation_cap(commit, limit):
+    return (
+        "Commit standards observation refused for %s: commit has reached the maximum of %d "
+        "recorded observations; existing observations are never evicted." % (commit, limit)
+    )
+
+
+def refusal_commit_observation_recorder_cap(commit, limit):
+    return (
+        "Commit standards observation refused for %s: recorder's party has reached the per-party "
+        "limit of %d observations on this commit." % (commit, limit)
+    )
+
+
+def refusal_commit_observation_size_cap(commit, limit):
+    return (
+        "Commit standards observation refused for %s: stored commit observations would exceed "
+        "the %d-byte limit; existing observations are never evicted." % (commit, limit)
     )
 
 
@@ -534,20 +549,44 @@ def _list_regular_names(dir_path, label):
     return names
 
 
-def _read_json_file(file_path, label):
+def _read_json_file(file_path, label, *, limit=MAX_FILE_BYTES):
     st = _lstat_or_none(file_path)
     if st is None:
         return None
     if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode):
         raise StandardsDamagedError('%s is not a regular file' % label)
     try:
-        raw = read_regular_text(str(file_path), limit=MAX_FILE_BYTES)
+        raw = read_regular_text(str(file_path), limit=limit)
         data = parse_json(raw)
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise StandardsDamagedError('%s cannot be read: %s' % (label, exc)) from exc
     if not isinstance(data, dict):
         raise StandardsDamagedError('%s is not a JSON object' % label)
     return data
+
+
+def _signoff_staged_filename(contribution_id, operation_id):
+    cid = str(contribution_id)
+    op_id = str(operation_id)
+    identity(cid)
+    identity(op_id)
+    name = '%s.staged.%s.json' % (cid, op_id)
+    if len(name) <= 200:
+        return name
+    digest = hashlib.sha256(('%s\0%s' % (cid, op_id)).encode('utf-8')).hexdigest()[:24]
+    return '%s.staged.sha256-%s.json' % (cid[:64], digest)
+
+
+def _signoff_committed_filename(contribution_id, operation_id):
+    cid = str(contribution_id)
+    op_id = str(operation_id)
+    identity(cid)
+    identity(op_id)
+    name = '%s.committed.%s.json' % (cid, op_id)
+    if len(name) <= 200:
+        return name
+    digest = hashlib.sha256(('%s\0%s' % (cid, op_id)).encode('utf-8')).hexdigest()[:24]
+    return '%s.committed.sha256-%s.json' % (cid[:64], digest)
 
 
 def _atomic_write_json(dir_path, filename, payload):
@@ -831,7 +870,9 @@ class HostStandardsStore:
         path = commits_dir / ('%s.json' % commit.lower())
         if _lstat_or_none(path) is None:
             return None
-        return _read_json_file(path, 'commits/%s.json' % commit.lower())
+        return _read_json_file(
+            path, 'commits/%s.json' % commit.lower(), limit=MAX_COMMIT_OBSERVATION_BYTES
+        )
 
     def write_commit_observation(self, commit, obs_obj):
         try:
@@ -919,21 +960,21 @@ class HostStandardsStore:
         return ('missing', None)
 
     def stage_signoff(self, contribution_id, operation_id, staged_obj):
-        identity(str(contribution_id))
-        identity(str(operation_id))
+        staged_name = _signoff_staged_filename(contribution_id, operation_id)
         try:
             so_dir = self._ensure_subdir('signoffs')
-            _atomic_write_json(so_dir, '%s.staged.%s.json' % (contribution_id, operation_id), staged_obj)
+            _atomic_write_json(so_dir, staged_name, staged_obj)
         except (StandardsDamagedError, ValueError, OSError) as exc:
             self._raise_damaged_subdir(exc)
 
     def commit_signoff(self, contribution_id, operation_id, final_obj):
-        identity(str(contribution_id))
-        identity(str(operation_id))
+        committed_name = _signoff_committed_filename(contribution_id, operation_id)
+        staged_name = _signoff_staged_filename(contribution_id, operation_id)
         try:
             so_dir = self._ensure_subdir('signoffs')
-            _atomic_write_json(so_dir, '%s.json' % contribution_id, final_obj)
-            _safe_unlink(so_dir, '%s.staged.%s.json' % (contribution_id, operation_id))
+            if _lstat_or_none(so_dir / committed_name) is None:
+                _atomic_write_json(so_dir, committed_name, final_obj)
+            _safe_unlink(so_dir, staged_name)
         except (StandardsDamagedError, ValueError, OSError) as exc:
             self._raise_damaged_subdir(exc)
 
@@ -946,31 +987,69 @@ class HostStandardsStore:
                 return None
         except StandardsDamagedError:
             return None
+        cid = str(contribution_id)
         try:
-            identity(str(contribution_id))
+            identity(cid)
         except ValueError:
             return None
         if approve_operation_id is not None:
+            op_id = str(approve_operation_id)
             try:
-                identity(str(approve_operation_id))
+                committed_name = _signoff_committed_filename(cid, op_id)
+                staged_name = _signoff_staged_filename(cid, op_id)
             except ValueError:
                 return None
-            staged_path = so_dir / ('%s.staged.%s.json' % (contribution_id, approve_operation_id))
-            if _lstat_or_none(staged_path) is not None:
+            committed_path = so_dir / committed_name
+            if _lstat_or_none(committed_path) is not None:
                 try:
-                    return _read_json_file(
-                        staged_path,
-                        'signoffs/%s.staged.%s.json' % (contribution_id, approve_operation_id),
-                    )
+                    so = _read_json_file(committed_path, 'signoffs/%s' % committed_name)
+                    if (
+                        isinstance(so, dict)
+                        and str(so.get('contribution_id') or '') == cid
+                        and str(so.get('operation_id') or '') == op_id
+                    ):
+                        return so
                 except StandardsDamagedError:
                     return None
-        committed_path = so_dir / ('%s.json' % contribution_id)
-        if _lstat_or_none(committed_path) is not None:
-            try:
-                return _read_json_file(committed_path, 'signoffs/%s.json' % contribution_id)
-            except StandardsDamagedError:
-                return None
-        return None
+            staged_path = so_dir / staged_name
+            if _lstat_or_none(staged_path) is not None:
+                try:
+                    so = _read_json_file(staged_path, 'signoffs/%s' % staged_name)
+                    if (
+                        isinstance(so, dict)
+                        and str(so.get('contribution_id') or '') == cid
+                        and str(so.get('operation_id') or '') == op_id
+                    ):
+                        return so
+                except StandardsDamagedError:
+                    return None
+            legacy_path = so_dir / ('%s.json' % cid)
+            if _lstat_or_none(legacy_path) is not None:
+                try:
+                    legacy = _read_json_file(legacy_path, 'signoffs/%s.json' % cid)
+                    if (
+                        isinstance(legacy, dict)
+                        and str(legacy.get('contribution_id') or '') == cid
+                        and str(legacy.get('operation_id') or '') == op_id
+                    ):
+                        return legacy
+                except StandardsDamagedError:
+                    return None
+            return None
+        for_cid = [
+            so for so in self.list_committed_signoffs()
+            if str(so.get('contribution_id') or '') == cid
+        ]
+        if not for_cid:
+            return None
+        for_cid.sort(
+            key=lambda s: (
+                str(s.get('created_at') or ''),
+                str(s.get('approval_comment_id') or ''),
+                str(s.get('operation_id') or ''),
+            )
+        )
+        return for_cid[-1]
 
     def list_committed_signoffs(self):
         try:
@@ -1008,19 +1087,39 @@ class HostStandardsStore:
         for name, st in so_entries:
             if '.staged.' not in name or not name.endswith('.json'):
                 continue
-            stem = name[:-5]
-            cid, _, op_id = stem.partition('.staged.')
             try:
-                identity(cid)
-                identity(op_id)
-            except ValueError:
-                continue
-            matched = approve_ops.get(op_id)
-            if matched is not None and matched[0] == cid:
+                staged = _read_json_file(so_dir / name, 'signoffs/%s' % name)
+            except StandardsDamagedError:
+                staged = None
+            if name.startswith('sha256-') and name.endswith('.staged.json'):
+                cid = str((staged or {}).get('contribution_id') or '')
+                op_id = str((staged or {}).get('operation_id') or '')
                 try:
-                    staged = _read_json_file(so_dir / name, 'signoffs/%s' % name)
+                    identity(cid)
+                    identity(op_id)
+                except ValueError:
+                    if now_val - st.st_mtime >= STAGED_TTL_SECONDS:
+                        _safe_unlink(so_dir, name)
+                    continue
+                if _signoff_staged_filename(cid, op_id) != name:
+                    if now_val - st.st_mtime >= STAGED_TTL_SECONDS:
+                        _safe_unlink(so_dir, name)
+                    continue
+            else:
+                stem = name[:-5]
+                cid, _, op_id = stem.partition('.staged.')
+                try:
+                    identity(cid)
+                    identity(op_id)
+                except ValueError:
+                    continue
+            matched = approve_ops.get(op_id)
+            if matched is not None and matched[0] == cid and isinstance(staged, dict):
+                try:
                     promoted = dict(staged, status='committed', approval_comment_id=matched[1])
                     self.commit_signoff(cid, op_id, promoted)
+                    if _lstat_or_none(so_dir / name) is not None:
+                        _safe_unlink(so_dir, name)
                 except (StandardsDamagedError, StandardsRefusal, OSError):
                     pass
             elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in approve_ops:
@@ -1122,6 +1221,18 @@ class HostStandardsStore:
         return items
 
 
+class _DamagedStandardsStore:
+    """Sentinel store returned when a sibling project path is a symlink or non-directory."""
+
+    def __init__(self, project_id, detail):
+        self.project_id = str(project_id)
+        self.detail = str(detail)
+        self.shared_loader = None
+
+    def inspect_register_raw(self):
+        return ('damaged', None, self.detail)
+
+
 def host_shared_loader_for(project_path):
     """Build a ``shared_loader(shared_pid)`` resolving sibling host projects under ``<root>/projects``."""
     base = Path(project_path)
@@ -1131,8 +1242,13 @@ def host_shared_loader_for(project_path):
         if not isinstance(shared_pid, str) or not PROJECT_ID_RE.fullmatch(shared_pid):
             return None
         target = projects_dir / shared_pid
-        if target.is_symlink() or not target.is_dir():
+        st = _lstat_or_none(target)
+        if st is None:
             return None
+        if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISDIR(st.st_mode):
+            return _DamagedStandardsStore(
+                shared_pid, 'shared project path %s is a symlink or non-directory' % shared_pid
+            )
         return HostStandardsStore(target, shared_pid)
 
     return _load
@@ -1357,25 +1473,66 @@ class DictStandardsStore:
         identity(str(contribution_id))
         identity(str(operation_id))
         bucket = self._bucket(write=True)
-        bucket.setdefault('signoffs', {})[str(contribution_id)] = parse_json(
-            canonical_bytes(final_obj).decode('utf-8')
-        )
-        (bucket.get('signoffs_staged') or {}).pop('%s:%s' % (contribution_id, operation_id), None)
+        key = '%s:%s' % (contribution_id, operation_id)
+        so_map = bucket.setdefault('signoffs', {})
+        if key not in so_map:
+            so_map[key] = parse_json(canonical_bytes(final_obj).decode('utf-8'))
+        (bucket.get('signoffs_staged') or {}).pop(key, None)
 
     def read_signoff(self, contribution_id, approve_operation_id=None):
         bucket = self._bucket(write=False)
         if not isinstance(bucket, dict):
             return None
-        committed = (bucket.get('signoffs') or {}).get(str(contribution_id))
-        if isinstance(committed, dict):
-            return dict(committed)
+        cid = str(contribution_id)
+        try:
+            identity(cid)
+        except ValueError:
+            return None
+        so_map = bucket.get('signoffs') or {}
         if approve_operation_id is not None:
-            staged = (bucket.get('signoffs_staged') or {}).get(
-                '%s:%s' % (contribution_id, approve_operation_id)
-            )
-            if isinstance(staged, dict):
+            op_id = str(approve_operation_id)
+            try:
+                identity(op_id)
+            except ValueError:
+                return None
+            key = '%s:%s' % (cid, op_id)
+            committed = so_map.get(key)
+            if (
+                isinstance(committed, dict)
+                and str(committed.get('contribution_id') or '') == cid
+                and str(committed.get('operation_id') or '') == op_id
+            ):
+                return dict(committed)
+            staged = (bucket.get('signoffs_staged') or {}).get(key)
+            if (
+                isinstance(staged, dict)
+                and str(staged.get('contribution_id') or '') == cid
+                and str(staged.get('operation_id') or '') == op_id
+            ):
                 return dict(staged)
-        return None
+            legacy = so_map.get(cid)
+            if (
+                isinstance(legacy, dict)
+                and str(legacy.get('contribution_id') or '') == cid
+                and str(legacy.get('operation_id') or '') == op_id
+            ):
+                return dict(legacy)
+            return None
+        for_cid = [
+            dict(v)
+            for v in so_map.values()
+            if isinstance(v, dict) and str(v.get('contribution_id') or '') == cid
+        ]
+        if not for_cid:
+            return None
+        for_cid.sort(
+            key=lambda s: (
+                str(s.get('created_at') or ''),
+                str(s.get('approval_comment_id') or ''),
+                str(s.get('operation_id') or ''),
+            )
+        )
+        return for_cid[-1]
 
     def list_committed_signoffs(self):
         bucket = self._bucket(write=False)
@@ -2214,31 +2371,26 @@ def put_register(
                 status=409,
             )
         prev_parent_store = store.shared_loader(prev_inherits)
-        if prev_parent_store is None:
-            raise StandardsRefusal(
-                'Cannot remove or change inherits from shared project %s while %s is unavailable.'
-                % (prev_inherits, prev_inherits),
-                status=409,
-            )
-        pp_status, pp_head, pp_versions = prev_parent_store.inspect_register_raw()
-        if pp_status == 'damaged':
-            raise StandardsRefusal(
-                'Cannot remove or change inherits from shared project %s while its standards register is damaged (%s).'
-                % (prev_inherits, pp_versions),
-                status=409,
-            )
-        if pp_status == 'active':
-            pp_ver = pp_versions[pp_head['current_version']]
-            inherited_must_ids = [
-                r['id'] for r in pp_ver['rules'] if r.get('severity') == 'must'
-            ]
-            if inherited_must_ids:
+        if prev_parent_store is not None:
+            pp_status, pp_head, pp_versions = prev_parent_store.inspect_register_raw()
+            if pp_status == 'damaged':
                 raise StandardsRefusal(
-                    refusal_detach_inherited_must(
-                        store.project_id, prev_inherits, inherited_must_ids
-                    ),
-                    status=422,
+                    'Cannot remove or change inherits from shared project %s while its standards register is damaged (%s).'
+                    % (prev_inherits, pp_versions),
+                    status=409,
                 )
+            if pp_status == 'active':
+                pp_ver = pp_versions[pp_head['current_version']]
+                inherited_must_ids = [
+                    r['id'] for r in pp_ver['rules'] if r.get('severity') == 'must'
+                ]
+                if inherited_must_ids:
+                    raise StandardsRefusal(
+                        refusal_detach_inherited_must(
+                            store.project_id, prev_inherits, inherited_must_ids
+                        ),
+                        status=422,
+                    )
 
     parent_ver_obj = None
     if inherits is not None:
@@ -3678,7 +3830,12 @@ def _entry_matches_party(entry_or_item, exclude_party):
 
 
 def _fold_commit_observations(commit_lower, observations, *, exclude_party=None):
-    """Fold ``observations`` preserving per-part provenance and excluding disallowed parties."""
+    """Fold ``observations`` preserving per-part provenance.
+
+    When ``exclude_party`` is provided, exclude only observation parts that could help an
+    excluded party pass (``changed_files``, ``tree_files``, and passing CI items); recorded
+    CI failures always count with their recorder regardless of party.
+    """
     kept_entries = []
     changed_files = None
     changed_files_recorded_by = None
@@ -3693,21 +3850,18 @@ def _fold_commit_observations(commit_lower, observations, *, exclude_party=None)
     for entry in observations or ():
         if not isinstance(entry, dict):
             continue
-        if _entry_matches_party(entry, exclude_party):
-            continue
-        kept_entries.append(entry)
-        latest_entry = entry
+        entry_excluded = _entry_matches_party(entry, exclude_party)
         rec_by = entry.get('recorded_by')
         rec_uid = entry.get('recorded_by_user_id')
         rec_prin = entry.get('recorded_by_principal')
         rec_at = entry.get('recorded_at')
 
-        if isinstance(entry.get('changed_files'), list):
+        if not entry_excluded and isinstance(entry.get('changed_files'), list):
             changed_files = list(entry['changed_files'])
             changed_files_recorded_by = rec_by
             changed_files_recorded_at = rec_at
 
-        if isinstance(entry.get('tree_files'), dict):
+        if not entry_excluded and isinstance(entry.get('tree_files'), dict):
             if merged_tree_files is None:
                 merged_tree_files = {}
             for p, meta in entry['tree_files'].items():
@@ -3716,6 +3870,7 @@ def _fold_commit_observations(commit_lower, observations, *, exclude_party=None)
                     tree_files_recorders[p] = rec_by
             tree_files_recorded_by = rec_by
 
+        retained_ci = []
         if isinstance(entry.get('ci_checks'), list):
             for raw_item in entry['ci_checks']:
                 if not isinstance(raw_item, dict):
@@ -3725,16 +3880,37 @@ def _fold_commit_observations(commit_lower, observations, *, exclude_party=None)
                 item.setdefault('recorded_by_user_id', rec_uid)
                 item.setdefault('recorded_by_principal', rec_prin)
                 item.setdefault('recorded_at', rec_at)
-                if _entry_matches_party(item, exclude_party):
+                is_fail = (item.get('exit_code') != 0) or (item.get('status') == 'fail')
+                item_excluded = entry_excluded or _entry_matches_party(item, exclude_party)
+                if item_excluded and not is_fail:
                     continue
                 key = (
                     ('rule', item['rule_id'])
                     if item.get('rule_id')
                     else ('cmd', item.get('tool'), item.get('command'))
                 )
-                if key not in ci_by_key:
-                    ci_order.append(key)
+                if key in ci_by_key:
+                    ci_order.remove(key)
+                ci_order.append(key)
                 ci_by_key[key] = item
+                retained_ci.append(item)
+
+        if entry_excluded:
+            if retained_ci:
+                sanitized = {
+                    'changed_files': None,
+                    'tree_files': None,
+                    'ci_checks': retained_ci,
+                    'recorded_by': rec_by,
+                    'recorded_by_user_id': rec_uid,
+                    'recorded_by_principal': rec_prin,
+                    'recorded_at': rec_at,
+                }
+                kept_entries.append(sanitized)
+                latest_entry = sanitized
+        else:
+            kept_entries.append(entry)
+            latest_entry = entry
 
     if not kept_entries:
         return None
@@ -4007,8 +4183,44 @@ def record_commit_observation(
                 'recorded_at': ts,
             })
 
-    existing = store.read_commit_observation(commit_lower)
+    try:
+        existing = store.read_commit_observation(commit_lower)
+    except StandardsDamagedError as exc:
+        raise StandardsRefusal(
+            'Commit standards observation in project %s is damaged (%s); repair or restore .standards/ before recording.'
+            % (store.project_id, exc),
+            status=409,
+        ) from None
     prev_observations = _normalize_commit_observations_list(existing)
+    if len(prev_observations) >= COMMIT_OBSERVATIONS_MAX:
+        raise StandardsRefusal(
+            refusal_commit_observation_cap(commit_lower, COMMIT_OBSERVATIONS_MAX),
+            status=409,
+        )
+    cur_keys = {
+        author_key(x)
+        for x in (actor, recorded_by_user_id, recorded_by_principal)
+        if isinstance(x, str) and x
+    }
+    cur_keys.discard('')
+    party_count = 0
+    for prev_entry in prev_observations:
+        if not isinstance(prev_entry, dict):
+            continue
+        if _entry_matches_party(prev_entry, same_party_checker) or any(
+            isinstance(prev_entry.get(f), str)
+            and prev_entry.get(f)
+            and author_key(prev_entry[f]) in cur_keys
+            for f in ('recorded_by', 'recorded_by_user_id', 'recorded_by_principal')
+        ):
+            party_count += 1
+    if party_count >= COMMIT_OBSERVATIONS_PER_RECORDER_MAX:
+        raise StandardsRefusal(
+            refusal_commit_observation_recorder_cap(
+                commit_lower, COMMIT_OBSERVATIONS_PER_RECORDER_MAX
+            ),
+            status=409,
+        )
     new_entry = {
         'changed_files': changed_files,
         'tree_files': tree_files,
@@ -4018,22 +4230,15 @@ def record_commit_observation(
         'recorded_by_principal': recorded_by_principal,
         'recorded_at': ts,
     }
-    observations = (prev_observations + [new_entry])[-256:]
+    observations = prev_observations + [new_entry]
     obs = _fold_commit_observations(commit_lower, observations)
+    if len(canonical_bytes(obs)) + 1 > MAX_COMMIT_OBSERVATION_BYTES:
+        raise StandardsRefusal(
+            refusal_commit_observation_size_cap(commit_lower, MAX_COMMIT_OBSERVATION_BYTES),
+            status=409,
+        )
     store.write_commit_observation(commit_lower, obs)
     return obs
-
-
-def check_reviewer_not_commit_recorder(obs, contribution_id, commit, same_party_with_actor):
-    """Refuse review/approval (#24b) if ``obs`` was recorded by the reviewer/approver's own party."""
-    if not isinstance(obs, dict):
-        return
-    for entry in _normalize_commit_observations_list(obs):
-        if _entry_matches_party(entry, same_party_with_actor):
-            raise StandardsRefusal(
-                refusal_self_recorded_commit_observation(contribution_id, commit),
-                status=403,
-            )
 
 
 # -- R4 Applicability Matcher -------------------------------------------------
@@ -4369,12 +4574,12 @@ def validate_reviewer_checks(
 def _resolve_mechanical_rule_from_ci(rule, commit, commit_obs):
     ci_list = (commit_obs or {}).get('ci_checks') or []
     matched = None
-    for entry in ci_list:
+    for entry in reversed(ci_list):
         if entry.get('rule_id') == rule['id']:
             matched = entry
             break
     if matched is None:
-        for entry in ci_list:
+        for entry in reversed(ci_list):
             if (
                 entry.get('rule_id') is None
                 and entry.get('tool') == rule['check']['tool']
@@ -5016,12 +5221,13 @@ def has_approve_operation_id(issue, contribution_id, operation_id):
     return False
 
 
-def find_approve_operation_id(issue, contribution_id):
-    """Return the latest ``approve`` operation_id for ``contribution_id`` in ``issue``, or None."""
+def find_approve_operations(issue, contribution_id):
+    """Return ordered unique ``approve`` ``operation_id``s for ``contribution_id`` in ``issue``."""
     if not isinstance(issue, dict) or not contribution_id:
-        return None
+        return []
     cid = str(contribution_id)
-    found = None
+    found = []
+    seen = set()
     for comment in issue.get('comments') or ():
         if not isinstance(comment, dict):
             continue
@@ -5032,43 +5238,151 @@ def find_approve_operation_id(issue, contribution_id):
             rec = parse_json(raw[len(REVIEW_PREFIX):])
         except ValueError:
             continue
+        op_id = rec.get('operation_id') if isinstance(rec, dict) else None
         if (
             isinstance(rec, dict)
             and rec.get('operation') == 'approve'
             and str(rec.get('contribution') or '') == cid
-            and isinstance(rec.get('operation_id'), str)
+            and isinstance(op_id, str)
+            and op_id
+            and op_id not in seen
         ):
-            found = rec['operation_id']
+            seen.add(op_id)
+            found.append(op_id)
     for rec in issue.get('review_records') or ():
+        op_id = rec.get('operation_id') if isinstance(rec, dict) else None
         if (
             isinstance(rec, dict)
             and rec.get('kind') == 'approve'
             and str(rec.get('contribution_id') or '') == cid
-            and isinstance(rec.get('operation_id'), str)
+            and isinstance(op_id, str)
+            and op_id
+            and op_id not in seen
         ):
-            found = rec['operation_id']
+            seen.add(op_id)
+            found.append(op_id)
     return found
 
 
-def read_signoff_for_contribution(store, contribution_id, expected_commit=None, approve_operation_id=None):
-    """Read a delivery's sign-off, refusing carryover if ``expected_commit`` differs (R8)."""
-    so = store.read_signoff(contribution_id, approve_operation_id=approve_operation_id)
-    if not isinstance(so, dict):
-        return None
-    if expected_commit is not None and str(so.get('commit') or '').lower() != str(expected_commit).lower():
-        return None
-    # Refresh live latest_register_version and reviewer tally on read (strictly read-only).
-    status, head, _ = store.inspect_register_raw()
-    if status == 'active' and so.get('register_version') is not None:
-        so = dict(so)
-        so['latest_register_version'] = head['current_version']
-        so['newer_register_version_exists'] = int(so['register_version']) < head['current_version']
-    rev = so.get('reviewer') or {}
+def find_approve_operation_id(issue, contribution_id):
+    """Return the latest ``approve`` operation_id for ``contribution_id`` in ``issue``, or None."""
+    ops = find_approve_operations(issue, contribution_id)
+    return ops[-1] if ops else None
+
+
+def _refresh_signoff_view(store, so, status_and_head=None):
+    out = dict(so)
+    out.pop('earlier_sign_offs', None)
+    status, head = (
+        status_and_head
+        if status_and_head is not None
+        else store.inspect_register_raw()[:2]
+    )
+    if status == 'active' and out.get('register_version') is not None:
+        out['latest_register_version'] = head['current_version']
+        out['newer_register_version_exists'] = int(out['register_version']) < head['current_version']
+    rev = out.get('reviewer') or {}
     tally_actor = rev.get('recommended_by') or rev.get('actor')
     if tally_actor:
-        so = dict(so)
-        so['reviewer_must_not_applicable_total'] = derive_reviewer_must_na_counts(store, tally_actor)
-    return so
+        out['reviewer_must_not_applicable_total'] = derive_reviewer_must_na_counts(store, tally_actor)
+    return out
+
+
+def read_signoffs_for_contribution(
+    store,
+    contribution_id,
+    expected_commit=None,
+    *,
+    issue=None,
+    approve_operation_id=None,
+):
+    """Return chronological ``[earliest, ..., latest]`` sign-offs for ``contribution_id`` (R8)."""
+    cid = str(contribution_id)
+    exp_lower = str(expected_commit).lower() if expected_commit is not None else None
+    issue_ops = list(find_approve_operations(issue, cid))
+    raw_items = []
+    seen_ops = set()
+    for op_id in issue_ops:
+        so = store.read_signoff(cid, approve_operation_id=op_id)
+        if not isinstance(so, dict):
+            continue
+        if exp_lower is not None and str(so.get('commit') or '').lower() != exp_lower:
+            continue
+        seen_ops.add(str(so.get('operation_id') or op_id))
+        raw_items.append(so)
+
+    extra_committed = []
+    for so in store.list_committed_signoffs():
+        if not isinstance(so, dict) or str(so.get('contribution_id') or '') != cid:
+            continue
+        if exp_lower is not None and str(so.get('commit') or '').lower() != exp_lower:
+            continue
+        op_id = str(so.get('operation_id') or '')
+        if op_id and op_id in seen_ops:
+            continue
+        if op_id:
+            seen_ops.add(op_id)
+        extra_committed.append(so)
+    if extra_committed:
+        extra_committed.sort(
+            key=lambda s: (
+                str(s.get('created_at') or ''),
+                str(s.get('approval_comment_id') or ''),
+                str(s.get('operation_id') or ''),
+            )
+        )
+        raw_items = extra_committed + raw_items
+
+    if isinstance(approve_operation_id, str) and approve_operation_id and approve_operation_id not in seen_ops:
+        so = store.read_signoff(cid, approve_operation_id=approve_operation_id)
+        if isinstance(so, dict) and (
+            exp_lower is None or str(so.get('commit') or '').lower() == exp_lower
+        ):
+            raw_items.append(so)
+
+    if not raw_items:
+        return []
+    status_and_head = store.inspect_register_raw()[:2]
+    return [_refresh_signoff_view(store, item, status_and_head) for item in raw_items]
+
+
+def read_signoff_for_contribution(
+    store,
+    contribution_id,
+    expected_commit=None,
+    approve_operation_id=None,
+    *,
+    issue=None,
+    strict_operation_id=False,
+):
+    """Read a delivery's sign-off, refusing carryover if ``expected_commit`` differs (R8).
+
+    When ``strict_operation_id=True``, return only the sign-off for ``approve_operation_id``
+    (so an exact retry of an earlier approval returns its own sign-off). Otherwise return the
+    latest sign-off for ``contribution_id`` with ``earlier_sign_offs`` attached oldest-first.
+    """
+    if strict_operation_id:
+        if approve_operation_id is None:
+            return None
+        so = store.read_signoff(contribution_id, approve_operation_id=approve_operation_id)
+        if not isinstance(so, dict):
+            return None
+        if expected_commit is not None and str(so.get('commit') or '').lower() != str(expected_commit).lower():
+            return None
+        return _refresh_signoff_view(store, so)
+
+    all_signoffs = read_signoffs_for_contribution(
+        store,
+        contribution_id,
+        expected_commit=expected_commit,
+        issue=issue,
+        approve_operation_id=approve_operation_id,
+    )
+    if not all_signoffs:
+        return None
+    latest = dict(all_signoffs[-1])
+    latest['earlier_sign_offs'] = list(all_signoffs[:-1])
+    return latest
 
 
 # -- Readable Sign-Off Renderers (R8a: "Checked against", never "certified") ---
@@ -5217,6 +5531,27 @@ def render_signoff_markdown(signoff):
                 waiver_txt,
             )
         )
+    earlier = signoff.get('earlier_sign_offs') or []
+    if earlier:
+        lines.extend([
+            '',
+            '## Earlier Approvals on This Delivery',
+            '',
+        ])
+        for prev_so in earlier:
+            if not isinstance(prev_so, dict):
+                continue
+            prev_rev = (prev_so.get('reviewer') or {}).get('actor') or 'unknown'
+            lines.append(
+                '- `%s` at `%s` (gate `%s`, `must` not-applicable: %d on delivery, %d total across project)'
+                % (
+                    prev_rev,
+                    prev_so.get('created_at'),
+                    prev_so.get('gate_mode'),
+                    int(prev_so.get('must_not_applicable_count') or 0),
+                    int(prev_so.get('reviewer_must_not_applicable_total') or 0),
+                )
+            )
     return '\n'.join(lines) + '\n'
 
 
@@ -5266,6 +5601,20 @@ def render_signoff_text(signoff):
                 chk.get('result'),
                 _format_evidence_summary(chk),
                 w_suffix,
+            )
+        )
+    for prev_so in signoff.get('earlier_sign_offs') or ():
+        if not isinstance(prev_so, dict):
+            continue
+        prev_rev = (prev_so.get('reviewer') or {}).get('actor') or 'unknown'
+        lines.append(
+            '  earlier_sign_off: %s at %s (gate: %s, must not_applicable: %d here, %d total)'
+            % (
+                prev_rev,
+                prev_so.get('created_at'),
+                prev_so.get('gate_mode'),
+                int(prev_so.get('must_not_applicable_count') or 0),
+                int(prev_so.get('reviewer_must_not_applicable_total') or 0),
             )
         )
     return '\n'.join(lines)
@@ -5421,6 +5770,7 @@ def brief_standards_block(
             cid,
             expected_commit=commit,
             approve_operation_id=find_approve_operation_id(issue, cid),
+            issue=issue,
         )
         if so is not None:
             block['sign_off'] = (
@@ -6043,6 +6393,7 @@ def endpoint_standards_action(root, path, name, actor, args, attachments, run_fn
             cid,
             expected_commit=expected_commit,
             approve_operation_id=find_approve_operation_id(issue, cid),
+            issue=issue,
         )
         if so is None:
             raise StandardsRefusal('Task %s has no delivery sign-off for its current contribution.' % task_id, status=404)
@@ -6318,6 +6669,7 @@ def _web_standards_action_inner(root, path, project, request, authority_config, 
                     cid,
                     expected_commit=expected_commit,
                     approve_operation_id=find_approve_operation_id(issue, cid),
+                    issue=issue,
                 )
                 if so is None:
                     raise StandardsRefusal(
@@ -6594,6 +6946,7 @@ def admin_standards_command(root, path, project, args, run_bd_fn, operators_list
                 cid,
                 expected_commit=expected_commit,
                 approve_operation_id=find_approve_operation_id(issue, cid),
+                issue=issue,
             )
         if so is None:
             raise StandardsRefusal(

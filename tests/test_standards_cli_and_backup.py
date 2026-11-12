@@ -361,6 +361,20 @@ class StandardsCliAndBackupTests(Harness):
             is_person_session=True, is_coordinator_or_owner=False,
             same_party_checker=lambda other: other == 'person:alice',
         )
+        store.commit_signoff('14', 'op-bkp-app-1', {
+            'schema_version': 1, 'status': 'committed', 'contribution_id': '14',
+            'commit': commit_sha, 'operation_id': 'op-bkp-app-1',
+            'reviewer': {'actor': 'cora-op'},
+            'checks': [{'rule_id': 'BKP-1', 'severity': 'must', 'result': 'not_applicable'}],
+            'created_at': '2026-11-12T00:00:00Z',
+        })
+        store.commit_signoff('14', 'op-bkp-app-2', {
+            'schema_version': 1, 'status': 'committed', 'contribution_id': '14',
+            'commit': commit_sha, 'operation_id': 'op-bkp-app-2',
+            'reviewer': {'actor': 'olive-op'},
+            'checks': [{'rule_id': 'BKP-1', 'severity': 'must', 'result': 'pass'}],
+            'created_at': '2026-11-12T00:05:00Z',
+        })
 
         # 1) Standards backup rides outside .coordination.json so legacy rollback ignores it cleanly!
         admin.validate_coordination_files({})
@@ -413,6 +427,12 @@ class StandardsCliAndBackupTests(Harness):
         self.assertEqual(2, restored_alpha_view['version'])
         self.assertEqual('block', rs.get_gate_view(restored_store)['mode'])
         self.assertEqual(1, len(rs.list_drafts_view(restored_store)['items']))
+        self.assertEqual(2, len(restored_store.list_committed_signoffs()))
+        self.assertEqual(1, rs.derive_reviewer_must_na_counts(restored_store, 'cora-op'))
+        self.assertEqual(
+            'op-bkp-app-1',
+            restored_store.read_signoff('14', approve_operation_id='op-bkp-app-1')['operation_id'],
+        )
         self.assertEqual(commit_sha, restored_store.read_commit_observation(commit_sha)['commit'])
         self.assertEqual(1, len(rs.list_waivers_view(restored_store, 'alpha-1')['items']))
 
