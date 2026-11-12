@@ -20,11 +20,12 @@ import * as rooms from './views/rooms.js';
 import * as releases from './views/releases.js';
 import * as designs from './views/designs.js';
 import * as trace from './views/trace.js';
+import * as standards from './views/standards.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
   home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
-  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, program: program.page, how: how.page,
+  project: project.overview, reviews: project.reviews, standards: standards.page, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, program: program.page, how: how.page,
   newTask: task.create, task: task.detail,
   lanes: project.lanesPage,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
@@ -85,6 +86,7 @@ export async function start(root, options = {}) {
     return [
       ['', 'Tasks'],
       ['reviews', 'Reviews'],
+      ['standards', 'Standards'],
       ['releases', 'Releases'],
       ctx.features.requirements && ['requirements', 'Requirements'],
       ['records', 'Records'],

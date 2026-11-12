@@ -2662,3 +2662,18 @@ names its accepted replacement in `replacement` (or null when none is readable);
 asserted when coverage is incomplete. No field grants a role, a read or runtime
 registration. Interface schema verification and `breaking-without-version` evidence
 arrive only with slice 3b.
+
+## Review standards, waivers, and delivery sign-offs
+
+When a project has a standards register (`head.json` or `versions/` entry), `brief` includes an additive `standards` object (`status`, `register_version`, `gate_mode`, `applicable_rules` for workers, `rules` + `diff_status` + `reviewer_must_na_count` for reviewers, and `sign_off` once approved). Projects with no register omit `standards` completely.
+
+- **Contributor SSH / `client.py` (`standards`):**
+  - Read & draft commands: `standards show [--version N] [--effective] [--json]`, `standards history [--json]`, `standards lint [--json]`, `standards draft-list [--status pending|accepted|rejected] [--json]`, `standards draft-propose --file FILE [--reason TEXT] [--json]`, `standards waivers TASK [--json]`, `standards sign-off TASK [--contribution ID] [--format text|json|markdown] [--out PATH]`, `standards notifications [--json]`, and client-local `standards inspect-commit --repo DIR --commit SHA [--target-ref REF]`.
+  - Person-only mutations (`put`, `rule-edit`, `draft-decide`, `set-gate`, `waive`, `record-commit`, `owner-departed`) are unconditionally refused on the SSH contributor endpoint (`403`); run them via a signed-in person web session or `admin.py standards ...` on the host.
+- **Host operator CLI (`admin.py standards`):**
+  - `admin.py standards show|history|lint|put|rule-edit|draft-list|draft-decide|set-gate|record-commit|waive|waivers|sign-off|owner-departed|notifications --project PROJECT ...` (mutations verify `--actor OPERATOR` via `require_configured_operator`).
+- **HTTP routes & `http_client.py` (`standards`):**
+  - `GET /v1/projects/{pid}/standards[?version=N]`, `PUT /v1/projects/{pid}/standards` (person session), `GET /v1/projects/{pid}/standards/versions`, `PATCH /v1/projects/{pid}/standards/rules/{rid}` (person session), `GET /v1/projects/{pid}/standards/drafts[?status=...]`, `POST /v1/projects/{pid}/standards/drafts` (`CAP_REVIEWS` or `CAP_TASKS`), `POST /v1/projects/{pid}/standards/drafts/{did}/decision` (person session), `PUT /v1/projects/{pid}/standards/gate` (person session + `CAP_COORDINATE`), `GET /v1/projects/{pid}/standards/commits/{commit}`, `POST /v1/projects/{pid}/standards/commits/{commit}` (`verify` credential or coordinator person session), `GET /v1/projects/{pid}/tasks/{tid}/waivers`, `POST /v1/projects/{pid}/tasks/{tid}/waivers` (person session), `GET /v1/projects/{pid}/tasks/{tid}/sign-off`, and `GET /v1/projects/{pid}/tasks/{tid}/sign-off.md`.
+  - `POST /v1/projects/{pid}/worker-credentials` accepts `scopes: ["verify"]` from `owner` or `coordinator` (`CAP_COORDINATE`); a `verify` credential is closed to every route except `POST /v1/projects/{pid}/standards/commits/{commit}`.
+  - `review` payloads (`request-changes`, `recommend`, `approve`) accept optional `checks`, `declared_tool`, `declared_model`, and (on `approve`) `adopt_recommendation`; `Kind: contribution-review-v1` and `Kind: review-recommendation-v1` tracker comments remain unchanged.
+

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb.570-reviews-standards-check-records-and-gate-r1",
+  "key": "reviews.standards-check-records-and-gate",
+  "name": "Review standards applicability, validated check records, verifier commit observations, warn/block gate, and brief rules",
+  "aliases": [
+    "standards check records",
+    "standards warn block gate",
+    "standards set-gate",
+    "verifier commit observation",
+    "verify credential",
+    "adopt_recommendation",
+    "file:line citation validation"
+  ],
+  "summary": "Applicable rules for a contribution are derived from trusted changed paths (serving_repos.<pid> merge-base diff with --no-renames or independent verifier commit observations; never author-supplied base_commit or file lists, falling back to diff_unverified) plus task labels and kinds, and are projected into worker and reviewer briefs. Judgement pass check records require server-validated file:line citations against regular text blobs in the commit tree (inspected outside the project lock from the self-contained verified bundle under a bounded O_NOFOLLOW fetch lock, serving_repo, or verifier tree_files) or command+exit_code evidence; fail cites a review item_id; mechanical rules read verifier-recorded CI observations (unverified when absent, refusing reviewer pass). Standalone verify credentials stamp their issuing person's party and enforce author/assignee/reviewer/approver independence. The per-project warn/block gate defaults to warn (recording would_have_refused without blocking) and fails closed in block mode (or when gate.json is damaged).",
+  "requirements": [],
+  "anchors": [
+    "docs/REVIEWS.md#applicability-check-records-citations-and-verifier-ci-observations-r4-r6-r9-r15",
+    "docs/REVIEWS.md#gate-modes-single-delivery-waivers-and-context-pinned-sign-offs-r7-r8-r8a-r10"
+  ],
+  "code": [
+    "review_standards.py::inspect_delivery_git",
+    "review_standards.py::validate_citation_against_tree",
+    "review_standards.py::record_commit_observation",
+    "review_standards.py::evaluate_applicability",
+    "review_standards.py::validate_reviewer_checks",
+    "review_standards.py::evaluate_approval_signoff",
+    "review_standards.py::set_gate_mode",
+    "review_standards.py::brief_standards_block",
+    "work.py::execute",
+    "briefing.py::brief",
+    "http_authority.py::credential_capabilities",
+    "http_service.py::ApiHandler.standards_gate_put",
+    "http_service.py::ApiHandler.standards_commit_record",
+    "http_service.py::ApiHandler.reviews_add"
+  ],
+  "tests": [
+    "tests/test_review_standards.py",
+    "tests/test_http_review_standards.py",
+    "tests/test_standards_cli_and_backup.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "reviews",
+    "standards",
+    "verification",
+    "http"
+  ]
+}

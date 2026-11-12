@@ -442,6 +442,11 @@ details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(-
 /* ---------- side column on the task page (wide screens) ---------- */
 .detail .side .panel-body { gap: 10px; }
 
+/* ---------- review standards & sign-off cards ---------- */
+.signoff-card { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+.standards-draft { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; display: grid; gap: 6px; }
+.standards-table td { vertical-align: top; }
+
 /* ---------- phone width ---------- */
 @media (max-width: 760px) {
   .summary { grid-template-columns: minmax(0, 1fr); }

@@ -998,7 +998,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: read the HTTP route serves under CAP_COORDINATE; it checks no capability itself, so no bound key
 #: may name it.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
-                      'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
+                      'web-standards','assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
                       'task-file','room-decision','delegation','decision-attest','web-switches')
 
 def key_project_refusal(request,key_projects):
@@ -1261,6 +1261,8 @@ READ_ONLY_ACTIONS={
     # operation identity and stays exclusive.
     'web-release':lambda args,operation:operation=='query',
     'web-guidance':_web_guidance_read_only,
+    'standards':lambda args,operation:__import__('review_standards').endpoint_standards_read_only(args,operation),
+    'web-standards':lambda args,operation:__import__('review_standards').web_standards_read_only(args,operation),
     # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
     # the one table, not a hand-coded LOCK_SH at its own call site. task-assign is
     # deliberately absent: it is a write and stays exclusive.
@@ -1558,7 +1560,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
     # Host notes repeat registry ownership at the private service before any read/effect.
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation','decision-attest'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','web-standards','standards','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation','decision-attest'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1697,6 +1699,14 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         # scope this endpoint computed for its own callers stays authoritative for them.
         lanes_scope=lanes_scope_requested(
             lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
+        git_obs=None
+        if action=='review':
+            import review_standards
+            def _show_single_prelock(tid):
+                out,_=native.split(native.run(native.argv(root,path,actor,['show',tid,'--json','--include-comments']),environment(root)))
+                return out
+            git_obs=review_standards.inspect_review_git_prelock(
+                root,path,name,args,request.get('attachments',{}),_show_single_prelock)
         def work_effect():
             read_context = {}
             if action in ('work', 'wait') and args[:1] != ['summary']:
@@ -1708,6 +1718,26 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                         read_context['authority_state'] = http_authority.read_state(store)
                     except Exception:
                         read_context['authority_state'] = None
+            if action=='review' and authority_config is not None:
+                try:
+                    import http_authority
+                    import review_standards
+                    st=http_authority.read_state(authority_config.store)
+                    _,active_person,same_party_pair=review_standards._build_state_person_helpers(st,name)
+                    auth_desc=request.get('authority') if isinstance(request.get('authority'),dict) else {}
+                    uid=auth_desc.get('user_id') if isinstance(auth_desc.get('user_id'),str) else None
+                    read_context['standards_context']={
+                        'actor_user_id':uid,
+                        'actor_owner_person':uid,
+                        'actor_via':auth_desc.get('via','web'),
+                        'active_person_checker':active_person,
+                        'same_party_pair':same_party_pair,
+                        'same_party_with_actor':lambda cand:(same_party_pair(actor,cand) or (bool(uid) and same_party_pair(uid,cand))),
+                    }
+                except Exception:
+                    pass
+            if git_obs is not None:
+                read_context['git_observation']=git_obs
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,
                                 verifiers=configured_verifiers(root),
@@ -1843,6 +1873,42 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         operation=request_operation(request)
         with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args,operation)):
             return web_action(path,name,request,authority_config,configured_operators(root))
+    if action=='web-standards':
+        from review_standards import web_standards_action, web_standards_request_operation
+        args=request.get('args',[])
+        operation=web_standards_request_operation(request)
+        run_warnings=[]
+        def run_std_web(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args,operation)):
+            return web_standards_action(root,path,name,request,authority_config,configured_operators(root),run_std_web)
+    if action=='standards':
+        import review_standards
+        args=request.get('args',[])
+        run_warnings=[]
+        def run_std(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        if review_standards.endpoint_standards_read_only(args):
+            with held_coordination_lock(path,shared=True):
+                result,_=review_standards.endpoint_standards_action(
+                    root,path,name,actor,args,request.get('attachments',{}),run_std,configured_operators(root))
+            rendered = result if isinstance(result, str) else json.dumps(result,ensure_ascii=False,indent=2)+'\n'
+            if not rendered.endswith('\n'):rendered += '\n'
+            return {'returncode':0,'stdout':rendered,'stderr':warning_text(run_warnings)}
+        tracker=review_standards._StandardsFileEffect()
+        def std_effect():
+            result,wrote=review_standards.endpoint_standards_action(
+                root,path,name,actor,args,request.get('attachments',{}),run_std,configured_operators(root))
+            if wrote:tracker.mark_write()
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':warning_text(run_warnings)}
+        with held_coordination_lock(path,shared=False):
+            return guarded_write(root,request,journal_path(path),std_effect,
+                                 authority_config=authority_config,
+                                 require_authority=require_authority,runner=tracker)
     if action=='guidance':
         # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
         # host/SSH guidance action is read-only except for the caller's acknowledgement.
@@ -2632,6 +2698,13 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             if warnings:run_warnings.append(warnings)
             return stdout
         runner=NativeRunner(run, project=path, bounded=bounded)
+        brief_git_obs=None
+        if action=='brief':
+            import review_standards
+            def _show_single_brief_prelock(tid):
+                out,_=native.split(native.run(native.argv(root,path,actor,['show',tid,'--json','--include-comments']),environment(root)))
+                return out
+            brief_git_obs=review_standards.inspect_brief_git_prelock(root,path,name,args,_show_single_brief_prelock)
         def briefing_effect():
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
@@ -2640,7 +2713,8 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                                                              independent_approval=rules['independent_approval'],
                                                              owners=owner_loader(path,'independent_approval')
                                                              if rules['independent_approval'] else None,
-                                                             identity_names=assignee_display_names(root,path,authority_config)),'stderr':''.join(run_warnings)}
+                                                             identity_names=assignee_display_names(root,path,authority_config),
+                                                             git_observation=brief_git_obs),'stderr':''.join(run_warnings)}
         with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
@@ -3658,6 +3732,7 @@ CONTRIBUTOR_COMMANDS = (
      "the program view of a program project: its areas, interfaces and requirements' coverage"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
+    ('standards ...', 'review standards register, drafts, waivers, and delivery sign-offs'),
     ('coordinator ...', 'the coordinator reads for this project'),
     ('refresh', 'refresh the cached export the reads are answered from'),
     ('view [NAME]', 'render one of the project views'),
@@ -3694,7 +3769,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
                   'wait','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
-                  'coordinator')
+                  'standards','coordinator')
 
 
 def contributor_command_names():
@@ -4064,6 +4139,8 @@ def main():
             # refusal explicitly. HTTP never decides this from words in stderr.
             answer['stderr']=f'ValueError: {e}\n'
             answer['refused']='coordinator-rule'
+            if type(getattr(e,'status',None)) is int:
+                answer['standards_status']=e.status
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
             # The export could not be read (bd failed, or answered something that is not

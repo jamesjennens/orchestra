@@ -81,6 +81,8 @@ LAST_COMPLETE_SUFFIX='.coordination.last-complete.json'
 #: every digest before it writes one byte.
 ROOMS_SUFFIX='.rooms.json'
 ROOMS_LAST_COMPLETE_SUFFIX='.rooms.last-complete.json'
+STANDARDS_SUFFIX='.standards.json'
+STANDARDS_LAST_COMPLETE_SUFFIX='.standards.last-complete.json'
 
 #: Additive key in a COMPLETE coordination sidecar that records a manifest of the native
 #: backup directory at the moment that generation completed. ``restore-new`` recomputes it
@@ -812,6 +814,64 @@ def delivery_serve_max_bytes(root, doc=None, warnings=None):
         % (value, DELIVERY_SERVE_MAX_BYTES_CAP, DELIVERY_SERVE_MAX_BYTES),
     )
     return DELIVERY_SERVE_MAX_BYTES
+
+
+def serving_repos(root, doc=None, warnings=None):
+    """Configured per-project local bare/serving git repositories from ``deployment.private.json``."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return {}
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return {}
+    value = doc.get('serving_repos')
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        _warn_deployment_setting(
+            warnings,
+            'deployment serving_repos is %r, not a mapping of project -> absolute path; reading it as empty' % (value,),
+        )
+        return {}
+    result = {}
+    for pid, item in value.items():
+        if not isinstance(pid, str) or not pid.strip():
+            continue
+        normalized, problem = _normalize_delivery_root_entry(item)
+        if problem is not None:
+            _warn_deployment_setting(
+                warnings,
+                'deployment serving_repos[%r] is %r (%s); skipping entry' % (pid, item, problem),
+            )
+            continue
+        result[pid] = normalized
+    return result
+
+
+def serving_target_ref(root, doc=None, warnings=None):
+    """Configured per-project target ref (default ``refs/heads/main``) from ``deployment.private.json``."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return {}
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return {}
+    value = doc.get('serving_target_ref')
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        _warn_deployment_setting(
+            warnings,
+            'deployment serving_target_ref is %r, not a mapping of project -> ref; reading it as empty' % (value,),
+        )
+        return {}
+    result = {}
+    for pid, ref_val in value.items():
+        if isinstance(pid, str) and pid.strip() and isinstance(ref_val, str) and ref_val.strip():
+            result[pid] = ref_val.strip()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -5102,6 +5162,10 @@ def backup_project(root,name):
                 rooms_record=rooms.backup_record(path)
                 if rooms_record is not None:
                     atomic(root/'backups'/(name+ROOMS_SUFFIX),rooms_record)
+                import review_standards
+                standards_record=review_standards.backup_record(path)
+                if standards_record is not None:
+                    atomic(root/'backups'/(name+STANDARDS_SUFFIX),standards_record)
                 # The new generation is now native + complete sidecar + promoted journal;
                 # from here the guard must not put the previous sidecar back. SIGTERM is
                 # held across the promotion and the flag together: a stop landing between
@@ -5118,6 +5182,8 @@ def backup_project(root,name):
                 _atomic_copy(bundle,last_complete)
                 if rooms_record is not None:
                     _atomic_copy(root/'backups'/(name+ROOMS_SUFFIX),last_complete_rooms_path(root,name))
+                if standards_record is not None:
+                    _atomic_copy(root/'backups'/(name+STANDARDS_SUFFIX),last_complete_standards_path(root,name))
             finally:
                 # On ANY path that is not a normally-finished client - SIGTERM/SIGINT, the
                 # explicit ceiling, an exception - stop the whole process group here, while
@@ -5497,6 +5563,8 @@ def backup_status_record(results,scope,generated_at,http_state=None):
                            'coordination':'backups/'+item['name']+'.coordination.json'}
             if item.get('rooms') is not None:
                 entry['rooms']=item['rooms']
+            if item.get('standards') is not None:
+                entry['standards']=item['standards']
         else:
             entry['reason']=item['reason']
         projects.append(entry)
@@ -5573,6 +5641,24 @@ def validate_backup_status(record):
                             name,name,ROOMS_LAST_COMPLETE_SUFFIX))
                     if not re.fullmatch(r'[0-9a-f]{64}',last.get('sha256') or ''):
                         raise ValueError('Rooms last_complete status for %s needs its sha256'%name)
+            standards=entry.get('standards')
+            if standards is not None:
+                if not isinstance(standards,dict) or set(standards)!={'file','sha256','last_complete'} \
+                        and set(standards)!={'file','sha256'}:
+                    raise ValueError('Standards backup status for %s must name file, sha256 and optionally last_complete'%name)
+                if standards['file']!='backups/'+name+STANDARDS_SUFFIX:
+                    raise ValueError('Standards backup status for %s must name backups/%s%s'%(name,name,STANDARDS_SUFFIX))
+                if not re.fullmatch(r'[0-9a-f]{64}',standards.get('sha256') or ''):
+                    raise ValueError('Standards backup status for %s needs the standards file sha256'%name)
+                slast=standards.get('last_complete')
+                if slast is not None:
+                    if not isinstance(slast,dict) or set(slast)!={'file','sha256'}:
+                        raise ValueError('Standards last_complete status for %s must name file and sha256'%name)
+                    if slast['file']!='backups/'+name+STANDARDS_LAST_COMPLETE_SUFFIX:
+                        raise ValueError('Standards last_complete status for %s must name backups/%s%s'%(
+                            name,name,STANDARDS_LAST_COMPLETE_SUFFIX))
+                    if not re.fullmatch(r'[0-9a-f]{64}',slast.get('sha256') or ''):
+                        raise ValueError('Standards last_complete status for %s needs its sha256'%name)
         else:
             reason=entry.get('reason')
             if not isinstance(reason,str) or not reason.strip():
@@ -5583,6 +5669,8 @@ def validate_backup_status(record):
                 raise ValueError('Incomplete backup status for %s must not carry a degraded message'%name)
             if 'rooms' in entry:
                 raise ValueError('Incomplete backup status for %s must not carry a rooms backup'%name)
+            if 'standards' in entry:
+                raise ValueError('Incomplete backup status for %s must not carry a standards backup'%name)
     expected='complete' if complete==len(projects) else 'incomplete'
     http_state=record.get('http_state')
     if http_state is not None:
@@ -5926,7 +6014,8 @@ def backup_copy_skips(root,record):
             add(name,'the last run recorded %s, not complete'%entry['status'])
     return sorted(reasons.items())
 
-def backup_copy_generation(entry,sidecar_bytes,rooms_bytes=None,rooms_last_bytes=None):
+def backup_copy_generation(entry,sidecar_bytes,rooms_bytes=None,rooms_last_bytes=None,
+                           standards_bytes=None,standards_last_bytes=None):
     """The generation of the pair a copy run wrote, named from what the destination holds.
 
     Native directory, complete sidecar, operation-journal snapshot and—when the project
@@ -5942,6 +6031,10 @@ def backup_copy_generation(entry,sidecar_bytes,rooms_bytes=None,rooms_last_bytes
         generation['rooms_sha256']=hashlib.sha256(rooms_bytes).hexdigest()
     if rooms_last_bytes is not None:
         generation['rooms_last_complete_sha256']=hashlib.sha256(rooms_last_bytes).hexdigest()
+    if standards_bytes is not None:
+        generation['standards_sha256']=hashlib.sha256(standards_bytes).hexdigest()
+    if standards_last_bytes is not None:
+        generation['standards_last_complete_sha256']=hashlib.sha256(standards_last_bytes).hexdigest()
     # Through the record guard, not a bare json.loads: a sidecar an older kit or an
     # operator wrote is still text this kit did not just create, and a deeply nested one
     # must read as "no manifest to name", never as a RecursionError out of a copy run.
@@ -6223,13 +6316,19 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             sidecar=backups/(name+'.coordination.json')
             rooms_file=backups/(name+ROOMS_SUFFIX)
             rooms_last=backups/(name+ROOMS_LAST_COMPLETE_SUFFIX)
+            standards_file=backups/(name+STANDARDS_SUFFIX)
+            standards_last=backups/(name+STANDARDS_LAST_COMPLETE_SUFFIX)
             journal=journal_snapshot_path(root,name)
             if native.is_symlink() or sidecar.is_symlink() or rooms_file.is_symlink() \
-                    or rooms_last.is_symlink() or journal.is_symlink():
+                    or rooms_last.is_symlink() or standards_file.is_symlink() \
+                    or standards_last.is_symlink() or journal.is_symlink():
                 raise ValueError('Backup pair paths must not be symlinks')
             for rooms_path in (rooms_file,rooms_last):
                 if rooms_path.exists() and not rooms_path.is_file():
                     raise ValueError('The rooms backup %s must be a regular file or absent'%rooms_path.name)
+            for std_path in (standards_file,standards_last):
+                if std_path.exists() and not std_path.is_file():
+                    raise ValueError('The standards backup %s must be a regular file or absent'%std_path.name)
             project=root/'projects'/name
             # This project's backup lock is held for its whole staging; it is the same lock
             # ``backup_project`` takes, so no concurrent backup can rewrite the native
@@ -6284,6 +6383,13 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
                     if rooms_last.is_file():
                         staged_rooms_last=staging/(name+ROOMS_LAST_COMPLETE_SUFFIX)
                         _atomic_copy(rooms_last,staged_rooms_last)
+                    staged_standards=staged_standards_last=None
+                    if standards_file.is_file():
+                        staged_standards=staging/(name+STANDARDS_SUFFIX)
+                        _atomic_copy(standards_file,staged_standards)
+                    if standards_last.is_file():
+                        staged_standards_last=staging/(name+STANDARDS_LAST_COMPLETE_SUFFIX)
+                        _atomic_copy(standards_last,staged_standards_last)
                     if journal.is_file():
                         staged_journal=staging/journal.name
                         _atomic_copy(journal,staged_journal)
@@ -6309,11 +6415,13 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal,
                            backup_copy_generation(entry,read_regular_text(staging/(name+'.coordination.json'),raw=True),
                                                   read_regular_text(staged_rooms,raw=True) if staged_rooms is not None else None,
-                                                  read_regular_text(staged_rooms_last,raw=True) if staged_rooms_last is not None else None),
-                           staged_rooms,staged_rooms_last))
+                                                  read_regular_text(staged_rooms_last,raw=True) if staged_rooms_last is not None else None,
+                                                  read_regular_text(staged_standards,raw=True) if staged_standards is not None else None,
+                                                  read_regular_text(staged_standards_last,raw=True) if staged_standards_last is not None else None),
+                           staged_rooms,staged_rooms_last,staged_standards,staged_standards_last))
         # Every project staged: move each pair into place, replacing (not merging) the
         # destination, then publish the completeness record last.
-        for name,native_staged,sidecar_staged,journal_staged,generation,rooms_staged,rooms_last_staged in staged:
+        for name,native_staged,sidecar_staged,journal_staged,generation,rooms_staged,rooms_last_staged,std_staged,std_last_staged in staged:
             _replace_with(native_staged,destination/name)
             _replace_with(sidecar_staged,destination/(name+'.coordination.json'))
             if journal_staged is not None:
@@ -6327,6 +6435,15 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
                 print('Copied %s rooms last-complete: %s -> %s'%(
                     name,backups/(name+ROOMS_LAST_COMPLETE_SUFFIX),
                     destination/(name+ROOMS_LAST_COMPLETE_SUFFIX)))
+            if std_staged is not None:
+                _replace_with(std_staged,destination/(name+STANDARDS_SUFFIX))
+                print('Copied %s standards: %s -> %s'%(name,backups/(name+STANDARDS_SUFFIX),
+                                                       destination/(name+STANDARDS_SUFFIX)))
+            if std_last_staged is not None:
+                _replace_with(std_last_staged,destination/(name+STANDARDS_LAST_COMPLETE_SUFFIX))
+                print('Copied %s standards last-complete: %s -> %s'%(
+                    name,backups/(name+STANDARDS_LAST_COMPLETE_SUFFIX),
+                    destination/(name+STANDARDS_LAST_COMPLETE_SUFFIX)))
             copied.append(name)
             copied_meta.append({'name':name,'generation':generation})
             print('Copied %s: %s -> %s'%(name,backups/name,destination/name))
@@ -7071,6 +7188,8 @@ def backup_projects(root,names,all_projects=False,named_http_state=None):
             if degraded_fault:entry['degraded']=degraded_fault
             rooms_entry=rooms_status_entry(root,name)
             if rooms_entry is not None:entry['rooms']=rooms_entry
+            standards_entry=standards_status_entry(root,name)
+            if standards_entry is not None:entry['standards']=standards_entry
             results.append(entry)
             print(native)
             # kittrial-5bb.380: the task files beside the backup, and their size in the report. A failure
@@ -7318,6 +7437,79 @@ def restore_rooms(root,source,destination,without_rooms=False):
         raise ValueError('Cannot restore the rooms backup %s: %s'
                          %(path.relative_to(root).as_posix(),error)) from None
     return ('Restored %d rooms files from %s.'%(count,path.relative_to(root).as_posix()))
+
+def last_complete_standards_path(root,name):
+    validate_name(name)
+    return root/'backups'/(name+STANDARDS_LAST_COMPLETE_SUFFIX)
+
+def standards_status_entry(root,name):
+    canonical=root/'backups'/(name+STANDARDS_SUFFIX)
+    if canonical.is_symlink() or not canonical.is_file():
+        return None
+    entry={'file':canonical.relative_to(root).as_posix(),
+           'sha256':hashlib.sha256(read_regular_text(canonical,raw=True)).hexdigest()}
+    last=last_complete_standards_path(root,name)
+    if last.is_file() and not last.is_symlink():
+        entry['last_complete']={'file':last.relative_to(root).as_posix(),
+                                'sha256':hashlib.sha256(read_regular_text(last,raw=True)).hexdigest()}
+    return entry
+
+def complete_standards_backup(path):
+    path=Path(path)
+    if path.is_symlink():return None,'it is a symlink'
+    if not path.is_file():return None,None
+    try:
+        import review_standards
+        from export_requirements import parse_json as _parse_json
+        data=_parse_json(read_regular_text(path))
+        review_standards.validate_backup(data)
+        return data,None
+    except (OSError,ValueError,UnicodeDecodeError) as error:
+        return None,str(error) or 'it cannot be read'
+
+def standards_backup_outcome(root,source):
+    validate_name(source)
+    canonical=root/'backups'/(source+STANDARDS_SUFFIX)
+    fallback=last_complete_standards_path(root,source)
+    problems=[]
+    for path in (canonical,fallback):
+        data,problem=complete_standards_backup(path)
+        if data is not None:return 'answer',path,data,None
+        if problem is not None:problems.append((path,problem))
+    if problems:
+        return 'refuse',None,None,'; '.join('%s: %s'%(path.relative_to(root).as_posix(),problem)
+                                            for path,problem in problems)
+    return 'absent',None,None,None
+
+def unusable_standards_message(root,source,problem):
+    return ('The standards backup of %s cannot be used (%s). Nothing was changed: repair or remove '
+            'backups/%s and backups/%s, or restore without standards using '
+            '`restore-new %s DEST --without-standards`.'
+            %(source,problem,source+STANDARDS_SUFFIX,source+STANDARDS_LAST_COMPLETE_SUFFIX,source))
+
+def restore_standards(root,source,destination,without_standards=False):
+    outcome,path,data,problem=standards_backup_outcome(root,source)
+    if without_standards:
+        if outcome=='absent':
+            return None
+        if outcome=='answer':
+            return ('NOT restored (--without-standards): the standards backup %s and its last-complete copy; '
+                    'the tracker and coordination data restored without standards.'
+                    %path.relative_to(root).as_posix())
+        return ('NOT restored (--without-standards): the standards backup of %s (%s); the tracker and '
+                'coordination data restored without standards.'%(source,problem))
+    if outcome=='absent':
+        return None
+    if outcome=='refuse':
+        raise ValueError(unusable_standards_message(root,source,problem))
+    import review_standards
+    destination_path=project_dir(root,destination)
+    try:
+        count=review_standards.restore_files(destination_path,data)
+    except ValueError as error:
+        raise ValueError('Cannot restore the standards backup %s: %s'
+                         %(path.relative_to(root).as_posix(),error)) from None
+    return ('Restored %d standards files from %s.'%(count,path.relative_to(root).as_posix()))
 
 def coordination_backup(root,source):
     # None only for a truly legacy backup (no sidecar copy at all). A copy that exists but
@@ -11249,6 +11441,10 @@ def _main():
                    help='do not restore this backup set\'s separate rooms file (backups/PROJECT.rooms.json); '
                         'the tracker, coordination sidecar and journals restore as usual, without rooms. '
                         'A damaged rooms file otherwise refuses the restore before anything is created')
+    a.add_argument('--without-standards',action='store_true',dest='without_standards',
+                   help='do not restore this backup set\'s separate standards file (backups/PROJECT.standards.json); '
+                        'the tracker, coordination sidecar and journals restore as usual, without standards. '
+                        'A damaged standards file otherwise refuses the restore before anything is created')
     a.add_argument('--restore-http-state',action='store_true',dest='restore_http_state',
                    help='ALSO restore the runtime HTTP state pair this backup set carries (accounts, agents, '
                         'memberships; mode 0600). The ONLY way it comes back: without the flag a restore never '
@@ -11301,6 +11497,24 @@ def _main():
                    help='set the high-water mark to the current clock and clear clock suspicion (after a clock correction)')
     a.add_argument('--stats',action='store_true',
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
+    a=sub.add_parser('standards',allow_abbrev=False,
+                     help='manage project review standards, warn/block gate, waivers, commit observations, and departed owners')
+    a.add_argument('standards_op',choices=['show','lint','notifications','put','rule-edit','set-gate','waive','draft-decide','record-commit','owner-departed'])
+    a.add_argument('--project',required=True,action=_OnceFlag)
+    a.add_argument('--actor',default=None,action=_OnceFlag)
+    a.add_argument('--file',default=None,action=_OnceFlag)
+    a.add_argument('--reason',default=None,action=_OnceFlag)
+    a.add_argument('--mode',choices=['warn','block'],default=None,action=_OnceFlag)
+    a.add_argument('--rule',default=None,action=_OnceFlag)
+    a.add_argument('--task',default=None,action=_OnceFlag)
+    a.add_argument('--contribution',default=None,action=_OnceFlag)
+    a.add_argument('--commit',default=None,action=_OnceFlag)
+    a.add_argument('--until',default=None,action=_OnceFlag)
+    a.add_argument('--draft',default=None,action=_OnceFlag)
+    a.add_argument('--decision',choices=['accept','reject'],default=None,action=_OnceFlag)
+    a.add_argument('--owner',default=None,action=_OnceFlag)
+    a.add_argument('--version',type=int,default=None,action=_OnceFlag)
+    a.add_argument('--expected-version',type=int,default=None,dest='expected_version',action=_OnceFlag)
     args=p.parse_args()
     # kittrial-5bb.454 (the trust boundary): no host command acts under an HTTP-shaped actor or a look-alike. Asked
     # first, before the root or anything else is looked at, of the value of the command's own --actor option however
@@ -11398,6 +11612,15 @@ def _main():
             print('Project claiming setting set to %s; back up the project after changes.'
                   %result['claiming'])
             print(json.dumps(result,sort_keys=True))
+    elif args.command=='standards':
+        import review_standards
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        ops_list=operators(root,strict=(args.standards_op not in ('show','lint','notifications')))
+        vers_list=verifiers(root)
+        result=review_standards.admin_standards_command(
+            root,path,args.project,args,run_bd,ops_list,vers_list)
+        print(json.dumps(result,sort_keys=True,indent=2,ensure_ascii=False))
     elif args.command=='set-guidance':
         import fcntl
         from guidance import write_guidance
@@ -12556,6 +12779,11 @@ def _main():
                 raise ValueError(unusable_rooms_message(root,args.project,rooms_problem))
             if args.without_rooms and rooms_outcome=='answer':
                 args.rooms_skipped=rooms_path
+            standards_outcome,standards_path,standards_data,standards_problem=standards_backup_outcome(root,args.project)
+            if standards_outcome=='refuse' and not getattr(args,'without_standards',False):
+                raise ValueError(unusable_standards_message(root,args.project,standards_problem))
+            if getattr(args,'without_standards',False) and standards_outcome=='answer':
+                args.standards_skipped=standards_path
             # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
             # must fail the restore with no destination project, Dolt restore or
             # coordination files left behind.
@@ -12774,6 +13002,9 @@ def finish_restore(root,args,snapshot,step=None):
     rooms_line=restore_rooms(root,args.project,args.destination,
                              without_rooms=getattr(args,'without_rooms',False))
     if rooms_line:print(rooms_line)
+    standards_line=restore_standards(root,args.project,args.destination,
+                                     without_standards=getattr(args,'without_standards',False))
+    if standards_line:print(standards_line)
     # What the deployment-authority step at the END of this function needed: it does not run when
     # the merge-slot step below fails, so the notice must say what was not compared and not
     # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).

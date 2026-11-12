@@ -620,7 +620,8 @@ class Client:
                    summary=None, actor=None, key=None, repository=None, delivery=None,
                    supersedes=None, follows=None, contribution=None, items=None, resolutions=None,
                    reason=None, reviewer=None, request=None, item=None, disposition=None,
-                   verdict=None, method=None, sha256=None, bytes_=None, hold=None):
+                   verdict=None, method=None, sha256=None, bytes_=None, hold=None,
+                   checks=None, adopt_recommendation=None, declared_tool=None, declared_model=None):
         """Record one contribution/review operation.
 
         The canonical backend forwards exactly the fields the operation needs, so the
@@ -652,7 +653,9 @@ class Client:
                 'items': items, 'resolutions': resolutions, 'reason': reason,
                 'reviewer': reviewer, 'request': request, 'item': item,
                 'disposition': disposition, 'verdict': verdict, 'method': method,
-                'sha256': sha256, 'bytes': bytes_, 'hold': hold}
+                'sha256': sha256, 'bytes': bytes_, 'hold': hold,
+                'checks': checks, 'adopt_recommendation': adopt_recommendation,
+                'declared_tool': declared_tool, 'declared_model': declared_model}
         kept_nullable = {'operation_id'}
         if operation != 'recommend':
             kept_nullable.add('previous')
@@ -664,10 +667,19 @@ class Client:
         return self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
                             % (quote(project, safe=''), quote(task, safe='')), body, key=key)
 
-    def recommend(self, project, task, contribution, commit, verdict, summary, items=None, key=None):
+    def recommend(self, project, task, contribution, commit, verdict, summary, items=None, key=None,
+                  *, checks=None, declared_tool=None, declared_model=None):
         """Record a recommendation beside the review chain, with no previous record."""
+        extra = {}
+        if checks is not None:
+            extra['checks'] = checks
+        if declared_tool is not None:
+            extra['declared_tool'] = declared_tool
+        if declared_model is not None:
+            extra['declared_model'] = declared_model
         return self.add_review(project, task, 'recommend', contribution=contribution,
-                               commit=commit, verdict=verdict, summary=summary, items=items, key=key)
+                               commit=commit, verdict=verdict, summary=summary, items=items,
+                               key=key, **extra)
 
     def delivery(self, project, task, *, contribution=None):
         qs = ('?' + urlencode({'contribution': contribution})) if contribution is not None else ''
@@ -928,6 +940,58 @@ class Client:
         return self._write_record('POST', '/v1/projects/%s/capabilities/%s/aliases/reject'
                                   % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
 
+    # -- review standards and sign-offs (kittrial-5bb.570) ---------------------
+    def standards(self, project, *, version=None):
+        qs = ('?' + urlencode({'version': str(version)})) if version is not None else ''
+        return self.request('GET', '/v1/projects/%s/standards%s' % (quote(project, safe=''), qs))
+
+    def put_standards(self, project, body, key=None):
+        return self._write_record('PUT', '/v1/projects/%s/standards' % quote(project, safe=''), body, key)
+
+    def edit_standards_rule(self, project, rule_id, body, key=None):
+        return self._write_record('PATCH', '/v1/projects/%s/standards/rules/%s'
+                                  % (quote(project, safe=''), quote(rule_id, safe='')), body, key)
+
+    def standards_versions(self, project):
+        return self.request('GET', '/v1/projects/%s/standards/versions' % quote(project, safe=''))
+
+    def standards_drafts(self, project, *, status=None):
+        qs = ('?' + urlencode({'status': status})) if status is not None else ''
+        return self.request('GET', '/v1/projects/%s/standards/drafts%s' % (quote(project, safe=''), qs))
+
+    def propose_standards_draft(self, project, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/standards/drafts' % quote(project, safe=''), body, key)
+
+    def decide_standards_draft(self, project, draft_id, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/standards/drafts/%s/decision'
+                                  % (quote(project, safe=''), quote(draft_id, safe='')), body, key)
+
+    def set_standards_gate(self, project, mode, reason, key=None):
+        return self._write_record('PUT', '/v1/projects/%s/standards/gate' % quote(project, safe=''),
+                                  {'mode': mode, 'reason': reason}, key)
+
+    def standards_commit(self, project, commit):
+        return self.request('GET', '/v1/projects/%s/standards/commits/%s'
+                            % (quote(project, safe=''), quote(commit, safe='')))
+
+    def record_standards_commit(self, project, commit, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/standards/commits/%s'
+                                  % (quote(project, safe=''), quote(commit, safe='')), body, key)
+
+    def task_waivers(self, project, task):
+        return self.request('GET', '/v1/projects/%s/tasks/%s/waivers'
+                            % (quote(project, safe=''), quote(task, safe='')))
+
+    def grant_task_waiver(self, project, task, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/tasks/%s/waivers'
+                                  % (quote(project, safe=''), quote(task, safe='')), body, key)
+
+    def task_sign_off(self, project, task, *, markdown=False, contribution=None):
+        suffix = '/sign-off.md' if markdown else '/sign-off'
+        qs = ('?contribution=' + quote(str(contribution), safe='')) if contribution else ''
+        return self.request('GET', '/v1/projects/%s/tasks/%s%s%s'
+                            % (quote(project, safe=''), quote(task, safe=''), suffix, qs))
+
 
 def new_idempotency_key():
     """A fresh key; keep it to retry an uncertain mutation exactly."""
@@ -941,6 +1005,54 @@ def _query(limit, cursor):
     if cursor is not None:
         params['cursor'] = cursor
     return ('?' + urlencode(params)) if params else ''
+
+
+def _inspect_commit_local(repo, commit, target_ref='refs/heads/main'):
+    import re
+    import subprocess
+    sha = (commit or '').strip().lower()
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha):
+        raise ValueError('commit must be a 40- or 64-character hex SHA')
+
+    def git_cmd(*gargs):
+        done = subprocess.run(
+            ['git', '--no-optional-locks', '-c', 'protocol.allow=never', '-c', 'protocol.file.allow=always', '-C', repo, *gargs],
+            capture_output=True, timeout=60, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        if done.returncode:
+            err = (done.stderr or b'').decode('utf-8', 'replace').strip()
+            raise ValueError('git %s failed: %s' % (' '.join(gargs[:2]), err or done.returncode))
+        return done.stdout
+
+    resolved = git_cmd('rev-parse', '--verify', sha + '^{commit}').decode('ascii', 'replace').strip().lower()
+    target_sha = git_cmd('rev-parse', '--verify', target_ref + '^{commit}').decode('ascii', 'replace').strip().lower()
+    merge_base = git_cmd('merge-base', target_sha, resolved).decode('ascii', 'replace').strip().lower()
+    raw_diff = git_cmd('diff', '--name-only', '-z', '--no-renames', merge_base, resolved)
+    changed = sorted({p.decode('utf-8', 'replace') for p in raw_diff.split(b'\0') if p})
+    tree_files = {}
+    for rel in changed:
+        listing = git_cmd('ls-tree', '-z', '--full-tree', resolved, '--', rel)
+        for entry in listing.split(b'\0'):
+            meta, _, name = entry.partition(b'\t')
+            parts = meta.split()
+            if entry and name.decode('utf-8', 'replace') == rel and len(parts) == 3:
+                mode, kind, obj = (x.decode('ascii', 'replace') for x in parts)
+                if kind == 'blob' and mode in ('100644', '100755'):
+                    blob = git_cmd('cat-file', 'blob', obj)
+                    is_text = len(blob) <= 10_485_760 and b'\x00' not in blob[:8192]
+                    lines = (0 if not blob else blob.count(b'\n') + (0 if blob.endswith(b'\n') else 1)) if is_text else None
+                    tree_files[rel] = {'regular_text': is_text, 'line_count': lines}
+                else:
+                    tree_files[rel] = {'regular_text': False, 'line_count': None}
+    return {
+        'schema_version': 1,
+        'commit': resolved,
+        'target_ref': target_ref,
+        'merge_base': merge_base,
+        'changed_files': changed,
+        'tree_files': tree_files,
+        'ci_checks': [],
+    }
 
 
 # --------------------------------------------------------------------------- CLI
@@ -1068,6 +1180,31 @@ def _build_parser():
                      help='use this worker credential for the call; pass it as '
                           '--credential=VALUE so a secret beginning with "-" is not read '
                           'as an option')
+    std = sub.add_parser('standards', help='read or mutate project review standards, waivers, and sign-offs')
+    std.add_argument('project')
+    std.add_argument('operation', choices=(
+        'show', 'history', 'lint', 'put', 'rule-edit', 'draft-propose', 'draft-list',
+        'draft-decide', 'set-gate', 'record-commit', 'inspect-commit', 'waive', 'waivers', 'sign-off'))
+    std.add_argument('target', nargs='?', help='rule_id, draft_id, commit, gate mode, or task id')
+    std.add_argument('--version', type=int)
+    std.add_argument('--effective', action='store_true')
+    std.add_argument('--status')
+    std.add_argument('--decision', choices=('accept', 'reject'))
+    std.add_argument('--expected-version', type=int)
+    std.add_argument('--contribution')
+    std.add_argument('--rule')
+    std.add_argument('--this-delivery', action='store_true')
+    std.add_argument('--until')
+    std.add_argument('--reason')
+    std.add_argument('--format', choices=('json', 'markdown', 'text'), default='json')
+    std.add_argument('--out')
+    std.add_argument('--file', help='UTF-8 JSON request body')
+    std.add_argument('--repo', default='.')
+    std.add_argument('--commit')
+    std.add_argument('--target-ref', default='refs/heads/main')
+    std.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    std.add_argument('--credential',
+                     help='use this worker/verifier credential for the call; pass it as --credential=VALUE')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -1083,6 +1220,22 @@ def _build_parser():
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == 'standards' and args.operation == 'inspect-commit':
+        try:
+            commit_sha = args.commit or args.target
+            if not commit_sha:
+                parser.error('inspect-commit requires --commit SHA')
+            payload = _inspect_commit_local(args.repo, commit_sha, args.target_ref)
+            text = json.dumps(payload, indent=2, ensure_ascii=False) + '\n'
+            if args.out:
+                with open(args.out, 'w', encoding='utf-8', newline='') as fh:
+                    fh.write(text)
+            else:
+                sys.stdout.write(text)
+            return 0
+        except (OSError, ValueError) as error:
+            print('ERROR: %s' % error, file=sys.stderr)
+            return 1
     if not args.base_url:
         parser.error('--base-url or ORCHESTRA_HTTP_URL is required')
     client = Client(args.base_url, ca_file=args.ca_file, insecure=args.insecure,
@@ -1240,6 +1393,133 @@ def main(argv=None):
                 result = client.delivery(args.project, args.task,
                                          contribution=args.contribution)
             print(json.dumps(result, indent=2))
+            return 0
+        if args.command == 'standards':
+            op = args.operation
+            key = args.idempotency_key
+            if op == 'show':
+                result = client.standards(args.project, version=args.version)
+            elif op == 'history':
+                result = client.standards_versions(args.project)
+            elif op == 'lint':
+                reg = client.standards(args.project, version=args.version)
+                result = {
+                    'schema_version': 1,
+                    'project': args.project,
+                    'status': reg.get('status'),
+                    'version': reg.get('version'),
+                    'warnings': reg.get('lint_warnings', []),
+                    'warning': reg.get('warning'),
+                }
+            elif op == 'put':
+                if not args.file:
+                    parser.error('standards put requires --file')
+                body = _lifecycle_body_file(args.file)
+                if args.reason is not None:
+                    body['reason'] = args.reason
+                if args.expected_version is not None:
+                    body['expected_version'] = args.expected_version
+                result = client.put_standards(args.project, body, key)
+            elif op == 'rule-edit':
+                if not args.target or not args.file:
+                    parser.error('standards rule-edit requires <RULE_ID> and --file')
+                body = _lifecycle_body_file(args.file)
+                if args.reason is not None:
+                    body['reason'] = args.reason
+                if args.expected_version is not None:
+                    body['expected_version'] = args.expected_version
+                result = client.edit_standards_rule(args.project, args.target, body, key)
+            elif op == 'draft-propose':
+                if not args.file:
+                    parser.error('standards draft-propose requires --file')
+                body = _lifecycle_body_file(args.file)
+                if args.reason is not None:
+                    body['reason'] = args.reason
+                result = client.propose_standards_draft(args.project, body, key)
+            elif op == 'draft-list':
+                result = client.standards_drafts(args.project, status=args.status)
+            elif op == 'draft-decide':
+                if not args.target:
+                    parser.error('standards draft-decide requires <DRAFT_ID>')
+                body = _lifecycle_body_file(args.file) if args.file else {}
+                if args.decision is not None:
+                    body['decision'] = args.decision
+                if args.reason is not None:
+                    body['reason'] = args.reason
+                if args.expected_version is not None:
+                    body['expected_version'] = args.expected_version
+                result = client.decide_standards_draft(args.project, args.target, body, key)
+            elif op == 'set-gate':
+                if args.target not in ('warn', 'block') or not args.reason:
+                    parser.error('standards set-gate requires warn|block and --reason')
+                result = client.set_standards_gate(args.project, args.target, args.reason, key)
+            elif op == 'record-commit':
+                commit_sha = args.target or args.commit
+                if not commit_sha or not args.file:
+                    parser.error('standards record-commit requires <COMMIT> and --file')
+                body = _lifecycle_body_file(args.file)
+                result = client.record_standards_commit(args.project, commit_sha, body, key)
+            elif op == 'waive':
+                if not args.target:
+                    parser.error('standards waive requires <TASK>')
+                if args.file:
+                    body = _lifecycle_body_file(args.file)
+                else:
+                    if not args.contribution or not args.rule or not args.reason:
+                        parser.error('standards waive requires --contribution, --rule, (--this-delivery | --until YYYY-MM-DD), and --reason')
+                    if bool(args.this_delivery) == bool(args.until):
+                        parser.error('standards waive requires either --this-delivery or --until YYYY-MM-DD')
+                    body = {
+                        'contribution_id': args.contribution,
+                        'rule_id': args.rule,
+                        'expiry': {'kind': 'date', 'date': args.until} if args.until else {'kind': 'delivery'},
+                        'reason': args.reason,
+                    }
+                    if args.commit:
+                        body['commit'] = args.commit
+                result = client.grant_task_waiver(args.project, args.target, body, key)
+            elif op == 'waivers':
+                if not args.target:
+                    parser.error('standards waivers requires <TASK>')
+                result = client.task_waivers(args.project, args.target)
+            else:  # sign-off
+                if not args.target:
+                    parser.error('standards sign-off requires <TASK>')
+                if args.format == 'markdown':
+                    md_text = client.task_sign_off(args.project, args.target, markdown=True, contribution=args.contribution)
+                    if not isinstance(md_text, str):
+                        md_text = json.dumps(md_text, indent=2) + '\n'
+                    if args.out:
+                        with open(args.out, 'w', encoding='utf-8', newline='') as fh:
+                            fh.write(md_text)
+                    else:
+                        sys.stdout.write(md_text)
+                    return 0
+                result = client.task_sign_off(args.project, args.target, markdown=False, contribution=args.contribution)
+                so = result.get('sign_off') if isinstance(result, dict) and isinstance(result.get('sign_off'), dict) else result
+                if args.format == 'text' and isinstance(so, dict):
+                    lines = [
+                        'Checked against standards register v%s' % so.get('register_version'),
+                        'Task: %s  Contribution: %s  Commit: %s  Gate: %s' % (
+                            so.get('task_id'), so.get('contribution_id'),
+                            so.get('commit'), so.get('gate_mode')),
+                    ]
+                    for ch in so.get('checks') or []:
+                        lines.append('  - %s [%s/%s]: %s' % (
+                            ch.get('rule_id'), ch.get('severity'), ch.get('check_kind'), ch.get('result')))
+                    text_out = '\n'.join(lines) + '\n'
+                    if args.out:
+                        with open(args.out, 'w', encoding='utf-8', newline='') as fh:
+                            fh.write(text_out)
+                    else:
+                        sys.stdout.write(text_out)
+                    return 0
+            out_json = json.dumps(result, indent=2) + '\n'
+            if args.out:
+                with open(args.out, 'w', encoding='utf-8', newline='') as fh:
+                    fh.write(out_json)
+            else:
+                sys.stdout.write(out_json)
             return 0
         if args.credential:
             client.use_credential(args.credential)

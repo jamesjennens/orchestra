@@ -841,7 +841,20 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     # contribution. They sit beside the review chain and change nothing in it; every
     # reader (review, brief, work) gets them from this one place.
     from review_recommendations import block as recommendations
-    result.update(recommendations(issue,result))
+    result.update(recommendations(issue,result,journal=journal))
+    if journal is not None and isinstance(result.get('contribution'),dict) and result['contribution'].get('comment_id'):
+        from pathlib import Path
+        import review_standards
+        jpath=Path(journal)
+        std_store=review_standards.HostStandardsStore(jpath,jpath.name,shared_loader=review_standards.host_shared_loader_for(jpath))
+        if std_store.inspect_register_raw()[0]!='none':
+            cid=str(result['contribution']['comment_id'])
+            ccommit=result['contribution'].get('commit')
+            so=review_standards.read_signoff_for_contribution(
+                std_store,cid,expected_commit=ccommit,
+                approve_operation_id=review_standards.find_approve_operation_id(issue,cid))
+            if so is not None:
+                result['sign_off']=so
     from review_workflow import author_key
     named=bool(actor) and any(author_key(r.get('reviewer'))==author_key(actor)
                              for r in result.get('pending_review_requests') or [])
@@ -1443,7 +1456,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
             independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
             lanes_scope='all',provenance_writes=True,identity_names=None,comment_authority=None,
-            authority_state=None):
+            authority_state=None,git_observation=None,standards_context=None):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
@@ -1577,17 +1590,234 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     rows=read_event_rows(run)
     from lifecycle import host_snapshot
     rows=host_snapshot(rows, run=run, project=path)
-    if payload.get('operation')=='recommend':
-        # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
-        # chain: it has its own writer and never passes through the chain's.
-        from review_recommendations import execute as recommend
-        return recommend(rows,task,actor,payload,run,operators=operators,journal=path)
-    from review_workflow import execute as review
-    result=review(rows,task,actor,payload,run, operators=operators, journal=path,
+    import review_standards
+    cleaned_payload,std_extracted=review_standards.strip_standards_fields(payload)
+    std_store=review_standards.HostStandardsStore(path,path.name,shared_loader=review_standards.host_shared_loader_for(path))
+    std_store.reconcile_or_clean_staged(rows)
+    reg_status,_,_=std_store.inspect_register_raw()
+    if reg_status=='none':
+        if cleaned_payload.get('operation')=='recommend':
+            # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
+            # chain: it has its own writer and never passes through the chain's.
+            from review_recommendations import execute as recommend
+            return recommend(rows,task,actor,cleaned_payload,run,operators=operators,journal=path)
+        from review_workflow import execute as review
+        result=review(rows,task,actor,cleaned_payload,run, operators=operators, journal=path,
+                      review_writes=review_writes, independent_approval=independent_approval,
+                      coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
+                      verifiers=verifiers, identity_names=identity_names)
+        if cleaned_payload.get('operation')=='request-changes':
+            # Retry repairs a label update interrupted after the durable review comment.
+            run(['update',task,'--remove-label','review-ready','--json'])
+        return result
+
+    from review_workflow import execute as review, project as rw_project, same_party
+    owners_map=owners() if callable(owners) else (owners or {})
+    std_ctx=standards_context or {}
+    extra_same_party=std_ctx.get('same_party_with_actor')
+    extra_pair_same_party=std_ctx.get('same_party_pair')
+    active_person_checker=std_ctx.get('active_person_checker')
+
+    def _same_party_actor(cand):
+        if same_party(actor,cand,owners_map):
+            return True
+        if callable(extra_same_party) and extra_same_party(cand):
+            return True
+        return False
+
+    def _same_party_pair(left,right):
+        if same_party(left,right,owners_map):
+            return True
+        if callable(extra_pair_same_party) and extra_pair_same_party(left,right):
+            return True
+        return False
+
+    op=cleaned_payload.get('operation')
+    matches=[row for row in rows if row.get('id')==task and row.get('issue_type')!='event']
+    issue_row=matches[0] if len(matches)==1 else None
+
+    if op=='recommend':
+        from review_recommendations import execute as recommend, validate as rec_validate, _records as rec_records
+        rec_validate(cleaned_payload,task)
+        staged_rec=None
+        if issue_row is not None and reg_status=='active':
+            existing_recs,_=rec_records(issue_row)
+            is_exact_retry=any(
+                stored['operation_id']==cleaned_payload['operation_id']
+                and stored==cleaned_payload and comment['author']==actor
+                for _,stored,comment in existing_recs
+            )
+            if not is_exact_retry:
+                rstate=rw_project(issue_row,operators,path)
+                contrib=rstate.get('contribution') or {}
+                if (contrib.get('comment_id')==cleaned_payload.get('contribution')
+                        and str(contrib.get('commit') or '').lower()==cleaned_payload['commit'].lower()):
+                    valid_ids=review_standards.collect_valid_item_ids_for_contribution(
+                        issue_row,contrib['comment_id'],cleaned_payload)
+                    staged_rec=review_standards.validate_and_stage_recommendation_checks(
+                        std_store,contribution=contrib,operation_id=cleaned_payload['operation_id'],
+                        actor=actor,extracted_fields=std_extracted,valid_item_ids=valid_ids,
+                        same_party_with_actor=_same_party_actor,git_observation=git_observation,
+                        active_person_checker=active_person_checker)
+        try:
+            rec_res=recommend(rows,task,actor,cleaned_payload,run,operators=operators,journal=path)
+        except BaseException:
+            if staged_rec is not None:
+                review_standards._safe_unlink(
+                    path/'.standards'/'recommendations',
+                    'op-%s.staged.json'%cleaned_payload['operation_id'])
+            raise
+        if staged_rec is not None:
+            committed_rec=dict(staged_rec,status='committed',recommendation_id=rec_res['comment_id'])
+            std_store.commit_recommendation(cleaned_payload['operation_id'],rec_res['comment_id'],committed_rec)
+        else:
+            chk_st,chk_bundle=std_store.read_recommendation_checks(
+                rec_res['comment_id'],cleaned_payload['operation_id'])
+            if chk_st=='ok' and isinstance(chk_bundle,dict) and chk_bundle.get('status')=='staged':
+                committed_rec=dict(chk_bundle,status='committed',recommendation_id=rec_res['comment_id'])
+                std_store.commit_recommendation(cleaned_payload['operation_id'],rec_res['comment_id'],committed_rec)
+        return rec_res
+
+    if op=='contribute':
+        if reg_status=='active':
+            review_standards.validate_declared_tool_model(
+                std_extracted.get('declared_tool'),std_extracted.get('declared_model'))
+        result=review(rows,task,actor,cleaned_payload,run, operators=operators, journal=path,
+                      review_writes=review_writes, independent_approval=independent_approval,
+                      coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
+                      verifiers=verifiers, identity_names=identity_names)
+        if reg_status=='active' and result.get('comment_id'):
+            review_standards.record_contribution_pin(
+                std_store,result['comment_id'],cleaned_payload['commit'],
+                declared_tool=std_extracted.get('declared_tool'),
+                declared_model=std_extracted.get('declared_model'))
+        return result
+
+    if op=='request-changes':
+        if issue_row is not None and reg_status=='active':
+            rstate=rw_project(issue_row,operators,path)
+            contrib=rstate.get('contribution') or {}
+            if contrib.get('comment_id')==cleaned_payload.get('contribution'):
+                cid=str(contrib['comment_id'])
+                ccommit=str(contrib['commit']).lower()
+                eff_git_obs=(git_observation if isinstance(git_observation,dict)
+                             and git_observation.get('contribution_id') in (None,cid)
+                             and git_observation.get('commit') in (None,ccommit) else None)
+                commit_obs=std_store.read_commit_observation(ccommit)
+                if commit_obs is not None:
+                    review_standards.check_reviewer_not_commit_recorder(
+                        commit_obs,cid,ccommit,_same_party_actor)
+                review_standards.validate_declared_tool_model(
+                    std_extracted.get('declared_tool'),std_extracted.get('declared_model'))
+                if std_extracted.get('checks') is not None:
+                    pinned_ver,pinned_shared,_=review_standards.resolve_pinned_version(std_store,contrib)
+                    reg=review_standards.resolve_effective_register(
+                        std_store,version=pinned_ver,shared_version_override=pinned_shared,
+                        active_person_checker=active_person_checker)
+                    if reg['status']=='active':
+                        git_obs=eff_git_obs or {}
+                        tree_avail=bool(git_obs.get('tree_available'))
+                        tree_files=dict(git_obs.get('tree_files') or {})
+                        if not tree_avail and commit_obs and isinstance(commit_obs.get('tree_files'),dict):
+                            tree_avail=True
+                            tree_files=dict(commit_obs['tree_files'])
+                        valid_ids=review_standards.collect_valid_item_ids_for_contribution(
+                            issue_row,cid,cleaned_payload)
+                        review_standards.validate_reviewer_checks(
+                            std_extracted['checks'],effective_rules=reg['effective_rules'],
+                            commit=ccommit,contribution_id=cid,valid_item_ids=valid_ids,
+                            tree_available=tree_avail,tree_files=tree_files)
+        result=review(rows,task,actor,cleaned_payload,run, operators=operators, journal=path,
+                      review_writes=review_writes, independent_approval=independent_approval,
+                      coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
+                      verifiers=verifiers, identity_names=identity_names)
+        run(['update',task,'--remove-label','review-ready','--json'])
+        return result
+
+    if op=='approve' and issue_row is not None:
+        rstate=rw_project(issue_row,operators,path)
+        contrib=rstate.get('contribution') or {}
+        op_id=cleaned_payload.get('operation_id')
+        already_landed=(isinstance(op_id,str) and op_id
+                        and review_standards.find_approve_operation_id(issue_row,cleaned_payload.get('contribution'))==op_id)
+        staged_signoff=None
+        if (not already_landed
+                and isinstance(contrib,dict)
+                and contrib.get('comment_id')==cleaned_payload.get('contribution')
+                and rstate.get('review_state') in ('awaiting-review','changes-requested')
+                and issue_row.get('status')!='closed'):
+            ccommit=str(contrib.get('commit') or '').lower()
+            eff_git_obs=(git_observation if isinstance(git_observation,dict)
+                         and git_observation.get('contribution_id') in (None,contrib['comment_id'])
+                         and git_observation.get('commit') in (None,ccommit) else None)
+            from review_recommendations import _standing as rec_standing
+            standing_recs=[]
+            for _,r_payload,r_comment in rec_standing(issue_row,rstate):
+                r_author=r_comment['author']
+                if _same_party_pair(r_author,contrib.get('author')):
+                    continue
+                if issue_row.get('assignee') and _same_party_pair(r_author,issue_row.get('assignee')):
+                    continue
+                standing_recs.append({
+                    'comment_id':str(r_comment['id']),
+                    'author':r_author,
+                    'contribution':r_payload['contribution'],
+                    'commit':r_payload['commit'],
+                    'operation_id':r_payload['operation_id'],
+                })
+            valid_ids=review_standards.collect_valid_item_ids_for_contribution(
+                issue_row,contrib['comment_id'],cleaned_payload)
+            staged_signoff=review_standards.evaluate_approval_signoff(
+                std_store,task_id=task,issue=issue_row,contribution=contrib,
+                operation_id=op_id,actor=actor,
+                actor_user_id=std_ctx.get('actor_user_id'),
+                actor_owner_person=std_ctx.get('actor_owner_person') or owners_map.get(actor),
+                actor_via=std_ctx.get('actor_via','host'),
+                extracted_fields=std_extracted,valid_item_ids=valid_ids,
+                standing_recommendations=standing_recs,
+                same_party_with_actor=_same_party_actor,
+                same_party_with_recommender=_same_party_pair,
+                git_observation=eff_git_obs,
+                active_person_checker=active_person_checker)
+            if staged_signoff is not None:
+                std_store.stage_signoff(contrib['comment_id'],op_id,staged_signoff)
+        try:
+            result=review(rows,task,actor,cleaned_payload,run, operators=operators, journal=path,
+                          review_writes=review_writes, independent_approval=independent_approval,
+                          coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
+                          verifiers=verifiers, identity_names=identity_names)
+        except BaseException:
+            if staged_signoff is not None:
+                review_standards._safe_unlink(
+                    path/'.standards'/'signoffs',
+                    '%s.staged.%s.json'%(contrib['comment_id'],op_id))
+            raise
+        cid_done=str(cleaned_payload.get('contribution') or '')
+        if staged_signoff is not None:
+            final_so=dict(staged_signoff,status='committed',approval_comment_id=result.get('comment_id'))
+            std_store.commit_signoff(cid_done,op_id,final_so)
+            result['sign_off']=final_so
+            if final_so.get('would_have_refused'):
+                wlist=list(result.get('warnings') or [])
+                wlist.append('Standards gate (warn mode) would have refused in block mode: '
+                             +'; '.join(final_so['would_have_refused']))
+                result['warnings']=wlist
+        elif cid_done:
+            existing_so=review_standards.read_signoff_for_contribution(
+                std_store,cid_done,expected_commit=contrib.get('commit'),
+                approve_operation_id=op_id)
+            if existing_so is not None:
+                if existing_so.get('status')=='staged':
+                    existing_so=dict(existing_so,status='committed',approval_comment_id=result.get('comment_id'))
+                    std_store.commit_signoff(cid_done,op_id,existing_so)
+                result['sign_off']=existing_so
+        return result
+
+    result=review(rows,task,actor,cleaned_payload,run, operators=operators, journal=path,
                   review_writes=review_writes, independent_approval=independent_approval,
                   coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
                   verifiers=verifiers, identity_names=identity_names)
-    if payload.get('operation')=='request-changes':
+    if op=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])
     return result

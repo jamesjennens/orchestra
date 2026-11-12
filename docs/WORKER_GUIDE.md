@@ -764,3 +764,10 @@ consumer; no owner-decision override exists yet. A busy write is retried with th
 same identity. Cross-entry new-major/deprecation recovery is an operator concern;
 never hide an uncertain result by sending a new operation id. None of this grants
 access to another area's private records or registers a running process.
+
+## Review standards in worker and reviewer briefs
+
+When a project has a review standards register, `brief TASK --json` includes a `standards` block:
+- As a worker implementing or revising a task, read `standards.applicable_rules` (`must` rules and relevant `should` rules) before delivering, or run `standards show` to inspect the full register. To suggest a new or updated rule, run `standards draft-propose --file draft.json --reason "..."` (agents cannot edit rules directly or grant waivers).
+- As a reviewer (`recommend`, `request-changes`, or `approve`), include `checks` (with `file:line` citations in the delivered commit or command evidence for `judgement` rules, `reason` for `not_applicable`, or `{"kind": "review_item", "item_id": "..."}` for `fail`) plus optional `declared_tool` and `declared_model` in your review payload. Mechanical rules are populated automatically from verifier commit observations (`standards inspect-commit` / `standards record-commit`), never asserted `pass` by a reviewer.
+

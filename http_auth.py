@@ -54,6 +54,7 @@ import nudge_messages
 import nudges
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_NUDGE_CARRY, CAP_PROJECT_ADMIN, CAP_PROPOSALS, NUDGES_SCOPE,
+                            CAP_STANDARDS_VERIFY, VERIFY_SCOPE,
                             CAP_ROOMS_POST,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
@@ -2710,8 +2711,13 @@ class Service:
             raise forbidden('A worker credential cannot issue another credential')
         with self.store.lock:
             self._refresh_authority(principal)
-            project, role = self.require_project(principal, project_id, 'owner')
             requested = self._scope_names(scopes) or ('tasks', 'checkpoints', 'reviews', 'feedback')
+            if requested == (VERIFY_SCOPE,):
+                if not self._is_person_session(principal):
+                    raise forbidden('Only a signed-in person coordinator or owner may issue a verifier credential')
+                project, role = self.require_project(principal, project_id, 'coordinator')
+            else:
+                project, role = self.require_project(principal, project_id, 'owner')
             if NUDGES_SCOPE in requested:
                 raise invalid('The nudges scope belongs to an agent credential, not a project worker credential')
             label = self._credential_label(label)
@@ -3425,6 +3431,8 @@ class Service:
                 names.append(scope)
         if NUDGES_SCOPE in names and names != [NUDGES_SCOPE]:
             raise invalid('The nudges scope is the nudge carrier\'s alone and is never combined with another scope')
+        if VERIFY_SCOPE in names and names != [VERIFY_SCOPE]:
+            raise invalid('The verify scope is a standalone verifier credential scope and is never combined with another scope')
         return tuple(names)
 
     def agent_scopes(self, agent):
@@ -4097,7 +4105,7 @@ class Service:
                 'settled': {'how': settled['how'], 'at': settled.get('at')} if settled else None,
                 'unread': note['to']['role'] == 'member' and settled is None}
 
-    def write_member_note(self, principal, project, text, reply_to, mode):
+    def write_member_note(self, principal, project, text, reply_to, mode, *, throttle=True):
         """Keep one member note in ``project`` (kittrial-5bb.508). Returns ``(note, dropped)``.
 
         ``mode='coordinators'``: a PERSON's session (never an agent's credential) holding contributor, coordinator
@@ -4128,7 +4136,8 @@ class Service:
                         raise forbidden('Only the coordinators of this project reply to a member note')
                 if reply_to is None:
                     raise invalid('A reply to a member needs reply_to, the id of the note it answers')
-            self.member_note_admit(principal.user_id, project, replying=mode == 'member')
+            if throttle:
+                self.member_note_admit(principal.user_id, project, replying=mode == 'member')
             if not isinstance(text, str) or not text.strip():
                 raise invalid('A note must be 1-%d characters of text' % self.NOTE_TEXT_MAX)
             if len(text) > self.NOTE_TEXT_MAX:
@@ -5440,6 +5449,8 @@ class Service:
         authorized account may narrow them, but widening remains owner-only.
         """
         requested = self._scope_names(scopes)
+        if requested and VERIFY_SCOPE in requested:
+            raise invalid('The verify scope belongs to a dedicated project verifier credential, not a personal agent')
         label = self._credential_label(label)
         has, source = self.agent_scopes(agent)
         if requested is not None and source in ('inferred', 'unknown') and principal.user_id != agent['owner']:
@@ -5529,6 +5540,8 @@ class Service:
             # What the agent may do is kept on its record from here on (kittrial-5bb.208): the
             # list asked for, or the default. Judged before anything is written.
             made_with = self._scope_names(scopes) or tuple(AGENT_DEFAULT_SCOPES)
+            if VERIFY_SCOPE in made_with:
+                raise invalid('The verify scope belongs to a dedicated project verifier credential, not a personal agent')
             expiry = self._agent_expiry_metadata()
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {

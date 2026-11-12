@@ -165,8 +165,22 @@ export async function detail(ctx, { pid, tid }) {
   // A reviewer's recommendation is advice to the owner; it never changes the review state.
   const advice = review.state === 'awaiting-review' ? review.recommendation : null;
   if (advice) reviewBody.append(recommendationNote(review, advice));
-  if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c, review));
-  if (!owner && writer && !mine && c && c.author !== ctx.me.id && review.state === 'awaiting-review') reviewBody.append(recommendForm(ctx, pid, tid, c));
+  const stdBlock = brief.standards || null;
+  if (stdBlock && stdBlock.sign_off) {
+    reviewBody.append(signOffCard(ctx, pid, tid, stdBlock.sign_off, stdBlock));
+  } else if (c && ['approved', 'awaiting-integration'].includes(review.state) && ctx.api.taskSignOff) {
+    const asyncSignOffHost = h('div');
+    reviewBody.append(asyncSignOffHost);
+    ctx.api.taskSignOff(pid, tid).then((so) => {
+      if (so && so.contribution_id === c.id) asyncSignOffHost.replaceChildren(signOffCard(ctx, pid, tid, so, stdBlock));
+    }).catch(() => {});
+  }
+  if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c, review, stdBlock));
+  if (!owner && writer && !mine && c && c.author !== ctx.me.id && review.state === 'awaiting-review') reviewBody.append(recommendForm(ctx, pid, tid, c, stdBlock));
+  if (stdBlock && stdBlock.status === 'active' && c && ['awaiting-review', 'changes-requested'].includes(review.state) && !project.archived && !mine && c.author !== (ctx.me && ctx.me.id)) {
+    reviewBody.append(h('details', { class: 'fold' }, h('summary', null, 'Grant a standards waiver for this delivery'),
+      h('div', { class: 'fold-body' }, waiverForm(ctx, pid, tid, c, stdBlock, reload))));
+  }
   if (responder) reviewBody.append(respondForm(ctx, pid, tid, c, review, openRequests, carried.length > 0));
   if (mine && writer && ['none', 'changes-requested'].includes(review.state) && t.status !== 'closed') reviewBody.append(deliverForm(ctx, pid, tid, c, openRequests.length, review, carried.length > 0));
   const reviewPanel = h('section', { class: 'panel', 'aria-labelledby': 'review-h' },
@@ -512,28 +526,174 @@ export function commentForm(ctx, pid, tid) {
   return h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, form));
 }
 
+export function signOffCard(ctx, pid, tid, signOff, standards) {
+  const regVer = signOff.register_version;
+  const headingText = regVer
+    ? `Checked against standards register v${regVer}`
+    : 'Standards sign-off (damaged register)';
+  const currentVer = standards && standards.register_version;
+  const newerNotice = (regVer && currentVer && currentVer > regVer)
+    ? h('p', { class: 'small muted' }, `Note: register v${currentVer} has been published since this delivery was pinned to v${regVer}.`)
+    : null;
+  const wouldRefuse = Array.isArray(signOff.would_have_refused) && signOff.would_have_refused.length
+    ? h('div', { class: 'banner warn', role: 'note' },
+      h('div', null, h('strong', null, 'Warn mode — would have refused in block mode: '), signOff.would_have_refused.join('; ')))
+    : null;
+  const checks = Array.isArray(signOff.checks) ? signOff.checks : [];
+  const mdHref = ctx.api && ctx.api.taskSignOffMarkdownUrl ? ctx.api.taskSignOffMarkdownUrl(pid, tid) : `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off.md`;
+  const jsonHref = `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off`;
+  return h('div', { class: 'signoff-card stack', 'data-signoff': signOff.contribution_id || '1' },
+    h('div', { class: 'chips' },
+      h('strong', null, headingText),
+      h('span', { class: 'chip ' + (signOff.gate_mode === 'block' ? 'ok' : 'plain') }, `Gate: ${signOff.gate_mode || 'warn'}`),
+      signOff.diff_status ? h('span', { class: 'chip plain' }, `Diff: ${signOff.diff_status}`) : null),
+    newerNotice,
+    wouldRefuse,
+    checks.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'standards-table' },
+      h('thead', null, h('tr', null,
+        h('th', { scope: 'col' }, 'Rule'),
+        h('th', { scope: 'col' }, 'Severity'),
+        h('th', { scope: 'col' }, 'Result'),
+        h('th', { scope: 'col' }, 'Source / waiver'))),
+      h('tbody', null, checks.map((ch) => h('tr', null,
+        h('td', { class: 'mono small' }, ch.rule_id),
+        h('td', null, h('span', { class: 'chip ' + (ch.severity === 'must' ? 'warn' : 'plain') }, ch.severity)),
+        h('td', null, h('span', { class: 'chip ' + (ch.result === 'pass' ? 'ok' : ch.result === 'fail' ? 'warn' : 'plain') }, ch.result)),
+        h('td', { class: 'small' }, ch.source || '', ch.waiver ? ` · Waived (${ch.waiver.id})` : '')))))) : null,
+    h('div', { class: 'actions small' },
+      h('a', { href: mdHref, download: '' }, 'Download sign-off (.md)'),
+      h('a', { href: jsonHref, target: '_blank', rel: 'noopener' }, 'Raw sign-off (JSON)')));
+}
+
+export function waiverForm(ctx, pid, tid, contribution, standards, onSaved) {
+  const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const rules = Array.isArray(standards && standards.applicable_rules)
+    ? standards.applicable_rules
+    : (Array.isArray(standards && standards.rules) ? standards.rules : []);
+  const ruleField = rules.length
+    ? field({ id: 'w-rule', label: 'Rule', type: 'select', options: rules.map((r) => [r.id, `${r.id} (${r.severity}) — ${r.statement || r.title || ''}`]) })
+    : field({ id: 'w-rule', label: 'Rule ID', required: true, placeholder: 'e.g. STD-01' });
+  const form = h('form', { class: 'form', novalidate: true, 'data-form': 'standards-waiver' },
+    status,
+    ruleField,
+    h('div', { class: 'form-row' },
+      field({ id: 'w-scope', label: 'Waiver scope', type: 'select', value: 'this-delivery', options: [
+        ['this-delivery', 'This delivery only'],
+        ['until', 'This delivery until date (UTC)'],
+      ] }),
+      field({ id: 'w-until', label: 'Until date (YYYY-MM-DD, when bounded)', placeholder: '2026-12-31' })),
+    field({ id: 'w-reason', label: 'Waiver reason', type: 'textarea', rows: 2, required: true, maxlength: 500 }),
+    h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'primary' }, 'Grant waiver')));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const v = formValues(form);
+    const ruleId = (v['w-rule'] || '').trim();
+    if (!ruleId) return setFieldError(form, 'w-rule', 'Choose a rule to waive.');
+    setFieldError(form, 'w-rule', '');
+    const reason = (v['w-reason'] || '').trim();
+    if (!reason) return setFieldError(form, 'w-reason', 'Enter a reason for this waiver.');
+    setFieldError(form, 'w-reason', '');
+    const scope = v['w-scope'] || 'this-delivery';
+    const body = {
+      contribution_id: String(contribution.id || contribution.comment_id),
+      rule_id: ruleId,
+      reason,
+      expiry: { kind: 'delivery' },
+    };
+    if (contribution.commit) body.commit = String(contribution.commit);
+    if (scope === 'until') {
+      const untilDate = (v['w-until'] || '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(untilDate)) return setFieldError(form, 'w-until', 'Enter YYYY-MM-DD.');
+      setFieldError(form, 'w-until', '');
+      body.expiry = { kind: 'date', date: untilDate };
+    }
+    status.hidden = true;
+    try {
+      await act(form.querySelector('button[type=submit]'), () => ctx.api.grantTaskWaiver(pid, tid, body), {
+        success: `Waiver granted for ${ruleId}`,
+        onError: (error) => { status.replaceChildren(describe(error)); status.hidden = false; return true; },
+      });
+    } catch { return; }
+    if (status.hidden && onSaved) onSaved();
+  });
+  return form;
+}
+
+function parseOptionalChecks(form, prefix, status) {
+  const v = formValues(form);
+  const rawChecks = (v[`${prefix}-checks`] || '').trim();
+  const tool = (v[`${prefix}-tool`] || '').trim();
+  const model = (v[`${prefix}-model`] || '').trim();
+  const extra = {};
+  if (rawChecks) {
+    let parsed;
+    try { parsed = JSON.parse(rawChecks); }
+    catch {
+      status.replaceChildren('Check records must be a valid JSON array.');
+      status.hidden = false;
+      return null;
+    }
+    if (!Array.isArray(parsed)) {
+      status.replaceChildren('Check records must be a JSON array.');
+      status.hidden = false;
+      return null;
+    }
+    extra.checks = parsed;
+  }
+  if (tool) extra.declared_tool = tool;
+  if (model) extra.declared_model = model;
+  return extra;
+}
+
 // Review bodies carry the canonical fields (the contribution id being judged and the
 // latest review record as ``previous``), so a stale page is refused with a 409 instead
 // of judging a revision the reviewer never saw.
-export function reviewActions(ctx, pid, tid, contribution, review) {
+export function reviewActions(ctx, pid, tid, contribution, review, standards = null) {
   const target = { contribution: contribution.id, previous: review.latest_id ?? null, contribution_revision: contribution.revision, contribution_commit: contribution.commit };
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const standingWithChecks = (review.recommendations || []).filter((r) => Array.isArray(r.checks) && r.checks.length > 0);
+  const adoptSelect = standingWithChecks.length
+    ? field({
+      id: 'r-adopt-rec',
+      label: 'Adopt check records from recommendation',
+      type: 'select',
+      value: String(standingWithChecks[0].id),
+      options: [
+        ['', 'Do not adopt recommendation check records'],
+        ...standingWithChecks.map((r) => [String(r.id), `Adopt check records from ${r.author_name || r.author}'s recommendation (#${r.id})`]),
+      ],
+    })
+    : null;
+  const hasRegister = Boolean((standards && standards.status === 'active') || standingWithChecks.length);
+  const checksFold = hasRegister ? h('details', { class: 'fold' },
+    h('summary', null, 'Standards check records (optional / override)'),
+    h('div', { class: 'fold-body stack' },
+      field({ id: 'r-checks', label: 'Check records (JSON array)', type: 'textarea', rows: 4, placeholder: '[{"rule_id":"STD-01","result":"pass","evidence":{"kind":"citations","citations":["file.py:10"]}}]' }),
+      h('div', { class: 'form-row' },
+        field({ id: 'r-tool', label: 'Declared tool (optional)', placeholder: 'e.g. web-ui' }),
+        field({ id: 'r-model', label: 'Declared model (optional)', placeholder: 'e.g. human' })))) : null;
   const form = h('form', { class: 'form', novalidate: true },
     h('h3', { class: 'small' }, `Review revision ${contribution.revision}`),
     status,
+    adoptSelect,
+    checksFold,
     field({ id: 'r-items', label: 'Requested changes', type: 'textarea', rows: 4, hint: 'One change per line. Leave empty to approve.' }),
     h('div', { class: 'actions' },
       h('button', { type: 'submit', name: 'request', class: '' }, 'Request changes'),
       h('button', { type: 'button', class: 'primary', onclick: async (e) => {
+        const extra = hasRegister ? parseOptionalChecks(form, 'r', status) : {};
+        if (extra === null) return;
+        const adoptVal = adoptSelect ? (formValues(form)['r-adopt-rec'] || '').trim() : '';
+        if (adoptVal) extra.adopt_recommendation = adoptVal;
         if (!(await confirmDialog({ title: `Approve revision ${contribution.revision}?`, body: `Commit ${shortSha(contribution.commit)} will be marked reviewed and approved if the server accepts it; a server set to require another party refuses an approval of your own party's work. It is not integrated or deployed until those steps are recorded separately.`, confirmLabel: 'Approve' }))) return;
-        await submit(e.currentTarget, { operation: 'approve', ...target, summary: `Approved revision ${contribution.revision} in the web interface` }, 'Approved');
+        await submit(e.currentTarget, { operation: 'approve', ...target, summary: `Approved revision ${contribution.revision} in the web interface`, ...extra }, 'Approved');
       } }, 'Approve')));
   async function submit(button, body, message) {
     try {
       await act(button, () => ctx.api.review(pid, tid, body), { success: message, onError: (error) => {
         // A refusal that says who must act instead (403: the approver's own party delivered it, or holds
         // the task) stays on the page; as a toast it was gone in seconds (kittrial-5bb.199 review).
-        if (error.status === 403) { status.replaceChildren(error.message || 'Not permitted.'); status.setAttribute('data-refused', '403'); status.hidden = false; return true; }
+        if (error.status === 403 || error.status === 422) { status.replaceChildren(error.message || 'Not permitted.'); status.setAttribute('data-refused', String(error.status)); status.hidden = false; return true; }
         if (error.status !== 409) return false;
         status.replaceChildren('A newer revision arrived or someone else already reviewed this. ', h('button', { type: 'button', class: 'link', onclick: () => ctx.render() }, 'Reload to see it'), '.');
         status.hidden = false; return true;
@@ -547,7 +707,9 @@ export function reviewActions(ctx, pid, tid, contribution, review) {
     const items = formValues(form)['r-items'].split('\n').map((s) => s.trim()).filter(Boolean);
     if (!items.length) return setFieldError(form, 'r-items', 'Describe at least one change, or use Approve.');
     setFieldError(form, 'r-items', '');
-    await submit(form.querySelector('button[name=request]'), { operation: 'request-changes', ...target, items: items.map((text, i) => ({ id: 'item-' + (i + 1), text })) }, 'Changes requested');
+    const extra = hasRegister ? parseOptionalChecks(form, 'r', status) : {};
+    if (extra === null) return;
+    await submit(form.querySelector('button[name=request]'), { operation: 'request-changes', ...target, items: items.map((text, i) => ({ id: 'item-' + (i + 1), text })), ...extra }, 'Changes requested');
   });
   return form;
 }
@@ -556,10 +718,13 @@ export function reviewActions(ctx, pid, tid, contribution, review) {
 // decision is still to make, and the page says so.
 function recommendationNote(review, advice) {
   const others = (review.recommendations || []).filter((r) => r.id !== advice.id).map((r) => actorWords(r.author_name, r.author, 'someone'));
+  const checksCount = Array.isArray(advice.checks) ? advice.checks.length : 0;
   // One child, so the banner's row layout does not split the sentence into columns.
   return h('div', { class: 'banner', role: 'note', id: 'recommendation' }, h('div', null,
     h('p', null, h('strong', null, 'Recommended for approval'), ' by ', actorWords(advice.author_name, advice.author, 'someone'), ' ', time(advice.at),
-      ' for commit ', h('code', { title: advice.commit }, shortSha(advice.commit)), '. An owner still decides.'),
+      ' for commit ', h('code', { title: advice.commit }, shortSha(advice.commit)),
+      checksCount ? ` (includes ${checksCount} standards check record${checksCount === 1 ? '' : 's'})` : '',
+      '. An owner still decides.'),
     h('p', { class: 'prose' }, advice.summary),
     advice.items && advice.items.length ? h('ul', null, advice.items.map((item) => h('li', null, item.text))) : null,
     others.length ? h('p', { class: 'small muted' }, 'Also recommended by ', others.join(', '), '.') : null));
@@ -567,13 +732,22 @@ function recommendationNote(review, advice) {
 
 // A member who can review but cannot approve records a recommendation for the owner.
 // It names the contribution and commit on the page, so a newer revision is refused (409).
-function recommendForm(ctx, pid, tid, contribution) {
+function recommendForm(ctx, pid, tid, contribution, standards = null) {
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const hasRegister = Boolean(standards && standards.status === 'active');
+  const checksFold = hasRegister ? h('details', { class: 'fold' },
+    h('summary', null, 'Standards check records (optional)'),
+    h('div', { class: 'fold-body stack' },
+      field({ id: 'rec-checks', label: 'Check records (JSON array)', type: 'textarea', rows: 4 }),
+      h('div', { class: 'form-row' },
+        field({ id: 'rec-tool', label: 'Declared tool (optional)' }),
+        field({ id: 'rec-model', label: 'Declared model (optional)' })))) : null;
   const form = h('form', { class: 'form', novalidate: true },
     h('h3', { class: 'small' }, `Recommend revision ${contribution.revision} for approval`),
     status,
     field({ id: 'rec-summary', label: 'What you checked', type: 'textarea', rows: 3, required: true, maxlength: 1200, hint: 'The owner reads this before deciding. Say what you checked and what you did not.' }),
     field({ id: 'rec-items', label: 'Notes for the owner', type: 'textarea', rows: 3, hint: 'Optional. One note per line. To ask for changes, an owner requests them.' }),
+    checksFold,
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Recommend approval')));
   form.addEventListener('input', () => ctx.setDirty(true));
   form.addEventListener('submit', async (event) => {
@@ -582,8 +756,10 @@ function recommendForm(ctx, pid, tid, contribution) {
     const summary = values['rec-summary'].trim();
     if (!summary) return setFieldError(form, 'rec-summary', 'Say what you checked.');
     setFieldError(form, 'rec-summary', '');
+    const extra = hasRegister ? parseOptionalChecks(form, 'rec', status) : {};
+    if (extra === null) return;
     const items = values['rec-items'].split('\n').map((s) => s.trim()).filter(Boolean).map((text, i) => ({ id: 'note-' + (i + 1), text }));
-    const body = { operation: 'recommend', contribution: contribution.id, commit: contribution.commit, verdict: 'approve', summary, items };
+    const body = { operation: 'recommend', contribution: contribution.id, commit: contribution.commit, verdict: 'approve', summary, items, ...extra };
     try {
       await act(form.querySelector('button[type=submit]'), () => ctx.api.review(pid, tid, body), { success: 'Recommendation recorded', onError: (error) => {
         if (error.status !== 409) return false;

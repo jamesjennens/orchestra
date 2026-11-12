@@ -39,7 +39,7 @@ async function load(ctx, pid) {
   return project;
 }
 
-function crumbs(ctx, project, extra) {
+export function crumbs(ctx, project, extra) {
   return [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: extra ? ctx.href('/p/' + project.id) : null }].concat(extra ? [{ label: extra }] : []);
 }
 
@@ -936,7 +936,20 @@ export async function settings(ctx, { pid }) {
   }
 
   async function drawCreds() {
-    if (!owner) { credsHost.replaceChildren(); return; }
+    const canCoord = canApprove(project);
+    if (!owner && !canCoord) { credsHost.replaceChildren(); return; }
+    const issueVerifier = h('button', { type: 'button', disabled: project.archived, onclick: async (e) => {
+      const result = await act(e.currentTarget, () => ctx.api.issueCredential(pid, ['verify'], 'Verifier credential')).catch(() => null);
+      if (!result) return;
+      secretDialog({ title: 'Verifier credential issued', body: 'Give this to the independent CI or verifier runner that records commit and CI observations for this project. It is shown once and never again, holds only the verify scope, and cannot read tasks or approve.', secret: result.credential.secret });
+      if (owner) drawCreds();
+    } }, 'Issue verifier credential');
+    if (!owner) {
+      credsHost.replaceChildren(h('section', { class: 'panel' },
+        h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Standards verifier credential'), issueVerifier),
+        h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, 'Coordinators and owners can issue a dedicated verify-only credential for recording commit diffs and CI observations.'))));
+      return;
+    }
     let data;
     try { data = await ctx.api.credentials(pid); } catch (error) { credsHost.replaceChildren(errorState(error, drawCreds)); return; }
     const issue = h('button', { type: 'button', disabled: project.archived, onclick: async (e) => {
@@ -946,7 +959,7 @@ export async function settings(ctx, { pid }) {
       drawCreds();
     } }, 'Issue credential');
     credsHost.replaceChildren(h('section', { class: 'panel' },
-      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Worker credentials'), issue),
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Worker credentials'), h('div', { class: 'actions' }, issue, issueVerifier)),
       data.items.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Label'), h('th', { scope: 'col' }, 'Issued by'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Scopes'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Expires'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
         h('tbody', null, data.items.map((c) => h('tr', null,

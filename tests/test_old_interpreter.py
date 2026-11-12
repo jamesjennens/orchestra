@@ -64,7 +64,7 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'reference_records.py', 'render.py', 'requirement_baseline_http.py', 'requirement_baseline_records.py',
            'requirement_baselines.py', 'requirement_brd.py', 'requirement_governance.py', 'requirement_http.py',
            'requirement_owner_records.py', 'requirement_terminal.py', 'reserved_comments.py', 'review_recommendations.py',
-           'review_rounds.py', 'review_state.py', 'review_workflow.py',
+           'review_rounds.py', 'review_standards.py', 'review_state.py', 'review_workflow.py',
            'task_files.py',  # kittrial-5bb.370: library-only (no __main__ block); imported by http_service/endpoint
            'trace_read.py',  # kittrial-5bb.425: library-only (no __main__ block); imported by endpoint/http_service
            'rooms.py',  # kittrial-5bb.385: library-only (no __main__ block); imported by http_service/admin

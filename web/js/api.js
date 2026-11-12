@@ -670,6 +670,20 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     uploadTaskFile,
     downloadTaskFile,
     withdrawTaskFile: (pid, tid, sha256, reason) => mutate('POST', `${filesPath(pid, tid)}/${encodeURIComponent(sha256)}/withdraw`, { reason }),
+    standards: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/standards`, { params }),
+    putStandards: (pid, body) => mutate('PUT', `/v1/projects/${encodeURIComponent(pid)}/standards`, body),
+    editStandardsRule: (pid, rid, body) => mutate('PATCH', `/v1/projects/${encodeURIComponent(pid)}/standards/rules/${encodeURIComponent(rid)}`, body),
+    standardsVersions: (pid) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/standards/versions`),
+    standardsDrafts: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/standards/drafts`, { params }),
+    proposeStandardsDraft: (pid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/standards/drafts`, body),
+    decideStandardsDraft: (pid, did, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/standards/drafts/${encodeURIComponent(did)}/decision`, body),
+    setStandardsGate: (pid, body) => mutate('PUT', `/v1/projects/${encodeURIComponent(pid)}/standards/gate`, body),
+    standardsCommit: (pid, commit) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/standards/commits/${encodeURIComponent(commit)}`),
+    recordStandardsCommit: (pid, commit, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/standards/commits/${encodeURIComponent(commit)}`, body),
+    taskWaivers: (pid, tid) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/waivers`),
+    grantTaskWaiver: (pid, tid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/waivers`, body),
+    taskSignOff: (pid, tid) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off`),
+    taskSignOffMarkdownUrl: (pid, tid) => `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off.md`,
   };
 }
 

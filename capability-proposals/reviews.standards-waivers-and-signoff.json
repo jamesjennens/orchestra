@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb.570-reviews-standards-waivers-and-signoff-r1",
+  "key": "reviews.standards-waivers-and-signoff",
+  "name": "Single-delivery standards waivers, derived reviewer not-applicable tally, and context-pinned Checked-against sign-offs",
+  "aliases": [
+    "standards waiver",
+    "standards sign-off",
+    "Checked against standards register",
+    "sign-off.md",
+    "reviewer not_applicable count"
+  ],
+  "summary": "Person rule owners and coordinators independent of the contribution author's and task assignee's party can grant single-delivery waivers bound to (task_id, contribution_id, commit), optionally bounded by an UTC expiry date, which expire immediately on any new contribution or commit. Per-reviewer must not_applicable counts are derived on read from committed sign-offs without double-counting on retries. Every approval in a project with a standards register stages a context-pinned sign-off before the native approve comment and crash-recovers by operation_id, exposing Checked against standards register v<N> (never certified or guaranteed) on the task page, JSON/Markdown HTTP endpoints, and CLI standards sign-off export, alongside backup/restore support (--without-standards).",
+  "requirements": [],
+  "anchors": [
+    "docs/REVIEWS.md#gate-modes-single-delivery-waivers-and-context-pinned-sign-offs-r7-r8-r8a-r10"
+  ],
+  "code": [
+    "review_standards.py::grant_waiver",
+    "review_standards.py::evaluate_waiver_status",
+    "review_standards.py::derive_reviewer_must_na_counts",
+    "review_standards.py::read_signoff_for_contribution",
+    "review_standards.py::render_signoff_markdown",
+    "review_standards.py::render_signoff_text",
+    "review_standards.py::backup_record",
+    "review_standards.py::restore_files",
+    "http_service.py::ApiHandler.task_waiver_grant",
+    "http_service.py::ApiHandler.task_sign_off_get",
+    "http_service.py::ApiHandler.task_sign_off_markdown",
+    "web/js/views/task.js::signOffCard",
+    "web/js/views/task.js::waiverForm"
+  ],
+  "tests": [
+    "tests/test_review_standards.py",
+    "tests/test_http_review_standards.py",
+    "tests/test_standards_cli_and_backup.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "reviews",
+    "standards",
+    "waivers",
+    "signoff"
+  ]
+}

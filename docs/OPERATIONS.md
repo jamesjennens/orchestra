@@ -3589,3 +3589,10 @@ record/evidence and identity/path binding. Backup/restore retains incomplete
 plans instead of pretending only the first entry exists. Keep normal private
 sidecar permissions. The deployment mutex file needs no restoration of ownership
 state. No schema cache, interface verifier or runtime registry is introduced here.
+
+## Review standards sidecar, `serving_repos`, and host trust boundary
+
+- **Deployment git object store (`serving_repos`):** In `deployment.private.json`, configure optional `"serving_repos": {"<pid>": "/abs/path/to/repo.git"}` (and optional `"serving_target_ref": {"<pid>": "refs/heads/main"}`) so R4 path/language applicability computes `git merge-base <target_ref_sha> <commit>` against `<commit>` without relying on author-supplied `base_commit`. Bundle deliveries validate `file:line` citations in a temporary bare repo serialized one-at-a-time via `<root>/.standards-bundle-fetch.lock` (and in-process semaphore) outside `<project>/.coordination.lock`, capped at `delivery_serve_max_bytes` with `protocol.allow=never` / `protocol.file.allow=always` and a 60-second git timeout.
+- **Sidecar backup and restore (`backups/<pid>.standards.json`):** `admin.py backup` writes `<project>/.standards/` into `backups/<pid>.standards.json` (keeping `.coordination.json`'s frozen path allowlist rollback-compatible), and `admin.py restore-new` restores it unless `--without-standards` is supplied.
+- **Host operator trust boundary:** `admin.py standards ...` (`put`, `rule-edit`, `draft-decide`, `set-gate`, `record-commit`, `waive`, `owner-departed`) trusts the host shell and checks `--actor` against configured operators. Agent worker lanes must never run as the kit user on the coordination host; connect agents only via the confined SSH `endpoint.py` or HTTP credentials.
+

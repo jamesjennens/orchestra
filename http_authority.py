@@ -362,6 +362,10 @@ CAP_AGENT_SELF = 'agent.self'
 #: carrier's own account. Held by no role and by no scope but ``nudges``, which is never combined.
 CAP_NUDGE_CARRY = 'nudge.carry'
 NUDGES_SCOPE = 'nudges'
+#: Dedicated project standards verifier credential (kittrial-5bb.570): records commit/CI
+#: observations only, never combined with other scopes, and receives no baseline read or grant.
+CAP_STANDARDS_VERIFY = 'standards.verify'
+VERIFY_SCOPE = 'verify'
 
 ROLES = ('viewer', 'contributor', 'coordinator', 'owner')
 RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
@@ -379,6 +383,9 @@ SCOPE_CAPABILITIES = {
     # The nudge carrier's whole authority (kittrial-5bb.415). Alone on its credential, never a
     # project capability and never the baseline read (``credential_capabilities``).
     NUDGES_SCOPE: frozenset({CAP_NUDGE_CARRY}),
+    # Dedicated project standards verifier authority (kittrial-5bb.570). Alone on a project
+    # credential, never combined, never on an agent, and never grants baseline read.
+    VERIFY_SCOPE: frozenset({CAP_STANDARDS_VERIFY}),
 }
 CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 
@@ -583,9 +590,24 @@ def credential_capabilities(state, credential, issuer, project_id):
     scope set; every other issuer must still be a current member, and a demotion
     immediately narrows the credential.
     """
-    if NUDGES_SCOPE in (credential.get('scopes') or []):
+    scopes = list(credential.get('scopes') or [])
+    if NUDGES_SCOPE in scopes:
         # A carrier's credential reads no task, board or comment and holds no project capability,
         # whatever else is on it (a mixed list is damage and fails closed).
+        return frozenset()
+    if VERIFY_SCOPE in scopes:
+        # A verifier credential holds ONLY standards.verify, never on an agent, never combined,
+        # never baseline read, and only while its issuer still holds coordinator/owner (or superuser).
+        if scopes != [VERIFY_SCOPE] or credential.get('agent_id'):
+            return frozenset()
+        if issuer.get('superuser'):
+            return frozenset({CAP_STANDARDS_VERIFY})
+        role = state.get('memberships', {}).get(project_id, {}).get(issuer['id'])
+        if role is None:
+            raise deny(403, 'forbidden',
+                       'The credential issuer is no longer a member of this project')
+        if role in ('coordinator', 'owner'):
+            return frozenset({CAP_STANDARDS_VERIFY})
         return frozenset()
     caps = {CAP_READ}
     for scope in credential.get('scopes') or []:
@@ -2757,6 +2779,14 @@ BLOCK_CAPABILITIES = {
                    'propose-alias': CAP_RECORDS, 'verify': CAP_RECORDS,
                    'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE,
                    'reject-alias': CAP_COORDINATE, 'web-verify': CAP_COORDINATE},
+    'standards': {'draft-propose': CAP_REVIEWS},
+    'web-standards': {'read': CAP_READ, 'versions': CAP_READ, 'draft-list': CAP_READ,
+                      'commit-read': CAP_READ, 'waivers-read': CAP_READ, 'sign-off': CAP_READ,
+                      'draft-propose': CAP_REVIEWS, 'draft-propose-tasks': CAP_TASKS,
+                      'put': CAP_READ, 'rule-edit': CAP_READ,
+                      'draft-decide': CAP_READ, 'waive': CAP_READ, 'set-gate': CAP_COORDINATE,
+                      'record-commit-coordinator': CAP_COORDINATE,
+                      'record-commit-verifier': CAP_STANDARDS_VERIFY},
 }
 
 
@@ -2778,8 +2808,8 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-release', 'web-guidance', 'assignee-followon',
-                  'task-file', 'room-decision'):
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-release', 'web-guidance',
+                  'web-standards', 'assignee-followon', 'task-file', 'room-decision'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}
