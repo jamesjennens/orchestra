@@ -2614,7 +2614,8 @@ class EndpointBackend:
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(dict(operation='read', task=task_id))],
                          authority=authority_request(principal, project_id, CAP_READ,
-                                                     now=self.service._expiry_now()),
+                                                     now=self.service._expiry_now(),
+                                                     raw_now=self.service._raw_now()),
                          require_authority=True)
 
     def integration_check(self, principal, project_id, task_id, target=None):
@@ -2625,7 +2626,8 @@ class EndpointBackend:
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(body)],
                          authority=authority_request(principal, project_id, CAP_READ,
-                                                     now=self.service._expiry_now()),
+                                                     now=self.service._expiry_now(),
+                                                     raw_now=self.service._raw_now()),
                          require_authority=True)
 
     def lifecycle_replay_guard(self, principal, project_id, task_id, dimension):
@@ -3210,8 +3212,12 @@ class EndpointBackend:
             # configuration (``self.authority_store``), not request data. The decision
             # time is the service's monotone expiry clock, so the canonical endpoint
             # re-check cannot revive an item expired by a backward step.
+            # The web-lifecycle writers also get the raw host clock: integration judges an
+            # agent key's raw deadline against it (kittrial-5bb.560 r2).
             authority = authority_request(principal, project_id, capability,
-                                          now=self.service._expiry_now())
+                                          now=self.service._expiry_now(),
+                                          raw_now=(self.service._raw_now() if route.startswith('lifecycle.')
+                                                   else None))
             if self.service.approval_by_another_party and (
                     route.startswith('references.') or route.startswith('capabilities.') or route.startswith('interfaces.')):
                 authority['approval_by_another_party'] = True
@@ -6977,7 +6983,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         'superuser).')
 
     #: An agent approving under the project's default ``by-agent`` setting (kittrial-5bb.438): it may approve
-    #: another agent of its person, never itself, its person or its person's worker credentials.
+    #: another agent of its person, and work under a worker credential only its person has held (a name no
+    #: other account has held, or ``ACCOUNT/label``: kittrial-5bb.519); never itself (its sub-labels included),
+    #: its person's bare account id or a name another account has held.
     SAME_AGENT = ('This contribution was delivered by this agent itself.',
                   'This task is assigned to this agent itself.')
     BY_AGENT_NEXT = (' On this project a coordinator agent may approve the work of another agent of the same person, '

@@ -804,7 +804,7 @@ export function agentApprovalPanel(ctx, project) {
       h('div', { class: 'panel-body' },
         h('p', { class: 'muted' }, chosen === 'by-person'
           ? 'Strict: an agent holding the coordinator grant never approves work by its own person or by any agent of that person.'
-          : 'An agent holding the coordinator grant may approve work delivered by another agent of the same person, or under a worker credential of that person issued with a name no other account has held. It never approves its own work (its sub-workers included), its person’s own work under the bare account id, or work under a name another account has held. That is the default.'),
+          : 'An agent holding the coordinator grant may approve work delivered by another agent of the same person, or under a worker credential of that person issued with a name no other account has held, or under a label below the person’s account id (account/label), which only that person’s worker credential issued without a name can write. It never approves its own work (its sub-workers included), its person’s own work under the bare account id, or work under a name another account has held. That is the default.'),
         canSet ? h('div', { class: 'toolbar' }, h('label', { class: 'check', for: 'agent-approval-value' }, 'Agent approvals'), select, save) : null,
         h('p', { class: 'small muted' },
           chosen === 'by-person' ? 'Set to strict' : 'Set to “another agent of the same person may be approved”',

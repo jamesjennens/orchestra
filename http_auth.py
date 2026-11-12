@@ -3111,10 +3111,14 @@ class Service:
     def agent_approves(self, agent_id, project_id):
         """Whether a live credential of the agent may approve in the project now: it holds the
         coordinator grant there and its account is a coordinator or an owner (kittrial-5bb.209).
-        Used to word what the agent is shown; it grants nothing. The decision is
-        :func:`http_authority.agent_grant_effective` (kittrial-5bb.560)."""
+
+        :func:`http_authority.agent_grant_effective` under the store lock, against the expiry and
+        raw clocks. The review queue uses it to decide what an agent is offered; the same function
+        is the grant step of the by-agent decision, which the approve route and integration ask
+        (kittrial-5bb.560), so it is a gate there."""
         with self.store.lock:
-            return http_authority.agent_grant_effective(self.state, agent_id, project_id, self._expiry_now())
+            return http_authority.agent_grant_effective(self.state, agent_id, project_id, self._expiry_now(),
+                                                        self._raw_now())
 
     def agent_review_standing(self, agent_id, project_id):
         """``(may_review, owner_approves)`` for one agent in one project, from live state.
@@ -4711,7 +4715,7 @@ class Service:
         with self.store.lock:
             return (http_authority.agent_approval_mode(self.state, project_id),
                     http_authority.by_agent_approval(self.state, project_id, agent_id, author, assignee,
-                                                     self._expiry_now(), names=names))
+                                                     self._expiry_now(), names=names, raw_now=self._raw_now()))
 
     def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
         """Delete the agent's coordinator AND release grants in each of ``project_ids``.

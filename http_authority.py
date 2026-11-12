@@ -577,7 +577,10 @@ def actor_parties(state, actor, project_id=None):
 
 #: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438).
 #: ``by-agent``, the default: it may approve the work of ANOTHER personal agent of the same
-#: person; its own work, its person's own work and its person's worker credentials stay refused.
+#: person, and work under a worker credential only that person has held (a name no other account
+#: has held, or ``ACCOUNT/label`` below the person's account id: kittrial-5bb.519); its own work
+#: (its sub-labels included), its person's bare account id and a name another account has held
+#: stay refused.
 #: ``by-person``: the strict rule of kittrial-5bb.209, every agent of a person is one party.
 AGENT_APPROVAL_MODES = ('by-agent', 'by-person')
 AGENT_APPROVAL_DEFAULT = 'by-agent'
@@ -608,8 +611,9 @@ def agent_approval_mode(state, project_id):
                 'damaged': True}
     set_by = entry.get('set_by') if isinstance(entry.get('set_by'), str) else None
     if set_by:
-        user = state['users'].get(set_by) or {}
-        display = user.get('display_name') or set_by
+        users = state.get('users') if isinstance(state.get('users'), dict) else {}
+        user = users.get(set_by)
+        display = (user.get('display_name') if isinstance(user, dict) else None) or set_by
     else:
         display = None
     return {'mode': entry['mode'], 'set_by': set_by,
@@ -617,23 +621,46 @@ def agent_approval_mode(state, project_id):
             'set_by_display_name': display}
 
 
-def agent_grant_effective(state, agent_id, project_id, now):
+def _finite_clock(value):
+    """Whether ``value`` is a finite real number usable as a decision clock (not a bool, NaN or inf)."""
+    return type(value) is not bool and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def agent_grant_effective(state, agent_id, project_id, now, raw_now=None):
     """Whether a live credential of the agent may approve in the project at ``now``: it holds the
     coordinator grant there and its account is a coordinator or an owner (kittrial-5bb.209).
 
-    ``now`` is the caller's expiry clock (the service's ``_expiry_now``).
+    ``now`` is the caller's expiry clock (the service's ``_expiry_now``); ``raw_now`` the raw host
+    clock (``_raw_now``). Each credential is judged as the service judges it (kittrial-5bb.560 r2):
+    revoked, its stored ``expires_at`` reached or unreadable (NaN and infinity included), past the
+    366-day read cap, issued to
+    another account than the agent's owner, or an agent key whose ``agent_raw_expires_at`` has
+    passed on the raw clock (or cannot be read, or no raw clock was given) does not count. A
+    ``now`` that is not a finite number answers False: never a guessed clock.
     """
-    agent = state['agents'].get(agent_id)
+    if not _finite_clock(now):
+        return False
+    agents = state.get('agents') if isinstance(state.get('agents'), dict) else {}
+    users = state.get('users') if isinstance(state.get('users'), dict) else {}
+    credentials = state.get('credentials') if isinstance(state.get('credentials'), dict) else {}
+    agent = agents.get(agent_id) if isinstance(agent_id, str) else None
     if not isinstance(agent, dict) or not agent.get('enabled') or \
             project_id not in (agent.get('projects') or []):
         return False
-    owner = state['users'].get(agent.get('owner'))
+    owner_id = agent.get('owner')
+    owner = users.get(owner_id) if isinstance(owner_id, str) else None
     if not isinstance(owner, dict) or owner.get('disabled'):
         return False
-    for credential in state.get('credentials', {}).values():
+    for credential in credentials.values():
         if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
-                credential.get('revoked') or credential.get('expires_at', 0) <= now:
+                credential.get('revoked') or credential.get('user_id') != owner_id or \
+                not _finite_clock(credential.get('expires_at')) or \
+                credential_stored_expired(credential, now) or credential_age_expired(credential, now):
             continue
+        if 'agent_raw_expires_at' in credential:
+            raw_expires = credential['agent_raw_expires_at']
+            if not _finite_clock(raw_expires) or not _finite_clock(raw_now) or raw_now >= raw_expires:
+                continue
         try:
             if CAP_APPROVE in credential_capabilities(state, credential, owner, project_id):
                 return True
@@ -706,13 +733,14 @@ def independent_of(state, names, target, project_id):
     return all(not (actor_parties(state, name, project_id) & taken) for name in names)
 
 
-def by_agent_approval(state, project_id, approver, author, assignee, now, names=None):
+def by_agent_approval(state, project_id, approver, author, assignee, now, names=None, raw_now=None):
     """Whether the project's by-agent setting lets agent ``approver`` approve work its party rule refused.
 
     Asked only once the plain party rule has refused an agent approver. In order:
 
     1. the setting is not ``by-agent`` (``by-person``, or a damaged record): ``strict``;
-    2. ``approver`` is not an agent whose coordinator grant is effective at ``now``: ``no-grant``;
+    2. ``approver`` is not an agent whose coordinator grant is effective at ``now`` and ``raw_now``
+       (:func:`agent_grant_effective`): ``no-grant``;
     3. the author, then the assignee. One that is not text, or that every one of ``names`` (the
        names the approver acts under; default just ``approver``) is independent of, is skipped.
        Another agent of the same person passes with basis ``agent``; a worker credential only that
@@ -724,7 +752,7 @@ def by_agent_approval(state, project_id, approver, author, assignee, now, names=
     if agent_approval_mode(state, project_id)['mode'] != 'by-agent':
         return ByAgentDecision(False, None, 'strict', None, None, False)
     agent_id = approver if isinstance(approver, str) else ''
-    if not agent_id or not agent_grant_effective(state, agent_id, project_id, now):
+    if not agent_id or not agent_grant_effective(state, agent_id, project_id, now, raw_now):
         return ByAgentDecision(False, None, 'no-grant', None, None, False)
     names = [approver] if names is None else list(names)
     basis = None
@@ -752,16 +780,17 @@ def by_agent_approval(state, project_id, approver, author, assignee, now, names=
     return ByAgentDecision(True, basis, None, None, None, False)
 
 
-def recorded_by_agent_approval(state, project_id, approver, author, assignee, now):
+def recorded_by_agent_approval(state, project_id, approver, author, assignee, now, raw_now=None):
     """:func:`by_agent_approval` for an approval already RECORDED under the name ``approver`` (kittrial-5bb.560).
 
     What integration asks, from the present state: the approve route judged the agent
     ``principal.agent_id`` under the names ``[actor, account]``; a recorded approval carries only
     the actor name, so the agent is the record of its first segment and the account is that
     agent's owner, the account its credential is issued to. A name of no agent record, or a
-    ``now`` that is not a number, is refused (``no-grant``/``strict``): never a guessed clock.
+    ``now`` that is not a finite number, is refused (``no-grant``/``strict``): never a guessed
+    clock. ``raw_now`` is the raw host clock an agent key's raw deadline is judged against.
     """
-    if type(now) is bool or not isinstance(now, (int, float)):
+    if not _finite_clock(now):
         return ByAgentDecision(False, None, 'strict', None, None, False)
     head = approver.split('/', 1)[0] if isinstance(approver, str) and approver else ''
     agents = state.get('agents') if isinstance(state.get('agents'), dict) else {}
@@ -769,7 +798,7 @@ def recorded_by_agent_approval(state, project_id, approver, author, assignee, no
     if not isinstance(agent, dict):
         return ByAgentDecision(False, None, 'no-grant', None, None, False)
     names = [approver] + ([agent['owner']] if isinstance(agent.get('owner'), str) and agent['owner'] else [])
-    return by_agent_approval(state, project_id, head, author, assignee, now, names=names)
+    return by_agent_approval(state, project_id, head, author, assignee, now, names=names, raw_now=raw_now)
 
 
 def _bare_account_id_of(state, agent_id, name):
@@ -779,13 +808,20 @@ def _bare_account_id_of(state, agent_id, name):
     return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
 
 
-def authority_request(principal, project_id, capability, *, now=None):
-    """Build the durable-identity descriptor for one principal/capability decision."""
-    return {'via': principal.via, 'user_id': principal.user_id,
-            'credential_id': principal.credential_id,
-            'session_hash': principal.session_hash,
-            'project': project_id, 'capability': capability,
-            'now': now}
+def authority_request(principal, project_id, capability, *, now=None, raw_now=None):
+    """Build the durable-identity descriptor for one principal/capability decision.
+
+    ``raw_now`` (the service's raw host clock) is added only when given: the web-lifecycle
+    routes send it so integration judges an agent key's raw deadline (kittrial-5bb.560 r2).
+    """
+    descriptor = {'via': principal.via, 'user_id': principal.user_id,
+                  'credential_id': principal.credential_id,
+                  'session_hash': principal.session_hash,
+                  'project': project_id, 'capability': capability,
+                  'now': now}
+    if raw_now is not None:
+        descriptor['raw_now'] = raw_now
+    return descriptor
 
 
 def credential_capabilities(state, credential, issuer, project_id):

@@ -19,7 +19,7 @@
     "endpoint authority table",
     "unknown authority action"
   ],
-  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party, except that by-agent (default) lets a coordinator agent approve its person's other agents and sole-held worker-credential names; integration applies that one decision. The endpoint table binds action/operation to capability and project; a carried block for an absent action/operation is refused before action locks, reservation or effects. The preceding worker namespace check may read registry/native rows. Nontext capabilities refuse403, and forged review help/list attachments reserve nothing. No-block host calls retain their behavior. One verified_web_authority helper checks configured live authority. Web merge-slot read/take/release use native holder/context; force-release and explicit repair need an owner/superuser, never an agent. Stale/repeated recovery preserves holder and audit; page and named client ship together. Host rules and independent approval remain. Older service without can_decide leaves newer page without an owner decision form. No web facts/integration writer or new store/switch.",
+  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party, except that by-agent (default) lets a coordinator agent approve its person's other agents and sole-held worker-credential names; integration applies that one decision. The endpoint table binds action/operation to capability and project; a carried block for an absent action/operation is refused before action locks, reservation or effects. The preceding worker namespace check may read registry/native rows. Nontext capabilities refuse403, and forged review help/list attachments reserve nothing. No-block host calls retain their behavior. One verified_web_authority helper checks configured live authority. Web merge-slot read/take/release use native holder/context; force-release and explicit repair need an owner/superuser, never an agent. Stale/repeated recovery preserves holder and audit; page and named client ship together. Host rules and independent approval remain. Older service without can_decide leaves newer page without an owner decision form. No new store or switch.",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve",
@@ -52,7 +52,9 @@
     "http_authority.py::required_capability",
     "http_authority.py::decide",
     "http_authority.py::by_agent_approval",
-    "web_lifecycle.py::approved_party"
+    "web_lifecycle.py::approved_party",
+    "http_authority.py::recorded_by_agent_approval",
+    "http_authority.py::agent_grant_effective"
   ],
   "tests": [
     "tests/test_coordinator_grant.py",
@@ -64,6 +66,7 @@
     "tests/test_http_proposals.py",
     "tests/test_authority_block_followups.py",
     "tests/test_by_agent_decision_560.py",
+    "tests/test_web_lifecycle_by_agent_560.py",
     "tests/test_agent_approval_integration_560.py"
   ],
   "owner": "person:orchestra-coordinator",

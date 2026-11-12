@@ -255,5 +255,87 @@ class Recorded(unittest.TestCase):
                                                                    NOW + 3600).refusal)
 
 
+
+RAW = 2_000_000.0
+
+
+class GrantJudgedAsTheService(unittest.TestCase):
+    """kittrial-5bb.560 r2 item m1: each credential counts toward the grant only as the service
+    would accept it. One shape per test, each through ``agent_grant_effective`` and through the
+    recorded decision integration asks."""
+
+    def assert_no_grant(self, state, now=NOW, raw_now=RAW):
+        self.assertFalse(ha.agent_grant_effective(state, 'heron', P, now, raw_now))
+        self.assertEqual('no-grant', ha.recorded_by_agent_approval(state, P, 'heron', 'egret', None, now,
+                                                                   raw_now).refusal)
+
+    def test_the_control_is_allowed(self):
+        self.assertTrue(ha.agent_grant_effective(base_state(), 'heron', P, NOW, RAW))
+        self.assertTrue(ha.recorded_by_agent_approval(base_state(), P, 'heron', 'egret', None, NOW, RAW).allowed)
+
+    def test_a_credential_past_the_366_day_cap_does_not_count(self):
+        state = base_state()
+        # Stored expiry still ahead, but the last legitimate write is more than 366 days back.
+        state['credentials']['c_heron'].update(agent_written_raw=NOW - ha.CREDENTIAL_MAX_AGE_SECONDS,
+                                               expires_at=NOW + 10 * 365 * 86400)
+        self.assert_no_grant(state)
+        state['credentials']['c_heron']['agent_written_raw'] = NOW - ha.CREDENTIAL_MAX_AGE_SECONDS + 1
+        self.assertTrue(ha.agent_grant_effective(state, 'heron', P, NOW, RAW))
+
+    def test_an_unreadable_expires_at_does_not_count_and_raises_nothing(self):
+        for value in (None, 'tomorrow', True, float('nan'), [NOW + 3600]):
+            state = base_state()
+            state['credentials']['c_heron']['expires_at'] = value
+            self.assert_no_grant(state)
+        state = base_state()
+        del state['credentials']['c_heron']['expires_at']
+        self.assert_no_grant(state)
+
+    def test_a_credential_issued_to_another_account_does_not_count(self):
+        for user_id in ('bob', 'olly', None):
+            state = base_state()
+            state['credentials']['c_heron']['user_id'] = user_id
+            self.assert_no_grant(state)
+
+    def test_an_agent_key_past_its_raw_deadline_does_not_count(self):
+        state = base_state()
+        state['credentials']['c_heron']['agent_raw_expires_at'] = RAW + 60
+        self.assertTrue(ha.agent_grant_effective(state, 'heron', P, NOW, RAW + 59))
+        self.assert_no_grant(state, raw_now=RAW + 60)
+        # No raw clock given, or one that cannot be read: the key does not count.
+        for raw_now in (None, float('nan'), True, 'now'):
+            self.assert_no_grant(state, raw_now=raw_now)
+        for value in (None, float('inf'), float('nan'), 'later', False):
+            state['credentials']['c_heron']['agent_raw_expires_at'] = value
+            self.assert_no_grant(state)
+
+    def test_a_key_without_a_raw_deadline_needs_no_raw_clock(self):
+        self.assertTrue(ha.agent_grant_effective(base_state(), 'heron', P, NOW, None))
+
+    def test_a_non_finite_now_fails_closed(self):
+        state = base_state()
+        state['credentials']['c_heron']['expires_at'] = NOW - 1        # expired at any real clock
+        for now in (float('nan'), float('inf'), float('-inf')):
+            self.assertFalse(ha.agent_grant_effective(base_state(), 'heron', P, now, RAW), now)
+            self.assertFalse(ha.agent_grant_effective(state, 'heron', P, now, RAW), now)
+            self.assertEqual('strict', ha.recorded_by_agent_approval(state, P, 'heron', 'egret', None, now,
+                                                                     RAW).refusal, now)
+
+    def test_damaged_agents_users_or_credentials_answer_false(self):
+        for key in ('agents', 'users', 'credentials'):
+            for damage in (None, [], 'x'):
+                state = base_state()
+                state[key] = damage
+                self.assertFalse(ha.agent_grant_effective(state, 'heron', P, NOW, RAW), (key, damage))
+                self.assertFalse(ha.recorded_by_agent_approval(state, P, 'heron', 'egret', None, NOW,
+                                                               RAW).allowed, (key, damage))
+
+    def test_a_damaged_users_map_does_not_break_the_setting_read(self):
+        state = base_state()
+        state['agent_approval'] = {P: {'mode': 'by-agent', 'set_by': 'olly', 'set_at': 'then'}}
+        state['users'] = None
+        self.assertEqual('olly', ha.agent_approval_mode(state, P)['set_by_display_name'])
+
+
 if __name__ == '__main__':
     unittest.main()

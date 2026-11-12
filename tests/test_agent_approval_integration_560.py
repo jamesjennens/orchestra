@@ -130,8 +130,8 @@ class AgentApprovalIntegration(grant_real.RealStackTests):
         self.assertEqual(200, checked.status, checked.data)
         return next(check for check in checked.data['checks'] if check['check'] == 'approval')
 
-    def writer(self, task):
-        """The integrated writer, with a scope on the approved commit and the task's merge slot held."""
+    def scoped(self, task):
+        """A lifecycle scope on the approved commit."""
         state = self.request('GET', '%s/%s/lifecycle' % (self.tasks, task), token=self.tokens['alex'])
         self.assertEqual(200, state.status, state.data)
         if state.data['scope'] != SCOPE:
@@ -140,19 +140,35 @@ class AgentApprovalIntegration(grant_real.RealStackTests):
                                       evidence=['scope 560'], provenance='performed'),
                                  token=self.tokens['alex'], key='scope-' + secrets.token_hex(6))
             self.assertEqual(201, scope.status, scope.data)
+
+    def with_slot(self, task, act):
+        """``act()`` with the task's merge slot held, released after."""
         taken = self.request('POST', '/v1/projects/pp/merge-slot/acquire', dict(task_id=task, target='main'),
                              token=self.tokens['alex'], key='slot-' + secrets.token_hex(6))
         self.assertEqual(200, taken.status, taken.data)
         try:
-            written = self.request('POST', '%s/%s/lifecycle/facts/integrated' % (self.tasks, task),
-                                   dict(scope=dict(SCOPE), value='failed', evidence=['integration 560'],
-                                        provenance='performed'), token=self.tokens['alex'],
-                                   key='fact-' + secrets.token_hex(6))
+            return act()
         finally:
             released = self.request('POST', '/v1/projects/pp/merge-slot/release', {}, token=self.tokens['alex'],
                                     key='release-' + secrets.token_hex(6))
             self.assertEqual(200, released.status, released.data)
+
+    def fact(self, task, dimension, value='failed'):
+        written = self.request('POST', '%s/%s/lifecycle/facts/%s' % (self.tasks, task, dimension),
+                               dict(scope=dict(SCOPE), value=value, evidence=['%s 560' % dimension],
+                                    provenance='performed'), token=self.tokens['alex'],
+                               key='fact-' + secrets.token_hex(6))
         return written.status, held.message(written)
+
+    def lifecycle(self, task):
+        state = self.request('GET', '%s/%s/lifecycle' % (self.tasks, task), token=self.tokens['alex'])
+        self.assertEqual(200, state.status, state.data)
+        return state.data
+
+    def writer(self, task):
+        """The integrated writer, with a scope on the approved commit and the task's merge slot held."""
+        self.scoped(task)
+        return self.with_slot(task, lambda: self.fact(task, 'integrated'))
 
     def integrates(self, task):
         row = self.row(task)
@@ -265,6 +281,58 @@ class AgentApprovalIntegration(grant_real.RealStackTests):
         self.integrates(task)
         self.set_mode('by-person')
         self.refuses(task)
+
+    def test_the_lifecycle_read_and_the_reviewed_writer_follow_the_decision(self):
+        """r2 item s1: GET .../lifecycle (standing approval, affordances) and POST .../facts/reviewed ask
+        the decision too, not only the check row and the integrated writer."""
+        task, contribution = self.deliver('egret')
+        self.assertEqual((201, ''), self.route(task, contribution))
+        self.scoped(task)
+
+        def read_and_review():
+            state = self.lifecycle(task)
+            return (state['standing_approval'] is not None, state['approval_reason'],
+                    state['affordances']['reviewed']['allowed'], state['affordances']['reviewed']['reason'],
+                    state['affordances']['integrated']['allowed'], state['affordances']['integrated']['reason'],
+                    self.fact(task, 'reviewed'))
+        self.assertEqual((True, None, True, None, True, None, (201, '')), self.with_slot(task, read_and_review))
+        self.set_mode('by-person')
+        self.assertEqual((False, OTHER_PARTY, False, OTHER_PARTY, False, OTHER_PARTY, (409, OTHER_PARTY)),
+                         self.with_slot(task, read_and_review))
+
+    def test_each_credential_shape_the_service_refuses_stops_integration(self):
+        """r2 item m1: the grant counts only a credential the service would accept. Each shape is written
+        into the state after the approval, and refuses at the row and the writer without an error;
+        undoing it integrates again."""
+        moment, raw = self.service._expiry_now(), self.service._raw_now()
+        shapes = {
+            'past the 366-day cap': dict(agent_written_raw=moment - 367 * 86400, agent_issued_raw=moment - 367 * 86400),
+            'expires_at null': dict(expires_at=None),
+            'expires_at NaN': dict(expires_at=float('nan')),
+            'issued to another account': dict(user_id=self.ids['alex']),
+            'raw deadline passed': dict(agent_raw_expires_at=raw - 1),
+        }
+        task, contribution = self.deliver('egret')
+        self.assertEqual((201, ''), self.route(task, contribution))
+        def mine(state):
+            return {key: c for key, c in state['credentials'].items() if c.get('agent_id') == self.agent_id}
+        for label, change in shapes.items():
+            with self.subTest(shape=label):
+                kept = {}
+
+                def spoil(state):
+                    for key, credential in mine(state).items():
+                        kept[key] = dict(credential)
+                        credential.update(change)
+
+                def restore(state):
+                    for key, credential in mine(state).items():
+                        credential.clear()
+                        credential.update(kept[key])
+                self.change_state(spoil)
+                self.refuses(task)
+                self.change_state(restore)
+                self.integrates(task)
 
     def test_one_source_the_route_the_queue_offer_and_the_row_agree(self):
         self.worker('lane', 'lane-c')

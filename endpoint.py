@@ -2831,11 +2831,14 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                 return actor_parties(read_state(authority_config.store),label,name)
             def lifecycle_by_agent(approver,author,assignee):
                 # kittrial-5bb.560: the approve route's by-agent decision, asked again from the
-                # present state when the party sets meet, against the descriptor's decision
-                # clock (the web service's _expiry_now). No clock in the descriptor: strict.
+                # present state when the party sets meet, against the descriptor's clocks (the
+                # web service's _expiry_now and _raw_now). No decision clock: strict; no raw
+                # clock: an agent key with a raw deadline does not count. Never time.time().
                 descriptor=request.get('authority')
                 now=descriptor.get('now') if isinstance(descriptor,dict) else None
-                return recorded_by_agent_approval(read_state(authority_config.store),name,approver,author,assignee,now)
+                raw_now=descriptor.get('raw_now') if isinstance(descriptor,dict) else None
+                return recorded_by_agent_approval(read_state(authority_config.store),name,approver,author,assignee,
+                                                  now,raw_now)
             def lifecycle_effect():
                 # The integration check needs the same operators, owners and mark family
                 # read as the writers whose decisions it reports (kittrial-5bb.374).
