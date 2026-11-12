@@ -1031,7 +1031,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       return [
         h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
         grantable.length === 0 ? h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
-          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again.") : null,
+          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.") : null,
         h('div', { class: 'copy-row', 'data-role-choice': 'true' },
           choice('setup-role', 'worker', 'Works on tasks', !state.coordinatorProject && state.role === 'worker', () => selectRole('worker')),
           choice('setup-role', 'reviewer', 'Reviews deliveries', !state.coordinatorProject && state.role === 'reviewer', () => selectRole('reviewer')),
@@ -1169,6 +1169,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 
   async function selectRole(role) {
     state.coordinatorProject = null;
+    state.rereadFailedProject = null;
     checkStatus.hidden = true;
     checkStatus.textContent = '';
     syncGrantRow();
@@ -1177,6 +1178,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 
   function selectCoordinatorProject(pid) {
     state.coordinatorProject = pid;
+    state.rereadFailedProject = null;
     wizard.clearError();
     checkStatus.hidden = true;
     checkStatus.textContent = '';
@@ -1185,6 +1187,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 
   async function grantCoordinatorRole(pid, btn) {
     if (state.grantingCoordinator) return;
+    state.rereadFailedProject = null;
     wizard.clearError();
     checkStatus.hidden = true;
     checkStatus.textContent = '';
@@ -1197,6 +1200,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       try {
         fresh = await ctx.api.agent(payload.agentId);
       } catch (rereadError) {
+        state.rereadFailedProject = pid;
         const wrapped = new Error(`The coordinator grant for ${projectLabel(pid)} may be saved, but re-reading ${payload.name} failed. Re-open this set-up to re-read before retrying.`);
         if (rereadError && rereadError.requestId) wrapped.requestId = rereadError.requestId;
         wizard.showError(wrapped);
@@ -1223,10 +1227,11 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       if (!(payload.coordinateGrantableProjects || []).includes(pid)) {
         state.coordinatorProject = null;
         render();
+        wizard.showError(new Error(`This set-up cannot tell whether ${payload.name} holds a coordinator grant for ${projectLabel(pid)}. Check the project's Members & settings page.`));
       } else {
         syncGrantRow();
+        wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));
       }
-      wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));
       return;
     }
     state.coordinatorProject = null;
@@ -1279,7 +1284,9 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   async function next() {
     if (state.screen === 'role' && state.coordinatorProject && !setupText.coordinating(payload)) {
       checkStatus.setAttribute('data-check-state', 'failed');
-      checkStatus.textContent = `Click “Make coordinator of ${projectLabel(state.coordinatorProject)}” first, or choose another role before continuing.`;
+      checkStatus.textContent = state.rereadFailedProject === state.coordinatorProject
+        ? `The coordinator grant for ${projectLabel(state.coordinatorProject)} may be saved, but re-reading ${payload.name} failed. Re-open this set-up to re-read, or choose another role before continuing.`
+        : `Click “Make coordinator of ${projectLabel(state.coordinatorProject)}” first, or choose another role before continuing.`;
       checkStatus.hidden = false;
       skipBtn.hidden = true;
       return false;

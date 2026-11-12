@@ -996,22 +996,31 @@ class WizardCoordinatorGrantTests(Grants):
                                            token=self.tokens['olive']).status)
 
         # 6. S4: Once the agent holds an effective coordinator grant in Alpha, Alpha is omitted from
-        #    coordinate_grantable_projects (both for a member owner and for a superuser who is not a
-        #    member of the project); a dormant grant whose issuer lost owner/superuser remains grantable.
+        #    coordinate_grantable_projects (both for the agent's owner and for a superuser reading the
+        #    agent); a dormant grant whose issuer lost owner/superuser remains grantable.
         self.assertEqual(200, self.grant(agent_id=olive_agent_id, token=self.tokens['olive']).status)
         for token in (self.tokens['olive'], self.admin):
             after_grant = self.request('GET', '/v1/agents/%s' % olive_agent_id, token=token)
             self.assertEqual(200, after_grant.status, after_grant.data)
             self.assertEqual([], after_grant.data['coordinate_grantable_projects'])
-        # Superuser-not-member case (m1-nonmember-superuser): admin owns an agent in olive_only (where admin is not
-        # in memberships[olive_only]). coordinate_grantable_projects leaves out any project whose agent's owner is not
-        # a member of it (the same rule as agent_coordinates); a non-member superuser grants on the Members page only.
+        # Owner-member rule (m1-nonmember-superuser, kittrial-5bb.541):
+        # (a) Positive caller-not-member case: self.admin is not in memberships[olive_only], but olive is.
+        #     When self.admin reads olive's agent in olive_only, coordinate_grantable_projects is [olive_only]
+        #     because the membership filter checks the agent's OWNER, not the caller.
         olive_only = self.create_project(self.tokens['olive'], 'OliveOnly')
+        _, olive_only_agent_id = self.agent_with_id('olive', 'OliveFalcon', projects=[olive_only])
+        admin_reads_olive_only = self.request('GET', '/v1/agents/%s' % olive_only_agent_id, token=self.admin)
+        self.assertEqual(200, admin_reads_olive_only.status, admin_reads_olive_only.data)
+        self.assertEqual([olive_only], admin_reads_olive_only.data['coordinate_grantable_projects'])
+        # (b) Negative owner-not-member case: admin owns an agent in olive_only while admin is not in
+        #     memberships[olive_only]. coordinate_grantable_projects leaves out olive_only (same rule as
+        #     agent_coordinates); a non-member superuser grants on the Members page only.
         admin_agent_res = self.request('POST', '/v1/agents',
                                        {'name': 'AdminHawk', 'projects': [olive_only]},
                                        token=self.admin)
         self.assertEqual(201, admin_agent_res.status, admin_agent_res.data)
         admin_agent_id = admin_agent_res.data['agent']['id']
+        admin_user_id = admin_agent_res.data['agent']['owner']
         self.assertEqual([], admin_agent_res.data['agent']['coordinate_grantable_projects'])
         admin_before = self.request('GET', '/v1/agents/%s' % admin_agent_id, token=self.admin)
         self.assertEqual(200, admin_before.status, admin_before.data)
@@ -1022,6 +1031,22 @@ class WizardCoordinatorGrantTests(Grants):
         self.assertEqual(200, admin_after.status, admin_after.data)
         self.assertEqual([], admin_after.data['coordinate_grantable_projects'])
         self.assertEqual([], admin_after.data['coordinates'])
+        # (c) Positive superuser-owner-is-member case: once admin is a member of olive_only (even as a
+        #     viewer, since _may_coordinate is True for a superuser owner), an ungranted agent owned by
+        #     admin gets [olive_only] in coordinate_grantable_projects, and after PUT gets coordinates.
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/agents/%s/coordinator' % (olive_only, admin_agent_id),
+                                           token=self.admin).status)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (olive_only, admin_user_id),
+                                           {'role': 'viewer'}, token=self.tokens['olive']).status)
+        admin_member_before = self.request('GET', '/v1/agents/%s' % admin_agent_id, token=self.admin)
+        self.assertEqual(200, admin_member_before.status, admin_member_before.data)
+        self.assertEqual([olive_only], admin_member_before.data['coordinate_grantable_projects'])
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/agents/%s/coordinator' % (olive_only, admin_agent_id),
+                                           {}, token=self.admin).status)
+        admin_member_after = self.request('GET', '/v1/agents/%s' % admin_agent_id, token=self.admin)
+        self.assertEqual(200, admin_member_after.status, admin_member_after.data)
+        self.assertEqual([], admin_member_after.data['coordinate_grantable_projects'])
+        self.assertEqual([{'project': olive_only, 'effective': True}], admin_member_after.data['coordinates'])
         # Dormant grant (issuer lost owner authority): Alpha becomes grantable again so a current owner can re-grant.
         with self.service.store.lock:
             self.service.state['coordinator_grants'][self.project][olive_agent_id]['granted_by'] = self.ids['cora']
