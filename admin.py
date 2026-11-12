@@ -814,6 +814,33 @@ def delivery_serve_max_bytes(root, doc=None, warnings=None):
     return DELIVERY_SERVE_MAX_BYTES
 
 
+def invites_enabled(root, doc=None, warnings=None):
+    """The installation switch ``invites_enabled`` from `deployment.private.json` (kittrial-5bb.578).
+
+    Absent or false means OFF, so an installation that sets nothing makes no invite links. A value that
+    is neither true nor false is read as OFF with a warning naming it (bounded with ``audit_field``), as
+    the coordinator rules read theirs. The web service reads it on every invite request, so turning it
+    on or off needs no restart.
+    """
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return False
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return False
+    value = doc.get('invites_enabled')
+    if value is None or value is False:
+        return False
+    if value is True:
+        return True
+    _warn_deployment_setting(
+        warnings,
+        'deployment invites_enabled is %s, not true or false; reading it as off (no invite links)' % audit_field(value),
+    )
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Slices 6 and 7 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.197) and
 # the decisions recorded on kittrial-5bb.106: three per-installation rules, each
@@ -6689,6 +6716,13 @@ def _restore_http_state(root, named=None, credentials='keep', now=None):
     resets=document.get('reset_tokens',{})
     unused=[record for record in resets.values() if not record.get('used')]
     for record in resets.values():record['used']=True
+    # kittrial-5bb.578: a pending invite link in the backup is withdrawn too, for the same reason: one
+    # redeemed since the backup would otherwise create its account a second time.
+    pending_invites=document.get('invites',{})
+    for record in (pending_invites.values() if isinstance(pending_invites,dict) else ()):
+        if isinstance(record,dict) and not record.get('used_at') and not record.get('revoked_at'):
+            record['revoked_at']=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(now))
+            record['revoked_by']='(restore)'
     stored=document.get('credentials',{})
     revoked_before=sum(1 for record in stored.values() if record.get('revoked'))
     if credentials=='revoke':
