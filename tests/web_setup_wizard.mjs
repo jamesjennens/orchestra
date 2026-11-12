@@ -21,8 +21,14 @@ globalThis.sessionStorage = {
   setItem: (k, v) => store.set(k, String(v)),
   removeItem: (k) => store.delete(k),
 };
+let copiedText = null;
 Object.defineProperty(globalThis, 'navigator', {
-  value: { platform: 'Win32', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }, configurable: true,
+  value: {
+    platform: 'Win32',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    clipboard: { writeText: async (text) => { copiedText = String(text); } },
+  },
+  configurable: true,
 });
 const body = globalThis.document.body;
 const listeners = new Map();
@@ -75,10 +81,22 @@ const server = {
   revoked: [],
   posts: [],
   listNew: false,
+  coordinateGrantableProjects: undefined,
+  ownerMemberships: ['p1', 'p2'],
+  agentProjects: ['p1'],
+  coordinatorGrants: [],
+  coordinatorRevokes: [],
+  failCoordinatorGrant: false,
+  failAgentReread: false,
+  grantHasNoEffectOnReread: false,
+  dropFromGrantableOnReread: false,
+  onCoordinatorPutInFlight: null,
 };
 let sessionReads = 0;
 let agentReads = 0;
+let transportCalls = 0;
 const api = createApi(async (method, path, _headers, text) => {
+  transportCalls += 1;
   const sent = text ? JSON.parse(text) : undefined;
   if (method === 'GET' && path === '/v1/sessions/current') { sessionReads += 1; return { status: 200, data: { csrf_token: 'c' } }; }
   if (method === 'GET' && path === '/v1/service/certificate') {
@@ -86,9 +104,63 @@ const api = createApi(async (method, path, _headers, text) => {
   }
   if (method === 'GET' && path === '/v1/agents/agent_1') {
     agentReads += 1;
+    if (server.failAgentReread) {
+      return { status: 500, data: { error: { code: 'internal_error', message: 'Database read failed' }, request_id: 'req_reread_500' } };
+    }
+    const ownerMemberships = Array.isArray(server.ownerMemberships) ? server.ownerMemberships : ['p1', 'p2'];
+    const coordinates = Array.isArray(server.coordinates)
+      ? server.coordinates.filter((c) => c && ownerMemberships.includes(c.project))
+      : undefined;
+    const grantable = Array.isArray(server.coordinateGrantableProjects)
+      ? server.coordinateGrantableProjects.filter((pid) => ownerMemberships.includes(pid))
+      : server.coordinateGrantableProjects;
     return { status: 200, data: { id: 'agent_1', name: 'Kestrel', owner: 'u1', role: 'worker', scopes: server.scopes, scopes_source: 'stored',
-      working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'], last_seen_at: server.lastSeen, credentials: server.credentials,
-      ...(server.coordinates ? { coordinates: server.coordinates } : {}) } };
+      working_directory: 'C:\\Users\\olive\\kestrel', projects: server.agentProjects || ['p1'], last_seen_at: server.lastSeen, credentials: server.credentials,
+      ...(coordinates !== undefined ? { coordinates } : {}),
+      ...(grantable !== undefined ? { coordinate_grantable_projects: grantable } : {}) } };
+  }
+  const coordRoute = /^\/v1\/projects\/([a-z0-9_-]+)\/agents\/(agent_[0-9]+)\/coordinator$/.exec(path);
+  if (method === 'PUT' && coordRoute) {
+    if (typeof server.onCoordinatorPutInFlight === 'function') await server.onCoordinatorPutInFlight();
+    if (server.failCoordinatorGrant) return { status: 403, data: { error: { code: 'forbidden', message: 'Project role does not permit this operation' } } };
+    server.coordinatorGrants.push(coordRoute[1] + '/' + coordRoute[2]);
+    if (!server.grantHasNoEffectOnReread) {
+      const current = Array.isArray(server.coordinates) ? server.coordinates.slice() : [];
+      if (!current.some((c) => c && c.project === coordRoute[1] && c.effective === true)) {
+        current.push({ project: coordRoute[1], effective: true });
+      }
+      server.coordinates = current;
+      if (Array.isArray(server.coordinateGrantableProjects)) {
+        server.coordinateGrantableProjects = server.coordinateGrantableProjects.filter((p) => p !== coordRoute[1]);
+      }
+    } else if (server.dropFromGrantableOnReread && Array.isArray(server.coordinateGrantableProjects)) {
+      server.coordinateGrantableProjects = server.coordinateGrantableProjects.filter((p) => p !== coordRoute[1]);
+    }
+    return {
+      status: 200,
+      data: {
+        id: coordRoute[2],
+        name: 'Kestrel',
+        owner: 'u1',
+        owner_display_name: 'Olive',
+        actor: 'agent:' + coordRoute[2],
+        enabled: true,
+        last_seen_at: server.lastSeen,
+        credentials: [],
+        coordinator: {
+          granted_by: 'u1',
+          granted_by_display_name: 'Olive',
+          granted_at: '2026-10-17T00:00:00Z',
+          effective: !server.grantHasNoEffectOnReread,
+          no_effect_because: server.grantHasNoEffectOnReread ? 'account-role' : null,
+        },
+        release: null,
+      },
+    };
+  }
+  if (method === 'DELETE' && coordRoute) {
+    server.coordinatorRevokes.push(coordRoute[1] + '/' + coordRoute[2]);
+    return { status: 200, data: {} };
   }
   if (method === 'POST' && path === '/v1/agents/agent_1/credentials') {
     if (server.failIssue) return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached.' } } };
@@ -110,7 +182,14 @@ const api = createApi(async (method, path, _headers, text) => {
   }
   return { status: 404, data: { error: { code: 'not_found', message: 'no route ' + method + ' ' + path } } };
 });
-const ctx = { api, me: { id: 'u1' }, query: { get: (k) => (k === 'agent' ? 'agent_1' : null) }, href: (p) => '#' + p, go: () => {} };
+const ctx = {
+  api,
+  me: { id: 'u1', superuser: true },
+  projects: [{ id: 'p1', name: 'Alpha' }, { id: 'p2', name: 'Beta' }, { id: 'p3', name: 'Gamma' }],
+  query: { get: (k) => (k === 'agent' ? 'agent_1' : null) },
+  href: (p) => '#' + p,
+  go: () => {},
+};
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const openDialogs = () => body.all((e) => e.tagName === 'DIALOG' && e.open === true);
@@ -287,6 +366,7 @@ out.longCommandIsCopyAndCollapsed = selfCheckLine.getAttribute('data-long-comman
   && selfCheckLine.all((e) => e.tagName === 'DETAILS')[0].all((e) => e.tagName === 'CODE').length === 1;
 out.selfCheckBypassesTheProxyForThisHostOnly = selfCheck.includes('--noproxy 127.0.0.1 --max-time 20') && !selfCheck.includes('--noproxy "*"');
 out.selfCheckSaysTheProxySentence = selfCheck.includes('a proxy probably answered; check HTTPS_PROXY in this shell, or ask IT to let this computer reach 127.0.0.1 directly.');
+out.testScreenSaysPasteAndPressEnter = shownText(d).includes('Paste this into a terminal and press Enter (pasting waits for Enter to run). It checks the file, calls Orchestra, and prints the agent’s details.');
 await d.wizard.next();
 out.testScreenChecksBeforeNext = screenOf(d) === 'test'
   && /Run the command above, then click Next again\./.test(attr(d, 'data-wizard-check-status', 'true')[0].textContent);
@@ -411,10 +491,10 @@ const rolesBefore = server.roles.length;
 d = await openWizard();
 await d.wizard.next();
 out.coordinatorRoleScreen = screenOf(d) === 'role' && attr(d, 'data-role-coordinator', 'true').length === 1
-  && /Kestrel holds the coordinator grant for p1: it is set up as a coordinator\./.test(shownText(d));
+  && /Kestrel holds the coordinator grant for Alpha: it is set up as a coordinator\./.test(shownText(d));
 const coordinatorRoleText = d.all(() => true).map((e) => e.textContent).join('\n');
-out.coordinatorRoleKeepsGrantLocation = coordinatorRoleText.includes('The grant is given and removed on the project’s Members & settings page.')
-  && coordinatorRoleText.includes('Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.');
+out.coordinatorRoleKeepsGrantLocation = coordinatorRoleText.includes('The grant is given here or on the project’s Members & settings page, and removed on the project’s Members & settings page.')
+  && coordinatorRoleText.includes('Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.');
 out.coordinatorSetupHintAbsentWithGrant = attr(d, 'data-role-coordinator-help', 'true').length === 0;
 out.coordinatorHasNoRoleChoice = !windowsChoice(d, 'setup-role', 'worker') && !windowsChoice(d, 'setup-role', 'reviewer');
 await d.wizard.next();
@@ -436,6 +516,220 @@ out.noEffectGrantIsAWorker = attr(d, 'data-role-coordinator', 'true').length ===
 out.noEffectGrantShowsCoordinatorHint = attr(d, 'data-role-coordinator-help', 'true').length === 1;
 server.coordinates = undefined;
 for (const open of openDialogs()) await open.close();   // a dialog left open keeps its online check going
+
+// ---- kittrial-5bb.521: making the agent a coordinator from the wizard's role screen ----------------
+async function readFilesGuideAndPrompt(dialog) {
+  const prevScreen = screenOf(dialog);
+  dialog.wizard.show('system');
+  const prevRuns = ['yes', 'no', 'none'].find((v) => windowsChoice(dialog, 'setup-bridge', v)?.checked) || 'yes';
+  await windowsChoice(dialog, 'setup-bridge', 'no').dispatch('change');
+  dialog.wizard.show('files');
+  copiedText = null;
+  const copyBtn = dialog.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Copy setup prompt (creates the files)')[0];
+  await copyBtn.dispatch('click');
+  await tick();
+  const prompt = copiedText;
+  const screenText = dialog.all(() => true).map((e) => e.textContent).join('\n');
+  dialog.wizard.show('system');
+  await windowsChoice(dialog, 'setup-bridge', prevRuns).dispatch('change');
+  dialog.wizard.show(prevScreen);
+  return { prompt, screenText };
+}
+store.clear();
+server.coordinates = undefined;
+server.coordinateGrantableProjects = [];
+d = await openWizard();
+await d.wizard.next();
+out.nonOwnerHasNoCoordinatorChoice = !windowsChoice(d, 'setup-role', 'coordinator:p1') && !button(d, 'grant-coordinator')
+  && attr(d, 'data-role-coordinator-help', 'true').length === 1;
+// m1-nonmember-superuser: a project (p3) where the agent's owner is not a member is omitted from
+// coordinate_grantable_projects (the same owner-member rule as coordinates), even for a superuser.
+store.clear();
+server.ownerMemberships = ['p1', 'p2'];
+server.agentProjects = ['p3'];
+server.coordinateGrantableProjects = ['p3'];
+d = await openWizard();
+await d.wizard.next();
+const nonMemberOnlyHasNoChoice = !windowsChoice(d, 'setup-role', 'coordinator:p3')
+  && !button(d, 'grant-coordinator')
+  && attr(d, 'data-role-coordinator-help', 'true').length === 1;
+store.clear();
+server.agentProjects = ['p1', 'p2', 'p3'];
+server.coordinateGrantableProjects = ['p1', 'p2', 'p3'];
+d = await openWizard();
+await d.wizard.next();
+out.nonMemberSuperuserProjectOmittedFromWizard = nonMemberOnlyHasNoChoice
+  && Boolean(windowsChoice(d, 'setup-role', 'coordinator:p1'))
+  && Boolean(windowsChoice(d, 'setup-role', 'coordinator:p2'))
+  && !windowsChoice(d, 'setup-role', 'coordinator:p3')
+  && !shownText(d).includes('Coordinator of Gamma');
+server.agentProjects = ['p1'];
+out.ownerSeesCoordinatorChoiceForEachGrantableProject = Boolean(windowsChoice(d, 'setup-role', 'coordinator:p1'))
+  && Boolean(windowsChoice(d, 'setup-role', 'coordinator:p2'))
+  && shownText(d).includes('Coordinator of Alpha')
+  && shownText(d).includes('Coordinator of Beta')
+  && attr(d, 'data-role-coordinator-help', 'true').length === 0
+  && !button(d, 'grant-coordinator');
+const rolesBeforeCoordSelect = server.roles.length;
+const transportBeforeSelectP1 = transportCalls;
+const coordP1Radio = windowsChoice(d, 'setup-role', 'coordinator:p1');
+await coordP1Radio.dispatch('change');
+await tick();
+out.selectingCoordinatorRadioShowsButtonWithoutGranting = transportCalls === transportBeforeSelectP1
+  && server.coordinatorGrants.length === 0
+  && server.roles.length === rolesBeforeCoordSelect
+  && windowsChoice(d, 'setup-role', 'coordinator:p1') === coordP1Radio
+  && globalThis.document.activeElement === coordP1Radio
+  && Boolean(button(d, 'grant-coordinator'))
+  && button(d, 'grant-coordinator').textContent === 'Make coordinator of Alpha';
+// S6: Next is held with one line while 'Coordinator of P' is chosen, until the button is clicked or another role is chosen.
+const heldNext = await d.wizard.next();
+const roleStatus = attr(d, 'data-wizard-check-status', 'true')[0];
+out.coordinatorChoiceHoldsNextWithOneLine = heldNext === false
+  && screenOf(d) === 'role'
+  && roleStatus.hidden === false
+  && roleStatus.textContent === 'Click “Make coordinator of Alpha” first, or choose another role before continuing.';
+const transportBeforeSwitchP2 = transportCalls;
+const coordP2Radio = windowsChoice(d, 'setup-role', 'coordinator:p2');
+await coordP2Radio.dispatch('change');
+await tick();
+out.switchingCoordinatorProjectUpdatesButtonWithoutWriting = transportCalls === transportBeforeSwitchP2
+  && server.coordinatorGrants.length === 0
+  && server.coordinatorRevokes.length === 0
+  && windowsChoice(d, 'setup-role', 'coordinator:p2') === coordP2Radio
+  && globalThis.document.activeElement === coordP2Radio
+  && roleStatus.hidden === true
+  && Boolean(button(d, 'grant-coordinator'))
+  && button(d, 'grant-coordinator').textContent === 'Make coordinator of Beta';
+const workerRadio = windowsChoice(d, 'setup-role', 'worker');
+await workerRadio.dispatch('change');
+await tick();
+out.switchingBackToWorkerHidesButtonAndRevokesNothing = !button(d, 'grant-coordinator')
+  && server.coordinatorGrants.length === 0
+  && server.coordinatorRevokes.length === 0
+  && windowsChoice(d, 'setup-role', 'worker') === workerRadio
+  && globalThis.document.activeElement === workerRadio
+  && windowsChoice(d, 'setup-role', 'worker').checked === true;
+await windowsChoice(d, 'setup-role', 'coordinator:p1').dispatch('change');
+await tick();
+// Note (2): A radio change during a refused PUT re-enables the newly created button.
+server.failCoordinatorGrant = true;
+let switchedBtnDuringRefusedPut = null;
+server.onCoordinatorPutInFlight = async () => {
+  await windowsChoice(d, 'setup-role', 'coordinator:p2').dispatch('change');
+  switchedBtnDuringRefusedPut = button(d, 'grant-coordinator');
+};
+await button(d, 'grant-coordinator').dispatch('click');
+await tick(); await tick();
+server.onCoordinatorPutInFlight = null;
+const grantError = attr(d, 'data-wizard-error', 'true')[0];
+out.radioChangeDuringRefusedPutReenablesNewButton = Boolean(switchedBtnDuringRefusedPut)
+  && button(d, 'grant-coordinator') === switchedBtnDuringRefusedPut
+  && switchedBtnDuringRefusedPut.textContent === 'Make coordinator of Beta'
+  && switchedBtnDuringRefusedPut.disabled === false;
+const refusedFiles = await readFilesGuideAndPrompt(d);
+out.refusedCoordinatorGrantShowsErrorAndLeavesWorkerGuide = grantError.hidden === false
+  && grantError.textContent.includes('Project role does not permit this operation')
+  && attr(d, 'data-role-coordinator', 'true').length === 0
+  && Boolean(refusedFiles.prompt)
+  && refusedFiles.prompt.includes('role is worker')
+  && refusedFiles.prompt.includes('Claim exactly one that nobody holds')
+  && !refusedFiles.prompt.includes('## You coordinate')
+  && refusedFiles.screenText.includes('Claim exactly one that nobody holds')
+  && !refusedFiles.screenText.includes('## You coordinate');
+server.failCoordinatorGrant = false;
+await windowsChoice(d, 'setup-role', 'coordinator:p1').dispatch('change');
+await tick();
+// S3 & s3-refusal-prompt: If PUT answers 200 (e.g. replay after revoke) but the re-read GET /v1/agents/{aid}
+// has no effective grant, the wizard says so in one line and keeps the worker guide/prompt.
+server.grantHasNoEffectOnReread = true;
+await button(d, 'grant-coordinator').dispatch('click');
+await tick(); await tick();
+const noEffectFiles = await readFilesGuideAndPrompt(d);
+out.rereadWithoutEffectiveGrantSaysSoInOneLine = grantError.hidden === false
+  && grantError.textContent === 'Kestrel does not hold an active coordinator grant for Alpha.'
+  && attr(d, 'data-role-coordinator', 'true').length === 0
+  && Boolean(noEffectFiles.prompt)
+  && noEffectFiles.prompt.includes('role is worker')
+  && noEffectFiles.prompt.includes('Claim exactly one that nobody holds')
+  && !noEffectFiles.prompt.includes('## You coordinate')
+  && noEffectFiles.screenText.includes('Claim exactly one that nobody holds')
+  && !noEffectFiles.screenText.includes('## You coordinate');
+// Note (1): When P is no longer grantable after the re-read, state.coordinatorProject is cleared and
+// the screen re-renders so the hold line never names a missing button.
+server.dropFromGrantableOnReread = true;
+await button(d, 'grant-coordinator').dispatch('click');
+await tick(); await tick();
+server.dropFromGrantableOnReread = false;
+server.grantHasNoEffectOnReread = false;
+const errorShownAfterDrop = grantError.hidden === false
+  && grantError.textContent === 'Kestrel does not hold an active coordinator grant for Alpha.';
+const choiceRemovedAfterDrop = !windowsChoice(d, 'setup-role', 'coordinator:p1')
+  && Boolean(windowsChoice(d, 'setup-role', 'coordinator:p2'))
+  && !button(d, 'grant-coordinator')
+  && windowsChoice(d, 'setup-role', 'worker').checked === true;
+const advancedAfterDrop = await d.wizard.next();
+out.rereadWithoutGrantableProjectClearsChoiceAndRerenders = errorShownAfterDrop
+  && choiceRemovedAfterDrop
+  && advancedAfterDrop === true
+  && roleStatus.hidden === true
+  && screenOf(d) !== 'role';
+for (const open of openDialogs()) await open.close();
+store.clear();
+server.coordinateGrantableProjects = ['p1', 'p2'];
+d = await openWizard();
+await d.wizard.next();
+await windowsChoice(d, 'setup-role', 'coordinator:p1').dispatch('change');
+await tick();
+const grantErrorAfterReopen = attr(d, 'data-wizard-error', 'true')[0];
+// Note (3): If the re-read fails after a committed PUT, don't say 'could not confirm whether this was saved';
+// say the grant may be saved and re-read before retrying.
+server.grantHasNoEffectOnReread = true;
+server.failAgentReread = true;
+await button(d, 'grant-coordinator').dispatch('click');
+await tick(); await tick();
+server.failAgentReread = false;
+server.grantHasNoEffectOnReread = false;
+out.failedRereadAfterCommittedPutSaysMayBeSavedAndRereadBeforeRetrying = grantErrorAfterReopen.hidden === false
+  && grantErrorAfterReopen.textContent.includes('The coordinator grant for Alpha may be saved, but re-reading Kestrel failed. Re-open this set-up to re-read before retrying.')
+  && grantErrorAfterReopen.textContent.includes('req_reread_500')
+  && !grantErrorAfterReopen.textContent.includes('could not confirm whether this was saved');
+server.coordinatorGrants.length = 0;
+// Note 1 (r2): Button is disabled while PUT is in flight so a double-click sends only one PUT.
+let seenDisabledDuringFlight = false;
+const grantBtn = button(d, 'grant-coordinator');
+server.onCoordinatorPutInFlight = async () => {
+  seenDisabledDuringFlight = grantBtn.disabled === true;
+  await grantBtn.dispatch('click');
+};
+const readsBeforeGrant = agentReads;
+await grantBtn.dispatch('click');
+await tick(); await tick();
+server.onCoordinatorPutInFlight = null;
+out.clickingMakeCoordinatorGrantsAndShowsHeldReadOnly = seenDisabledDuringFlight === true
+  && JSON.stringify(server.coordinatorGrants) === JSON.stringify(['p1/agent_1'])
+  && agentReads === readsBeforeGrant + 1
+  && server.coordinatorRevokes.length === 0
+  && attr(d, 'data-role-coordinator', 'true').length === 1
+  && /Kestrel holds the coordinator grant for Alpha: it is set up as a coordinator\./.test(shownText(d))
+  && !button(d, 'grant-coordinator')
+  && !windowsChoice(d, 'setup-role', 'worker');
+d.wizard.show('system');
+await windowsChoice(d, 'setup-bridge', 'no').dispatch('change');
+d.wizard.show('files');
+copiedText = null;
+const copyPromptBtn = d.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Copy setup prompt (creates the files)')[0];
+await copyPromptBtn.dispatch('click');
+await tick();
+const filesScreenText = d.all(() => true).map((e) => e.textContent).join('\n');
+out.clickingMakeCoordinatorUpdatesGuideAndPromptFromStart = Boolean(copiedText)
+  && copiedText.includes('## You coordinate')
+  && copiedText.includes('You hold the coordinator grant for p1.')
+  && copiedText.includes('role is coordinator')
+  && filesScreenText.includes('## You coordinate')
+  && filesScreenText.includes('You hold the coordinator grant for p1.');
+server.coordinateGrantableProjects = undefined;
+for (const open of openDialogs()) await open.close();
 
 // ---- kittrial-5bb.456: what the agent runs in, the secret screens and the credentials -------------
 store.clear();

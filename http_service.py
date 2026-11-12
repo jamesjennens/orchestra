@@ -6831,9 +6831,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             status = result.pop('status', status)
         return status, result
 
-    def require(self, ctx, capability):
+    def require(self, ctx, capability, *, moment=None):
         """Authorize one read/route capability against live authority."""
-        return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability)
+        return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability, moment=moment)
 
     def _project(self, ctx, capability=CAP_READ):
         return self.service.check_authority(ctx.principal, ctx.params['pid'], capability)
@@ -8459,7 +8459,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def sessions_delete(self, ctx):
         return 204, self.service.logout(ctx.principal, request_id=ctx.request_id)
 
-    def _credential_expiry_view(self, principal):
+    def _credential_expiry_view(self, principal, moment=None):
         """The caller's own credential expiry, or ``None`` when it has none to show.
 
         The same secret-free shape both ``GET /v1/sessions/current`` and
@@ -8471,7 +8471,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         credential_id = getattr(principal, 'credential_id', None)
         credential = self.service.state['credentials'].get(credential_id) if credential_id else None
         if credential and credential.get('agent_id'):
-            return self.service.agent_credential_expiry_view(credential)
+            return self.service.agent_credential_expiry_view(credential, moment=moment)
         return None
 
     @route('POST', r'/v1/accounts')
@@ -10068,7 +10068,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
-        agent = self.service.agent_for_credential(ctx.principal)
+        moment = self.service._expiry_now()
+        agent = self.service.agent_for_credential(ctx.principal, moment=moment)
         # The agent record only (kittrial-5bb.303): this route is a polled whoami, so it
         # makes NO work read. The counted limit/held/available view needs the bounded
         # current-work snapshot, so it stays on ``/v1/agents/me/next``, which already
@@ -10088,7 +10089,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # extension read this route, and the read caps the stored expiry at 366 days from
         # issuance (item 4). No new disclosure: it is the caller's credential only, never
         # another credential's.
-        expiry = self._credential_expiry_view(ctx.principal)
+        expiry = self._credential_expiry_view(ctx.principal, moment=moment)
         if expiry is not None:
             body['credential_expiry'] = expiry
             body['expires_soon'] = bool(expiry.get('expires_soon'))
@@ -10202,22 +10203,23 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
         role_override = validate_agent_role(ctx.query['role']) if 'role' in ctx.query else None
-        agent = self.service.agent_for_credential(ctx.principal)
-        attention = self._agent_attention(ctx.principal, agent, role=role_override)
+        moment = self.service._expiry_now()
+        agent = self.service.agent_for_credential(ctx.principal, moment=moment)
+        attention = self._agent_attention(ctx.principal, agent, role=role_override, moment=moment)
         # kittrial-5bb.443: an unacknowledged hand-over note for this agent's person, where it coordinates, is its
         # first next action. It carries the note's identity and the routes, never its text, and counts nowhere.
         notes = [self._handover_action(project_id, pointer)
                  for project_id, pointer in self.service.handover_notes_to_acknowledge(ctx.principal.agent_id)]
         # kittrial-5bb.447: an unsettled note from another project's coordinator, to a project where this agent's
         # grant has effect, comes next: its pointer and routes, never its text.
-        waking = self._notes_waking(ctx.principal)
+        waking = self._notes_waking(ctx.principal, moment=moment)
         notes = notes + [self._note_action(note) for note in waking]
         if notes:
             attention = dict(attention, actions=notes + list(attention['actions']))
         # `repository` is where the project's owner says its code lives (kittrial-5bb.118):
         # a label, null when not recorded. Data for the agent, never an instruction.
         projects = [{'id': p['id'], 'name': p['name'], 'repository': p.get('repository')}
-                    for p in self.service.list_projects(ctx.principal)]
+                    for p in self.service.list_projects(ctx.principal, moment=moment)]
         next_action = attention['actions'][0] if attention['actions'] else None
         if next_action is None and not projects:
             next_action = {'kind': 'no-project', 'reason': self.NO_PROJECT_NEXT_ACTION}
@@ -10549,11 +10551,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         return view
 
     # -- coordinator notes (kittrial-5bb.447) ---------------------------------------------------------------------
-    def _notes_waking(self, principal):
+    def _notes_waking(self, principal, moment=None):
         """The unsettled notes to the projects where this agent's coordinator grant has effect (none for a person)."""
         if principal is None or principal.via != 'credential' or not principal.agent_id:
             return []
-        projects, _more = self.service.note_projects(principal)
+        projects, _more = self.service.note_projects(principal, moment=moment)
         return self.service.unsettled_notes_to(projects)
 
     @staticmethod
@@ -10821,31 +10823,33 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'agents.create', None, create, status=201,
                             capability=CAP_AGENTS, replay_status=200, replay_check=replay_check)
 
-    def _agent_items(self, principal, agents=None):
+    def _agent_items(self, principal, agents=None, moment=None):
+        moment = self.service._expiry_now() if moment is None else moment
         items = []
-        for agent in self.service.list_agents(principal) if agents is None else agents:
+        for agent in self.service.list_agents(principal, moment=moment) if agents is None else agents:
             # One read per project for all the agents listed, not one per agent.
-            attention = self._agent_attention(principal, agent, many=True)
+            attention = self._agent_attention(principal, agent, many=True, moment=moment)
             items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
                               resume_prompt=self._agent_resume_prompt(agent, attention)))
         return items
 
     @route('GET', r'/v1/agents')
     def agents_list(self, ctx):
-        self.require(ctx, CAP_AGENTS)
+        moment = self.service._expiry_now()
+        self.require(ctx, CAP_AGENTS, moment=moment)
         if any(key in ctx.query for key in ('limit', 'cursor', 'unconfirmed')):
             limit, state = self._page(ctx, ctx.query)
             unconfirmed = ctx.query.get('unconfirmed', 'false')
             if unconfirmed not in ('true', 'false'):
                 raise invalid('unconfirmed must be true or false')
             agents, total = self.service.agent_page(ctx.principal, state['o'], limit,
-                                                  unconfirmed=unconfirmed == 'true')
-            return 200, {'items': self._agent_items(ctx.principal, agents), 'total': total,
+                                                  unconfirmed=unconfirmed == 'true', moment=moment)
+            return 200, {'items': self._agent_items(ctx.principal, agents, moment=moment), 'total': total,
                          'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit,
                                                     key=self.service.cursor_key())
                          if state['o'] + limit < total else None,
                          'generated_at': now_iso(self.service._now())}
-        items = self._agent_items(ctx.principal)
+        items = self._agent_items(ctx.principal, moment=moment)
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
 
@@ -10861,9 +10865,10 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('GET', r'/v1/agents/(?P<aid>' + ID + r')')
     def agents_get(self, ctx):
-        self.require(ctx, CAP_AGENTS)
-        agent = self.service.get_agent(ctx.principal, ctx.params['aid'])
-        attention = self._agent_attention(ctx.principal, agent)
+        moment = self.service._expiry_now()
+        self.require(ctx, CAP_AGENTS, moment=moment)
+        agent = self.service.get_agent(ctx.principal, ctx.params['aid'], moment=moment)
+        attention = self._agent_attention(ctx.principal, agent, moment=moment)
         return 200, dict(agent, attention=self._agent_attention_view(agent, attention),
                          resume_prompt=self._agent_resume_prompt(agent, attention),
                          generated_at=now_iso(self.service._now()))
@@ -11330,7 +11335,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: At most this many reviewer actions are listed per read; the counts stay exact.
     AGENT_REVIEW_LIMIT = 20
 
-    def _agent_review_actions(self, principal, agent, project_id, rows, counts):
+    def _agent_review_actions(self, principal, agent, project_id, rows, counts, moment=None):
         """The review work one agent is shown in one project: the actions to list.
 
         Two kinds, both at the priority of claimable work and listed before it
@@ -11353,8 +11358,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         agent_id = agent.get('id')
         actor = agent.get('actor') or agent_id
-        may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id)
-        approves = self.service.agent_approves(agent_id, project_id)
+        may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id, moment=moment)
+        approves = self.service.agent_approves(agent_id, project_id, moment=moment)
         if not may_review and not approves:
             return []
         # kittrial-5bb.438: under the project's default agent-approval setting a granted agent may approve the
@@ -11457,7 +11462,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         action.update(extra)
         return action
 
-    def _agent_may_read(self, principal, project_id):
+    def _agent_may_read(self, principal, project_id, moment=None):
         """The task-route authority check for one project, reused by attention.
 
         ``Service.check_authority`` is the single boundary every task route uses and it
@@ -11469,7 +11474,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         is skipped rather than read.
         """
         try:
-            self.service.check_authority(principal, project_id, CAP_READ)
+            self.service.check_authority(principal, project_id, CAP_READ, moment=moment)
         except HttpError:
             return False
         return True
@@ -11645,7 +11650,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'guidance_version': item.get('guidance_version'),
                 'links': {'project': '/v1/projects/%s' % project_id}}
 
-    def _agent_attention(self, principal, agent, many=False, role=None):
+    def _agent_attention(self, principal, agent, many=False, role=None, moment=None):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
         Each granted project is re-authorized with the same live-authority check the
@@ -11691,8 +11696,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         truncated = False
         snapshot_truncated = own_tasks_truncated = actions_truncated = False
         claiming_modes = {}
+        moment = self.service._expiry_now() if moment is None else moment
         for project_id in agent.get('projects') or []:
-            if not self._agent_may_read(principal, project_id):
+            if not self._agent_may_read(principal, project_id, moment=moment):
                 continue
             # The per-project claiming setting (kittrial-5bb.352), read FRESH here (it
             # lives outside the tracker, so the tracker read cache would not see it) and
@@ -11871,7 +11877,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             # When the agent is configured (or queried) as a worker, omit other people's
             # deliveries awaiting review while keeping CAP_REVIEWS for its own deliveries.
             if effective_role != 'worker':
-                review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
+                review_actions += self._agent_review_actions(
+                    principal, agent, project_id, read['tasks'], counts, moment=moment)
         # Counts cover the read pages; incomplete-source counts are lower bounds.
         # Only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.

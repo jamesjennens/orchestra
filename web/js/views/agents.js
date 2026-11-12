@@ -892,7 +892,7 @@ function issueBlock(ctx, agent, payload, wizard) {
 }
 
 function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
-  const payload = setupText.secretlessPayload(source, location.origin);
+  let payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
   const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate })]];
   const folder = payload.workingDirectory;
@@ -908,6 +908,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     runs: setupText.runsFromStored(same),
     bridge: setupText.runsFromStored(same) === 'bridge',
     role: (same && setupText.BRIDGE_ROLES.includes(same.role) && same.role) || (agent.role === 'reviewer' ? 'reviewer' : 'worker'),
+    coordinatorProject: null,
     screen: 'system',
     stepStartedAt: Date.now(),
     checkVerified: false,
@@ -972,9 +973,37 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     h('div', { class: 'dialog-foot' }, skipBtn, backBtn, nextBtn, doneBtn));
 
   // ---- the screens -------------------------------------------------------------------------
+  const projectsById = new Map(((ctx && ctx.projects) || []).filter((p) => p && typeof p.id === 'string').map((p) => [p.id, p]));
+  const projectLabel = (pid) => {
+    const found = projectsById.get(pid);
+    return (found && typeof found.name === 'string' && found.name.trim()) ? found.name : pid;
+  };
+  const grantRow = h('div', { class: 'copy-row', 'data-coordinator-grant-row': 'true', hidden: true });
+  function syncGrantRow() {
+    const grantable = payload.coordinateGrantableProjects || [];
+    const pid = state.coordinatorProject;
+    if (!pid || !grantable.includes(pid)) {
+      grantRow.hidden = true;
+      grantRow.replaceChildren();
+      return;
+    }
+    const btn = h('button', {
+      type: 'button',
+      class: 'primary',
+      'data-action': 'grant-coordinator',
+      'data-project': pid,
+      disabled: Boolean(state.grantingCoordinator),
+      onclick: () => grantCoordinatorRole(pid, btn),
+    }, 'Make coordinator of ' + projectLabel(pid));
+    grantRow.replaceChildren(btn);
+    grantRow.hidden = false;
+  }
   function choice(name, value, label, checked, onchange) {
-    return h('label', { class: 'small', 'data-choice': name + ':' + value },
-      h('input', { type: 'radio', name, value, checked, onchange }), ' ', label);
+    const input = h('input', { type: 'radio', name, value, checked, onchange: (event) => {
+      if (typeof input.focus === 'function') input.focus();
+      onchange(event);
+    } });
+    return h('label', { class: 'small', 'data-choice': name + ':' + value }, input, ' ', label);
   }
   const screens = {
     system: () => [
@@ -994,17 +1023,23 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     // saved as its role on Orchestra (a worker/reviewer setting), so there is nothing to choose here.
     role: () => setupText.coordinating(payload) ? [
       h('p', { class: 'small', 'data-role-coordinator': 'true' },
-        `${payload.name} holds the coordinator grant for ${payload.coordinates.join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
-      more(h('p', { class: 'small muted' }, 'The grant is given and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.')),
-    ] : [
-      h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
-      h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
-        "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again."),
-      h('div', { class: 'copy-row', 'data-role-choice': 'true' },
-        choice('setup-role', 'worker', 'Works on tasks', state.role === 'worker', () => saveRole('worker')),
-        choice('setup-role', 'reviewer', 'Reviews deliveries', state.role === 'reviewer', () => saveRole('reviewer'))),
-      more(h('p', { class: 'small muted' }, `This is saved as ${payload.name}’s role on Orchestra. A worker keeps the “Deliver and review” scope, which it needs to deliver its own work; only the reviewer role adds other people’s deliveries to its list.`)),
-    ],
+        `${payload.name} holds the coordinator grant for ${payload.coordinates.map(projectLabel).join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
+      more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Members & settings page, and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
+    ] : (() => {
+      const grantable = payload.coordinateGrantableProjects || [];
+      syncGrantRow();
+      return [
+        h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
+        grantable.length === 0 ? h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
+          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again.") : null,
+        h('div', { class: 'copy-row', 'data-role-choice': 'true' },
+          choice('setup-role', 'worker', 'Works on tasks', !state.coordinatorProject && state.role === 'worker', () => selectRole('worker')),
+          choice('setup-role', 'reviewer', 'Reviews deliveries', !state.coordinatorProject && state.role === 'reviewer', () => selectRole('reviewer')),
+          ...grantable.map((pid) => choice('setup-role', 'coordinator:' + pid, 'Coordinator of ' + projectLabel(pid), state.coordinatorProject === pid, () => selectCoordinatorProject(pid)))),
+        grantRow,
+        more(h('p', { class: 'small muted' }, `This is saved as ${payload.name}’s role on Orchestra. A worker keeps the “Deliver and review” scope, which it needs to deliver its own work; only the reviewer role adds other people’s deliveries to its list.`)),
+      ];
+    })(),
     'cert-save': () => [
       h('p', { class: 'small' }, 'This server has its own certificate. Save it; the next screen moves it into place.'),
       h('div', { class: 'copy-row' }, h('button', { type: 'button', class: 'primary', 'data-action': 'save-certificate',
@@ -1050,7 +1085,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       const check = setupText.checkCommands(payload, { hasCertificate });
       const plain = setupText.testCommands(payload);
       return [
-        h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It checks the file, then calls Orchestra; it prints the agent’s details when it works.`),
+        h('p', { class: 'small' }, `Paste this into ${osWords(state.os).shell} and press Enter (pasting waits for Enter to run). It checks the file, calls Orchestra, and prints the agent’s details.`),
         commandLine(posix ? check.posix : check.powershell, 'self-check command'),
         more(h('p', { class: 'small muted' }, 'The plain test, without the checks:'),
           h('code', { class: 'path' }, posix ? plain.posix : plain.powershell),
@@ -1121,12 +1156,81 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 
   async function saveRole(role) {
     state.role = role;
+    if (dialog.wizard) {
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
+    }
     persist();
     wizard.clearError();
     if (ctx && ctx.api && typeof ctx.api.updateAgent === 'function' && payload.agentId) {
       try { await ctx.api.updateAgent(payload.agentId, { role }); }
       catch (error) { wizard.showError(error); }
     }
+  }
+
+  async function selectRole(role) {
+    state.coordinatorProject = null;
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    syncGrantRow();
+    await saveRole(role);
+  }
+
+  function selectCoordinatorProject(pid) {
+    state.coordinatorProject = pid;
+    wizard.clearError();
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    syncGrantRow();
+  }
+
+  async function grantCoordinatorRole(pid, btn) {
+    if (state.grantingCoordinator) return;
+    wizard.clearError();
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    if (!ctx || !ctx.api || typeof ctx.api.grantCoordinator !== 'function' || !payload.agentId) return;
+    state.grantingCoordinator = true;
+    if (btn) btn.disabled = true;
+    let fresh;
+    try {
+      await ctx.api.grantCoordinator(pid, payload.agentId);
+      try {
+        fresh = await ctx.api.agent(payload.agentId);
+      } catch (rereadError) {
+        const wrapped = new Error(`The coordinator grant for ${projectLabel(pid)} may be saved, but re-reading ${payload.name} failed. Re-open this set-up to re-read before retrying.`);
+        if (rereadError && rereadError.requestId) wrapped.requestId = rereadError.requestId;
+        wizard.showError(wrapped);
+        return;
+      }
+    } catch (error) {
+      wizard.showError(error);
+      return;
+    } finally {
+      state.grantingCoordinator = false;
+      if (btn) btn.disabled = false;
+      if (grantRow.firstChild) grantRow.firstChild.disabled = false;
+    }
+    const freshAgent = (fresh && fresh.agent) || fresh || {};
+    Object.assign(agent, freshAgent);
+    payload = setupText.secretlessPayload({ ...(source || {}), agent }, location.origin);
+    PAYLOAD_META.set(payload, { certificate, bridgeServer });
+    files[0][1] = setupText.agentJson(payload);
+    files[1][1] = setupText.agentGuide(payload, { hasCertificate });
+    if (dialog.wizard) {
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
+    }
+    if (!payload.coordinates.includes(pid)) {
+      if (!(payload.coordinateGrantableProjects || []).includes(pid)) {
+        state.coordinatorProject = null;
+        render();
+      } else {
+        syncGrantRow();
+      }
+      wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));
+      return;
+    }
+    state.coordinatorProject = null;
+    render();
   }
 
   // ---- moving between screens ----------------------------------------------------------------
@@ -1173,6 +1277,13 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   }
 
   async function next() {
+    if (state.screen === 'role' && state.coordinatorProject && !setupText.coordinating(payload)) {
+      checkStatus.setAttribute('data-check-state', 'failed');
+      checkStatus.textContent = `Click “Make coordinator of ${projectLabel(state.coordinatorProject)}” first, or choose another role before continuing.`;
+      checkStatus.hidden = false;
+      skipBtn.hidden = true;
+      return false;
+    }
     if (CHECKED_SCREENS.includes(state.screen) && !state.checkVerified) {
       if (!(await runCheck())) return false;
     }

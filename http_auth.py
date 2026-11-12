@@ -2176,18 +2176,22 @@ class Service:
         raise unauthenticated('Authentication required')
 
     # -- live authority --------------------------------------------------------
-    def _refresh_authority(self, principal):
+    def _refresh_authority(self, principal, moment=None):
         """Re-read the live session/credential behind ``principal``.
 
         The caller must hold ``store.lock``. This is the authority half of the
         serializable authorization/revocation boundary: a revocation that commits
         before this call is observed here, so an in-flight mutation can never
         inherit authority the caller has already lost. Derived fields are refreshed
-        from live state rather than trusted from the original request.
+        from live state rather than trusted from the original request. A ``moment``
+        is this request's own :meth:`_expiry_now`; only read routes (and
+        :meth:`create_agent`, under ``store.lock``) pass one; it freezes only the
+        monotone half of expiry; the raw half, revocation, disablement and membership
+        stay live.
         """
         if principal is None:
             raise unauthenticated()
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         if principal.via == 'session':
             session = self.state['sessions'].get(principal.session_hash)
             if session is None or session['revoked'] or self._expired(
@@ -2257,26 +2261,32 @@ class Service:
                 continue
         return frozenset(caps)
 
-    def check_authority(self, principal, project_id, capability, *, allow_self_user=None):
+    def check_authority(self, principal, project_id, capability, *, allow_self_user=None,
+                        moment=None):
         """Authorize one capability against live authority, or raise 401/403/404.
 
         This is the single boundary every route uses. When called inside a mutation
         it runs while ``store.lock`` is held and before the canonical write, so a
         revocation cannot interleave between the check and the write. The decision
         itself is :func:`http_authority.decide`, the same function the canonical
-        endpoint runs immediately before the effect.
+        endpoint runs immediately before the effect. A ``moment`` is this request's
+        own :meth:`_expiry_now`; only read routes (and :meth:`create_agent`, under
+        ``store.lock``) pass one; it freezes only the monotone half of expiry; the raw
+        half, revocation, disablement and membership stay live.
         """
         with self.store.lock:
             return self._check_authority_locked(principal, project_id, capability,
-                                                allow_self_user=allow_self_user)
+                                                allow_self_user=allow_self_user,
+                                                moment=moment)
 
     def _check_authority_locked(self, principal, project_id, capability, *,
-                                allow_self_user=None):
-        self._refresh_authority(principal)
+                                allow_self_user=None, moment=None):
+        moment = self._expiry_now() if moment is None else moment
+        self._refresh_authority(principal, moment=moment)
         try:
             decision = decide(self.state,
                               authority_request(principal, project_id, capability,
-                                                now=self._expiry_now()),
+                                                now=moment),
                               allow_self_user=allow_self_user)
         except AuthorityDenied as denied:
             raise HttpError(denied.status, denied.code, denied.message, denied.detail)
@@ -2416,9 +2426,10 @@ class Service:
                                                          name or ''):
             raise invalid('Project name must be 2-64 characters of letters, digits, space, . _ -')
 
-    def list_projects(self, principal):
+    def list_projects(self, principal, moment=None):
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             if principal.via == 'credential':
                 if principal.agent_id:
                     # An agent credential reads exactly its live grant list, and only the
@@ -2428,18 +2439,18 @@ class Service:
                     visible = []
                     for pid in (agent.get('projects') if agent else []) or []:
                         try:
-                            visible.append(self.project_view(principal, pid))
+                            visible.append(self.project_view(principal, pid, moment=moment))
                         except HttpError:
                             continue
                     return visible
                 pid = principal.credential_project
                 if pid not in self.state['projects']:
                     return []
-                return [self.project_view(principal, pid)]
+                return [self.project_view(principal, pid, moment=moment)]
             visible = []
             for pid in self.state['projects']:
                 if principal.superuser or principal.user_id in self.state['memberships'].get(pid, {}):
-                    visible.append(self.project_view(principal, pid))
+                    visible.append(self.project_view(principal, pid, moment=moment))
             return visible
 
     #: Where a project's repository is (kittrial-5bb.118): a LABEL an owner writes, shown
@@ -2599,8 +2610,8 @@ class Service:
                 self.store.save()
         return {'id': project_id, 'repository': value}
 
-    def project_view(self, principal, project_id):
-        project, role = self.require_project(principal, project_id)
+    def project_view(self, principal, project_id, moment=None):
+        project, role = self.require_project(principal, project_id, moment=moment)
         view = dict(project)
         made = view.get('host_created')
         if isinstance(made, dict) and 'operation' in made:
@@ -2622,7 +2633,7 @@ class Service:
         view['program'] = bool((self.state.get('program_flags') or {}).get(project_id))
         return view
 
-    def require_project(self, principal, project_id, minimum='viewer'):
+    def require_project(self, principal, project_id, minimum='viewer', moment=None):
         """Role/capability gate kept for internal callers.
 
         ``minimum`` maps onto the capability model so a credential can never borrow
@@ -2631,7 +2642,7 @@ class Service:
         """
         capability = {'viewer': CAP_READ, 'contributor': CAP_TASKS,
                       'owner': CAP_PROJECT_ADMIN}.get(minimum, CAP_READ)
-        return self.check_authority(principal, project_id, capability)
+        return self.check_authority(principal, project_id, capability, moment=moment)
 
     def set_member(self, principal, project_id, user_id, role, request_id=None):
         if role not in ROLES:
@@ -2727,13 +2738,13 @@ class Service:
                     and claimed.casefold() != str(principal.user_id).casefold():
                 raise invalid('A credential actor namespace cannot have the shape of an account or agent id '
                               'other than your own account id')
+            moment = self._expiry_now()
             if actor is not None:
                 # One name has one issuer at a time (kittrial-5bb.199 review): with the party
                 # rule on, work under a name is of every account that ever issued it, so a
                 # second account must not be able to take a name that is in use, written
                 # under yet or not. The same account may: that is how it replaces a lane's
                 # credential without a gap, and both are its own party.
-                moment = self._expiry_now()
                 for other in self.state['credentials'].values():
                     if not isinstance(other, dict) or other.get('agent_id') or other.get('project_id') != project_id \
                             or other.get('user_id') == principal.user_id or not self._credential_live(other, moment):
@@ -2751,7 +2762,6 @@ class Service:
             # forward jump that is later corrected does not live late. ``issued_raw`` keeps
             # the real issuance instant, so the TTL still bounds it while the monotone floor
             # is pinned ahead of the corrected host clock.
-            moment = self._expiry_now()
             credential = {
                 'id': 'cred_' + secrets.token_hex(8),
                 'user_id': principal.user_id,
@@ -2820,9 +2830,9 @@ class Service:
             return raw
         return min(float(raw), cap)
 
-    def agent_credential_expiry_view(self, credential):
+    def agent_credential_expiry_view(self, credential, moment=None):
         """Secret-free expiry metadata, also safe for a project's owner controls."""
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         working = self._credential_live(credential, moment)
         expires = self.credential_effective_expiry(credential)
         deadline = expires if isinstance(expires, (int, float)) and \
@@ -2838,7 +2848,7 @@ class Service:
                 'working': bool(working), 'revoked': bool(credential.get('revoked')),
                 'expires_soon': bool(working and remaining is not None and remaining <= 7 * 86400)}
 
-    def credential_view(self, credential):
+    def credential_view(self, credential, moment=None):
         view = {'id': credential['id'], 'project': credential['project_id'],
                 'agent': credential.get('agent_id'),
                 'label': credential['label'], 'scopes': list(credential['scopes']),
@@ -2846,7 +2856,7 @@ class Service:
                 'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
                 'expires_at': now_iso(credential['expires_at'])}
         if credential.get('agent_id'):
-            view.update(self.agent_credential_expiry_view(credential))
+            view.update(self.agent_credential_expiry_view(credential, moment=moment))
         # A waived name is shown as allowed, by whom and when (kittrial-5bb.188 item 4): it is
         # not colliding and it does write. Never actor_rows_checked: the two are distinct.
         if isinstance(credential.get('actor_waived'), dict):
@@ -3107,7 +3117,7 @@ class Service:
     # agent on its next request. ``working_directory`` is a free-text hint for the
     # owner's own machine; the server stores it and never reads it, and only the owner
     # (or a superuser) ever receives it in a response.
-    def agent_approves(self, agent_id, project_id):
+    def agent_approves(self, agent_id, project_id, moment=None):
         """Whether a live credential of the agent may approve in the project now: it holds the
         coordinator grant there and its account is a coordinator or an owner (kittrial-5bb.209).
         Used to word what the agent is shown; it grants nothing."""
@@ -3120,7 +3130,7 @@ class Service:
             owner = self.state['users'].get(agent.get('owner'))
             if not isinstance(owner, dict) or owner.get('disabled'):
                 return False
-            moment = self._expiry_now()
+            moment = self._expiry_now() if moment is None else moment
             for credential in self.state.get('credentials', {}).values():
                 if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
                         credential.get('revoked') or credential.get('expires_at', 0) <= moment:
@@ -3132,7 +3142,7 @@ class Service:
                     continue
             return False
 
-    def agent_review_standing(self, agent_id, project_id):
+    def agent_review_standing(self, agent_id, project_id, moment=None):
         """``(may_review, owner_approves)`` for one agent in one project, from live state.
 
         ``may_review``: a live credential of the agent holds the reviews capability there
@@ -3151,7 +3161,7 @@ class Service:
                 return False, False
             role = self.state.get('memberships', {}).get(project_id, {}).get(owner['id'])
             approves = bool(owner.get('superuser')) or CAP_APPROVE in ROLE_CAPABILITIES.get(role, frozenset())
-            moment = self._expiry_now()
+            moment = self._expiry_now() if moment is None else moment
             for credential in self.state.get('credentials', {}).values():
                 if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
                         credential.get('revoked') or credential.get('expires_at', 0) <= moment:
@@ -3427,7 +3437,7 @@ class Service:
             raise invalid('The nudges scope is the nudge carrier\'s alone and is never combined with another scope')
         return tuple(names)
 
-    def agent_scopes(self, agent):
+    def agent_scopes(self, agent, moment=None):
         """What an agent may do, and where that is known from: ``(scopes, source)``.
 
         ``set``: the list on the agent record, written when the agent is made and by a renewal
@@ -3452,7 +3462,7 @@ class Service:
                                                   for scope in stored) or len(stored) != len(set(stored)):
                 return None, 'unknown'
             return tuple(stored), 'inferred' if agent.get('scopes_source') == 'inferred' else 'set'
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
                  for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
         if len(lists) == 1:
@@ -3469,7 +3479,7 @@ class Service:
         return (credential.get('agent_issued_raw', credential.get('issued_raw')) or 0,
                 credential.get('created_at') or '', credential.get('id') or '')
 
-    def _prune_agent_credentials(self, agent):
+    def _prune_agent_credentials(self, agent, moment=None):
         """Delete all but the newest few credentials of the agent that no longer work.
 
         Caller holds ``store.lock`` and saves. Without it the state grew by a record for every
@@ -3478,22 +3488,22 @@ class Service:
         issued and revoked, by whom and when, remains until the shared audit tail's
         fixed AUDIT_LIMIT retention evicts it.
         """
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         dead = sorted((c for c in self._agent_credentials(agent) if not self._credential_live(c, moment)),
                       key=self._credential_age)
         for credential in dead[:max(0, len(dead) - AGENT_DEAD_CREDENTIALS_KEPT)]:
             self.state['credentials'].pop(credential['id'], None)
             self.state['credential_tokens'].pop(credential.get('token_hash'), None)
 
-    def _agent_credentials_shown(self, agent):
+    def _agent_credentials_shown(self, agent, moment=None):
         """What an agent read carries: bounded whether or not anything was pruned yet (a
         credential also stops working by expiry, with no write)."""
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         rows = sorted(self._agent_credentials(agent), key=self._credential_age)
         live = [c for c in rows if self._credential_live(c, moment)]
         dead = [c for c in rows if not self._credential_live(c, moment)][-AGENT_DEAD_CREDENTIALS_KEPT:]
         shown = sorted(live + dead, key=self._credential_age)
-        return [dict(self.credential_view(c), working=self._credential_live(c, moment)) for c in shown]
+        return [dict(self.credential_view(c, moment=moment), working=self._credential_live(c, moment)) for c in shown]
 
     # -- an agent's history (kittrial-5bb.365) ---------------------------------------
     #: The audit actions that make an agent's history, and the word each is shown as.
@@ -3636,11 +3646,12 @@ class Service:
                                                    if event.get('target_credential_ids') is not None else None)})
             return rows
 
-    def agent_view(self, agent, principal):
+    def agent_view(self, agent, principal, moment=None):
         """The owner-visible agent record. The path never leaks to anyone else."""
+        moment = self._expiry_now() if moment is None else moment
         owner_sees_path = bool(principal.superuser or
                                principal.user_id == agent['owner'])
-        scopes, source = self.agent_scopes(agent)
+        scopes, source = self.agent_scopes(agent, moment=moment)
         view = {
             'id': agent['id'], 'name': agent['name'], 'owner': agent['owner'],
             'owner_display_name': self._owner_name(agent['owner']),
@@ -3657,7 +3668,7 @@ class Service:
             'last_seen_at': agent.get('last_seen_at'),
             # Every credential that works (at most AGENT_MAX_CREDENTIALS) and the newest few that
             # do not; ``working`` says which is which (an expired one is not ``revoked``).
-            'credentials': self._agent_credentials_shown(agent),
+            'credentials': self._agent_credentials_shown(agent, moment=moment),
             # What the agent may do, which is what a new credential for it carries when no list
             # is sent (kittrial-5bb.208); null when nothing says. ``scopes_source``: ``set`` (kept on
             # the agent record: given when it was made or by a renewal that sent a list),
@@ -3674,7 +3685,7 @@ class Service:
             # the same; else []. A read for whoever reads the agent record: its account, a
             # superuser, and the agent itself on /v1/agents/me. It says only that they differ:
             # an account may have narrowed its agent on purpose and left the older credential.
-            'scopes_differ': self.agent_scope_differences(agent),
+            'scopes_differ': self.agent_scope_differences(agent, moment=moment),
         }
         if agent.get('created_by'):
             view['created_by'] = agent['created_by']
@@ -3690,9 +3701,45 @@ class Service:
         # has effect now, so the set-up wizard writes a coordinator AGENT.md. Only for the agent's owner
         # (or a superuser) signed in as a person: never for another member, and never for a credential,
         # the agent's own included. Computed live; only projects the owner is a member of.
+        # kittrial-5bb.521: coordinate_grantable_projects lists the agent's projects where THIS caller
+        # may grant coordination now (same live checks as PUT /v1/projects/{pid}/agents/{aid}/coordinator);
+        # empty for anyone who may not grant, and never reveals another project's existence.
         if principal.credential_id is None and (principal.superuser or principal.user_id == agent['owner']):
             view['coordinates'] = self.agent_coordinates(agent)
+            view['coordinate_grantable_projects'] = self.coordinate_grantable_projects(
+                agent, principal, moment=moment)
+        else:
+            view['coordinate_grantable_projects'] = []
         return view
+
+    def coordinate_grantable_projects(self, agent, principal, moment=None):
+        """Unarchived projects on ``agent`` where ``principal`` may newly grant coordination now."""
+        if principal is None or principal.via == 'credential' or principal.credential_id is not None:
+            return []
+        if not (principal.superuser or principal.user_id == agent.get('owner')):
+            return []
+        if not agent.get('enabled'):
+            return []
+        owner_id = agent.get('owner')
+        with self.store.lock:
+            moment = self._expiry_now() if moment is None else moment
+            found = []
+            for project_id in sorted({p for p in (agent.get('projects') or ()) if isinstance(p, str)}):
+                if owner_id not in self.state.get('memberships', {}).get(project_id, {}):
+                    continue
+                if not self._may_coordinate(project_id, agent):
+                    continue
+                held = coordinator_grant(self.state, project_id, agent['id'])
+                if held is not None and grant_issuer_holds(self.state, project_id, held):
+                    continue
+                try:
+                    project, _ = self._check_authority_locked(principal, project_id, CAP_PROJECT_ADMIN, moment=moment)
+                except HttpError:
+                    continue
+                if isinstance(project, dict) and project.get('archived'):
+                    continue
+                found.append(project_id)
+            return found
 
     def agent_coordinates(self, agent):
         """``[{project, effective}]``: the agent's coordinator grants in projects its owner is a member of."""
@@ -3721,6 +3768,7 @@ class Service:
         expose only id, expiry, working/revoked and seven-day warning, so this owner
         can extend a live key without seeing its label, scopes, path, hash or secret.
         """
+        moment = self._expiry_now()
         view = {
             'id': agent['id'],
             'name': agent['name'],
@@ -3730,8 +3778,8 @@ class Service:
             'enabled': bool(agent.get('enabled')),
             'last_seen_at': agent.get('last_seen_at'),
         }
-        shown = {c['id'] for c in self._agent_credentials_shown(agent)}
-        view['credentials'] = [self.agent_credential_expiry_view(c)
+        shown = {c['id'] for c in self._agent_credentials_shown(agent, moment=moment)}
+        view['credentials'] = [self.agent_credential_expiry_view(c, moment=moment)
                                for c in self._agent_credentials(agent) if c['id'] in shown]
         if project_id is not None:
             # Whether this agent coordinates THIS project (kittrial-5bb.209): who granted it and
@@ -4360,7 +4408,7 @@ class Service:
             if persist: self.store.save()
             return dict(note)
 
-    def note_projects(self, principal):
+    def note_projects(self, principal, moment=None):
         """The projects where ``principal`` coordinates now: a person's owner or coordinator memberships, or an agent's
         projects where its coordinator grant has effect. Each is checked live; at most 50, in order."""
         with self.store.lock:
@@ -4371,10 +4419,13 @@ class Service:
                 candidates = sorted(project for project, members in (self.state.get('memberships') or {}).items()
                                     if isinstance(members, dict)
                                     and members.get(principal.user_id) in ('owner', 'coordinator'))
+        if not candidates:
+            return [], False
+        moment = self._expiry_now() if moment is None else moment
         found = []
         for project in candidates:
             try:
-                self.check_authority(principal, project, CAP_COORDINATE)
+                self.check_authority(principal, project, CAP_COORDINATE, moment=moment)
             except HttpError:
                 continue
             # Review of .447, B2: the account's own role, as the records routes require; a superuser who is only a
@@ -5507,9 +5558,9 @@ class Service:
                         % (secret_file['windows'], secret_file['posix'], AGENT_SECRET_ENV),
         }
 
-    def agent_scope_differences(self, agent):
+    def agent_scope_differences(self, agent, moment=None):
         """The distinct scope lists of an agent's working credentials, when there is more than one."""
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
                  for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
         return [list(item) for item in sorted(lists)] if len(lists) > 1 else []
@@ -5598,7 +5649,7 @@ class Service:
                      scopes_after=None if after[0] is None else list(after[0]),
                      scopes_source_before=before[1], scopes_source_after=after[1])
 
-    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None, expiry=None):
+    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None, expiry=None, moment=None):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.
 
         With no list it carries exactly what the agent has (:meth:`agent_scopes`), and where
@@ -5607,9 +5658,10 @@ class Service:
         inferred or unknown scopes, with or without a list. Once confirmed, another
         authorized account may narrow them, but widening remains owner-only.
         """
+        moment = self._expiry_now() if moment is None else moment
         requested = self._scope_names(scopes)
         label = self._credential_label(label)
-        has, source = self.agent_scopes(agent)
+        has, source = self.agent_scopes(agent, moment=moment)
         if requested is not None and source in ('inferred', 'unknown') and principal.user_id != agent['owner']:
             raise forbidden(self.SCOPES_OWNER_REQUIRED)
         if requested is None:
@@ -5627,7 +5679,6 @@ class Service:
                                 % (', '.join(has) if has else 'no scopes on record', ', '.join(more)))
         # Twenty that still work. A revoked or expired credential is not counted: counted,
         # the twentieth renewal of an agent was refused for good.
-        moment = self._expiry_now()
         expiry = self._agent_expiry_metadata(moment) if expiry is None else expiry
         if sum(1 for credential in self._agent_credentials(agent)
                if self._credential_live(credential, moment)) >= AGENT_MAX_CREDENTIALS:
@@ -5655,15 +5706,15 @@ class Service:
         credential.update(expiry)
         self.state['credentials'][credential['id']] = credential
         self.state['credential_tokens'][token_hash(secret)] = credential['id']
-        self._prune_agent_credentials(agent)
+        self._prune_agent_credentials(agent, moment=moment)
         return credential, secret
 
-    def agent_creation_owner(self, principal, owner):
+    def agent_creation_owner(self, principal, owner, moment=None):
         """Resolve a real enabled account before inspecting any target grants."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to create an agent')
         with self.store.lock:
-            self.check_authority(principal, None, CAP_AGENTS)
+            self.check_authority(principal, None, CAP_AGENTS, moment=moment)
             if not isinstance(owner, str) or not owner:
                 raise invalid('owner must be an account id')
             if owner != principal.user_id and not principal.superuser:
@@ -5686,8 +5737,9 @@ class Service:
         notes = self._agent_text(notes, 'notes', AGENT_NOTES_MAX)
         clean_role = validate_agent_role(role)
         with self.store.lock:
-            self._refresh_authority(principal)
-            owner_id = self.agent_creation_owner(principal, principal.user_id if owner is None else owner)
+            moment = self._expiry_now()
+            self._refresh_authority(principal, moment=moment)
+            owner_id = self.agent_creation_owner(principal, principal.user_id if owner is None else owner, moment=moment)
             owned = [a for a in self.state['agents'].values()
                      if a['owner'] == owner_id]
             if len(owned) >= AGENT_MAX_PER_OWNER:
@@ -5697,7 +5749,7 @@ class Service:
             # What the agent may do is kept on its record from here on (kittrial-5bb.208): the
             # list asked for, or the default. Judged before anything is written.
             made_with = self._scope_names(scopes) or tuple(AGENT_DEFAULT_SCOPES)
-            expiry = self._agent_expiry_metadata()
+            expiry = self._agent_expiry_metadata(moment)
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {
                 'id': agent_id, 'name': clean_name, 'owner': owner_id,
@@ -5721,11 +5773,11 @@ class Service:
                 self.state['agents'][agent_id] = agent
                 # The grants first, so a project's view of the history includes the first credential.
                 self._audit_project_grants(principal, agent, list(granted or []), request_id)
-                credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
+                credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry, moment=moment)
                 change.created(self.state['credentials'], credential['id'])
                 change.created(self.state['credential_tokens'], credential['token_hash'])
                 self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
-                                             self.agent_scopes(agent), request_id)
+                                             self.agent_scopes(agent, moment=moment), request_id)
                 event = self.audit(request_id, principal, 'agents.created', 'committed',
                                    actor=self.agent_actor(agent))
                 event.update(agent_id=agent_id, owner_id=owner_id, created_by=principal.user_id)
@@ -5733,48 +5785,52 @@ class Service:
             # The one-time secret travels only in this response.
             public = {
                 'operation': 'agents.create',
-                'agent': self.agent_view(agent, principal),
-                'credential': dict(self.credential_view(credential), secret=secret,
+                'agent': self.agent_view(agent, principal, moment=moment),
+                'credential': dict(self.credential_view(credential, moment=moment), secret=secret,
                                    secret_available=True),
                 'setup': self.agent_setup(agent, secret),
                 'secret_available': True,
             }
         return public
 
-    def list_agents(self, principal):
+    def list_agents(self, principal, moment=None):
         """Agents the principal may administer: its own, or every agent for a superuser."""
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agents = [a for a in self.state['agents'].values()
                       if principal.superuser or a['owner'] == principal.user_id]
             agents.sort(key=lambda a: a['id'])
-            return [self.agent_view(a, principal) for a in agents]
+            return [self.agent_view(a, principal, moment=moment) for a in agents]
 
-    def agent_page(self, principal, offset, limit, *, unconfirmed=False):
+    def agent_page(self, principal, offset, limit, *, unconfirmed=False, moment=None):
         """Select a bounded owner-visible page before building credential/card views."""
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agents = [a for a in self.state['agents'].values()
                       if principal.superuser or a['owner'] == principal.user_id]
             if unconfirmed:
-                agents = [a for a in agents if self.agent_scopes(a)[1] != 'set']
+                agents = [a for a in agents if self.agent_scopes(a, moment=moment)[1] != 'set']
             agents.sort(key=lambda a: a['id'])
-            return [self.agent_view(a, principal) for a in agents[offset:offset + limit]], len(agents)
+            return [self.agent_view(a, principal, moment=moment) for a in agents[offset:offset + limit]], len(agents)
 
-    def get_agent(self, principal, agent_id):
+    def get_agent(self, principal, agent_id, moment=None):
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agent = self._agent_owned(principal, agent_id)
-            return self.agent_view(agent, principal)
+            return self.agent_view(agent, principal, moment=moment)
 
-    def agent_for_credential(self, principal):
+    def agent_for_credential(self, principal, moment=None):
         """The agent behind an agent credential, for ``GET /v1/agents/me``."""
         if principal is None or principal.via != 'credential' or not principal.agent_id:
             raise forbidden('An agent credential is required')
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agent = self._agent(principal.agent_id)
-            return self.agent_view(agent, principal)
+            return self.agent_view(agent, principal, moment=moment)
 
     def update_agent(self, principal, agent_id, payload, request_id=None):
         if principal is None or principal.via == 'credential':
