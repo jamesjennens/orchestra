@@ -604,6 +604,62 @@ class CanonicalSameCommitRefusalTests(unittest.TestCase):
         c3 = self.send(self.contribute_payload(COMMIT_A))['comment_id']
         self.assertEqual(w.project(self.issue)['contribution']['comment_id'], c3)
 
+    def test_carried_open_item_from_superseded_delivery_keeps_open_refusal_sentence(self):
+        # kittrial-5bb.573 S1: delivery A gets r1 (item old, never answered); delivery B
+        # supersedes A and gets r2 (item new); worker answers new and sends B again.
+        # Because old is still pending, the refusal must give the open sentence (not the
+        # answered sentence) while keeping review_id naming r2.
+        c1 = self.send(self.contribute_payload(COMMIT_A))['comment_id']
+        r1 = self.request_changes(c1, items=[dict(id='old', text='Unanswered item on A')], actor='reviewer')
+        c2 = self.send(self.contribute_payload(COMMIT_B))['comment_id']
+        r2 = self.request_changes(c2, items=[dict(id='new', text='Item on B')], actor='reviewer')
+        self.send(
+            self.payload('respond', contribution=c2, resolutions=[
+                dict(request=r2, item='new', reason='Fixed on B', evidence='tests')
+            ]),
+            actor='worker'
+        )
+        state = w.project(self.issue)
+        self.assertEqual([(p['request'], p['item']) for p in state['pending_requests']], [(r1, 'old')])
+        with tempfile.TemporaryDirectory() as tmp:
+            mine, _ = self.work_queue_snapshot(tmp)
+        self.assertEqual(mine['items'][0]['whose_move'], 'you')
+        with self.assertRaises(w.SameCommitChangesRequested) as ctx:
+            self.send(self.contribute_payload(COMMIT_B))
+        self.assert_refused_409(ctx.exception, r2, answered=False)
+
+    def test_answered_refusal_sentence_unchanged_when_nothing_is_pending(self):
+        # Single delivery with its item answered -> nothing pending -> answered sentence.
+        c1 = self.send(self.contribute_payload(COMMIT_A))['comment_id']
+        r1 = self.request_changes(c1, items=[dict(id='only', text='Single item')], actor='reviewer')
+        self.send(
+            self.payload('respond', contribution=c1, resolutions=[
+                dict(request=r1, item='only', reason='Answered', evidence='tests')
+            ]),
+            actor='worker'
+        )
+        self.assertEqual(w.project(self.issue)['pending_requests'], [])
+        with self.assertRaises(w.SameCommitChangesRequested) as single:
+            self.send(self.contribute_payload(COMMIT_A))
+        self.assert_refused_409(single.exception, r1, answered=True)
+
+        # Superseded delivery once BOTH new and carried old are answered -> nothing pending -> answered sentence.
+        a = self.send(self.contribute_payload(COMMIT_A, task='task-2'))['comment_id']
+        ra = self.request_changes(a, items=[dict(id='old', text='Item on A')], actor='reviewer', task='task-2')
+        b = self.send(self.contribute_payload(COMMIT_B, task='task-2'))['comment_id']
+        rb = self.request_changes(b, items=[dict(id='new', text='Item on B')], actor='reviewer', task='task-2')
+        self.send(
+            self.payload('respond', task='task-2', contribution=b, resolutions=[
+                dict(request=rb, item='new', reason='Answered B', evidence='tests'),
+                dict(request=ra, item='old', reason='Answered A', evidence='tests'),
+            ]),
+            actor='worker'
+        )
+        self.assertEqual(w.project(self._row('task-2'))['pending_requests'], [])
+        with self.assertRaises(w.SameCommitChangesRequested) as both:
+            self.send(self.contribute_payload(COMMIT_B, task='task-2'))
+        self.assert_refused_409(both.exception, rb, task='task-2', answered=True)
+
 
 class SharedHttpSameCommitRefusalTests:
     """Shared HTTP scenarios run against both InProcessBackend and EndpointBackend."""
@@ -821,6 +877,36 @@ class SharedHttpSameCommitRefusalTests:
         self.assertIn('Operation ID already used with different payload or actor',
                       json.dumps(mismatch.data))
 
+    def test_carried_open_item_from_superseded_delivery_keeps_open_refusal_sentence(self):
+        task, c1 = self.deliver('task-s1-carried', COMMIT_A)
+        r1 = self.ask_changes(self.reviewer, task, c1, items=[{'id': 'old', 'text': 'Unanswered item on A'}])
+        self.assertTrue(r1)
+        second = self.post_contribute(task, COMMIT_B)
+        self.assertEqual(201, second.status, second.data)
+        c2 = second.data.get('comment_id') or second.data['contribution']['id']
+        r2 = self.ask_changes(self.reviewer, task, c2, items=[{'id': 'new', 'text': 'Item on B'}])
+        answered_new = self.post_respond(task, c2, r2, 'new')
+        self.assertEqual(201, answered_new.status, answered_new.data)
+
+        refused = self.post_contribute(task, COMMIT_B)
+        self.assert_http_refused_409(refused, r2, answered=False)
+
+    def test_answered_refusal_sentence_unchanged_when_nothing_is_pending(self):
+        task1, c1 = self.deliver('task-s1-clean-single', COMMIT_A)
+        r1 = self.ask_changes(self.reviewer, task1, c1, items=[{'id': 'only', 'text': 'Single item'}])
+        self.assertEqual(201, self.post_respond(task1, c1, r1, 'only').status)
+        self.assert_http_refused_409(self.post_contribute(task1, COMMIT_A), r1, answered=True)
+
+        task2, a = self.deliver('task-s1-clean-both', COMMIT_A)
+        ra = self.ask_changes(self.reviewer, task2, a, items=[{'id': 'old', 'text': 'Item on A'}])
+        second = self.post_contribute(task2, COMMIT_B)
+        self.assertEqual(201, second.status, second.data)
+        b = second.data.get('comment_id') or second.data['contribution']['id']
+        rb = self.ask_changes(self.reviewer, task2, b, items=[{'id': 'new', 'text': 'Item on B'}])
+        self.assertEqual(201, self.post_respond(task2, b, rb, 'new').status)
+        self.assertEqual(201, self.post_respond(task2, b, ra, 'old').status)
+        self.assert_http_refused_409(self.post_contribute(task2, COMMIT_B), rb, answered=True)
+
 
 class InProcessHttpSameCommitRefusalTests(SharedHttpSameCommitRefusalTests, test_http_agents.AgentHarness):
     """HTTP coverage on InProcessBackend."""
@@ -932,6 +1018,72 @@ class InProcessHttpSameCommitRefusalTests(SharedHttpSameCommitRefusalTests, test
     def contribution_record_count(self, task):
         return sum(1 for r in self.backend.state['contributions'].get(task, [])
                    if r.get('kind') == 'contribution')
+
+    def test_inprocess_reused_operation_id_with_different_actor_is_422(self):
+        task = self.make_claimed_task('task-n5-actor')
+        op_c = 'op-n5-contrib-' + secrets.token_hex(4)
+        contrib_body = self.build_contribute_body(task, COMMIT_A, operation_id=op_c)
+        first = self.request('POST', self.base(task) + '/reviews', copy.deepcopy(contrib_body), token=self.agent)
+        self.assertEqual(201, first.status, first.data)
+        c1 = first.data['contribution']['id']
+
+        other_contrib = self.request('POST', self.base(task) + '/reviews',
+                                     copy.deepcopy(contrib_body), token=self.dana)
+        self.assertEqual(422, other_contrib.status, other_contrib.data)
+        self.assertIn('Operation ID already used with different payload or actor',
+                      json.dumps(other_contrib.data))
+
+        op_rc = 'op-n5-rc-' + secrets.token_hex(4)
+        rc_body = {
+            'operation': 'request-changes',
+            'operation_id': op_rc,
+            'contribution': c1,
+            'summary': 'Check boundary',
+            'items': [{'id': 'i-1', 'text': 'Check boundary'}],
+        }
+        rc_first = self.request('POST', self.base(task) + '/reviews', copy.deepcopy(rc_body), token=self.reviewer)
+        self.assertEqual(201, rc_first.status, rc_first.data)
+        rc_same = self.request('POST', self.base(task) + '/reviews', copy.deepcopy(rc_body), token=self.reviewer)
+        self.assertEqual(201, rc_same.status, rc_same.data)
+        self.assertEqual(rc_first.data['review']['id'], rc_same.data['review']['id'])
+
+        rc_other = self.request('POST', self.base(task) + '/reviews', copy.deepcopy(rc_body), token=self.owner)
+        self.assertEqual(422, rc_other.status, rc_other.data)
+        self.assertIn('Operation ID already used with different payload or actor',
+                      json.dumps(rc_other.data))
+
+    def test_inprocess_contribute_and_request_changes_refuse_each_others_operation_ids(self):
+        task = self.make_claimed_task('task-n5-cross-kind')
+        op_c = 'op-n5-c-' + secrets.token_hex(4)
+        first = self.post_contribute(task, COMMIT_A, operation_id=op_c)
+        self.assertEqual(201, first.status, first.data)
+        c1 = first.data['contribution']['id']
+
+        rc_reusing_c = self.request('POST', self.base(task) + '/reviews', {
+            'operation': 'request-changes',
+            'operation_id': op_c,
+            'contribution': c1,
+            'summary': 'Delivered revision',
+            'items': [{'id': 'i-1', 'text': 'Fix'}],
+        }, token=self.reviewer)
+        self.assertEqual(422, rc_reusing_c.status, rc_reusing_c.data)
+        self.assertIn('Operation ID already used with different payload or actor',
+                      json.dumps(rc_reusing_c.data))
+
+        op_rc = 'op-n5-r-' + secrets.token_hex(4)
+        rc_ok = self.request('POST', self.base(task) + '/reviews', {
+            'operation': 'request-changes',
+            'operation_id': op_rc,
+            'contribution': c1,
+            'summary': 'Delivered revision',
+            'items': [{'id': 'i-1', 'text': 'Fix'}],
+        }, token=self.reviewer)
+        self.assertEqual(201, rc_ok.status, rc_ok.data)
+
+        contrib_reusing_rc = self.post_contribute(task, COMMIT_B, operation_id=op_rc)
+        self.assertEqual(422, contrib_reusing_rc.status, contrib_reusing_rc.data)
+        self.assertIn('Operation ID already used with different payload or actor',
+                      json.dumps(contrib_reusing_rc.data))
 
 
 class EndpointHttpSameCommitRefusalTests(SharedHttpSameCommitRefusalTests, fixes.EndpointCase):

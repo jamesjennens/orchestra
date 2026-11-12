@@ -1286,6 +1286,7 @@ class InProcessBackend:
             if current and commit.lower() == current[-1]['commit'].lower():
                 review_id, answered = self._active_changes_requested_review(contributions, current[-1]['id'])
                 if review_id is not None:
+                    answered = answered and not self._requests(contributions, True)
                     from review_workflow import same_commit_refusal_message
                     raise conflict(same_commit_refusal_message(review_id, answered=answered),
                                    {'review_id': review_id})
@@ -1541,11 +1542,6 @@ class InProcessBackend:
         if responded_ids:
             return responded_ids[-1], True
         return None, False
-
-    @staticmethod
-    def _active_changes_requested_review_id(records, latest_id):
-        """Return the ``request-changes`` id blocking a same-commit ``contribute``, or ``None``."""
-        return InProcessBackend._active_changes_requested_review(records, latest_id)[0]
 
     @staticmethod
     def _requests(records, open_only=False):

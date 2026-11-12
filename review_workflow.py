@@ -2722,11 +2722,6 @@ def active_changes_requested_review(ordered, state, voids=None, positions=None):
     return None, False
 
 
-def active_changes_requested_review_id(ordered, state, voids=None, positions=None):
-    """Return the ``request-changes`` comment id blocking a same-commit ``contribute``, or ``None``."""
-    return active_changes_requested_review(ordered, state, voids, positions)[0]
-
-
 def project(issue, operators=None, journal=None, reverts=None, invalid_reverts=None):
     """Raw workflow projection for one issue; ``journal`` is the project directory
     holding the host-issued ``.integration-reverts/`` journal (None trusts no
@@ -3354,6 +3349,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         if payload['commit'].lower() == state['contribution']['commit'].lower():
             blocking_review, review_answered = active_changes_requested_review(ordered, state, voids, positions)
             if blocking_review is not None:
+                review_answered = review_answered and not state.get('pending_requests')
                 raise SameCommitChangesRequested(
                     task, blocking_review, payload['commit'], answered=review_answered
                 )
