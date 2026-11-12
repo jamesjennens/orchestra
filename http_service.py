@@ -53,6 +53,14 @@ import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
 from review_workflow import TEXT_LIMITS, limited
+
+#: The approval_basis field value for each basis the approve route names (kittrial-5bb.515 B, with the
+#: worker-credential basis of kittrial-5bb.519). Both values are in review_workflow.APPROVAL_BASES.
+APPROVAL_BASIS_OF = {'agent': 'same-person-agent', 'worker-credential': 'same-person-worker-credential'}
+#: Where the approve route puts the basis it decided, for the backends to write as ``approval_basis``
+#: (kittrial-5bb.515 r2). A tuple key: a JSON request body only has string keys, so no caller can spell it, and
+#: ``approval_basis`` itself is not a field a caller may send (a body naming it is refused).
+SERVER_APPROVAL_BASIS = ('server', 'approval_basis')
 import claim_limit
 import handover_steps
 import project_setup
@@ -626,6 +634,17 @@ def written_at(service):
     return server_time(service._now())
 
 
+def approval_basis_listed(help_payload):
+    """Whether a ``review`` help payload lists ``approval_basis`` among ``approve``'s optional fields.
+
+    The one gate for writing the field (kittrial-5bb.515): an endpoint whose help does not say so (a kit before
+    the readers' release) may refuse a record that carries it, so the service keeps the sentence for it.
+    """
+    fields = help_payload.get('optional_fields') if isinstance(help_payload, dict) else None
+    approve = fields.get('approve') if isinstance(fields, dict) else None
+    return isinstance(approve, list) and 'approval_basis' in approve
+
+
 class InProcessBackend:
     """Disposable canonical operations used for local validation.
 
@@ -1179,6 +1198,15 @@ class InProcessBackend:
         self._event(project_id, task['id'], 'checkpoint-added', principal, record['actor'])
         return {'checkpoint': record, 'task_version': task['version']}
 
+    def approval_basis_advertised(self, project_id=None):
+        """Whether this backend's review help lists ``approval_basis`` for ``approve`` (kittrial-5bb.515).
+
+        The same help payload the endpoint serves for ``review --help``: this backend is the service's own kit,
+        so it asks that kit's help rather than assuming.
+        """
+        import work
+        return approval_basis_listed(work.help_payload('review'))
+
     def _review_add(self, principal, project_id, payload):
         task = self._task(project_id, payload.get('task_id'))
         operation = payload.get('operation')
@@ -1310,6 +1338,14 @@ class InProcessBackend:
                   'items': items,
                   'actor': actor,
                   'created_at': now_iso(self.service._now())}
+        if operation == 'approve' and payload.get(SERVER_APPROVAL_BASIS) is not None:
+            # kittrial-5bb.515: the server's own statement, from the route (never a caller's key); the canonical
+            # vocabulary.
+            from review_workflow import APPROVAL_BASES
+            if payload[SERVER_APPROVAL_BASIS] not in APPROVAL_BASES:
+                raise invalid('Canonical command rejected the request',
+                              'ValueError: Invalid approval basis; expected one of: ' + ', '.join(sorted(APPROVAL_BASES)))
+            record['approval_basis'] = payload[SERVER_APPROVAL_BASIS]
         if operation == 'request-changes':
             # Marks the request as following the canonical respond rule. Requests
             # recorded before the respond step existed carry no flag and keep the old
@@ -1794,7 +1830,16 @@ class InProcessBackend:
         records_standing = self._standing_recommendations(task, records)
         standing = [self._recommendation_view(record) for record in records_standing]
         import review_recommendations as rec
+        approved = ([r for r in records if r['kind'] == 'approve'][-1:]
+                    if task.get('review_state') == 'approved' else [])
+        basis = approved[0].get('approval_basis') if approved else None
+        import review_workflow
         return {'state': task.get('review_state') or 'none', 'contribution': contribution,
+                # Additive (kittrial-5bb.515): why the server let the standing approval through, only when it
+                # carries the field (an approval written before it has none).
+                **({'approval_basis': {'basis': basis, 'text': review_workflow.APPROVAL_BASES.get(basis, basis),
+                                       'author': approved[0]['actor'], 'at': approved[0]['created_at']}}
+                   if isinstance(basis, str) and basis else {}),
                 # Additive (kittrial-5bb.115): advice to approve the current contribution.
                 'recommendation': standing[0] if standing else None,
                 # Each in full: the brief route leaves out the author's own person and shows the next.
@@ -3297,6 +3342,8 @@ class EndpointBackend:
         'request-review': ('summary',),
         'withdraw': ('disposition',),
         'resolve-item': ('disposition',),
+        # kittrial-5bb.515: approval_basis is NOT here. The route alone decides it and hands it over under
+        # SERVER_APPROVAL_BASIS; a body naming it is refused (the dedicated 422, and the unknown-field check).
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -3517,6 +3564,9 @@ class EndpointBackend:
                 # keep their null, because their ABSENCE is an invalid field set.
                 if payload.get(field) is not None:
                     body[field] = payload.get(field)
+            if operation == 'approve' and payload.get(SERVER_APPROVAL_BASIS) is not None:
+                # kittrial-5bb.515: the route's own value, never a caller's key.
+                body['approval_basis'] = payload[SERVER_APPROVAL_BASIS]
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
             if not body['operation_id']:
@@ -3600,6 +3650,20 @@ class EndpointBackend:
         if not isinstance(payload, dict):
             raise uncertain('Canonical design read returned an unexpected shape')
         return payload
+
+    def approval_basis_advertised(self, project_id):
+        """Whether the endpoint's machine-readable ``review`` help lists ``approval_basis`` for ``approve``.
+
+        Read from the endpoint each time it is asked (a read, not a write; no cache, so an endpoint replaced
+        under a running service is believed at the next approval). An endpoint of a kit before the field lists
+        nothing, and so does one whose answer cannot be read: the service then writes the sentence as before.
+        """
+        try:
+            reply = self._endpoint('review', project_id, self.actor_namespace + '/read', ['--help'])
+            payload = self._checked(reply, 'review', reading=True)
+        except Exception:                     # noqa: BLE001 -- any failure to read the help: not advertised, the sentence
+            return False
+        return approval_basis_listed(payload)
 
     def switches(self, project_id):
         """kittrial-5bb.434: the installation switches that refuse a web write, through the read-only
@@ -4366,6 +4430,10 @@ class EndpointBackend:
                            'pending_review_requests': pending_review_requests,
                            'declined_review_requests': declined_review_requests,
                            'withdrawal': withdrawal,
+                           # Additive (kittrial-5bb.515): why the server let the approval through, from the
+                           # record's own field and present only when it has one. An older endpoint, or an
+                           # approval written before the field, has none, and its summary is only a summary.
+                           **self._approval_basis_view(review.get('approval_basis')),
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
                            # The newest few carry their whole content (a kit before that
@@ -4418,6 +4486,15 @@ class EndpointBackend:
                 'changes_since_checkpoint': data.get('changes_since_checkpoint')
                 if isinstance(data.get('changes_since_checkpoint'), dict)
                 else self._no_checkpoint_section(task_id) if data.get('checkpoint') is None else None}
+
+    @staticmethod
+    def _approval_basis_view(raw):
+        """The page's ``approval_basis`` block from the canonical projection's, or nothing."""
+        if not isinstance(raw, dict) or not isinstance(raw.get('basis'), str) or not raw['basis']:
+            return {}
+        text = raw.get('text')
+        return {'approval_basis': {'basis': raw['basis'], 'text': text if isinstance(text, str) and text else raw['basis'],
+                                   'author': raw.get('author'), 'at': raw.get('timestamp')}}
 
     @staticmethod
     def _no_checkpoint_section(task):
@@ -7118,11 +7195,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         for target, is_author in ((author, True), (assignee, False)):
             if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
                 continue
+            # The basis is the DELIVERING author's whenever the author is of the approver's party; the assignee
+            # decides it only when the author is independent (kittrial-5bb.515 r2: the author comes first, so the
+            # first basis found stands).
             if self.service.other_agent_of_same_person(agent_id, target):
                 basis = basis or 'agent'
                 continue
             if self.service.worker_credential_of_same_person(agent_id, target, project):
-                basis = 'worker-credential'
+                basis = basis or 'worker-credential'
                 continue
             head = target.split('/', 1)[0]
             if agent_id and head.casefold() == agent_id.casefold():
@@ -7144,6 +7224,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             agents = self.service.state.get('agents')
             mine = agents.get(agent_id) if isinstance(agents, dict) else None
             return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
+
+    @staticmethod
+    def _refuse_caller_approval_basis(payload):
+        """The first of two barriers (kittrial-5bb.515): the basis of an approval is the server's statement.
+
+        A body naming ``approval_basis`` gets this 422 on every operation. The second barrier holds without it:
+        ``approval_basis`` is not a field a caller may send, so the unknown-field check refuses it too, and the
+        backends only ever write the value the route put under :data:`SERVER_APPROVAL_BASIS`.
+        """
+        if 'approval_basis' in payload:
+            raise invalid('approval_basis is set by the server')
 
     def _approval_permission(self, principal, pid, author, assignee, setting=None, can_approve=None):
         """Whether ``principal`` may approve a delivery now, and why (kittrial-5bb.518). Informational: it grants nothing.
@@ -14734,6 +14825,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (kittrial-5bb.209), and is then judged by party below whatever the setting says.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
+        self._refuse_caller_approval_basis(payload)
         recommending = payload.get('operation') == 'recommend'
         # With the installation's setting on, an approval is judged by whose work it is, which
         # needs the same read a recommendation makes (kittrial-5bb.199). Off: no read, no rule.
@@ -14810,11 +14902,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if typed is not None:
                     raise invalid('The approval summary may not contain %r; the server adds that sentence itself'
                                   % typed)
+                setting_basis = (setting.get('basis') or 'agent') if setting is not None else None
+                advertised = getattr(self.backend, 'approval_basis_advertised', None)
+                if setting is not None and advertised is not None and advertised(pid):
+                    # kittrial-5bb.515: the endpoint's review help lists the field, so the basis is a field of
+                    # the record and the approver's summary stays the approver's own words. The value is the
+                    # one the route's basis names (kittrial-5bb.519: an agent, or a worker credential).
+                    payload[SERVER_APPROVAL_BASIS] = APPROVAL_BASIS_OF[setting_basis]
                 if setting is not None:
-                    basis = setting.get('basis') or 'agent'
-                    sentence = (self.WORKER_CREDENTIAL_APPROVAL if basis == 'worker-credential'
+                    sentence = (self.WORKER_CREDENTIAL_APPROVAL if setting_basis == 'worker-credential'
                                 else self.SAME_PERSON_APPROVAL)
-                    if isinstance(summary, str):
+                    if isinstance(summary, str) and SERVER_APPROVAL_BASIS not in payload:
                         joined = (summary.rstrip() + ' ' if summary.strip() else '') + sentence
                         over = len(joined) - self.SUMMARY_MAX
                         if over > 0:
@@ -14825,7 +14923,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         payload['summary'] = joined
                     same_person.update(same_person_coordinator=True, author=delivered.get('author'),
                                        assignee=(current.get('task') or {}).get('assignee'),
-                                       basis=basis,
+                                       basis=setting_basis,
                                        agent_approval=setting['mode'],
                                        agent_approval_set_by=setting.get('set_by') or 'default',
                                        agent_approval_set_at=setting.get('set_at'))

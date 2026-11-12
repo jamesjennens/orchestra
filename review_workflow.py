@@ -124,6 +124,8 @@ OPTIONAL = {
     # optional: an attestation that cannot observe them says so in its method and
     # never invents a digest (kittrial-5bb.10).
     'attest': {'sha256', 'bytes'},
+    # The server-recorded basis of an approval (kittrial-5bb.515); see ``APPROVAL_BASIS``.
+    'approve': {'approval_basis'},
 }
 #: The operation values that write a NEW record shape (kittrial-5bb.94 item 3,
 #: extended by kittrial-5bb.10). Every one is refused unless the per-installation
@@ -192,6 +194,23 @@ RESOLVE_DEFAULT = 'resolved'
 # exactly and refuses a record that carries it. See the module docstring and
 # docs/REVIEWS.md.
 ASSIGNEE_SNAPSHOT = 'assignee_at_approval'
+# Optional additive field on an ``approve`` record (kittrial-5bb.515): why the server let the approval
+# through, a token of the closed vocabulary ``APPROVAL_BASES``. Written ONLY by the web service
+# (``check_write_fields`` refuses it from every other writer), so a caller can no longer pass text off as the
+# server's. Like ``assignee_at_approval`` it is not rollback-safe once written: a kit that predates it validates
+# the approve field set exactly and refuses a record that carries it ("Invalid review workflow fields"), so the
+# release that reads it (A) must reach every reader before any writer (B) uses it. The endpoint advertises it in
+# its machine-readable ``review`` help (``help_optional_fields``), which is the writer's one gate.
+APPROVAL_BASIS = 'approval_basis'
+#: The closed vocabulary: token -> the line a reader shows (apart from the approver's summary).
+APPROVAL_BASES = {
+    'same-person-agent': 'Allowed by: coordinator agent of the same person as the delivering agent '
+                         '(project setting agent_approval: by-agent; the audit entry holds who set it and when)',
+    # kittrial-5bb.519: a coordinator agent approving a worker credential of its own person.
+    'same-person-worker-credential': 'Allowed by: coordinator agent of the same person as the delivering worker '
+                                     'credential (project setting agent_approval: by-agent; the audit entry holds '
+                                     'who set it and when)',
+}
 # The audited revert record. A separate reserved kind (see the module docstring),
 # written only by the operator CLI; ``issued_revert`` is its exact schema and
 # ``revert_records`` its tolerant reader.
@@ -328,7 +347,16 @@ def check_plain_text(payload):
                         plain_text(item[key], 'resolution ' + key)
 
 
-def check_write_fields(payload):
+def help_optional_fields():
+    """The optional fields of each operation, for the machine-readable ``review`` help.
+
+    A service reads this before it writes ``approval_basis``: a field the endpoint does not list is a field
+    its kit may refuse (kittrial-5bb.515).
+    """
+    return {op: sorted(names) for op, names in sorted(OPTIONAL.items())}
+
+
+def check_write_fields(payload, by_service=False):
     """Refuse an explicitly null OPTIONAL field on the WRITE path (kittrial-5bb.110 item 2).
 
     ``validate`` stays tolerant so a record an older kit stored with ``"disposition":
@@ -340,6 +368,9 @@ def check_write_fields(payload):
     explicit null) before any native write.
     """
     op = payload.get('operation')
+    if APPROVAL_BASIS in payload and not by_service:
+        # The basis is the server's statement about an approval; nobody else writes it (kittrial-5bb.515).
+        raise ValueError('approval_basis is set by the web service and cannot be written here')
     if op not in ('withdraw', 'resolve-item') or 'disposition' not in payload:
         return
     if payload['disposition'] is None:
@@ -648,6 +679,9 @@ def validate(p, task):
             snapshot = p.get(ASSIGNEE_SNAPSHOT)
             if snapshot is not None:
                 limited(snapshot, 'assignee snapshot')
+            basis = p.get(APPROVAL_BASIS, '')
+            if APPROVAL_BASIS in p and (not isinstance(basis, str) or basis not in APPROVAL_BASES):
+                raise ValueError('Invalid approval basis; expected one of: ' + ', '.join(sorted(APPROVAL_BASES)))
         elif op == 'request-changes':
             # The summary is additive (kittrial-5bb.94 item 3): request-changes used
             # to reject it, so the reviewer's reasoning sat in an unlinked comment.
@@ -2264,7 +2298,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
     does not flip the disposition - the first one stands and the ignored record is
     warned about (item 5), so a chain that already holds two still reads."""
     contribution = None; prior = []; pending = {}; notes = {}; reviews = {}
-    declined = []; approved = False; approved_id = None; latest = None; withdrawal = None
+    declined = []; approved = False; approved_id = None; approving = None; latest = None; withdrawal = None
     ignored_withdrawals = []; last_response = None
     # Verifier attestations and explicit integration holds (kittrial-5bb.10). An
     # attestation belongs to the revision it was recorded against, so it resets with a
@@ -2433,7 +2467,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
             elif op == 'approve':
                 if pending:
                     raise ValueError(unresolved_changes_approval_refusal(assignee))
-                approved = True; approved_id = cid
+                approved = True; approved_id = cid; approving = (p, c)
             if op == 'approve':
                 # An approval settles the contribution: no review request for it
                 # stays open, whoever recorded the approval (item 4).
@@ -2580,6 +2614,14 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
     if attestation is not None:
         answer['attestation'] = attestation
         answer['verification'] = verification
+    # Additive (kittrial-5bb.515) and present only when the standing approval carries the field: why the server
+    # let it through, taken from the record's own field and never read out of the summary. An approval written
+    # before the field existed carries no such key, and the sentence in its summary is then plain text.
+    basis = approving[0].get(APPROVAL_BASIS) if approved and approving else None
+    if isinstance(basis, str) and basis in APPROVAL_BASES:
+        answer['approval_basis'] = {'basis': basis, 'text': APPROVAL_BASES[basis],
+                                    'comment_id': str(approving[1]['id']), 'author': approving[1]['author'],
+                                    'timestamp': approving[1]['created_at']}
     if attestations:
         answer['attestations'] = attestations[-ATTEST_LIMIT:]
     if open_holds:
@@ -3042,7 +3084,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     validate(payload, task); text(actor, 'actor', 300)
     # A null optional disposition is refused on the WRITE path before anything else, so
     # the writer never stores the shape `validate` must keep reading (item 2).
-    check_write_fields(payload)
+    check_write_fields(payload, by_service=verified_web_authority)
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')

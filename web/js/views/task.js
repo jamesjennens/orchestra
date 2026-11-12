@@ -142,7 +142,13 @@ export async function detail(ctx, { pid, tid }) {
         h('dt', null, 'Commit'), h('dd', null, h('code', { title: c.commit }, shortSha(c.commit)), c.branch ? h('span', { class: 'muted' }, ' on ', h('code', null, c.branch)) : null),
         c.base_commit ? [h('dt', null, 'Based on'), h('dd', null, h('code', { title: c.base_commit }, shortSha(c.base_commit)))] : null,
         h('dt', null, 'Delivered'), h('dd', null, time(c.at), ' by ', actorWords(c.author_name, c.author, 'someone'))),
-      h('p', { class: 'prose' }, c.summary));
+      h('p', { class: 'prose' }, c.summary),
+      // kittrial-5bb.515: why the server let the approval through. Its own line, taken from the approval
+      // record's field and never from any summary, so it cannot be mistaken for the approver's words. An
+      // approval written before the field has none: its summary, whatever it says, stays a plain summary.
+      review.approval_basis && typeof review.approval_basis.text === 'string' && review.approval_basis.text
+        ? h('p', { class: 'approval-basis small', 'data-approval-basis': String(review.approval_basis.basis || '') },
+          review.approval_basis.text) : null);
   } else {
     reviewBody.append(empty('No contribution yet', t.assignee ? `${t.assignee_name} will deliver work here for review.` : 'Once someone claims this task, their delivered work appears here.'));
   }
