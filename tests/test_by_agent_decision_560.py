@@ -132,9 +132,12 @@ class Bases(unittest.TestCase):
     def test_basis_none_when_independent(self):
         self.assertEqual(ha.ByAgentDecision(True, None, None, None, None, False), decide(base_state(), 'kite'))
 
-    def test_worker_credential_outranks_agent_either_way(self):
-        self.assertEqual('worker-credential', decide(base_state(), 'egret', assignee='builder').basis)
+    def test_the_delivering_author_decides_the_basis(self):
+        # kittrial-5bb.515 r2 (S1), carried into this decision by candidate 1112a: the author comes first, so the
+        # first basis found stands; the assignee decides only when the author is independent.
+        self.assertEqual('agent', decide(base_state(), 'egret', assignee='builder').basis)
         self.assertEqual('worker-credential', decide(base_state(), 'builder', assignee='egret').basis)
+        self.assertEqual('worker-credential', decide(base_state(), 'kite', assignee='builder').basis)
 
     def test_names_default_to_the_approver(self):
         self.assertTrue(ha.by_agent_approval(base_state(), P, 'heron', 'egret', 'kite', NOW).allowed)

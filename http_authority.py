@@ -759,11 +759,14 @@ def by_agent_approval(state, project_id, approver, author, assignee, now, names=
     for target, role in ((author, 'author'), (assignee, 'assignee')):
         if not isinstance(target, str) or not target or independent_of(state, names, target, project_id):
             continue
+        # The basis is the DELIVERING author's whenever the author is of the approver's party; the assignee
+        # decides it only when the author is independent (kittrial-5bb.515 r2: the author comes first, so the
+        # first basis found stands; carried here by candidate 1112a when .560 moved this loop).
         if other_agent_of_same_person(state, agent_id, target):
             basis = basis or 'agent'
             continue
         if worker_credential_of_same_person(state, agent_id, target, project_id):
-            basis = 'worker-credential'
+            basis = basis or 'worker-credential'
             continue
         head = target.split('/', 1)[0]
         if head.casefold() == agent_id.casefold():
