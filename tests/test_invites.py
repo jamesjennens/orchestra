@@ -443,7 +443,7 @@ class RateLimitTests(InviteCase):
         status, body = self.redeem(token, source=guesser)
         self.assertEqual(status, 429, body)
         self.assertEqual(self.record(token)['used_at'], None)
-        # The same guessing address is held back at sign-in too: the counts are the sign-in counts.
+        # Another address is not held back by the guesser's misses.
         self.assertEqual(self.view(token, source='198.51.100.67')[0], 200)
         self.assertEqual(self.redeem(token, source='198.51.100.67')[0], 201)
 
