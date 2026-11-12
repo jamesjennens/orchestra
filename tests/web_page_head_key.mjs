@@ -111,13 +111,16 @@ const out = {};
   out.agents = { head: header(page), ids: ids(page), expected: { num: String(data.total) } };
 }
 
-// Members & settings: the member count.
+// People (Members & settings before kittrial-5bb.522 slice 2): the member count. Settings has no key.
 {
   const data = await api.members(PID);
-  const page = await project.settings(ctx, { pid: PID });
+  const page = await project.people(ctx, { pid: PID });
   await settle();
-  out.settings = { head: header(page), ids: ids(page),
+  out.people = { head: header(page), ids: ids(page),
     expected: { num: String(typeof data.total === 'number' ? data.total : data.items.length) } };
+  const settingsPage = await project.settings(ctx, { pid: PID });
+  await settle();
+  out.settings = { head: header(settingsPage) };
 }
 
 console.log(JSON.stringify(out));

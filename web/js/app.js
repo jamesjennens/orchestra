@@ -25,7 +25,7 @@ import * as invites from './views/invites.js';
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
   home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
-  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, program: program.page, how: how.page,
+  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, people: project.people, projectAgents: project.projectAgents, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, program: program.page, how: how.page,
   newTask: task.create, task: task.detail,
   lanes: project.lanesPage,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
@@ -150,7 +150,9 @@ export async function start(root, options = {}) {
       // kittrial-5bb.453: only on a project with an accepted program.area side (the server's cached flag).
       program.showsProgram(proj) && ['program', 'Program'],
       ['feedback', 'Orchestra feedback'],
-      ['settings', 'Members & settings'],
+      ['people', 'People'],
+      ['agents', 'Agents'],
+      ['settings', 'Settings'],
       ['owner', 'superuser'].includes(proj.role) && ['setup', 'Set up'],
       ['how', 'How work is found'],
     ].filter(Boolean);
@@ -176,7 +178,7 @@ export async function start(root, options = {}) {
       // An unknown section (a hand-written URL) has no name to give: the page-level sentence, not the task one.
       lines.push(t.section && !label ? fallbackMessage(name, '', 'other') : fallbackMessage(name, label, t.page));
     }
-    if (t.qDropped) lines.push(searchLeftMessage(here ? here.name : 'the project you left'));
+    if (t.qDropped) lines.push(searchLeftMessage());
     if (lines.length) toast(lines.join(' '));
   }
 

@@ -22,7 +22,7 @@ http_service.py's on that branch.
 | Guidance | `GET/PUT/DELETE .../guidance` (:8796-8833) | `coordinate` to write |
 | Reference and capability records | `.../references`, `.../capabilities` (:11659, :11724, :11814) | contributor to propose; `coordinate` to accept |
 | The coordinator role and an agent's grant | the member role `coordinator`; `PUT/DELETE .../agents/{aid}/coordinator` (:9829, :9842) | an owner |
-| See which installation switches refuse a web write | `GET .../switches` (:10795; kittrial-5bb.434), shown on Members & settings: each switch's name, state, what it unlocks and the operator command. Turning a switch on stays an operator's `admin.py` command on the server. | `coordinate` |
+| See which installation switches refuse a web write | `GET .../switches` (:10795; kittrial-5bb.434), shown on the project's Settings (Members & settings before kittrial-5bb.522 slice 2): each switch's name, state, what it unlocks and the operator command. Turning a switch on stays an operator's `admin.py` command on the server. | `coordinate` |
 | Approve a contribution | `POST .../tasks/{tid}/reviews` (:13011) | a person with `reviews.approve`, or an agent holding the coordinator grant (http_authority.py:399, `GRANT_CAPABILITIES`) |
 | Triage a proposal, or decide one | `POST .../proposals/{key}/dispositions`: **a signed-in person only**. See slice 8 below. | a coordinator triages; an owner decides |
 

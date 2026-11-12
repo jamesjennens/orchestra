@@ -3,7 +3,7 @@
 tests/web_page_head_key.mjs runs the real views under Node (the DOM shim) against the
 prototype's mock service, signed in as the project owner. It reads each expected figure from
 the service itself. This module asserts, for My work, Tasks, a task (waiting for review, and
-not), My agents and Members & settings:
+not), My agents and People (Members & settings before .522 slice 2):
 - the header is there once, with one h1 that names the page (#page-title);
 - the key number equals the server's figure and names its source; a page with no honest
   number shows none;
@@ -109,15 +109,21 @@ class PageHeadKey(unittest.TestCase):
         self.assertEqual([('Add an agent', True, 'add-agent')], [(a['text'], a['primary'], a['next']) for a in head['actions']])
         self.assertIn('a-name', data['ids'])
 
-    def test_members_and_settings(self):
-        data, head = self.head('settings')
-        self.assertEqual(['Members & settings'], head['h1'])
+    def test_people(self):
+        # the member count moved with the members panel to People (.522 slice 2)
+        data, head = self.head('people')
+        self.assertEqual(['People'], head['h1'])
         self.assertEqual(data['expected']['num'], head['key']['num'])
         self.assertTrue(head['key']['shown'])
         self.assertEqual('member' if data['expected']['num'] == '1' else 'members', head['key']['label'])
         self.assertIn(head['key']['source'], ('members.total', 'members.items'))
         self.assertEqual([('Add a member', True, 'add-member')], [(a['text'], a['primary'], a['next']) for a in head['actions']])
         self.assertIn('m-username', data['ids'])
+
+    def test_settings_has_no_key(self):
+        data, head = self.head('settings')
+        self.assertEqual(['Settings'], head['h1'])
+        self.assertIsNone(head['key'])
 
 
 if __name__ == '__main__':

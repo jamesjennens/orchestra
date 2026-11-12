@@ -59,14 +59,18 @@ const press = async (page, agent, label) => {
 
 // 1. An owner: the members list offers the role, and the agents of the project are listed.
 {
-  const page = await view.settings(who.owner, { pid: project });
+  // kittrial-5bb.522 slice 2: the members panel is on People, the project-agents panel (and its
+  // coordination panel, redrawn after a grant) on Agents, the claiming setting on Settings.
+  const peoplePage = await view.people(who.owner, { pid: project });
+  const settingsPage = await view.settings(who.owner, { pid: project });
+  const page = await view.projectAgents(who.owner, { pid: project });
   await settle();
   // The role list is the OPTIONs of the members panel, read through its own selector. The
   // claiming setting is a separate control in its own panel (kittrial-5bb.352), so its two
   // choices must never be read as roles.
-  const members = page.all((e) => e.tagName === 'DIV' && e.attributes['data-panel'] === 'members')[0];
+  const members = peoplePage.all((e) => e.tagName === 'DIV' && e.attributes['data-panel'] === 'members')[0];
   out.roles = [...new Set(members.all((e) => e.tagName === 'OPTION').map((o) => o.textContent))];
-  const claiming = page.all((e) => e.tagName === 'SECTION' && e.attributes['data-panel'] === 'claiming')[0];
+  const claiming = settingsPage.all((e) => e.tagName === 'SECTION' && e.attributes['data-panel'] === 'claiming')[0];
   out.claiming = claiming ? {
     options: [...new Set(claiming.all((e) => e.tagName === 'OPTION').map((o) => o.textContent))],
     select: Boolean(claiming.all((e) => e.tagName === 'SELECT' && e.attributes.id === 'claiming-value')[0]),
@@ -99,7 +103,7 @@ const press = async (page, agent, label) => {
 }
 // 5. A coordinator who is not an owner sees no such panel (the server would answer 403).
 {
-  const page = await view.settings(who.coordinator, { pid: project });
+  const page = await view.projectAgents(who.coordinator, { pid: project });
   await settle();
   out.coordinatorSeesPanel = Boolean(panel(page));
   out.coordinationOfCoordinator = coordination(page);

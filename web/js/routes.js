@@ -20,6 +20,8 @@ export const ROUTE_PATTERNS = [
   ['rooms', '/p/{pid}/rooms'],
   ['room', '/p/{pid}/rooms/{rid}'],
   ['lanes', '/p/{pid}/lanes'],
+  ['people', '/p/{pid}/people'],
+  ['projectAgents', '/p/{pid}/agents'],
   ['settings', '/p/{pid}/settings'],
   ['setup', '/p/{pid}/setup'],
   ['handover', '/p/{pid}/handover'],
@@ -82,7 +84,7 @@ const LIST_OF_RECORD = { room: ['rooms', 'room'], requirement: ['requirements', 
 // The name of each section, for the toast when the page the person left does not show it in the rail.
 export const SECTION_LABELS = { reviews: 'Reviews', releases: 'Releases', requirements: 'Requirements', records: 'Records',
   decisions: 'Decisions', rooms: 'Rooms', lanes: 'Lanes', program: 'Program', feedback: 'Orchestra feedback',
-  settings: 'Members & settings', setup: 'Set up', how: 'How work is found', handover: 'Handover', notes: 'Notes' };
+  people: 'People', agents: 'Agents', settings: 'Settings', setup: 'Set up', how: 'How work is found', handover: 'Handover', notes: 'Notes' };
 
 // Where the project switcher sends the current page. A project page keeps its section when the target project
 // has it (`sections` lists the segments the target serves to this person, '' for Tasks); a record page (room,
@@ -181,8 +183,9 @@ export function forgetProject(storage, userId) {
 }
 
 // The line the toast adds when a switch leaves the search behind (switchTarget's qDropped).
-export function searchLeftMessage(oldName) {
-  return `The search was not carried over, because it names something in ${oldName}.`;
+// The coordinator's wording (approval of slice 1 r3): the search's shape is the reason, not the old project.
+export function searchLeftMessage() {
+  return 'The search was not carried over, because it looks like an id, and ids belong to one project.';
 }
 
 // The sentence the switcher's toast shows after a fallback, one true reason per case. `label` is the section's
