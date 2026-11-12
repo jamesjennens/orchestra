@@ -852,7 +852,8 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
             ccommit=result['contribution'].get('commit')
             so=review_standards.read_signoff_for_contribution(
                 std_store,cid,expected_commit=ccommit,
-                approve_operation_id=review_standards.find_approve_operation_id(issue,cid))
+                approve_operation_id=review_standards.find_approve_operation_id(issue,cid),
+                issue=issue)
             if so is not None:
                 result['sign_off']=so
     from review_workflow import author_key
@@ -1801,7 +1802,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             if staged_signoff is not None:
                 review_standards._safe_unlink(
                     path/'.standards'/'signoffs',
-                    '%s.staged.%s.json'%(contrib['comment_id'],op_id))
+                    review_standards._signoff_staged_filename(contrib['comment_id'],op_id))
             raise
         cid_done=str(cleaned_payload.get('contribution') or '')
         if staged_signoff is not None:
@@ -1813,10 +1814,11 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                 wlist.append('Standards gate (warn mode) would have refused in block mode: '
                              +'; '.join(final_so['would_have_refused']))
                 result['warnings']=wlist
-        elif cid_done:
+        elif cid_done and review_standards._is_valid_identity(op_id):
+            exp_commit=contrib.get('commit') if contrib.get('comment_id')==cid_done else None
             existing_so=review_standards.read_signoff_for_contribution(
-                std_store,cid_done,expected_commit=contrib.get('commit'),
-                approve_operation_id=op_id)
+                std_store,cid_done,expected_commit=exp_commit,
+                approve_operation_id=op_id,issue=issue_row,strict_operation_id=True)
             if existing_so is not None:
                 if existing_so.get('status')=='staged':
                     existing_so=dict(existing_so,status='committed',approval_comment_id=result.get('comment_id'))

@@ -1309,9 +1309,11 @@ class InProcessBackend:
             for rec in records:
                 if rec.get('kind') == 'approve' and rec.get('contribution_id') == cid and rec.get('operation_id'):
                     app_op_id = rec['operation_id']
+            issue_view = self._standards_issue_view(task, records)
             try:
                 so = review_standards.read_signoff_for_contribution(
-                    store, cid, expected_commit=ccommit, approve_operation_id=app_op_id
+                    store, cid, expected_commit=ccommit, approve_operation_id=app_op_id,
+                    issue=issue_view,
                 )
                 if so is None:
                     raise review_standards.StandardsRefusal(
@@ -1624,15 +1626,44 @@ class InProcessBackend:
         current = [r for r in contributions if r['kind'] == 'contribution']
         if not current:
             raise conflict('There is no contribution to review')
-        # A review names the revision it judges (canonical ``contribution``); a stale
-        # reviewer who read an older revision is refused instead of judging new work.
-        named = payload.get('contribution')
-        if named is not None and named != current[-1]['id']:
-            raise conflict('A newer contribution arrived; reread the task before reviewing',
-                           {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
         summary = (payload.get('summary') or '')[:1200]
         operation_id = payload.get('operation_id')
+        named = payload.get('contribution')
+        if operation == 'approve' and isinstance(operation_id, str) and operation_id and reg_status != 'none':
+            for stored in contributions:
+                if stored.get('kind') != 'approve' or stored.get('operation_id') != operation_id:
+                    continue
+                if (
+                    stored.get('actor') == actor
+                    and (named is None or stored.get('contribution_id') == named)
+                    and stored.get('summary') == summary
+                ):
+                    ans = {'review': stored, 'task_version': task['version']}
+                    std_w = self._standards_store(project_id, writable=True)
+                    so = review_standards.read_signoff_for_contribution(
+                        std_w,
+                        stored['contribution_id'],
+                        approve_operation_id=operation_id,
+                        strict_operation_id=True,
+                    )
+                    if so is not None:
+                        if so.get('status') == 'staged':
+                            so = dict(so, status='committed', approval_comment_id=stored['id'])
+                            std_w.commit_signoff(stored['contribution_id'], operation_id, so)
+                        ans['sign_off'] = so
+                        if so.get('would_have_refused'):
+                            ans['warnings'] = [
+                                'Standards gate (warn mode) would have refused in block mode: '
+                                + '; '.join(so['would_have_refused'])
+                            ]
+                    return ans
+                raise invalid('Operation ID already used with different payload or actor')
+        # A review names the revision it judges (canonical ``contribution``); a stale
+        # reviewer who read an older revision is refused instead of judging new work.
+        if named is not None and named != current[-1]['id']:
+            raise conflict('A newer contribution arrived; reread the task before reviewing',
+                           {'current_contribution': current[-1]['id']})
         items, resolutions = [], []
         staged_signoff = None
         eff_op_id = operation_id or operation_key or ('inproc-' + secrets.token_hex(8))
@@ -2372,6 +2403,7 @@ class InProcessBackend:
                 so = review_standards.read_signoff_for_contribution(
                     std_ro, contribution['id'], expected_commit=contribution['commit'],
                     approve_operation_id=app_op_id,
+                    issue=self._standards_issue_view(task, records),
                 )
                 if so is not None:
                     view['sign_off'] = so

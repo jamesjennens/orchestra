@@ -21,23 +21,35 @@ import http_service
 import review_standards as rs
 import review_workflow as rw
 from http_authority import AuthorityConfig
+import test_http_review_fixes
 from test_http_review_fixes import Harness
 from test_http_web import WEB, run_node_module
 from test_lane_nudge_carrier import fill
 
 _ORIG_HASH_PASSWORD = http_auth.hash_password
+_ORIG_TMP_ROOT = test_http_review_fixes.TMP_ROOT
+_MOD_TMP = None
 
 
 def setUpModule():
+    global _MOD_TMP
     http_auth.hash_password = lambda pw, **kw: _ORIG_HASH_PASSWORD(
         pw, n=16, r=8, p=1, minimum=kw.get('minimum', http_auth.MIN_PASSWORD)
     )
     http_auth._DUMMY_VERIFIER = http_auth.hash_password('orchestra-dummy-password')
+    if 'ORCHESTRA_TEST_TMP' not in os.environ:
+        _MOD_TMP = tempfile.TemporaryDirectory()
+        test_http_review_fixes.TMP_ROOT = Path(_MOD_TMP.name)
 
 
 def tearDownModule():
+    global _MOD_TMP
     http_auth.hash_password = _ORIG_HASH_PASSWORD
     http_auth._DUMMY_VERIFIER = None
+    test_http_review_fixes.TMP_ROOT = _ORIG_TMP_ROOT
+    if _MOD_TMP is not None:
+        _MOD_TMP.cleanup()
+        _MOD_TMP = None
 
 try:
     import endpoint
@@ -1269,7 +1281,9 @@ class _HttpStandardsMixin:
         self.assertEqual({'VIC-1': 'pass', 'SHLD-1': 'fail'}, by_rule)
 
     def test_r2_n1_author_party_waiver_and_direct_backend_person_guards(self):
-        # Kills M13c (author-party waiver over HTTP), M9 (endpoint web-standards person check), and M9b (InProcessBackend person check)!
+        # Kills M13c (author-party waiver over HTTP), M9b (InProcessBackend person check), and M9+
+        # (dropping both web_standards_action's is_person_sess check and the per-operation person-session
+        # defense-in-depth checks; single-layer M9 at review_standards.py:6239 alone is equivalent).
         pid = self.pid
         _, alice_tok = self.create_person('alice_n1', 'contributor', pid)
         cora_uid, cora_tok = self.create_person('cora_n1', 'coordinator', pid)
@@ -1299,7 +1313,7 @@ class _HttpStandardsMixin:
         self.assertIn('Waiver refused for rule WN-1:', self_waive.data['error']['message'])
         self.assertIn('cannot waive a rule on their own delivery.', self_waive.data['error']['message'])
 
-        # Direct backend-level person-only checks bypassing HTTP handler route guards (kills M9 and M9b)!
+        # Direct backend-level person-only checks bypassing HTTP handler route guards (kills M9+ and M9b)!
         cred_principal = self.service.authenticate(cora_bot)
         for route_name, cap, extra_payload in (
             ('standards.put', http_authority.CAP_READ, {'payload': {'expected_version': 1, 'reason': 'x', 'rules': []}}),
@@ -1318,6 +1332,330 @@ class _HttpStandardsMixin:
                         capability=cap,
                     )
                 self.assertEqual(403, cm_direct.exception.status)
+
+    def test_r3_m1_no_eviction_per_party_and_256_flood_on_both_http_backends(self):
+        # m1-no-eviction on both InProcessBackend and EndpointBackend:
+        # 1) One party cannot exceed 32 observations even across rotating verify credentials + person session.
+        # 2) Across 9 independent parties, 256 observations fill the commit cap; the 257th returns 409 with
+        #    pinned sentence, nothing is evicted, and entry #0's CI FAIL + N/A refusal survive intact!
+        pid = self.pid
+        alice_uid, alice_tok = self.create_person('alice_r3m1', 'contributor', pid)
+        ver0_uid, ver0_tok = self.create_person('ver0_r3m1', 'coordinator', pid)
+        approver_uid, approver_tok = self.create_person('app_r3m1', 'coordinator', pid)
+
+        self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'reason': 'Flood test mechanical rule.',
+            'rules': [_rule(
+                'STD-50', owner=alice_uid, severity='must',
+                check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'},
+            )],
+        }, token=self.owner_tok)
+        self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {'mode': 'block', 'reason': 'block'}, token=self.owner_tok)
+
+        tid, cid, prev, commit = self.deliver_task_bundle(pid, alice_tok, {'app.py': 'x = 1\n'}, title='HTTP flood test')
+
+        # Entry #1: independent verifier ver0 records STD-50 FAIL (exit 1).
+        ver0_cred = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'Ver0 CI',
+        }, token=ver0_tok).data['credential']['secret']
+        r0 = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit), {
+            'changed_files': ['app.py'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        }, token=ver0_cred)
+        self.assertEqual(201, r0.status, r0.data)
+
+        # Approver (not yet a participant!) issues TWO verify credentials + uses person session:
+        # 15 + 10 + 7 = 32 succeed, 33rd is refused 409!
+        app_v1 = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'App Ver 1',
+        }, token=approver_tok).data['credential']['secret']
+        app_v2 = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'App Ver 2',
+        }, token=approver_tok).data['credential']['secret']
+
+        for tok, count in ((app_v1, 15), (app_v2, 10), (approver_tok, 7)):
+            for _ in range(count):
+                res = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit), {
+                    'changed_files': ['app.py'],
+                }, token=tok)
+                self.assertEqual(201, res.status, res.data)
+
+        party_cap_res = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit), {
+            'changed_files': ['app.py'],
+        }, token=app_v2)
+        self.assertEqual(409, party_cap_res.status, party_cap_res.data)
+        self.assertEqual(
+            rs.refusal_commit_observation_recorder_cap(commit, rs.COMMIT_OBSERVATIONS_PER_RECORDER_MAX),
+            party_cap_res.data['error']['message'],
+        )
+
+        # Fill up to 256 total observations across 8 more coordinator accounts (currently 1 + 32 = 33; need 223 more: 7*31 + 6)!
+        flood_creds = []
+        for idx in range(8):
+            _, f_tok = self.create_person('flood_%d_r3m1' % idx, 'coordinator', pid)
+            f_cred = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+                'scopes': ['verify'], 'label': 'Flood %d' % idx,
+            }, token=f_tok).data['credential']['secret']
+            flood_creds.append(f_cred)
+
+        for f_cred in flood_creds[:7]:
+            for _ in range(31):
+                res = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit), {
+                    'changed_files': ['app.py'],
+                }, token=f_cred)
+                self.assertEqual(201, res.status, res.data)
+        for _ in range(6):
+            res = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit), {
+                'changed_files': ['app.py'],
+            }, token=flood_creds[7])
+            self.assertEqual(201, res.status, res.data)
+
+        # Now at 256: 257th observation from flood_creds[7] (who only used 6 < 32) is refused 409!
+        cap_res = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit), {
+            'changed_files': ['app.py'],
+        }, token=flood_creds[7])
+        self.assertEqual(409, cap_res.status, cap_res.data)
+        self.assertEqual(
+            rs.refusal_commit_observation_cap(commit, rs.COMMIT_OBSERVATIONS_MAX),
+            cap_res.data['error']['message'],
+        )
+
+        # Verify commits/<commit>.json still holds 256 observations with ver0's FAIL at index 0!
+        obs_doc = self.request('GET', '/v1/projects/%s/standards/commits/%s' % (pid, commit), token=approver_tok).data
+        self.assertEqual(256, len(obs_doc['observations']))
+        self.assertEqual(1, obs_doc['observations'][0]['ci_checks'][0]['exit_code'])
+
+        # Approver's N/A attempt in block mode is STILL refused 422!
+        na_res = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r3-m1-http-na',
+            'previous': prev, 'contribution': cid, 'summary': 'Try N/A after 256 flood.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Claim N/A.'}],
+        }, token=approver_tok)
+        self.assertEqual(422, na_res.status, na_res.data)
+        self.assertEqual(rs.refusal_na_over_mechanical_fail('STD-50', commit), na_res.data['error']['message'])
+
+    def test_r3_m2_fails_always_count_s2p_and_w8_on_both_http_backends(self):
+        # m2-fails-always-count: Opus S2P cases (1) and (2) and Fable W8 on both HTTP backends!
+        pid = self.pid
+        alice_uid, alice_tok = self.create_person('alice_r3m2', 'contributor', pid)
+        oscar_uid, oscar_tok = self.create_person('oscar_r3m2', 'coordinator', pid)
+        olga_uid, olga_tok = self.create_person('olga_r3m2', 'coordinator', pid)
+        cara_uid, cara_tok = self.create_person('cara_r3m2', 'coordinator', pid)
+
+        oscar_ver = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'Oscar Ver',
+        }, token=oscar_tok).data['credential']['secret']
+        olga_ver = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'Olga Ver',
+        }, token=olga_tok).data['credential']['secret']
+
+        self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'reason': 'S2P + W8 rule.',
+            'rules': [_rule(
+                'STD-50', owner=alice_uid, severity='must',
+                applicability={'paths': ['src/**']},
+                check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'},
+            )],
+        }, token=self.owner_tok)
+        self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {'mode': 'block', 'reason': 'block'}, token=self.owner_tok)
+
+        # Case (1) & Fable W8: Oscar's verify cred records CI FAIL + changed_files=['README.md'], then CI PASS.
+        # When Oscar approves: changed_files & CI PASS are excluded, CI FAIL counts -> N/A refused 422, plain refused 422!
+        tid1, cid1, prev1, commit1 = self.deliver_task_bundle(pid, alice_tok, {'src/x.py': 'x = 1\n'}, title='S2P1 HTTP')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'changed_files': ['README.md'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        }, token=oscar_ver).status)
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=oscar_ver).status)
+
+        na1 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r3-s2p1-na',
+            'previous': prev1, 'contribution': cid1, 'summary': 'Oscar NA over own-party fail.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Skip fail.'}],
+        }, token=oscar_tok)
+        self.assertEqual(422, na1.status, na1.data)
+        self.assertEqual(rs.refusal_na_over_mechanical_fail('STD-50', commit1), na1.data['error']['message'])
+
+        plain1 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r3-s2p1-plain',
+            'previous': prev1, 'contribution': cid1, 'summary': 'Oscar plain approve.',
+        }, token=oscar_tok)
+        self.assertEqual(422, plain1.status, plain1.data)
+        self.assertIn('fail without waiver', plain1.data['error']['message'])
+
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/tasks/%s/waivers' % (pid, tid1), {
+            'contribution_id': cid1, 'commit': commit1, 'rule_id': 'STD-50',
+            'reason': 'Cara waives for Oscar', 'expiry': {'kind': 'delivery'},
+        }, token=cara_tok).status)
+        ok1 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r3-s2p1-ok',
+            'previous': prev1, 'contribution': cid1, 'summary': 'Oscar approves with waiver.',
+        }, token=oscar_tok)
+        self.assertEqual(201, ok1.status, ok1.data)
+        self.assertEqual('diff_unverified', ok1.data['sign_off']['diff_status'])
+        row1 = [c for c in ok1.data['sign_off']['checks'] if c['rule_id'] == 'STD-50'][0]
+        self.assertEqual('fail', row1['result'])
+        self.assertEqual(1, row1['ci_evidence']['exit_code'])
+        self.assertTrue(row1['ci_evidence']['recorded_by'])
+
+        # Case (2): Olga's verify cred records CI FAIL, then Olga recommends, then Cara tries N/A & plain approve!
+        tid2, cid2, prev2, commit2 = self.deliver_task_bundle(pid, alice_tok, {'src/y.py': 'y = 2\n'}, title='S2P2 HTTP')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+            'changed_files': ['src/y.py'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1}],
+        }, token=olga_ver).status)
+        rec2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'recommend', 'operation_id': 'op-r3-s2p2-rec',
+            'contribution': cid2, 'commit': commit2, 'verdict': 'approve',
+            'summary': 'Code logic looks ok despite pytest fail.', 'items': [],
+        }, token=olga_tok)
+        self.assertEqual(201, rec2.status, rec2.data)
+
+        na2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r3-s2p2-na',
+            'previous': prev2, 'contribution': cid2, 'summary': 'Cara NA over Olga fail.',
+            'checks': [{'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Ignore Olga fail.'}],
+        }, token=cara_tok)
+        self.assertEqual(422, na2.status, na2.data)
+        self.assertEqual(rs.refusal_na_over_mechanical_fail('STD-50', commit2), na2.data['error']['message'])
+
+        plain2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r3-s2p2-plain',
+            'previous': prev2, 'contribution': cid2, 'summary': 'Cara plain approve.',
+        }, token=cara_tok)
+        self.assertEqual(422, plain2.status, plain2.data)
+        self.assertIn('fail without waiver', plain2.data['error']['message'])
+
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/tasks/%s/waivers' % (pid, tid2), {
+            'contribution_id': cid2, 'commit': commit2, 'rule_id': 'STD-50',
+            'reason': 'Oscar waives for Cara', 'expiry': {'kind': 'delivery'},
+        }, token=oscar_tok).status)
+        ok2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r3-s2p2-ok',
+            'previous': prev2, 'contribution': cid2, 'summary': 'Cara approves with waiver.',
+        }, token=cara_tok)
+        self.assertEqual(201, ok2.status, ok2.data)
+        row2 = [c for c in ok2.data['sign_off']['checks'] if c['rule_id'] == 'STD-50'][0]
+        self.assertEqual('fail', row2['result'])
+        self.assertEqual(1, row2['ci_evidence']['exit_code'])
+        self.assertTrue(row2['ci_evidence']['recorded_by'])
+
+    def test_r3_s1_signoff_history_tally_retry_and_n1c_pins_on_both_http_backends(self):
+        # s1-signoff-history + n1(c) (MR9 diff-first recorder, R6a notified_coordinator=False, NOTE-5 deleted parent)!
+        pid = self.pid
+        alice_uid, alice_tok = self.create_person('alice_r3s1', 'contributor', pid)
+        oscar_uid, oscar_tok = self.create_person('oscar_r3s1', 'coordinator', pid)
+        olga_uid, olga_tok = self.create_person('olga_r3s1', 'coordinator', pid)
+        ver_a_uid, ver_a_tok = self.create_person('vera_r3s1', 'coordinator', pid)
+        ver_b_uid, ver_b_tok = self.create_person('verb_r3s1', 'coordinator', pid)
+
+        # 1) NOTE-5: child project can detach inherits when shared parent project no longer exists!
+        dead_parent = self.new_project('Ephemeral Shared', 'ephemsh')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards' % dead_parent, {
+            'expected_version': 0, 'shared': True, 'reason': 'Shared must',
+            'rules': [_rule('EPHEM-1', owner=self.owner_uid, severity='must')],
+        }, token=self.owner_tok).status)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'inherits': dead_parent, 'reason': 'Inherit ephemsh',
+            'rules': [_rule('STD-1', owner=self.owner_uid, severity='must')],
+        }, token=self.owner_tok).status)
+
+        # Simulate shared parent project deletion across both backends:
+        self.service.state['projects'].pop(dead_parent, None)
+        if self.is_endpoint_backend:
+            shutil.rmtree(self.canonical_root / 'projects' / dead_parent, ignore_errors=True)
+        detach_ok = self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 1, 'inherits': None, 'reason': 'Leave deleted parent',
+            'rules': [_rule('STD-1', owner=self.owner_uid, severity='must')],
+        }, token=self.owner_tok)
+        self.assertEqual(200, detach_ok.status, detach_ok.data)
+        self.assertIsNone(detach_ok.data['inherits'])
+
+        # 2) R6a: non-member superuser editing a rule gets notified_coordinator == False (kills R6a)!
+        su_uid = self.create_account(self.admin_tok, 'super_nonmember', 'super-pw-123456')
+        self.service.state['users'][su_uid]['superuser'] = True
+        self.service.store.save()
+        su_tok, _, _ = self.login('super_nonmember', 'super-pw-123456')
+        su_patch = self.request('PATCH', '/v1/projects/%s/standards/rules/STD-1' % pid, {
+            'expected_version': 2,
+            'reason': 'Superuser non-member edit.',
+            'rule': _rule('STD-1', owner=self.owner_uid, severity='must', statement='Updated by non-member superuser.'),
+        }, token=su_tok)
+        self.assertEqual(200, su_patch.status, su_patch.data)
+        self.assertIs(False, su_patch.data['notified_coordinator'])
+
+        # 3) MR9 / R2e: ver_a records changed_files FIRST, ver_b records ci_checks SECOND -> diff_recorded_by == ver_a!
+        self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {'mode': 'block', 'reason': 'block'}, token=self.owner_tok)
+        tid1, cid1, prev1, commit1 = self.deliver_task_bundle(pid, alice_tok, {'k.py': 'k = 1\n'}, title='S1 HTTP')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'changed_files': ['k.py'],
+        }, token=ver_a_tok).status)
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'ci_checks': [{'tool': 'pytest', 'command': 'pytest', 'exit_code': 0}],
+        }, token=ver_b_tok).status)
+
+        # 4) s1-signoff-history: Oscar approves first with STD-1: not_applicable (tally = 1).
+        app1_body = {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-http-s1-first',
+            'previous': prev1, 'contribution': cid1, 'summary': 'Oscar first approve.',
+            'checks': [{'rule_id': 'STD-1', 'result': 'not_applicable', 'reason': 'Config path only.'}],
+        }
+        app1 = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), app1_body,
+            token=oscar_tok, headers={'Idempotency-Key': 'idem-oscar-1'},
+        )
+        self.assertEqual(201, app1.status, app1.data)
+        self.assertEqual(ver_a_uid, app1.data['sign_off']['diff_recorded_by'])
+        self.assertEqual(1, app1.data['sign_off']['reviewer_must_not_applicable_total'])
+
+        # Olga approves second on the SAME contribution with STD-1: pass!
+        prev_after_app1 = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid1), token=olga_tok).data['review']['latest_id']
+        app2 = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+                'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-http-s1-second',
+                'previous': prev_after_app1, 'contribution': cid1, 'summary': 'Olga second approve.',
+                'checks': [{'rule_id': 'STD-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['k.py:1']}}],
+            },
+            token=olga_tok, headers={'Idempotency-Key': 'idem-olga-2'},
+        )
+        self.assertEqual(201, app2.status, app2.data)
+        self.assertEqual(0, app2.data['sign_off']['reviewer_must_not_applicable_total'])
+
+        # Exact retry of Oscar's first approve (with a NEW Idempotency-Key so it reaches the backend!)
+        # returns Oscar's OWN sign-off, NOT Olga's!
+        retry1 = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), app1_body,
+            token=oscar_tok, headers={'Idempotency-Key': 'idem-oscar-retry-new-key'},
+        )
+        self.assertIn(retry1.status, (200, 201), retry1.data)
+        self.assertEqual('op-http-s1-first', retry1.data['sign_off']['operation_id'])
+        self.assertEqual(oscar_uid, retry1.data['sign_off']['reviewer']['actor'])
+        self.assertEqual('not_applicable', retry1.data['sign_off']['checks'][0]['result'])
+        self.assertEqual(1, retry1.data['sign_off']['reviewer_must_not_applicable_total'])
+
+        # GET sign-off & sign-off.md return Olga as latest + Oscar in earlier_sign_offs!
+        so_get = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid1), token=oscar_tok).data
+        self.assertEqual('op-http-s1-second', so_get['operation_id'])
+        self.assertEqual(olga_uid, so_get['reviewer']['actor'])
+        self.assertEqual(1, len(so_get['earlier_sign_offs']))
+        self.assertEqual('op-http-s1-first', so_get['earlier_sign_offs'][0]['operation_id'])
+        self.assertEqual(oscar_uid, so_get['earlier_sign_offs'][0]['reviewer']['actor'])
+
+        so_md = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off.md' % (pid, tid1), token=oscar_tok).body.decode('utf-8')
+        self.assertIn('Earlier Approvals on This Delivery', so_md)
+        self.assertIn(oscar_uid, so_md)
+
+        # Oscar's must-N/A tally survived Olga's second approve: Oscar's next N/A approval shows total == 2!
+        tid2, cid2, prev2, _ = self.deliver_task_bundle(pid, alice_tok, {'k2.py': 'k = 2\n'}, title='S1 HTTP T2')
+        app_t2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-http-s1-t2',
+            'previous': prev2, 'contribution': cid2, 'summary': 'Oscar second task N/A.',
+            'checks': [{'rule_id': 'STD-1', 'result': 'not_applicable', 'reason': 'Also config only.'}],
+        }, token=oscar_tok)
+        self.assertEqual(201, app_t2.status, app_t2.data)
+        self.assertEqual(2, app_t2.data['sign_off']['reviewer_must_not_applicable_total'])
 
 
 class HttpStandardsInProcessSuite(_HttpStandardsMixin, Harness):
@@ -1622,6 +1960,7 @@ const ctxWithReg = {
         gate_mode: 'block',
         diff_status: 'verified',
         diff_recorded_by: 'usr_oscar',
+        reviewer: { actor: 'usr_olga' },
         would_have_refused: [],
         checks: [
           {
@@ -1644,6 +1983,29 @@ const ctxWithReg = {
             evidence: { kind: 'ci', status: 'fail', tool: 'ruff', command: 'ruff check', exit_code: 1, recorded_by: 'usr_oscar' },
             ci_evidence: { kind: 'ci', status: 'fail', tool: 'ruff', command: 'ruff check', exit_code: 1, recorded_by: 'usr_oscar' },
             waiver: { id: 'waiver-77', granted_by: 'usr_cora', reason: 'Legacy lint exemption' },
+          },
+        ],
+        earlier_sign_offs: [
+          {
+            operation_id: 'op-prev-1',
+            created_at: '2026-11-11T12:00:00Z',
+            gate_mode: 'warn',
+            must_not_applicable_count: 1,
+            reviewer_must_not_applicable_total: 1,
+            would_have_refused: ['STD-50 (unverified)'],
+            reviewer: { actor: 'usr_oscar' },
+            checks: [
+              {
+                rule_id: 'STD-1',
+                statement: 'Bounds checked.',
+                severity: 'must',
+                check_kind: 'judgement',
+                result: 'not_applicable',
+                source: 'reviewer',
+                evidence: { kind: 'not_applicable', reason: 'Docs only' },
+                waiver: null,
+              },
+            ],
           },
         ],
       };
@@ -1707,6 +2069,7 @@ console.log(JSON.stringify({ signOffCallsWithReg, signOffCallsNoReg, taskText, s
         self.assertEqual(0, out['signOffCallsNoReg'])
         for expected in (
             'Checked against standards register v1',
+            'Approver: usr_olga',
             'STD-1',
             'Bounds checked.',
             'citations: src/app.py:10-14',
@@ -1716,6 +2079,11 @@ console.log(JSON.stringify({ signOffCallsWithReg, signOffCallsNoReg, taskText, s
             'CI ruff: ruff check exit 1 (recorded by usr_oscar)',
             'Waived by usr_cora: Legacy lint exemption',
             'Diff: verified (usr_oscar)',
+            'Earlier approvals on this delivery (1)',
+            'Approved by usr_oscar',
+            'must N/A: 1 (1 total)',
+            'Warn mode — would have refused: STD-50 (unverified)',
+            'reason: Docs only',
         ):
             self.assertIn(expected, out['taskText'])
         self.assertIn('Register defines 6 all_changes must rules (limit 5).', out['stdText'])

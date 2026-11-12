@@ -563,6 +563,29 @@ function formatCheckEvidence(ch) {
   return summary;
 }
 
+function renderSignOffChecksTable(checks) {
+  if (!Array.isArray(checks) || !checks.length) return null;
+  return h('div', { class: 'table-wrap' }, h('table', { class: 'standards-table' },
+    h('thead', null, h('tr', null,
+      h('th', { scope: 'col' }, 'Rule'),
+      h('th', { scope: 'col' }, 'Severity'),
+      h('th', { scope: 'col' }, 'Result'),
+      h('th', { scope: 'col' }, 'Evidence'),
+      h('th', { scope: 'col' }, 'Source / waiver'))),
+    h('tbody', null, checks.map((ch) => h('tr', null,
+      h('td', { class: 'small' },
+        h('div', { class: 'mono' }, ch.rule_id),
+        ch.statement ? h('div', { class: 'muted' }, ch.statement) : null),
+      h('td', null, h('span', { class: 'chip ' + (ch.severity === 'must' ? 'warn' : 'plain') }, ch.severity)),
+      h('td', null, h('span', { class: 'chip ' + (ch.result === 'pass' ? 'ok' : ch.result === 'fail' ? 'warn' : 'plain') }, ch.result)),
+      h('td', { class: 'small' }, formatCheckEvidence(ch)),
+      h('td', { class: 'small' },
+        ch.source || '',
+        ch.waiver
+          ? ` · Waived by ${ch.waiver.granted_by || 'person'}: ${ch.waiver.reason || ch.waiver.id}`
+          : ''))))));
+}
+
 export function signOffCard(ctx, pid, tid, signOff, standards) {
   const regVer = signOff.register_version;
   const headingText = regVer
@@ -577,37 +600,44 @@ export function signOffCard(ctx, pid, tid, signOff, standards) {
       h('div', null, h('strong', null, 'Warn mode — would have refused in block mode: '), signOff.would_have_refused.join('; ')))
     : null;
   const checks = Array.isArray(signOff.checks) ? signOff.checks : [];
+  const earlier = Array.isArray(signOff.earlier_sign_offs) ? signOff.earlier_sign_offs : [];
+  const revActor = signOff.reviewer && (signOff.reviewer.actor || signOff.reviewer.user_id);
   const mdHref = ctx.api && ctx.api.taskSignOffMarkdownUrl ? ctx.api.taskSignOffMarkdownUrl(pid, tid) : `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off.md`;
   const jsonHref = `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off`;
   const diffLabel = signOff.diff_status
     ? `Diff: ${signOff.diff_status}` + (signOff.diff_recorded_by ? ` (${signOff.diff_recorded_by})` : '')
     : null;
+  const earlierFold = earlier.length
+    ? h('details', { class: 'fold', 'data-earlier-signoffs': String(earlier.length) },
+      h('summary', null, `Earlier approvals on this delivery (${earlier.length})`),
+      h('div', { class: 'fold-body stack' },
+        earlier.map((prev) => {
+          const prevActor = (prev && prev.reviewer && (prev.reviewer.actor || prev.reviewer.user_id)) || 'unknown';
+          const prevNa = Number(prev && prev.must_not_applicable_count) || 0;
+          const prevNaTotal = Number(prev && prev.reviewer_must_not_applicable_total) || 0;
+          const prevWould = Array.isArray(prev && prev.would_have_refused) && prev.would_have_refused.length
+            ? h('div', { class: 'small muted' }, `Warn mode — would have refused: ${prev.would_have_refused.join('; ')}`)
+            : null;
+          return h('div', { class: 'stack', 'data-earlier-signoff-op': (prev && prev.operation_id) || '' },
+            h('div', { class: 'chips small' },
+              h('strong', null, `Approved by ${prevActor}`),
+              prev && prev.created_at ? h('span', { class: 'muted' }, prev.created_at) : null,
+              h('span', { class: 'chip plain' }, `Gate: ${(prev && prev.gate_mode) || 'warn'}`),
+              h('span', { class: 'chip plain' }, `must N/A: ${prevNa} (${prevNaTotal} total)`)),
+            prevWould,
+            renderSignOffChecksTable(prev && prev.checks));
+        })))
+    : null;
   return h('div', { class: 'signoff-card stack', 'data-signoff': signOff.contribution_id || '1' },
     h('div', { class: 'chips' },
       h('strong', null, headingText),
+      revActor ? h('span', { class: 'chip plain' }, `Approver: ${revActor}`) : null,
       h('span', { class: 'chip ' + (signOff.gate_mode === 'block' ? 'ok' : 'plain') }, `Gate: ${signOff.gate_mode || 'warn'}`),
       diffLabel ? h('span', { class: 'chip plain' }, diffLabel) : null),
     newerNotice,
     wouldRefuse,
-    checks.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'standards-table' },
-      h('thead', null, h('tr', null,
-        h('th', { scope: 'col' }, 'Rule'),
-        h('th', { scope: 'col' }, 'Severity'),
-        h('th', { scope: 'col' }, 'Result'),
-        h('th', { scope: 'col' }, 'Evidence'),
-        h('th', { scope: 'col' }, 'Source / waiver'))),
-      h('tbody', null, checks.map((ch) => h('tr', null,
-        h('td', { class: 'small' },
-          h('div', { class: 'mono' }, ch.rule_id),
-          ch.statement ? h('div', { class: 'muted' }, ch.statement) : null),
-        h('td', null, h('span', { class: 'chip ' + (ch.severity === 'must' ? 'warn' : 'plain') }, ch.severity)),
-        h('td', null, h('span', { class: 'chip ' + (ch.result === 'pass' ? 'ok' : ch.result === 'fail' ? 'warn' : 'plain') }, ch.result)),
-        h('td', { class: 'small' }, formatCheckEvidence(ch)),
-        h('td', { class: 'small' },
-          ch.source || '',
-          ch.waiver
-            ? ` · Waived by ${ch.waiver.granted_by || 'person'}: ${ch.waiver.reason || ch.waiver.id}`
-            : '')))))) : null,
+    renderSignOffChecksTable(checks),
+    earlierFold,
     h('div', { class: 'actions small' },
       h('a', { href: mdHref, download: '' }, 'Download sign-off (.md)'),
       h('a', { href: jsonHref, target: '_blank', rel: 'noopener' }, 'Raw sign-off (JSON)')));
