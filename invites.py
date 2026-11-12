@@ -30,8 +30,9 @@ import re
 import secrets
 
 import claim_limit
-from http_auth import (AGENT_DEFAULT_SCOPES, HttpError, Principal, Service, _validate_password, conflict,
-                       forbidden, hash_password, invalid, new_token, not_found, now_iso, token_hash)
+from http_auth import (AGENT_DEFAULT_SCOPES, LOGIN_WINDOW_SECONDS, THROTTLE_KEY_CAP, HttpError, Principal, Service,
+                       _validate_password, conflict, forbidden, hash_password, invalid, new_token, not_found,
+                       now_iso, throttled, token_hash)
 from http_authority import CAP_PROJECT_ADMIN, ROLE_CAPABILITIES
 
 #: How long an invite lives: 72 hours unless the inviter asks for less or more, at most 7 days.
@@ -269,7 +270,9 @@ def create(service, principal, payload, *, usable=None, request_id=None):
                                 'to an archived project')
             if usable is not None:
                 usable(pid)
-        if username.lower() in state['usernames']:
+        _charge_username_check(service, principal, username, projects[0], request_id)
+        holder = state['users'].get(state['usernames'].get(username.lower()) or '')
+        if isinstance(holder, dict) and not holder.get('disabled'):
             raise conflict('Username already exists')
         moment = service._expiry_now()
         invites = _invites(service)
@@ -352,6 +355,32 @@ def revoke(service, principal, invite_id, request_id=None):
         return view(service, found)
 
 
+def _charge_username_check(service, principal, username, project_id, request_id):
+    """Count one username check against the caller's account-lookup limit (review S3 of kittrial-5bb.578).
+
+    Making an invite answers whether a username is taken, so it is held to exactly what
+    ``Service.lookup_account`` is held to: the same per-person count (``_lookups``, at most
+    ``lookup_max`` in ``lookup_window``, 429 beyond it) and one audit line on the project with a keyed
+    digest of the name, never the name. A disabled account is not reported as taken, as the lookup
+    hides it; such an invite is refused at redemption (``username_taken``) with nothing created.
+    Caller holds ``store.lock``.
+    """
+    digest = 'username_hmac=' + service._lookup_digest(username)
+    now = service._now()
+    recent = [t for t in service._lookups.get(principal.user_id, []) if t >= now - service.lookup_window]
+    if len(recent) >= service.lookup_max:
+        service._lookups[principal.user_id] = recent
+        service.audit(request_id, principal, 'invites.username_check', 'throttled', project_id=project_id,
+                      reason=digest)
+        raise throttled('Too many account lookups; wait a few minutes and try again')
+    recent.append(now)
+    service._lookups[principal.user_id] = recent
+    holder = service.state['users'].get(service.state['usernames'].get(username.lower()) or '')
+    taken = isinstance(holder, dict) and not holder.get('disabled')
+    service.audit(request_id, principal, 'invites.username_check', 'found' if taken else 'not_found',
+                  project_id=project_id, reason=digest)
+
+
 def _throttle_name(service, source, shared_source):
     return '%s%s' % (THROTTLE_PREFIX, service._source_key(source, shared_source))
 
@@ -360,22 +389,52 @@ def _lookup(service, token, source, shared_source):
     """The pending record ``token`` names, or the one refusal. Caller holds ``store.lock``.
 
     The sign-in counts are checked first and fed by every miss, so an address that guesses is
-    answered 429 exactly as one that guesses passwords.
+    answered 429 exactly as one that guesses passwords. The expiry clock is read once, before the
+    lookup, for every token (review S1): an unknown, used or withdrawn token costs the same read as
+    an expired one. Returns ``(record, moment)``.
     """
     name = _throttle_name(service, source, shared_source)
     service._check_throttle(name, source, shared_source)
+    moment = service._expiry_now()
     record = _invites(service).get(token_hash(token)) if isinstance(token, str) and token else None
-    if record is None or status(service, record) != 'pending':
+    if record is None or status(service, record, moment) != 'pending':
         service._record_failure(name, source, shared_source)
         raise unusable()
-    return record
+    return record, moment
+
+
+#: How long one address's 429s on the invite routes are audited once (review S2): the sign-in window.
+QUIET_WINDOW = LOGIN_WINDOW_SECONDS
+
+
+def quiet_throttle(service, source, shared_source):
+    """Whether a 429 on an invite route from this address was already audited in this window.
+
+    The first 429 of an address in QUIET_WINDOW is audited (and saved); the rest are answered with
+    neither an audit line nor a save, so a flood cannot roll the audit over or write the state per
+    request. The table is bounded as the sign-in tables are.
+    """
+    group = _throttle_name(service, source, shared_source)
+    now = service._now()
+    with service.store.lock:
+        seen = service.__dict__.setdefault('_invite_throttle_audited', {})
+        last = seen.get(group)
+        if last is not None and 0 <= now - last < QUIET_WINDOW:
+            return True
+        if group not in seen and len(seen) >= THROTTLE_KEY_CAP:
+            for stale in [key for key, when in seen.items() if not 0 <= now - when < QUIET_WINDOW]:
+                del seen[stale]
+            if len(seen) >= THROTTLE_KEY_CAP:
+                del seen[min(seen, key=seen.get)]
+        seen[group] = now
+        return False
 
 
 def public_view(service, token, *, source='local', shared_source=False):
     """What the signed-out invite page shows: who invited whom, the projects and the agent."""
     with service.store.lock:
-        record = _lookup(service, token, source, shared_source)
-        shown = view(service, record, for_inviter=False)
+        record, moment = _lookup(service, token, source, shared_source)
+        shown = view(service, record, moment, for_inviter=False)
         shown.pop('invited_by', None)
         shown.pop('id', None)
         shown['password_min_length'] = service.password_min_length
@@ -390,7 +449,7 @@ def redeem(service, token, password, *, source='local', shared_source=False, usa
     the set-up payload New agent gives.
     """
     with service.store.lock:
-        record = _lookup(service, token, source, shared_source)
+        record, _moment = _lookup(service, token, source, shared_source)
         _validate_password(password, service.password_min_length)
         state = service.state
         inviter = record['invited_by']

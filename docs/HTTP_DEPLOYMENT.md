@@ -4316,7 +4316,10 @@ on every invite request, so turning it on or off needs no restart; a value that 
 While it is off the create form is hidden and `POST /v1/invites`, `POST /v1/invites/view` and
 `POST /v1/invites/redeem` all answer `403` with the one sentence
 `Invite links are switched off on this installation. An operator turns them on with "invites_enabled": true in deployment.private.json.`
-Listing and withdrawing stay open, so an invite made while it was on can still be withdrawn. To turn it
+Listing and withdrawing stay open, so an invite made while it was on can still be withdrawn. Switching
+off withdraws nothing: a pending link that has not expired works again once the switch is back on. If
+that is not wanted, withdraw the pending invites (Members & settings, or `POST /v1/invites/{id}/revoke`)
+before switching off. To turn it
 on, stop nothing: add `"invites_enabled": true` to the top-level object of
 `<runtime root>/deployment.private.json` (keep it a regular file, mode 600, owned by the service
 account) and save. The service-local (disposable) backend has no deployment file; there it is the
@@ -4353,6 +4356,11 @@ sends it in a request body. Unknown, expired, used and withdrawn tokens all get 
 `404 invite_unusable` `This invite link cannot be used. Ask the person who sent it for a new one.`, and
 every miss counts against the address exactly as a failed sign-in does (`Service._check_throttle`; ten
 in five minutes from one address answers `429`, and the shared tunnel address is slowed, not locked).
+The expiry clock is read once for every token, found or not, so no answer is slower for one kind of
+token. The first `429` of an address in that window is audited; the rest are not audited or saved. The
+username check when an invite is made counts against the inviter's account-lookup limit (20 in ten
+minutes, as `GET /v1/accounts/lookup`) and is audited with a keyed digest of the name; a disabled
+account's name is not reported as taken there, and such an invite is refused at redemption.
 
 **Redeeming** sets the password under the installation's password rule, then, in one transaction under
 the state lock (`Service._widening`): creates the account, adds the memberships, creates the agent and

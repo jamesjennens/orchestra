@@ -467,6 +467,93 @@ class RateLimitTests(InviteCase):
         self.assertEqual(self.redeem(token)[0], 201)
 
 
+class ReviewHardeningTests(InviteCase):
+    """The Opus review of 4b622a50: S1 timing, S2 audit flooding, S3 username probing."""
+
+    def counted_clock(self):
+        real, calls = self.service._expiry_now, []
+
+        def counted():
+            calls.append(1)
+            return real()
+        return mock.patch.object(self.service, '_expiry_now', counted), calls
+
+    def test_the_expiry_clock_is_read_once_for_every_kind_of_token(self):
+        """S1: unknown, used, withdrawn, expired and pending tokens each read the clock exactly once."""
+        expired = self.invite(username='e1', expires_hours=1)['token']
+        used = self.invite(username='u1')['token']
+        withdrawn = self.invite(username='w1')
+        self.assertEqual(self.redeem(used)[0], 201)
+        self.call('POST', '/v1/invites/%s/revoke' % withdrawn['invite']['id'], {}, self.cora)
+        self.clock.advance(3600)
+        pending = self.invite(token=self.session('cora', 'cora-password-1'), username='p1')['token']
+        n = 0
+        for kind, token in (('unknown', secrets.token_urlsafe(32)), ('used', used), ('withdrawn', withdrawn['token']),
+                            ('expired', expired), ('pending', pending)):
+            routes = [('view', lambda t, a: invites.public_view(self.service, t, source=a))]
+            if kind != 'pending':
+                routes.append(('redeem', lambda t, a: invites.redeem(self.service, t, GOOD_PASSWORD, source=a)))
+            for route, run in routes:
+                n += 1
+                patcher, calls = self.counted_clock()
+                with self.subTest(kind=kind, route=route), patcher:
+                    try:
+                        run(token, '198.51.100.%d' % n)
+                    except http_auth.HttpError as refused:
+                        self.assertEqual(refused.status, 404)
+                    self.assertEqual(len(calls), 1)
+
+    def test_repeated_429s_are_audited_once_and_never_saved_per_request(self):
+        """S2: after the first 429 of an address, its further 429s add no audit event and no save."""
+        guesser = '198.51.100.99'
+        for _ in range(http_auth.LOGIN_MAX_ATTEMPTS):
+            self.assertEqual(self.view(secrets.token_urlsafe(32), source=guesser)[0], 404)
+        before = len(self.service.state['audit'])
+        saves, soon = [], []
+        real_save, real_soon = self.store.save, self.store.save_soon
+
+        def counted_save(*args, **kwargs):
+            saves.append(1)
+            return real_save(*args, **kwargs)
+
+        def counted_soon(*args, **kwargs):
+            soon.append(1)
+            return real_soon(*args, **kwargs)
+        with mock.patch.object(self.store, 'save', counted_save), mock.patch.object(self.store, 'save_soon', counted_soon):
+            for _ in range(15):
+                self.assertEqual(self.view(secrets.token_urlsafe(32), source=guesser)[0], 429)
+        events = [e for e in self.service.state['audit'][before:] if e.get('reason') == 'rate_limited']
+        self.assertEqual(len(events), 1, events)
+        self.assertLessEqual(len(soon), 1)
+        self.assertLessEqual(len(saves), 1)
+
+    def test_the_username_check_is_held_to_the_lookup_limit_and_audited_by_digest(self):
+        """S3: the same per-person limit and keyed-digest audit as GET /v1/accounts/lookup."""
+        self.service.lookup_max = 3
+        self.assertEqual(self.invite(expect=409, username='carl')['error']['code'], 'conflict')
+        self.invite(username='free1')
+        self.invite(username='free2')
+        answer = self.invite(expect=429, username='free3')
+        self.assertEqual(answer['error']['code'], 'rate_limited')
+        checks = [e for e in self.service.state['audit'] if e['action'] == 'invites.username_check']
+        self.assertEqual([e['outcome'] for e in checks], ['found', 'not_found', 'not_found', 'throttled'])
+        self.assertTrue(all(e['reason'].startswith('username_hmac=') for e in checks))
+        self.assertFalse(any(name in json.dumps(checks) for name in ('carl', 'free1', 'free2', 'free3')))
+        # Another person has a count of their own.
+        self.invite(token=self.admin, username='free3')
+
+    def test_a_disabled_account_is_not_reported_as_taken_and_its_invite_creates_nothing(self):
+        """S3: hidden as the lookup hides it; the redemption then refuses with nothing made."""
+        status, body = self.call('POST', '/v1/accounts', {'username': 'dora'}, self.admin)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.call('POST', '/v1/accounts/%s/disable' % body['id'], {}, self.admin)[0], 200)
+        token = self.invite(username='dora')['token']
+        before = self.snapshot()
+        status, body = self.redeem(token)
+        self.assertEqual((status, body['error']['code']), (409, 'username_taken'), body)
+        self.assertEqual(self.snapshot(), before)
+
+
 class SwitchTests(InviteCase):
     def test_switch_off_refuses_create_view_and_redeem_with_the_one_sentence(self):
         token = self.invite()['token']
@@ -540,6 +627,11 @@ class EndpointSwitchTests(unittest.TestCase):
             marker.write_text(json.dumps({'invites_enabled': 'yes'}), encoding='utf-8')
             self.assertFalse(admin.invites_enabled(root, warnings=warnings))
             self.assertIn('invites_enabled', warnings[0])
+            # Review N7: a JSON string reads as a string, never as "is true, not true or false".
+            warnings = []
+            marker.write_text(json.dumps({'invites_enabled': 'true'}), encoding='utf-8')
+            self.assertFalse(admin.invites_enabled(root, warnings=warnings))
+            self.assertIn('invites_enabled is "true" (str), not the JSON value true or false', warnings[0])
 
     def test_an_unreadable_configuration_is_the_usual_503(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -563,6 +655,9 @@ class WebPageTests(unittest.TestCase):
                                      capture_output=True, text=True, encoding='utf-8', timeout=60)
                 self.assertEqual(run.returncode, 0, run.stderr[:400])
         source = (web / 'views' / 'invites.js').read_text(encoding='utf-8')
+        # Review N2: the page drops the token from the address bar first thing.
+        page = source[source.index('export function invitePage'):]
+        self.assertIn("history.replaceState(null, '', '#/')", page[:400])
         start = source.index('export function inviteLink')
         body = source[start:source.index('\n}\n', start) + 3].replace('export ', '')
         script = body + ("console.log(JSON.stringify([inviteLink({token: 'T'}, 'https://here'), "

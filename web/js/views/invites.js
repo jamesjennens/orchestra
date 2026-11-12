@@ -128,6 +128,8 @@ export function invitePanel(ctx, project) {
 
 // The signed-out page an invite link opens. `token` is the part after #/invite/.
 export function invitePage(ctx, token) {
+  // The token leaves the address bar (and so the browser history) at once; it lives in this closure only.
+  try { history.replaceState(null, '', '#/'); } catch { /* ignore */ }
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
   const body = h('div', { class: 'stack' }, h('p', { class: 'muted' }, 'Reading the invite…'));
   const title = h('h1', { id: 'page-title', tabindex: '-1' }, 'You are invited');

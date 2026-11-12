@@ -836,7 +836,8 @@ def invites_enabled(root, doc=None, warnings=None):
         return True
     _warn_deployment_setting(
         warnings,
-        'deployment invites_enabled is %s, not true or false; reading it as off (no invite links)' % audit_field(value),
+        'deployment invites_enabled is %s (%s), not the JSON value true or false; reading it as off (no invite links)'
+        % (audit_field(json.dumps(value)), type(value).__name__),
     )
     return False
 

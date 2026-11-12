@@ -8376,7 +8376,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         return read is not None and read() is True
 
     def _invite_refused(self, ctx, action, error):
-        """One audit line for an anonymous invite route's refusal (never the token or the password)."""
+        """One audit line for an anonymous invite route's refusal (never the token or the password).
+
+        A 429 is audited and saved once per address in the sign-in window; repeats are answered with
+        neither (review S2 of kittrial-5bb.578), so a flood cannot roll the audit over."""
+        if isinstance(error, HttpError) and error.status == 429 and \
+                invites.quiet_throttle(self.service, self._source(), self._source_is_shared()):
+            error.quiet_audit = True
+            return
         if isinstance(error, HttpError):
             self.service.audit(ctx.request_id, None, action, 'denied' if error.status in (401, 403, 404, 429)
                                else 'rejected', reason=error.code)
