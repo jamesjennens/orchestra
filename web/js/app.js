@@ -78,6 +78,8 @@ export async function start(root, options = {}) {
   };
 
   function showLogin(message) {
+    // Nothing is rendered from the route now, so opening any route (an invite link included) renders again.
+    rendered = null;
     mount(root, auth.login(ctx, message));
   }
 

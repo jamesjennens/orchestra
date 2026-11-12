@@ -184,6 +184,7 @@ export function invitePage(ctx, token) {
     setTimeout(() => focusFirstEmpty(form));
   }
 
+  try { document.title = 'Invitation · Orchestra'; } catch { /* no document */ }
   Promise.resolve().then(() => ctx.api.viewInvite(token)).then(show).catch((error) => {
     body.replaceChildren(h('p', { class: 'auth-foot' }, toSignIn));
     fail(error);
