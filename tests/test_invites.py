@@ -311,6 +311,20 @@ class WhoMayInviteTests(InviteCase):
                 self.assertEqual(self.call(method, path, body, secret)[0], 403)
         self.assertEqual(len(self.service.state.get('invites', {})), before)
 
+    def test_the_module_refuses_a_credential_whatever_the_route_checked(self):
+        """The second layer: invites.create, list_for and revoke refuse any principal that is not a session."""
+        secret = self.agent_secret(self.cora, 'north')
+        principal = self.service.authenticate(secret)
+        self.assertEqual(principal.via, 'credential')
+        body = {'display_name': 'X', 'username': 'xx', 'projects': ['north']}
+        for call in (lambda: invites.create(self.service, principal, body),
+                     lambda: invites.list_for(self.service, principal),
+                     lambda: invites.revoke(self.service, principal, 'inv_0123456789abcdef')):
+            with self.assertRaises(http_auth.HttpError) as refused:
+                call()
+            self.assertEqual((refused.exception.status, refused.exception.message), (403, invites.PERSON_ONLY))
+        self.assertFalse(self.service.state.get('invites'))
+
     def test_an_agent_holding_the_coordinator_grant_still_cannot_create_one(self):
         secret = self.agent_secret(self.cora, 'north')
         agent_id = next(a['id'] for a in self.service.state['agents'].values() if a['name'] == 'Helper')
