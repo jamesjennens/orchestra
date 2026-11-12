@@ -42,6 +42,35 @@ export async function start(root, options = {}) {
   // prototype-only until their own backend routes are released.
   const features = { requirements: true, records: false, ...(options.features || {}) };
   const ctx = { api, me: null, projects: [], root, dirty: false, options, features, query: new URLSearchParams('') };
+
+  // kittrial-5bb.581: the service was upgraded under this open page. One banner, kept above every later page
+  // (place() puts it first), until the person reloads.
+  let upgradeBanner = null;
+  const place = (...nodes) => mount(root, upgradeBanner ? [upgradeBanner, ...nodes] : nodes);
+  function showUpgraded() {
+    if (upgradeBanner) return;
+    upgradeBanner = h('div', { class: 'banner info upgrade-banner', role: 'status', 'data-banner': 'upgraded' },
+      h('span', null, 'Orchestra was upgraded. Reload.'), ' ',
+      h('button', { type: 'button', 'data-action': 'reload', onclick: () => { try { location.reload(); } catch { /* ignore */ } } }, 'Reload'));
+    // Put it on top of the page shown now without drawing that page again (a form being typed in is kept).
+    if (typeof root.prepend === 'function') root.prepend(upgradeBanner);
+    else root.replaceChildren(upgradeBanner, ...Array.from(root.childNodes));
+  }
+  if (typeof api.onBuildChange === 'function') api.onBuildChange(showUpgraded);
+  // A tab that comes back into view asks the service its build, at most once a minute.
+  const HEALTH_EVERY_MS = 60 * 1000;
+  let lastHealth = -Infinity;
+  try {
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible' || upgradeBanner) return;
+        const now = Date.now();
+        if (now - lastHealth < HEALTH_EVERY_MS) return;
+        lastHealth = now;
+        Promise.resolve().then(() => api.checkBuild()).catch(() => { /* the next answer tells */ });
+      });
+    }
+  } catch { /* no document events: the answers still tell */ }
   let memoryRoute = '/';
 
   const currentRoute = () => {
@@ -123,7 +152,7 @@ export async function start(root, options = {}) {
   function showLogin(message) {
     // Nothing is rendered from the route now, so opening any route (an invite link included) renders again.
     rendered = null;
-    mount(root, auth.login(ctx, message));
+    place(auth.login(ctx, message));
   }
 
   // kittrial-5bb.578: an invite link (#/invite/TOKEN) opens its own signed-out page, whoever is signed in.
@@ -132,7 +161,7 @@ export async function start(root, options = {}) {
     const route = currentRoute();
     if (!route.startsWith(INVITE_PREFIX)) return false;
     rendered = route;
-    mount(root, invites.invitePage(ctx, route.slice(INVITE_PREFIX.length)));
+    place(invites.invitePage(ctx, route.slice(INVITE_PREFIX.length)));
     return true;
   }
 
@@ -234,7 +263,7 @@ export async function start(root, options = {}) {
     rendered = route;
     const mine = ++token;
     const main = buildShell(route);
-    mount(root, ctx.options.banner ? [ctx.options.banner(ctx), shell] : shell);
+    place(...(ctx.options.banner ? [ctx.options.banner(ctx), shell] : [shell]));
     // A route may carry a query, e.g. /p/{pid}/reviews?proposal=<key>: the path selects
     // the view and the query is the view's own state.
     const [path, search] = route.split('?');

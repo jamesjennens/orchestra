@@ -101,7 +101,9 @@ class PageHeadKey(unittest.TestCase):
         self.assertKey(data['afterClosed'], expected['closed'], 'closed item' if expected['closed'] == '1' else 'closed items', 'page.total')
         # the tab names the project again: 'Tasks · <project>' (app.js reads data-tab-title)
         self.assertEqual('Tasks · Customer portal', head['tabTitle'])
-        self.assertEqual([('New task', True)], [(a['text'], a['primary']) for a in head['actions']])
+        # kittrial-5bb.581: the owner also sees the invite action beside it, never as the primary one.
+        self.assertEqual([('New task', True), ('Invite someone or add an agent', False)],
+                         [(a['text'], a['primary']) for a in head['actions']])
 
     def test_tasks_failed_reread_after_a_filter_clears_the_key(self):
         data = observed(self)['tasksFailedReread']
@@ -229,7 +231,9 @@ class PageHeadKey(unittest.TestCase):
         self.assertTrue(head['key']['shown'])
         self.assertEqual('member' if data['expected']['num'] == '1' else 'members', head['key']['label'])
         self.assertIn(head['key']['source'], ('members.total', 'members.items'))
-        self.assertEqual([('Add a member', True, 'add-member')], [(a['text'], a['primary'], a['next']) for a in head['actions']])
+        # kittrial-5bb.581: the owner also sees the invite action beside it, never as the primary one.
+        self.assertEqual([('Add a member', True, 'add-member'), ('Invite someone or add an agent', False, None)],
+                         [(a['text'], a['primary'], a['next']) for a in head['actions']])
         self.assertIn('m-username', data['ids'])
 
     def test_settings_has_no_key(self):

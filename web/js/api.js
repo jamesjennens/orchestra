@@ -41,6 +41,20 @@ function cancel(handle) { if (handle !== null && handle !== undefined) globalThi
 export function createApi(transport, binaryTransport = fetchBinaryTransport) {
   let csrf = null;
 
+  // kittrial-5bb.581: the service's build. The first X-Orchestra-Build value seen is this page's; a later answer
+  // with another non-empty value means the service was upgraded under the open page, and the listener is told
+  // once. A transport gives the header's value as `build` on its answer.
+  let knownBuild = null;
+  let buildChanged = null;
+  let buildListener = null;
+  function noteBuild(value) {
+    if (typeof value !== 'string' || !value) return;
+    if (knownBuild === null) { knownBuild = value; return; }
+    if (value === knownBuild || buildChanged !== null) return;
+    buildChanged = value;
+    if (buildListener) { try { buildListener(value, knownBuild); } catch { /* the page's banner is not the API's concern */ } }
+  }
+
   async function call(method, path, { body, params, key } = {}) {
     const headers = { Accept: 'application/json' };
     const mutating = method !== 'GET';
@@ -48,6 +62,7 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     if (mutating && csrf) headers['X-CSRF-Token'] = csrf;
     if (mutating && key) headers['Idempotency-Key'] = key;
     const response = await transport(method, path + query(params), headers, body === undefined ? undefined : JSON.stringify(body));
+    if (response) noteBuild(response.build);
     if (response.status === 204) return null;
     const data = response.data;
     if (response.status >= 200 && response.status < 300) return data;
@@ -457,6 +472,19 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     revokeInvite: (id) => mutate('POST', `/v1/invites/${encodeURIComponent(id)}/revoke`, {}),
     viewInvite: (token) => call('POST', '/v1/invites/view', { body: { token } }),
     redeemInvite: (token, password) => call('POST', '/v1/invites/redeem', { body: { token, password } }),
+    // kittrial-5bb.581: a signed-in person accepts an invite made for their existing account.
+    acceptInvite: (token) => mutate('POST', '/v1/invites/accept', { token }),
+    // kittrial-5bb.581: the build check. onBuildChange(fn) calls fn once, when an answer names another build
+    // than the first one seen (at once if that has already happened); checkBuild reads /healthz for it.
+    onBuildChange(fn) {
+      buildListener = typeof fn === 'function' ? fn : null;
+      if (buildListener && buildChanged !== null) { try { buildListener(buildChanged, knownBuild); } catch { /* ignore */ } }
+    },
+    async checkBuild() {
+      const result = await call('GET', '/healthz');
+      noteBuild(result && result.build_id);
+      return result;
+    },
 
     // accounts (superuser)
     accounts: () => call('GET', '/v1/accounts'),
@@ -693,7 +721,9 @@ export async function fetchTransport(method, path, headers, body) {
   let data = null;
   const text = await response.text();
   if (text) { try { data = JSON.parse(text); } catch { data = null; } }
-  return { status: response.status, data };
+  let build = null;
+  try { build = response.headers.get('X-Orchestra-Build'); } catch { build = null; }
+  return { status: response.status, data, build };
 }
 
 // Real transport for task-file bytes: same-origin fetch. A successful download answers its

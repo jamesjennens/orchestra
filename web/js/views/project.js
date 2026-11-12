@@ -33,6 +33,20 @@ export const RELEASE_NO_EFFECT = {
   'account-role': ' — its account is no longer an owner here',
   'issuer-role': ' — the person who gave it is no longer an owner here',
 };
+// kittrial-5bb.581: the way to the invite panel, in the page head of the overview and of People, for a person who may
+// invite to this project (its owner, or a superuser) while it is not archived. The server still decides.
+export function inviteAction(ctx, project) {
+  const superuser = Boolean(ctx.me && ctx.me.superuser);
+  if (!project || project.archived || !(isOwner(project) || superuser)) return null;
+  return h('a', { class: 'btn', href: ctx.href(`/p/${project.id}/people?invite=1`), 'data-action': 'invite' }, 'Invite someone or add an agent');
+}
+
+// The page head's actions, or null when there is none (pageHead draws no empty actions box).
+function headActions(...actions) {
+  const shown = actions.filter(Boolean);
+  return shown.length ? shown : null;
+}
+
 export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['coordinator', 'Coordinator'], ['owner', 'Owner']];
 
 async function load(ctx, pid) {
@@ -563,7 +577,8 @@ export async function overview(ctx, { pid }) {
   const tableHost = h('div', { class: 'panel' });
   // The page is the project's Tasks list: the h1 says so, the crumb names the project.
   const head = pageHead({ crumbs: crumbs(ctx, project, 'Tasks'), title: 'Tasks', tabTitle: 'Tasks · ' + project.name, lede: project.description || null, key: 'pending',
-    actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null });
+    actions: headActions(canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null,
+      inviteAction(ctx, project)) });
 
   const search = h('input', { type: 'search', id: 'task-search', placeholder: 'Search title, description or ID', 'aria-label': 'Search tasks', value: state.q });
   // A requirement record or BRD section is a visible row the server never calls claimable
@@ -1120,12 +1135,12 @@ export async function people(ctx, { pid }) {
   // total, or the rows when the read says there is no further page); the next action, for an owner, takes the
   // reader to the "Add by username" form below.
   const head = pageHead({ crumbs: crumbs(ctx, project, 'People'), title: 'People', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.',
-    key: 'pending', actions: owner && !project.archived ? h('button', { type: 'button', class: 'primary', 'data-next-action': 'add-member', onclick: () => {
+    key: 'pending', actions: headActions(owner && !project.archived ? h('button', { type: 'button', class: 'primary', 'data-next-action': 'add-member', onclick: () => {
       const input = document.getElementById('m-username');
       if (!input) return;
       input.scrollIntoView({ block: 'center' });
       input.focus({ preventScroll: true });
-    } }, 'Add a member') : null });
+    } }, 'Add a member') : null, inviteAction(ctx, project)) });
   return h('div', { class: 'stack' },
     head,
     archivedBanner(project),
