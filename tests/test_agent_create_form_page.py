@@ -57,6 +57,9 @@ class CreateFormTests(unittest.TestCase):
             'detailsHoldTheRest', 'createDialogSaysYouNeedNotSaveItNow',
             'createDialogSaysSaveAndNeverPasteInAChat', 'unknownScopesOpenDetailsWithTheInstruction',
             'inferredScopesOpenDetailsWithTheNotice', 'aDifferentCreatorOpensDetailsWithTheNote',
+            'ownerLabelsShowOwnerPlusId', 'mineFilterHiddenWithOneOwner', 'mineFilterShownToSuperuser',
+            'duplicateWarnsWithOwnerAndConfirm', 'noHintForFreshAgent', 'hintForActedAgent',
+            'duplicateNameAsksFirst',
         }, set(facts))
 
 
