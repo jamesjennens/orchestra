@@ -29,8 +29,12 @@ kits; all-off native write effects remain compatible.
 - **The web route** judges an agent holding the coordinator grant by person. By default it now
   agrees with the host route for another personal agent of the same person (the project setting
   `agent_approval: by-agent`).
-- **What both routes still refuse on the web:** the agent's own work, its person's own work and
-  work under that person's worker credentials.
+- **What the web route still refuses:** the agent's own work (its sub-workers included), its
+  person's own work under the bare account id, and work under a worker-credential name another
+  account has held. Work under a worker credential of that person issued with a name no other
+  account has held, or under `ACCOUNT/label` below the person's account id (only that person's
+  credential issued with no name can write it), is approved (kittrial-5bb.519), and it integrates
+  under the same decision (kittrial-5bb.560).
 - **Strict projects:** a project an owner set to `by-person` is strict on the web route only.
 - **The record:** an approval written that way carries a fixed sentence at the end of its
   `summary`. The record's field set is unchanged.

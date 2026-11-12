@@ -190,7 +190,11 @@ fields in the body. Scope compare-and-set controls never enter the native payloa
 
 All values of `reviewed` and `integrated` require the current contribution's
 standing independent approval, with no unresolved review requests. The approver
-must be a different party from both author and current assignee, the source must
+must be a different party from both author and current assignee, or a coordinator
+agent that the project's `agent_approval: by-agent` setting lets through: the same
+decision as the approve route, asked again from the present state on every read and
+write (see "Integration follows the setting and the grant" under Coordinators below;
+kittrial-5bb.560). The source must
 equal the full approved commit, and the caller must hold the merge slot for this
 task. These requirements are checked again under the project and configured
 authority locks before the effect. Recording a fact writes evidence; it does not
@@ -2514,9 +2518,25 @@ credential approved anything; this is the one place where that is lifted.
     an "Approvals by coordinator agents" panel.
   - Damage: a damaged stored value reads as the strict `by-person` (with `damaged: true`), never
     as the default.
-  - Storage: it lives in this service's state and only the web route applies it. The host route
-    compares actor names, so over ssh an agent of the same person was never refused, and a
-    project set to `by-person` here is not strict over ssh.
+  - Storage: it lives in this service's state, and the web route and the web integration
+    (below) apply it. The host route compares actor names, so over ssh an agent of the same
+    person was never refused, and a project set to `by-person` here is not strict over ssh.
+- **Integration follows the setting and the grant (kittrial-5bb.560).** The approval row of
+  `GET .../integration-check`, the standing approval and the `reviewed`/`integrated`
+  affordances of `GET .../lifecycle`, and the `reviewed` and `integrated` writers ask the
+  approve route's decision again, from the present state, whenever the approver is of the
+  author's or the assignee's party.
+  - It is re-decided on every read and write, not taken from the record. An approval already
+    recorded stops integrating when the project is switched to `by-person` or its setting is
+    damaged, or when the agent's grant ends: the grant is deleted, the account loses its
+    role, or no credential of the agent is still live (revoked, expired on the decision clock
+    or on its own raw deadline, past the 366-day cap, or issued to another account than the
+    agent's). The row then reads `allowed: false` and the writers answer `409`, both with "The
+    approval must be from another party than the author and current assignee".
+  - The same holds the other way: switching back to `by-agent`, or giving the grant again,
+    lets an older approval integrate again. A worker-credential name that another account
+    is issued later becomes shared, and an approval recorded under it then refuses.
+  - The host (ssh) route is not changed: it still compares actor names.
 - **What an agent sees, and agents set up before this release (kittrial-5bb.518).**
   - The brief (`GET .../tasks/{task}/brief`) answers `review.approval_permission` for a delivery awaiting
     review: `may_approve`, a `case` (`another-agent`, `worker-credential`, `own-work`, `own-person`,

@@ -70,6 +70,7 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
                             clock_trusted, decide, file_lock,
                             actor_person as http_actor_person,
                             actor_parties as full_actor_parties, namespace_holds)
+import http_authority
 
 # Password verifier policy. n=2**14, r=8 needs ~16 MiB per hash; scrypt is the
 # memory-hard scheme available in the standard library without third-party wheels.
@@ -3121,27 +3122,16 @@ class Service:
     def agent_approves(self, agent_id, project_id, moment=None):
         """Whether a live credential of the agent may approve in the project now: it holds the
         coordinator grant there and its account is a coordinator or an owner (kittrial-5bb.209).
-        Used to word what the agent is shown; it grants nothing."""
-        from http_authority import credential_capabilities
+
+        :func:`http_authority.agent_grant_effective` under the store lock, against the expiry and
+        raw clocks. The review queue uses it to decide what an agent is offered; the same function
+        is the grant step of the by-agent decision, which the approve route and integration ask
+        (kittrial-5bb.560), so it is a gate there."""
         with self.store.lock:
-            agent = self.state['agents'].get(agent_id)
-            if not isinstance(agent, dict) or not agent.get('enabled') or \
-                    project_id not in (agent.get('projects') or []):
-                return False
-            owner = self.state['users'].get(agent.get('owner'))
-            if not isinstance(owner, dict) or owner.get('disabled'):
-                return False
-            moment = self._expiry_now() if moment is None else moment
-            for credential in self.state.get('credentials', {}).values():
-                if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
-                        credential.get('revoked') or credential.get('expires_at', 0) <= moment:
-                    continue
-                try:
-                    if CAP_APPROVE in credential_capabilities(self.state, credential, owner, project_id):
-                        return True
-                except AuthorityDenied:
-                    continue
-            return False
+            # Candidate 1112a: .521's one request moment (``moment``), judged by .560's agent_grant_effective.
+            return http_authority.agent_grant_effective(self.state, agent_id, project_id,
+                                                        self._expiry_now() if moment is None else moment,
+                                                        self._raw_now())
 
     def agent_review_standing(self, agent_id, project_id, moment=None):
         """``(may_review, owner_approves)`` for one agent in one project, from live state.
@@ -4721,32 +4711,20 @@ class Service:
                     change.save()
             return self.project_agent_view(agent, project_id)
 
-    #: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438).
-    #: ``by-agent``, the default: it may approve the work of ANOTHER personal agent of the same
-    #: person; its own work, its person's own work and its person's worker credentials stay refused.
-    #: ``by-person``: the strict rule of kittrial-5bb.209, every agent of a person is one party.
-    AGENT_APPROVAL_MODES = ('by-agent', 'by-person')
-    AGENT_APPROVAL_DEFAULT = 'by-agent'
+    #: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438); the
+    #: modes and the default live in :mod:`http_authority` (kittrial-5bb.560).
+    AGENT_APPROVAL_MODES = http_authority.AGENT_APPROVAL_MODES
+    AGENT_APPROVAL_DEFAULT = http_authority.AGENT_APPROVAL_DEFAULT
 
     def agent_approval(self, project_id):
         """The project's agent-approval setting: ``{'mode', 'set_by', 'set_at', 'set_by_display_name'}``.
 
         Absent is the default (``by-agent``, nobody set it). A record of any other shape reads as the
         strict ``by-person`` with ``damaged`` true: a damaged setting never lets more through.
+        The decision is :func:`http_authority.agent_approval_mode` (kittrial-5bb.560).
         """
         with self.store.lock:
-            stored = self.state.get('agent_approval')
-            entry = stored.get(project_id) if isinstance(stored, dict) else None
-            if 'agent_approval' not in self.state or (isinstance(stored, dict) and project_id not in stored):
-                return {'mode': self.AGENT_APPROVAL_DEFAULT, 'set_by': None, 'set_at': None,
-                        'set_by_display_name': None}
-            if not isinstance(entry, dict) or entry.get('mode') not in self.AGENT_APPROVAL_MODES:
-                return {'mode': 'by-person', 'set_by': None, 'set_at': None, 'set_by_display_name': None,
-                        'damaged': True}
-            set_by = entry.get('set_by') if isinstance(entry.get('set_by'), str) else None
-            return {'mode': entry['mode'], 'set_by': set_by,
-                    'set_at': entry.get('set_at') if isinstance(entry.get('set_at'), str) else None,
-                    'set_by_display_name': self._owner_name(set_by) if set_by else None}
+            return http_authority.agent_approval_mode(self.state, project_id)
 
     def set_agent_approval(self, principal, project_id, mode):
         """Record the project's agent-approval setting (kittrial-5bb.438): who set it and when.
@@ -4825,55 +4803,26 @@ class Service:
         return self.auto_nudge(project_id)
 
     def other_agent_of_same_person(self, agent_id, name):
-        """Whether ``name`` was written by ANOTHER personal agent of the account that owns ``agent_id``.
-
-        A name belongs to an agent when its first segment is that agent's id (``agent`` and ``agent/x``
-        are one actor). The approving agent itself, its account, a worker credential's name and any
-        name of no agent record are not another agent: they answer False, and stay judged by party.
-        """
-        if not isinstance(name, str) or not name or not isinstance(agent_id, str) or not agent_id:
-            return False
-        head = name.split('/', 1)[0]
+        """Whether ``name`` was written by ANOTHER personal agent of the account that owns ``agent_id``:
+        :func:`http_authority.other_agent_of_same_person` under the store lock (kittrial-5bb.560)."""
         with self.store.lock:
-            agents = self.state.get('agents') if isinstance(self.state.get('agents'), dict) else {}
-            mine, other = agents.get(agent_id), agents.get(head)
-            return (head.casefold() != agent_id.casefold() and isinstance(mine, dict) and isinstance(other, dict)
-                    and isinstance(mine.get('owner'), str) and other.get('owner') == mine['owner'])
+            return http_authority.other_agent_of_same_person(self.state, agent_id, name)
 
     def worker_credential_of_same_person(self, agent_id, name, project_id):
-        """Whether ``name`` was written under a WORKER CREDENTIAL of the account that owns ``agent_id`` (kittrial-5bb.519).
-
-        True only when the record shows the name is a worker credential's of that one account O, and
-        nothing else could have written it:
-
-        * a name whose head is neither an account nor an agent id: the issuers of the project's worker
-          credentials whose namespace holds the name are exactly {O}. The set is the one
-          :meth:`actor_parties` computes (``full_actor_parties``), working, revoked or expired
-          credentials alike, so a name O revoked and issued again stays one issuer, and a name another
-          account held once stays shared (False);
-        * ``O/label`` with a non-empty label: a session writes exactly its account id, an agent only
-          its own id, and a worker credential only inside its namespace, so only O's own credential
-          issued with no name can write below O's account id.
-
-        False for everything else: the bare account id (O's own session writes it too), a shared name,
-        the agent itself or any agent id, another account's names, and a name no credential record holds
-        (a name of the host route).
-        """
-        if not all(isinstance(value, str) and value for value in (agent_id, name, project_id)):
-            return False
-        head, _, label = name.partition('/')
+        """Whether ``name`` was written under a WORKER CREDENTIAL of the account that owns ``agent_id``
+        (kittrial-5bb.519): :func:`http_authority.worker_credential_of_same_person` under the store lock
+        (kittrial-5bb.560)."""
         with self.store.lock:
-            agents = self.state.get('agents') if isinstance(self.state.get('agents'), dict) else {}
-            users = self.state.get('users') if isinstance(self.state.get('users'), dict) else {}
-            mine = agents.get(agent_id)
-            owner = mine.get('owner') if isinstance(mine, dict) else None
-            if not isinstance(owner, str) or not owner or head in agents or head.casefold() == agent_id.casefold():
-                return False
-            if head == owner:
-                return bool(label)
-            if head in users:
-                return False
-            return full_actor_parties(self.state, name, project_id) == {owner}
+            return http_authority.worker_credential_of_same_person(self.state, agent_id, name, project_id)
+
+    def by_agent_approval(self, project_id, agent_id, author, assignee, names=None):
+        """``(setting, decision)``: the project's agent-approval setting and
+        :func:`http_authority.by_agent_approval` for agent ``agent_id``, read under ONE hold of the
+        store lock against the expiry clock (kittrial-5bb.560)."""
+        with self.store.lock:
+            return (http_authority.agent_approval_mode(self.state, project_id),
+                    http_authority.by_agent_approval(self.state, project_id, agent_id, author, assignee,
+                                                     self._expiry_now(), names=names, raw_now=self._raw_now()))
 
     def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
         """Delete the agent's coordinator AND release grants in each of ``project_ids``.

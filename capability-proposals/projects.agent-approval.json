@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-5bb560-agent-approval-0001",
+  "key": "projects.agent-approval",
+  "name": "Per-project setting agent_approval: how a coordinator agent is judged when it approves",
+  "aliases": [
+    "agent_approval",
+    "approvals by coordinator agents",
+    "by-agent",
+    "by-person",
+    "agent approval setting",
+    "can a coordinator agent approve work",
+    "strict agent approval",
+    "agent approves another agent of the same person",
+    "coordinator agent approval rule",
+    "Agent approvals"
+  ],
+  "summary": "A per-project setting with two values. by-agent (the default): an agent holding the coordinator grant may approve work delivered by another personal agent of the same person, or under a worker credential of that person issued with a name no other account has held (kittrial-5bb.519). by-person: strict, all agents of a person are one party and none approves the others. Either way an agent never approves its own work (its sub-labels count as itself), its person's bare account id, or a name another account also held; the refusal says which. Only an owner or superuser sets it, by web session (PUT /v1/projects/{id}/agent-approval; Members & settings); a credential never can, so no agent sets the rule that judges it. Who and when are recorded and audited; a damaged value reads as by-person. People follow the installation's approval_by_another_party instead. An approval it let through ends with a fixed sentence. Integration's check row, lifecycle read and writers ask the same decision from current state (kittrial-5bb.560), so by-person, damage or an ended grant refuses there too. KNOWN GAP: only the web route applies it (over ssh an agent of the same person is never refused).",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve"
+  ],
+  "code": [
+    "http_service.py::ApiHandler.project_agent_approval",
+    "http_service.py::ApiHandler._may_set_agent_approval",
+    "http_service.py::ApiHandler._agent_approval_refusal",
+    "http_service.py::ApiHandler._another_agent_only",
+    "http_service.py::ApiHandler._credential_work_in",
+    "http_service.py::ApiHandler.reviews_add",
+    "http_service.py::ApiHandler.project_get",
+    "http_auth.py::Service.agent_approval",
+    "http_auth.py::Service.set_agent_approval",
+    "http_auth.py::Service.other_agent_of_same_person",
+    "http_auth.py::Service.worker_credential_of_same_person",
+    "handover_steps.py::steps",
+    "web/js/views/project.js::agentApprovalPanel",
+    "http_authority.py::by_agent_approval",
+    "http_authority.py::agent_approval_mode",
+    "web_lifecycle.py::approved_party",
+    "http_authority.py::other_agent_of_same_person",
+    "http_authority.py::worker_credential_of_same_person",
+    "http_authority.py::agent_grant_effective",
+    "http_authority.py::recorded_by_agent_approval"
+  ],
+  "tests": [
+    "tests/test_agent_approval.py",
+    "tests/test_agent_approval_credentials.py",
+    "tests/test_by_agent_decision_560.py",
+    "tests/test_web_lifecycle_by_agent_560.py",
+    "tests/test_agent_approval_integration_560.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "projects",
+    "approval",
+    "agents",
+    "settings",
+    "http"
+  ],
+  "revision": 2,
+  "expected_sha256": "76807c44d7273adb27d1df5900189a1d0c6f3b1794e2f4ae538edd9a137d4bfe"
+}

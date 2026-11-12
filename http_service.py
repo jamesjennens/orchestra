@@ -2761,7 +2761,8 @@ class EndpointBackend:
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(dict(operation='read', task=task_id))],
                          authority=authority_request(principal, project_id, CAP_READ,
-                                                     now=self.service._expiry_now()),
+                                                     now=self.service._expiry_now(),
+                                                     raw_now=self.service._raw_now()),
                          require_authority=True)
 
     def integration_check(self, principal, project_id, task_id, target=None):
@@ -2772,7 +2773,8 @@ class EndpointBackend:
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(body)],
                          authority=authority_request(principal, project_id, CAP_READ,
-                                                     now=self.service._expiry_now()),
+                                                     now=self.service._expiry_now(),
+                                                     raw_now=self.service._raw_now()),
                          require_authority=True)
 
     def lifecycle_replay_guard(self, principal, project_id, task_id, dimension):
@@ -3366,8 +3368,12 @@ class EndpointBackend:
             # configuration (``self.authority_store``), not request data. The decision
             # time is the service's monotone expiry clock, so the canonical endpoint
             # re-check cannot revive an item expired by a backward step.
+            # The web-lifecycle writers also get the raw host clock: integration judges an
+            # agent key's raw deadline against it (kittrial-5bb.560 r2).
             authority = authority_request(principal, project_id, capability,
-                                          now=self.service._expiry_now())
+                                          now=self.service._expiry_now(),
+                                          raw_now=(self.service._raw_now() if route.startswith('lifecycle.')
+                                                   else None))
             if self.service.approval_by_another_party and (
                     route.startswith('references.') or route.startswith('capabilities.') or route.startswith('interfaces.')):
                 authority['approval_by_another_party'] = True
@@ -7166,7 +7172,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         'superuser).')
 
     #: An agent approving under the project's default ``by-agent`` setting (kittrial-5bb.438): it may approve
-    #: another agent of its person, never itself, its person or its person's worker credentials.
+    #: another agent of its person, and work under a worker credential only its person has held (a name no
+    #: other account has held, or ``ACCOUNT/label``: kittrial-5bb.519); never itself (its sub-labels included),
+    #: its person's bare account id or a name another account has held.
     SAME_AGENT = ('This contribution was delivered by this agent itself.',
                   'This task is assigned to this agent itself.')
     BY_AGENT_NEXT = (' On this project a coordinator agent may approve the work of another agent of the same person, '
@@ -7246,21 +7254,18 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _contains_same_person_approval(self, summary, recommending=False):
         return self._basis_sentence_in(summary, recommending) is not None
 
-    def _another_agent_only(self, agent_id, names, parties, project):
-        """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
+    def _another_agent_only(self, agent_id, names, assignee, author, project):
+        """Whether the by-agent setting lets agent ``agent_id`` approve work of ``author`` and ``assignee`` (kittrial-5bb.438).
 
         True when nothing of its party is there at all, or only other personal agents of the same account or
-        worker credentials of that account that the approve route lets through (kittrial-5bb.519: the same two
-        functions :meth:`_agent_approval_refusal` calls, so the list and the route have one source); False as
-        soon as one is the agent itself or a sub-label of it, the bare account id, or a shared name.
+        worker credentials of that account that the approve route lets through; False as soon as one is the
+        agent itself or a sub-label of it, the bare account id, or a shared name. It is
+        :func:`http_authority.by_agent_approval`, the one decision :meth:`_agent_approval_refusal` asks too
+        (kittrial-5bb.560), so the list and the route have one source. The caller has already asked that the
+        setting is ``by-agent`` and the agent's grant is effective; the decision asks both again.
         """
-        for target in parties:
-            if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
-                continue
-            if not (self.service.other_agent_of_same_person(agent_id, target)
-                    or self.service.worker_credential_of_same_person(agent_id, target, project)):
-                return False
-        return True
+        _, decision = self.service.by_agent_approval(project, agent_id, author, assignee, names)
+        return decision.allowed
 
     def _credential_work_in(self, agent_id, names, parties, project):
         """Whether one of ``parties`` of the approver's party is a worker credential of its person (kittrial-5bb.519)."""
@@ -7281,47 +7286,45 @@ class ApiHandler(BaseHTTPRequestHandler):
         its person's bare account id and a name shared with another account still refuse.
 
         ``setting`` is the project's setting when the caller already holds it (a list of rows reads it once,
-        kittrial-5bb.518); the approve route passes none and reads it here, inside the mutation, every time.
+        kittrial-5bb.518): under any mode but ``by-agent`` that refusal stands without another read. Otherwise,
+        and when the approve route passes none, the setting is read here, inside the mutation, every time.
+
+        The decision is :func:`http_authority.by_agent_approval` (kittrial-5bb.560); this maps its refusal
+        kind to the route's sentence. The setting and the decision are read under one hold of the store lock.
         """
-        if setting is None:
-            setting = self.service.agent_approval(project)
-        if setting['mode'] != 'by-agent':
+        if setting is not None and setting.get('mode') != 'by-agent':
+            return self._own_party_refusal(names, assignee, author, project, True), setting
+        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        setting, decision = self.service.by_agent_approval(project, agent_id, author, assignee, names)
+        if decision.allowed:
+            return None, dict(setting, basis=decision.basis)
+        if decision.refusal in ('strict', 'no-grant'):
+            # ``no-grant`` cannot be met here today: the route only asks for an agent whose credential
+            # holds ``approve``, which only an effective grant gives (kittrial-5bb.560).
             return self._own_party_refusal(names, assignee, author, project, True), setting
         own, shared_name, held, _ = self.OWN_PARTY_AGENT
-        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
-        basis = None
-        for target, is_author in ((author, True), (assignee, False)):
-            if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
-                continue
-            # The basis is the DELIVERING author's whenever the author is of the approver's party; the assignee
-            # decides it only when the author is independent (kittrial-5bb.515 r2: the author comes first, so the
-            # first basis found stands).
-            if self.service.other_agent_of_same_person(agent_id, target):
-                basis = basis or 'agent'
-                continue
-            if self.service.worker_credential_of_same_person(agent_id, target, project):
-                basis = basis or 'worker-credential'
-                continue
-            head = target.split('/', 1)[0]
-            if agent_id and head.casefold() == agent_id.casefold():
-                return (self.SAME_AGENT[0 if is_author else 1]
-                        + (self.SUB_WORKER_NEXT if '/' in target else self.SAME_AGENT_NEXT)
-                        + self.BY_AGENT_NEXT), setting
-            if not is_author:
-                return held + self.BY_AGENT_NEXT, setting
-            if len(self.service.actor_parties(target, project, True)) > 1:
-                return shared_name % target + self.SHARED_NAME_NEXT + self.BY_AGENT_NEXT, setting
-            if self._bare_account_id_of(agent_id, target):
-                return self.ACCOUNT_ID_AUTHOR + self.BY_AGENT_NEXT, setting
-            return own + self.BY_AGENT_NEXT, setting
-        return None, dict(setting, basis=basis)
+        target = decision.target
+        if decision.refusal == 'same-agent':
+            return (self.SAME_AGENT[0 if decision.role == 'author' else 1]
+                    + (self.SUB_WORKER_NEXT if decision.sub_worker else self.SAME_AGENT_NEXT)
+                    + self.BY_AGENT_NEXT), setting
+        if decision.refusal == 'held-assignee':
+            return held + self.BY_AGENT_NEXT, setting
+        if decision.refusal == 'shared-name':
+            return shared_name % target + self.SHARED_NAME_NEXT + self.BY_AGENT_NEXT, setting
+        if decision.refusal == 'account-id':
+            return self.ACCOUNT_ID_AUTHOR + self.BY_AGENT_NEXT, setting
+        return own + self.BY_AGENT_NEXT, setting
 
     def _bare_account_id_of(self, agent_id, name):
-        """Whether ``name`` is exactly the account id of the person who owns ``agent_id``."""
+        """Whether ``name`` is exactly the account id of the person who owns ``agent_id``.
+
+        Candidate 1112a: the label :meth:`_approval_permission` (kittrial-5bb.518) reads. The decision itself
+        moved to :func:`http_authority._bare_account_id_of` (kittrial-5bb.560); this reads that one function.
+        """
+        import http_authority
         with self.service.store.lock:
-            agents = self.service.state.get('agents')
-            mine = agents.get(agent_id) if isinstance(agents, dict) else None
-            return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
+            return http_authority._bare_account_id_of(self.service.state, agent_id, name)
 
     @staticmethod
     def _refuse_caller_approval_basis(payload):
@@ -11454,7 +11457,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
                 continue
             parties = [row.get('assignee'), row.get('contribution_author')]
-            same_person = by_agent and self._another_agent_only(agent_id, [actor], parties, project_id)
+            same_person = by_agent and self._another_agent_only(agent_id, [actor], row.get('assignee'),
+                                                                row.get('contribution_author'), project_id)
             if not same_person and not self._independent([actor], parties, project_id):
                 continue
             recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
