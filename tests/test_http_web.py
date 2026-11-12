@@ -2415,6 +2415,13 @@ console.log(JSON.stringify({
             'vscodeScreenFourth',
             'vscodeScreenHasFolderAndCommand',
             'workerPreselected',
+            # kittrial-5bb.545 (website part): the proxy line before Set up on the Bridge path.
+            'bridgeNoProxyLineBeforeSetUp',
+            'noProxyLineAbsentOffTheBridgePath',
+            'noProxyLineNamesTheHostOfThisPage',
+            'noProxySentencePinned',
+            # kittrial-5bb.550 r2 (review S2): created with a configured public address, macOS chosen.
+            'noProxyLineNamesThisPagesHostOnCreateWithAConfiguredAddress',
             # kittrial-5bb.387: an agent with an effective coordinator grant.
             'coordinatorHasNoRoleChoice',
             'coordinatorRoleKeepsGrantLocation',
