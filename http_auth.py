@@ -4719,6 +4719,53 @@ class Service:
                     change.save()
         return self.agent_approval(project_id)
 
+    def auto_nudge(self, project_id):
+        """The project's automatic lane nudge setting (kittrial-5bb.514): ``{'enabled', 'set_by', 'set_at', 'set_by_display_name'}``.
+
+        Absent is the default (``False``, nobody set it). A record of any other shape reads as off
+        (``enabled: False``) with ``damaged: True``: a damaged setting never types into a lane.
+        """
+        with self.store.lock:
+            stored = self.state.get('auto_nudge')
+            entry = stored.get(project_id) if isinstance(stored, dict) else None
+            if 'auto_nudge' not in self.state or (isinstance(stored, dict) and project_id not in stored):
+                return {'enabled': False, 'set_by': None, 'set_at': None, 'set_by_display_name': None}
+            if not isinstance(entry, dict) or type(entry.get('enabled')) is not bool:
+                return {'enabled': False, 'set_by': None, 'set_at': None, 'set_by_display_name': None,
+                        'damaged': True}
+            set_by = entry.get('set_by') if isinstance(entry.get('set_by'), str) else None
+            return {'enabled': entry['enabled'], 'set_by': set_by,
+                    'set_at': entry.get('set_at') if isinstance(entry.get('set_at'), str) else None,
+                    'set_by_display_name': self._owner_name(set_by) if set_by else None}
+
+    def set_auto_nudge(self, principal, project_id, enabled):
+        """Record the project's automatic lane nudge setting (kittrial-5bb.514): who set it and when.
+
+        The route holds the ``CAP_PROJECT_ADMIN`` boundary (an owner of the project or a superuser);
+        a credential never changes it, so an agent cannot enable automatic nudging.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change automatic lane nudges')
+        if type(enabled) is not bool:
+            raise invalid('auto_nudge must be true or false')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if 'auto_nudge' in self.state and not isinstance(self.state.get('auto_nudge'), dict):
+                raise HttpError(503, 'unavailable',
+                                'The record of automatic-nudge settings in the service state is damaged (it is not '
+                                'an object), so nothing was written. An operator must repair the state file')
+            if not enabled:
+                self.state.setdefault('auto_nudge', {})[project_id] = {
+                    'enabled': False, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
+                self._save_narrowing()
+            else:
+                with self._widening() as change:
+                    change.remember(self.state, 'auto_nudge')
+                    self.state.setdefault('auto_nudge', {})[project_id] = {
+                        'enabled': True, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
+                    change.save()
+        return self.auto_nudge(project_id)
+
     def other_agent_of_same_person(self, agent_id, name):
         """Whether ``name`` was written by ANOTHER personal agent of the account that owns ``agent_id``.
 
@@ -5052,6 +5099,127 @@ class Service:
             for gone in [key for key in beats if key not in registry]:
                 del beats[gone]
         return dict(answer), True
+
+    def carrier_auto_nudge_projects(self, principal):
+        """Projects the carrier's agent is granted where ``auto_nudge`` is on and this carrier is fresh."""
+        with self.store.lock:
+            agent = self._carrier_agent(principal)
+            now = self._now()
+            entry = self._carrier_registry().get(agent['id'])
+            if not isinstance(entry, dict):
+                return []
+            seen = entry.get('seen_ts')
+            if type(seen) not in (int, float) or not (0 <= now - seen <= nudges.CARRIER_WINDOW):
+                return []
+            reached = entry.get('lanes') if isinstance(entry.get('lanes'), list) else []
+            if not reached:
+                return []
+            projects = []
+            for project_id in agent.get('projects') or []:
+                if (project_id in self.state['projects']
+                        and account_in_project(self.state, principal.user_id, project_id)
+                        and self.auto_nudge(project_id)['enabled'] is True):
+                    projects.append(project_id)
+            return projects
+
+    def evaluate_auto_nudges(self, principal, project_id, lanes_payload, request_id=None):
+        """Create eligible automatic ``resume`` nudges for the lanes this carrier reaches in ``project_id``."""
+        import lanes as lanes_mod
+        with self.store.lock:
+            agent = self._carrier_agent(principal)
+            if (project_id not in (agent.get('projects') or [])
+                    or project_id not in self.state['projects']
+                    or not account_in_project(self.state, principal.user_id, project_id)
+                    or not self.auto_nudge(project_id)['enabled']):
+                return []
+            now = self._now()
+            entry = self._carrier_registry().get(agent['id'])
+            if not isinstance(entry, dict):
+                return []
+            seen = entry.get('seen_ts')
+            if type(seen) not in (int, float) or not (0 <= now - seen <= nudges.CARRIER_WINDOW):
+                return []
+            reached = set(entry.get('lanes') if isinstance(entry.get('lanes'), list) else ())
+            if not reached:
+                return []
+            records = self._nudge_records(project_id)
+            changed = nudges.settle(records, now, now_iso, self._carried)
+            all_records = [
+                record
+                for project_records in (self.state.get('nudges') or {}).values()
+                if isinstance(project_records, list)
+                for record in project_records
+                if isinstance(record, dict)
+            ]
+            threshold_minutes = lanes_payload.get('idle_threshold_minutes') if isinstance(lanes_payload, dict) else None
+            threshold_seconds = (threshold_minutes if isinstance(threshold_minutes, int) and threshold_minutes > 0 else 15) * 60
+            created = []
+            for row in (lanes_payload.get('items') if isinstance(lanes_payload, dict) else None) or []:
+                if not isinstance(row, dict):
+                    continue
+                actor = row.get('actor') or row.get('lane')
+                if not isinstance(actor, str) or actor not in reached:
+                    continue
+                if full_actor_parties(self.state, actor, project_id) != {principal.user_id}:
+                    continue
+                if lanes_mod.holder_retired(actor, project=project_id, authority_state=self.state):
+                    continue
+                if nudges.pending_for(records, actor, 'resume', now) is not None:
+                    continue
+                if not nudges.auto_allowed(all_records, actor, now):
+                    continue
+                eligible = nudges.eligible_auto_nudge_entry(row, threshold_seconds, records, actor, now)
+                if eligible is None:
+                    continue
+                fields = {'lane': actor, 'message': 'resume', 'reason': 'stalled-at-prompt', 'note': None}
+                record = nudges.new_record(
+                    project_id, fields, {'kind': 'auto', 'user_id': None, 'agent_id': None},
+                    None, now, now_iso,
+                    episode_task=eligible.get('task'),
+                    episode_write_at=eligible.get('holder_last_write_at'),
+                    episode_started_ts=now - eligible['holder_last_write_seconds'])
+                nudges.note_carrier(record, now)
+                target = self._nudge_records(project_id, create=True)
+                target.append(record)
+                records = target
+                all_records.append(record)
+                created.append(record)
+                self.audit(request_id, None, 'lanes.nudge.auto', 'committed',
+                           project_id=project_id, actor=actor,
+                           reason='resume stalled-at-prompt %s' % eligible.get('task'))
+            if created or changed:
+                self.store.save()
+            return created
+
+    def filter_coordinator_wait_lanes(self, project_id, lanes_payload):
+        """Read-only: apply automatic-nudge ``lane-quiet`` withholding from stored records and the board alone."""
+        with self.store.lock:
+            if not self.auto_nudge(project_id)['enabled'] or not isinstance(lanes_payload, dict):
+                return lanes_payload
+            now = self._now()
+            records = [
+                nudges.effective(record, now, now_iso, self._carried)
+                for record in self._nudge_records(project_id)
+                if isinstance(record, dict)
+            ]
+            all_records = [
+                record
+                for project_records in (self.state.get('nudges') or {}).values()
+                if isinstance(project_records, list)
+                for record in project_records
+                if isinstance(record, dict)
+            ]
+            actors = [
+                row.get('actor') or row.get('lane')
+                for row in (lanes_payload.get('items') or [])
+                if isinstance(row, dict)
+            ]
+            carried = self.carrier_seen_views(project_id, actors)
+            return nudges.withhold_auto_nudge_lanes(
+                lanes_payload, records, all_records, carried, now, now_iso,
+                users=self.state.get('users') or {},
+                agents=self.state.get('agents') or {},
+                carried_fn=self._carried)
 
     def carrier_nudges(self, principal):
         """The carrier's own open requests: ``{id, project, lane, message, message_set}``, nothing else."""

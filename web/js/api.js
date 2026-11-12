@@ -526,6 +526,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     setProjectClaiming: (pid, claiming) => mutate('PUT', `/v1/projects/${pid}/claiming`, { claiming }),
     // kittrial-5bb.438: how a coordinator agent is judged when it approves. An owner only.
     setAgentApproval: (pid, mode) => mutate('PUT', `/v1/projects/${pid}/agent-approval`, { agent_approval: mode }),
+    // kittrial-5bb.514: whether the project sends automatic resume nudges to idle lanes. An owner only.
+    setAutoNudge: (pid, enabled) => mutate('PUT', `/v1/projects/${pid}/auto-nudge`, { auto_nudge: enabled }),
     // Superuser only: the records this server will not serve, to confirm or archive.
     unconfirmedProjects: () => call('GET', '/v1/projects/unconfirmed'),
     confirmProject: (pid) => mutate('POST', `/v1/projects/${pid}/confirm`, {}),
