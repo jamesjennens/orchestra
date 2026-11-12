@@ -31,8 +31,7 @@
     "http_service.py::ApiHandler.invites_create",
     "http_service.py::ApiHandler.invites_revoke",
     "http_service.py::ApiHandler.invites_view",
-    "http_service.py::ApiHandler.invites_redeem",
-    "web/js/views/invites.js"
+    "http_service.py::ApiHandler.invites_redeem"
   ],
   "tests": [
     "tests/test_invites.py"
