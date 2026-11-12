@@ -96,7 +96,7 @@ export function invitePanel(ctx, project) {
         h('td', null, h('div', { class: 'title' }, item.display_name), h('div', { class: 'sub' }, '@' + item.username,
           item.agent ? ` · agent ${item.agent.name} in ${item.agent.project}` : '')),
         h('td', null, (item.projects || []).map((p) => p.name).join(', ')),
-        h('td', null, h('span', { class: 'chip ' + (item.status === 'pending' ? 'accent' : 'plain') }, STATUS_WORDS[item.status] || String(item.status))),
+        h('td', null, h('span', { class: 'chip ' + (item.status === 'pending' ? 'info' : 'plain') }, STATUS_WORDS[item.status] || String(item.status))),
         h('td', { class: 'hide-narrow small' },
           'Made by ', item.invited_by_name, ' ', time(item.created_at),
           item.status === 'used' ? [' · used ', time(item.used_at), ' by ', item.used_by_name || item.used_by, ' from ', item.used_from || 'an unknown address'] :
