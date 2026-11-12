@@ -1371,7 +1371,7 @@ class _RecordsScenarioMixin:
             planted = plant(text_for, owner_uid)
             r = accept('deleg.demoted2', r6, agent3['token'], 'planted', decision=planted)
             self.assertEqual(r.status, 403, r.data)
-            self.assertIn('no delegation is recorded', r.data['error']['message'].lower())
+            self.assertIn('unhonoured comment', r.data['error']['message'].lower())
 
     def run_self_acceptance_and_party_rules_suite(self):
         harness = self.harness

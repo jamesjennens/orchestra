@@ -970,6 +970,12 @@ RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: capability-', 'Kind: interface-', 'Kind: open-item-', 'Kind: item-resolution-',
                            'Kind: owner-answer-', 'Kind: coordinator-decision-', 'Kind: design-index-',
                            'Kind: design-verification-')
+# kittrial-5bb.469 item 2. Lookalikes of the delegation and attestation prefixes that carry no newline
+# (`Kind: delegation-v1` alone, `-vx`, `Kind: decision-attest-`) are refused on the raw write path
+# by reserved_match ONLY. They are deliberately NOT in RECORD_COMMENT_FAMILIES: that list also hides
+# matching comments from history (is_record_comment), and real delegation and attestation records
+# must stay visible as comments.
+RESERVED_LOOKALIKE_FAMILIES = ('Kind: delegation-', 'Kind: decision-attest-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
 SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3), ('capability-entry', 2)})
@@ -2176,6 +2182,11 @@ def reserved_match(body):
                 key = next((k for k in _RECORD_KIND_RESERVATIONS if ('Kind: %s-' % k).startswith(family)
                             or family.startswith('Kind: %s-' % k)), None)
                 kind, operation = _RECORD_KIND_RESERVATIONS[key]
+                return (family, kind, operation)
+        for family in RESERVED_LOOKALIKE_FAMILIES:
+            if view.startswith(family):
+                # Reported as the RESERVED entry of that family (its kind and operation text).
+                _, kind, operation = next(entry for entry in RESERVED if entry[0].startswith(family))
                 return (family, kind, operation)
     return None
 

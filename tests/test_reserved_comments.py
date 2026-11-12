@@ -982,6 +982,53 @@ class LookalikeReservedPrefixTests(unittest.TestCase):
                 check_raw_request(['comments', 'add', 'task-1', body, '--json'], {})
 
 
+class DelegationLookalikeTests(unittest.TestCase):
+    """kittrial-5bb.469 item 2: a no-newline lookalike of the delegation or attestation prefix is
+    refused on the raw path, while the real records stay visible as comments."""
+
+    LOOKALIKES = ('Kind: delegation-v1', 'Kind: delegation-vx', 'Kind: delegation-', 'Kind: delegation-v1x\n{}',
+                  'Kind: decision-attest-', 'Kind: decision-attest-v1', '\ufeffKind: delegation-v1',
+                  'Kind: delegation-v1\r\n{}')
+
+    def test_lookalikes_are_refused_by_every_raw_check_with_the_reserved_operation(self):
+        for body in self.LOOKALIKES:
+            with self.subTest(body=repr(body)):
+                match = reserved_match(body)
+                self.assertIsNotNone(match)
+                self.assertIn('delegat' if 'delegation' in body else 'attest', match[1])
+                with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                    check_comment_body(body, 'positional')
+                with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                    check_raw_request(['comments', 'add', 'task-1', body, '--json'], {})
+
+    def test_the_real_records_stay_visible_in_history(self):
+        import reserved_comments
+        for prefix in (reserved_comments.DELEGATION_PREFIX, reserved_comments.DECISION_ATTEST_PREFIX):
+            self.assertIsNotNone(reserved_match(prefix + '{}'))
+            self.assertFalse(reserved_comments.is_record_comment(prefix + '{}'), prefix)
+            self.assertFalse(reserved_comments.is_record_comment(prefix.rstrip('\n')), prefix)
+        for family in reserved_comments.RESERVED_LOOKALIKE_FAMILIES:
+            self.assertNotIn(family, reserved_comments.RECORD_COMMENT_FAMILIES)
+
+    def test_prose_mentioning_the_prefix_still_passes(self):
+        for body in ('We discussed Kind: delegation-v1 yesterday', 'delegation-v1', 'Kind: delegations'):
+            with self.subTest(body=body):
+                self.assertIsNone(reserved_match(body))
+                check_comment_body(body, 'positional')
+
+    def test_removing_the_reserved_delegation_label_is_refused_on_every_spelling(self):
+        # The label is reserved exactly (RESERVED_EXACT_LABELS), so a raw add, set or remove is refused
+        # and a retype cannot be undone by hiding the label.
+        for args in (['update', 'dec-1', '--remove-label', 'delegation'],
+                     ['update', 'dec-1', '--remove-label=delegation'],
+                     ['update', 'dec-1', '--add-label', 'delegation'],
+                     ['update', 'dec-1', '--set-labels', 'delegation'],
+                     ['create', '--title', 'x', '--labels', 'delegation']):
+            with self.subTest(args=str(args)):
+                self.assertEqual('delegation', reserved_label_in_args(args))
+        self.assertEqual('delegation', first_reserved_label(['decision', 'delegation']))
+
+
 class DepSubcommandShorthandTests(unittest.TestCase):
     """kittrial-5bb.30 P3: `bd dep` keyed its whole shorthand inventory to the
     parent (`-b`), so the legitimate subcommand short forms `dep add -t`,

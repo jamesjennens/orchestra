@@ -4579,6 +4579,17 @@ ungranted agents or worker credentials, or for the host route.
 - **Narrowing and revoking.** `action: narrow` names a strict subset of the scope in force;
   `action: revoke` ends the delegation. Either takes effect on the next acceptance. A second
   grant on the same decision is refused; record a new decision instead.
+- **Closing is not revoking.** Closing the decision issue does not end the delegation, and
+  reopening it does not bring one back (a contributor can change an issue's status): only
+  `revoke` ends it. The list shows each decision's `status`, and a closed decision still in force
+  carries the line "closing does not end a delegation: revoke it to end it".
+- **What the list shows.** Every decision with a delegation comment, honoured or not: a grant that
+  lost its journal entry is listed as not in force ("has an unhonoured comment"), so the owner
+  records a new decision. A decision retyped away from `decision` still reads as one while it
+  carries the reserved `delegation` label (only the delegation operation adds it, and a raw label
+  write or removal is refused); the list notes the current type. The label never grants anything.
+- **Comment floods.** Very many comments on a decision issue slow the reads that check it. A read
+  that times out refuses, so the delegation fails closed until the comments are fewer.
 - **Checked live at every acceptance**, under the write's lock, never cached: the decision exists
   in this project and is a decision issue; its one honoured grant was recorded by someone who is
   **still** a person owner of the project (or whose exact actor name is still on the operator
