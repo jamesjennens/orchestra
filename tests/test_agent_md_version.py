@@ -19,7 +19,9 @@ import test_coordinator_agent_md as md
 
 #: AGENT.md version -> sha256 of the four texts the page writes for the fixed payload below, in order
 #: (worker, worker with certificate, coordinator, coordinator with certificate), each ended by a NUL.
-PINS = {2: '01c340cc064af2134d2aa9128e6be666dbeead832ebef2a8a36a5a6807de3878'}
+#: Candidate 1112a: version 2 first ships with this candidate, so its pin is the text as integrated (with .521/.541,
+#: .550 and .559), not the text on .518's own base (01c340cc...), which was never on main.
+PINS = {2: '1eeed6d71b17d7e6fe6230e1aa52f8138da23118fe6964d1bb90a9af00c8acd1'}
 
 
 class VersionTests(md.CoordinatorGuideTests):
