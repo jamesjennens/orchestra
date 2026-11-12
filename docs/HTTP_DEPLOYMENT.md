@@ -4385,11 +4385,17 @@ creates one **worker** agent owned by it with its first credential, issued exact
 one. Everything is the web service's own state (`http_auth.Store`), so the same routes serve both
 backends; the code is `invites.py` and the routes in `http_service.py`.
 
+kittrial-5bb.581 adds a second kind: an invite for an account that **already exists**
+(`person: "existing"`), to add it to projects and, optionally, add an agent for it, whether or not it is
+already a member. See "Invites for an existing account" below. Everything said here about the switch,
+who may invite, the token and the one `404` holds for both kinds.
+
 **The switch.** `invites_enabled` in `deployment.private.json`, **off** unless it is `true`. It is read
 on every invite request, so turning it on or off needs no restart; a value that is not `true` or
 `false` reads as off with a warning in the service's log, and an unreadable file is the usual `503`.
-While it is off the create form is hidden and `POST /v1/invites`, `POST /v1/invites/view` and
-`POST /v1/invites/redeem` all answer `403` with the one sentence
+While it is off the create form is replaced by that sentence (an owner still sees the panel), and
+`POST /v1/invites`, `POST /v1/invites/view`, `POST /v1/invites/redeem` and `POST /v1/invites/accept` all
+answer `403` with the one sentence
 `Invite links are switched off on this installation. An operator turns them on with "invites_enabled": true in deployment.private.json.`
 Listing and withdrawing stay open, so an invite made while it was on can still be withdrawn. Switching
 off withdraws nothing: a pending link that has not expired works again once the switch is back on. If
@@ -4411,19 +4417,21 @@ owner is `403`; an archived project, or one the backend will not serve, is refus
 
 | Route | Who | What |
 | --- | --- | --- |
-| `GET /v1/invites` | a person's session | `enabled`, the caller's invites (a superuser: everyone's) with `status` `pending`, `used` (`used_by`, `used_at`, `used_from`), `expired` or `revoked`, and `projects` the caller may invite to |
-| `POST /v1/invites` | as above, switch on | `{display_name, username, projects, expires_hours?, agent?: {name, project, claim_limit?}}`; `201` with `token`, `path` (`/#/invite/TOKEN`), `link` (with `--public-url`) and the warning that the link is a key, **once**; an exact retry under the same `Idempotency-Key` answers `200` without the token |
+| `GET /v1/invites` | a person's session | `enabled`, the caller's invites (a superuser: everyone's) with `person`, `status` `pending`, `used` (`used_by`, `used_at`, `used_from`, and for an existing account `memberships`), `expired` or `revoked`, and `projects` the caller may invite to with `may_invite` (listed while the switch is off too) |
+| `POST /v1/invites` | as above, switch on | `{person?: "new", display_name, username, projects, expires_hours?, agent?: {name, project, claim_limit?, role?}}` or `{person: "existing", username, role?, projects, expires_hours?, agent?}`; `201` with `token`, `path` (`/#/invite/TOKEN`), `link` (with `--public-url`) and the warning that the link is a key, **once**; an exact retry under the same `Idempotency-Key` answers `200` without the token |
 | `POST /v1/invites/{id}/revoke` | its inviter or a superuser | withdraws a pending invite (anyone else: `404`) |
 | `POST /v1/invites/view` | anyone holding the token, switch on | `{token}`: who invites whom, the projects, the agent, the expiry and the password minimum |
-| `POST /v1/invites/redeem` | anyone holding the token, switch on | `{token, password}`; `201` with the account, the projects and, with an agent, the agent, its credential's secret and the set-up payload of New agent, **once** |
+| `POST /v1/invites/redeem` | anyone holding the token of a **new-person** invite, switch on | `{token, password}`; `201` with the account, the projects and, with an agent, the agent, its credential's secret and the set-up payload of New agent, **once** |
+| `POST /v1/invites/accept` | the **named existing account's own session** (CSRF, `Idempotency-Key`), switch on | `{token}`; `201` with the account, each project's `role` and `role_before` and, with an agent, the agent, its credential's secret and the set-up payload, **once**; an exact retry answers `200` without the secret |
 
 The username is checked as an account's is (2-64 characters of letters, digits, `. _ @ -`), and must not
 belong to an account or to another pending invite. The expiry is 72 hours unless `expires_hours` says
 1 to 168 (7 days). The agent takes a name (the New agent rule, and the secret-file clash rule against
 the new account's other agents), a project that is one of the invite's, and a claim limit (default 1);
-it gets the default scopes and the `worker` role. A `role` other than `worker`, or any `coordinator`,
-`grant`, `grants` or `scopes` field, is refused with one sentence: there is no coordinator grant in an
-invite.
+it gets the default scopes and the `worker` role, or `reviewer` when asked (kittrial-5bb.581). Any other
+`role`, or any `coordinator`, `grant`, `grants` or `scopes` field, is refused with one sentence: there is
+no coordinator grant in an invite. A new person always joins as a contributor; `role` on a new-person
+invite is `422`.
 
 **The token.** `secrets.token_urlsafe(32)` (32 random bytes); the state keeps only its SHA-256, as the
 key of `invites`, with the record of who invited whom, when, and the expiry on both clocks (as a reset
@@ -4450,11 +4458,70 @@ status on their list. If the redemption answer is lost the secret is gone with i
 and issues a new one from the agent's card. A restore of the HTTP state withdraws the pending invites in
 the backup, as it spends unused reset values.
 
-**On the page.** The project's People page shows "Invite someone" to a person who may invite to at least one
-project while the switch is on (and the list of their invites at any time). The link opens a signed-out
+**On the page.** The project's People page shows "Invite someone or add an agent" to a person who may invite to at least
+one project (with the off sentence while the switch is off), and the list of their invites at any time. The link opens a signed-out
 page (`#/invite/TOKEN`) that shows the invite, asks for the password twice, and then offers the agent's
 credential file, `.orchestra/agent.json` and `.orchestra/AGENT.md` (and the service certificate, when it
 has one) once.
+
+### Invites for an existing account
+
+kittrial-5bb.581. An owner (or a superuser) picks an existing account by username. The username check is
+the account lookup's: an unknown or disabled account is `404 No active account with that username`,
+counted and audited as `GET /v1/accounts/lookup` is. The invite names a membership `role`: `viewer`,
+`contributor` (the default) or `coordinator`, or `owner` from a superuser only (as `Service.set_member`).
+It may also name the same one agent as a new-person invite (`worker` or `reviewer`). The state keeps the
+account's id (`user_id`), never a password. These are refused when the invite is made:
+- yourself: `422`, "To add an agent for yourself use New agent on My agents; an invite is for someone else.";
+- a `display_name`: `422`;
+- an account that already has the named role or higher in every project, with no agent asked: `409`;
+- an agent name that shares the account's secret file with one of its agents: `409`, without naming that agent;
+- an account at its agent limit: `409`.
+
+**The view** of such a link (`POST /v1/invites/view`, anonymous) says what a new-person invite's says:
+the inviter, the username it is for, the projects, the role named, the agent and the expiry. It says
+nothing about the account itself, not even whether it is already a member anywhere, because the holder
+of a link may not be that person. `password_min_length` is `null`.
+
+**Accepting.** Only `POST /v1/invites/accept` serves this kind. It is not anonymous, it is CSRF-checked
+and it goes through the operation journal like every web write. The anonymous `POST /v1/invites/redeem`
+answers a token of this kind with the unknown-token `404` before it reads the password, so no invite
+can ever set the password of an existing account. These all get the same `404 invite_unusable`, counted
+against the address as a miss:
+- a session of any other account (the inviter and a superuser included);
+- a token of the new-person kind;
+- an unknown, used, expired or withdrawn token.
+
+An agent or worker credential is `403` before the token is read. In one transaction under the state lock
+(`Service._widening`), accepting does three things:
+- **adds** each membership the account lacks, and **raises** one it holds below the named role. One at
+  or above it is **kept**: nothing is ever lowered, and an owner is never touched;
+- makes the agent under the account with its first credential, as New agent does (`created_by` is the
+  inviter);
+- marks the invite used, with `memberships` (`{project: {before, after}}`).
+
+The inviter's right is judged again from present state:
+- every project needs `_holds` and must still be served;
+- an `owner` role needs the inviter still a superuser.
+
+Either failing is `409 invite_stale`. An agent name or the agent limit reached since then is `409`, with
+nothing changed. Any refusal or failure, a failed save included, takes all of it back. Each use writes
+`invites.redeemed` into every named project's audit with `existing_user` (a new-person redeem says
+`new_user`), `role_before` and `role_after`. The secret reaches only the accepting person, in that one
+answer; the inviter's list shows the status and the memberships, never a secret.
+
+**On the page.** The panel "Invite someone or add an agent" is on the project's **People** page. The
+project overview and People show an action with that name to a person who may invite (an owner or a
+superuser; the server still decides). While the switch is off, that person sees the panel with the off
+sentence. The link opens the same `#/invite/TOKEN` page:
+- signed out, it asks the named person to sign in (the ordinary `POST /v1/sessions`) and then accepts;
+- signed in as that person, it offers Accept;
+- signed in as anyone else, it says the invite is for another account.
+
+After accepting, it says what was added or kept in each project and offers the agent's files once.
+
+**Upgrades.** Every API answer carries `X-Orchestra-Build`, the build id `/healthz` already shows. An open
+page that sees it change offers "Orchestra was upgraded. Reload."
 
 ## Files attached to a task over HTTP
 
