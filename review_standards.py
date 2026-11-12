@@ -54,6 +54,11 @@ STAGED_TTL_SECONDS = 24 * 3600
 
 MAX_FILE_BYTES = 512 * 1024
 MAX_COMMIT_OBSERVATION_BYTES = 4 * 1024 * 1024
+MAX_COMMIT_OBSERVATION_FILE_BYTES = 8 * 1024 * 1024
+COMMIT_OBSERVATIONS_PER_PARTY_MAX_BYTES = 512 * 1024
+COMMIT_FAIL_ONLY_ENTRY_MAX_BYTES = 16 * 1024
+COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX = 8
+COMMIT_FAIL_ALLOWANCE_TOTAL_MAX = 256
 MAX_BLOB_BYTES = 10 * 1024 * 1024
 BINARY_SNIFF_BYTES = 8192
 NOTIFICATIONS_MAX = 500
@@ -188,6 +193,10 @@ class StandardsDamagedError(ValueError):
 
 class BundleLockTimeoutError(RuntimeError):
     """Raised when the installation-wide bundle fetch lock wait times out."""
+
+
+class SignoffCommitError(RuntimeError):
+    """Raised post-approval when finalizing a committed sign-off cannot complete safely."""
 
 
 # -- Verbatim pinned refusal sentences (#1..#24) ------------------------------
@@ -456,6 +465,21 @@ def refusal_commit_observation_size_cap(commit, limit):
     )
 
 
+def refusal_commit_observation_party_bytes_cap(commit, limit):
+    return (
+        "Commit standards observation refused for %s: recorder's party would exceed the "
+        "per-party %d-byte observation budget on this commit." % (commit, limit)
+    )
+
+
+def refusal_commit_fail_allowance_cap(commit, limit):
+    return (
+        "Commit standards observation refused for %s: recorder's party has reached the "
+        "per-party reserve of %d compact failing CI observations on this commit."
+        % (commit, limit)
+    )
+
+
 # -- Time & Digest Helpers ----------------------------------------------------
 
 def utc_now_iso(now=None):
@@ -565,28 +589,73 @@ def _read_json_file(file_path, label, *, limit=MAX_FILE_BYTES):
     return data
 
 
-def _signoff_staged_filename(contribution_id, operation_id):
+def _signoff_filename(
+    contribution_id=None,
+    operation_id=None,
+    *,
+    stage='committed',
+    parse_name=None,
+    staged_payload=None,
+):
+    """Produce or parse a sign-off filename for ``(contribution_id, operation_id)``.
+
+    Inline names (``<= 200`` chars) use ``<cid>.<stage>.<op_id>.json``. Longer names use
+    ``<cid[:64]>.<stage>._sha256-<24hex>.json``; the leading ``_`` on ``_sha256-`` is
+    disjoint from every valid ``identity()`` (which starts with ``[A-Za-z0-9]``), and one
+    function both emits and parses names so ``reconcile_or_clean_staged`` cannot drift.
+    """
+    if stage not in ('staged', 'committed'):
+        raise ValueError('Invalid sign-off filename stage: %r' % (stage,))
+    marker = '.%s.' % stage
+    if parse_name is not None:
+        if (
+            not isinstance(parse_name, str)
+            or not parse_name.endswith('.json')
+            or marker not in parse_name
+        ):
+            return None
+        stem = parse_name[:-5]
+        cid_part, _, op_part = stem.partition(marker)
+        if not cid_part or not op_part:
+            return None
+        if op_part.startswith('_sha256-'):
+            if not isinstance(staged_payload, dict):
+                return ('hashed_unverified', None, None)
+            cid = str(staged_payload.get('contribution_id') or '')
+            op_id = str(staged_payload.get('operation_id') or '')
+            try:
+                expected = _signoff_filename(cid, op_id, stage=stage)
+            except ValueError:
+                return ('hashed_invalid', None, None)
+            if expected != parse_name:
+                return ('hashed_invalid', None, None)
+            return ('ok', cid, op_id)
+        try:
+            identity(cid_part)
+            identity(op_part)
+        except ValueError:
+            return None
+        if _signoff_filename(cid_part, op_part, stage=stage) != parse_name:
+            return None
+        return ('ok', cid_part, op_part)
+
     cid = str(contribution_id)
     op_id = str(operation_id)
     identity(cid)
     identity(op_id)
-    name = '%s.staged.%s.json' % (cid, op_id)
+    name = '%s%s%s.json' % (cid, marker, op_id)
     if len(name) <= 200:
         return name
     digest = hashlib.sha256(('%s\0%s' % (cid, op_id)).encode('utf-8')).hexdigest()[:24]
-    return '%s.staged.sha256-%s.json' % (cid[:64], digest)
+    return '%s%s_sha256-%s.json' % (cid[:64], marker, digest)
+
+
+def _signoff_staged_filename(contribution_id, operation_id):
+    return _signoff_filename(contribution_id, operation_id, stage='staged')
 
 
 def _signoff_committed_filename(contribution_id, operation_id):
-    cid = str(contribution_id)
-    op_id = str(operation_id)
-    identity(cid)
-    identity(op_id)
-    name = '%s.committed.%s.json' % (cid, op_id)
-    if len(name) <= 200:
-        return name
-    digest = hashlib.sha256(('%s\0%s' % (cid, op_id)).encode('utf-8')).hexdigest()[:24]
-    return '%s.committed.sha256-%s.json' % (cid[:64], digest)
+    return _signoff_filename(contribution_id, operation_id, stage='committed')
 
 
 def _atomic_write_json(dir_path, filename, payload):
@@ -871,7 +940,7 @@ class HostStandardsStore:
         if _lstat_or_none(path) is None:
             return None
         return _read_json_file(
-            path, 'commits/%s.json' % commit.lower(), limit=MAX_COMMIT_OBSERVATION_BYTES
+            path, 'commits/%s.json' % commit.lower(), limit=MAX_COMMIT_OBSERVATION_FILE_BYTES
         )
 
     def write_commit_observation(self, commit, obs_obj):
@@ -968,15 +1037,30 @@ class HostStandardsStore:
             self._raise_damaged_subdir(exc)
 
     def commit_signoff(self, contribution_id, operation_id, final_obj):
-        committed_name = _signoff_committed_filename(contribution_id, operation_id)
-        staged_name = _signoff_staged_filename(contribution_id, operation_id)
+        cid = str(contribution_id)
+        op_id = str(operation_id)
+        committed_name = _signoff_committed_filename(cid, op_id)
+        staged_name = _signoff_staged_filename(cid, op_id)
         try:
             so_dir = self._ensure_subdir('signoffs')
-            if _lstat_or_none(so_dir / committed_name) is None:
+            committed_path = so_dir / committed_name
+            if _lstat_or_none(committed_path) is not None:
+                existing = _read_json_file(committed_path, 'signoffs/%s' % committed_name)
+                if (
+                    not isinstance(existing, dict)
+                    or str(existing.get('contribution_id') or '') != cid
+                    or str(existing.get('operation_id') or '') != op_id
+                ):
+                    raise StandardsDamagedError(
+                        'signoffs/%s does not match (%s, %s)' % (committed_name, cid, op_id)
+                    )
+            else:
                 _atomic_write_json(so_dir, committed_name, final_obj)
             _safe_unlink(so_dir, staged_name)
         except (StandardsDamagedError, ValueError, OSError) as exc:
-            self._raise_damaged_subdir(exc)
+            raise SignoffCommitError(
+                'Cannot finalize committed sign-off in project %s (%s)' % (self.project_id, exc)
+            ) from None
 
     def read_signoff(self, contribution_id, approve_operation_id=None):
         try:
@@ -1010,7 +1094,7 @@ class HostStandardsStore:
                     ):
                         return so
                 except StandardsDamagedError:
-                    return None
+                    pass
             staged_path = so_dir / staged_name
             if _lstat_or_none(staged_path) is not None:
                 try:
@@ -1022,7 +1106,7 @@ class HostStandardsStore:
                     ):
                         return so
                 except StandardsDamagedError:
-                    return None
+                    pass
             legacy_path = so_dir / ('%s.json' % cid)
             if _lstat_or_none(legacy_path) is not None:
                 try:
@@ -1091,28 +1175,14 @@ class HostStandardsStore:
                 staged = _read_json_file(so_dir / name, 'signoffs/%s' % name)
             except StandardsDamagedError:
                 staged = None
-            if name.startswith('sha256-') and name.endswith('.staged.json'):
-                cid = str((staged or {}).get('contribution_id') or '')
-                op_id = str((staged or {}).get('operation_id') or '')
-                try:
-                    identity(cid)
-                    identity(op_id)
-                except ValueError:
-                    if now_val - st.st_mtime >= STAGED_TTL_SECONDS:
-                        _safe_unlink(so_dir, name)
-                    continue
-                if _signoff_staged_filename(cid, op_id) != name:
-                    if now_val - st.st_mtime >= STAGED_TTL_SECONDS:
-                        _safe_unlink(so_dir, name)
-                    continue
-            else:
-                stem = name[:-5]
-                cid, _, op_id = stem.partition('.staged.')
-                try:
-                    identity(cid)
-                    identity(op_id)
-                except ValueError:
-                    continue
+            parsed = _signoff_filename(stage='staged', parse_name=name, staged_payload=staged)
+            if parsed is None:
+                continue
+            pstatus, cid, op_id = parsed
+            if pstatus != 'ok':
+                if now_val - st.st_mtime >= STAGED_TTL_SECONDS:
+                    _safe_unlink(so_dir, name)
+                continue
             matched = approve_ops.get(op_id)
             if matched is not None and matched[0] == cid and isinstance(staged, dict):
                 try:
@@ -1120,7 +1190,7 @@ class HostStandardsStore:
                     self.commit_signoff(cid, op_id, promoted)
                     if _lstat_or_none(so_dir / name) is not None:
                         _safe_unlink(so_dir, name)
-                except (StandardsDamagedError, StandardsRefusal, OSError):
+                except (StandardsDamagedError, StandardsRefusal, SignoffCommitError, OSError):
                     pass
             elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in approve_ops:
                 _safe_unlink(so_dir, name)
@@ -1470,14 +1540,30 @@ class DictStandardsStore:
         )
 
     def commit_signoff(self, contribution_id, operation_id, final_obj):
-        identity(str(contribution_id))
-        identity(str(operation_id))
+        cid = str(contribution_id)
+        op_id = str(operation_id)
+        identity(cid)
+        identity(op_id)
         bucket = self._bucket(write=True)
-        key = '%s:%s' % (contribution_id, operation_id)
+        key = '%s:%s' % (cid, op_id)
         so_map = bucket.setdefault('signoffs', {})
-        if key not in so_map:
+        if not isinstance(so_map, dict):
+            raise SignoffCommitError('signoffs store in project %s is not a mapping' % self.project_id)
+        if key in so_map:
+            existing = so_map[key]
+            if (
+                not isinstance(existing, dict)
+                or str(existing.get('contribution_id') or '') != cid
+                or str(existing.get('operation_id') or '') != op_id
+            ):
+                raise SignoffCommitError(
+                    'existing sign-off entry %s in project %s is invalid' % (key, self.project_id)
+                )
+        else:
             so_map[key] = parse_json(canonical_bytes(final_obj).decode('utf-8'))
-        (bucket.get('signoffs_staged') or {}).pop(key, None)
+        staged_map = bucket.get('signoffs_staged')
+        if isinstance(staged_map, dict):
+            staged_map.pop(key, None)
 
     def read_signoff(self, contribution_id, approve_operation_id=None):
         bucket = self._bucket(write=False)
@@ -3548,9 +3634,10 @@ def parse_citation(citation, rule_id, commit):
 
 def collect_citation_paths_from_checks(checks):
     paths = []
+    seen = set()
     if not isinstance(checks, list):
         return paths
-    for chk in checks:
+    for chk in checks[:CHECKS_MAX]:
         if not isinstance(chk, dict):
             continue
         ev = chk.get('evidence')
@@ -3559,7 +3646,7 @@ def collect_citation_paths_from_checks(checks):
         cites = ev.get('citations')
         if not isinstance(cites, list):
             continue
-        for c in cites:
+        for c in cites[:CITATIONS_MAX]:
             if isinstance(c, str) and ':' in c:
                 m = CITATION_RE.fullmatch(c.strip())
                 if m:
@@ -3568,7 +3655,8 @@ def collect_citation_paths_from_checks(checks):
                         segs = p.split('/')
                         if not any(s in ('', '.', '..') for s in segs):
                             norm = '/'.join(segs)
-                            if norm not in paths:
+                            if norm not in seen:
+                                seen.add(norm)
                                 paths.append(norm)
     return paths
 
@@ -3906,6 +3994,8 @@ def _fold_commit_observations(commit_lower, observations, *, exclude_party=None)
                     'recorded_by_principal': rec_prin,
                     'recorded_at': rec_at,
                 }
+                if entry.get('reserved_fail'):
+                    sanitized['reserved_fail'] = True
                 kept_entries.append(sanitized)
                 latest_entry = sanitized
         else:
@@ -4040,6 +4130,23 @@ def filter_commit_observation_for_evaluation(
         _normalize_commit_observations_list(obs),
         exclude_party=_is_excluded,
     )
+
+
+def _is_compact_fail_only_entry(entry):
+    """True when ``entry`` carries only failing CI items (no file lists) and fits in 16 KiB."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get('changed_files') is not None or entry.get('tree_files') is not None:
+        return False
+    ci_list = entry.get('ci_checks')
+    if not isinstance(ci_list, list) or not ci_list:
+        return False
+    for item in ci_list:
+        if not isinstance(item, dict):
+            return False
+        if not ((item.get('exit_code') != 0) or (item.get('status') == 'fail')):
+            return False
+    return len(canonical_bytes(entry)) <= COMMIT_FAIL_ONLY_ENTRY_MAX_BYTES
 
 
 def record_commit_observation(
@@ -4192,35 +4299,36 @@ def record_commit_observation(
             status=409,
         ) from None
     prev_observations = _normalize_commit_observations_list(existing)
-    if len(prev_observations) >= COMMIT_OBSERVATIONS_MAX:
-        raise StandardsRefusal(
-            refusal_commit_observation_cap(commit_lower, COMMIT_OBSERVATIONS_MAX),
-            status=409,
-        )
     cur_keys = {
         author_key(x)
         for x in (actor, recorded_by_user_id, recorded_by_principal)
         if isinstance(x, str) and x
     }
     cur_keys.discard('')
-    party_count = 0
+    ordinary_prev = []
+    reserved_fail_prev = []
+    party_ordinary_count = 0
+    party_ordinary_bytes = 0
+    party_reserved_fail_count = 0
     for prev_entry in prev_observations:
         if not isinstance(prev_entry, dict):
             continue
-        if _entry_matches_party(prev_entry, same_party_checker) or any(
+        same_p = _entry_matches_party(prev_entry, same_party_checker) or any(
             isinstance(prev_entry.get(f), str)
             and prev_entry.get(f)
             and author_key(prev_entry[f]) in cur_keys
             for f in ('recorded_by', 'recorded_by_user_id', 'recorded_by_principal')
-        ):
-            party_count += 1
-    if party_count >= COMMIT_OBSERVATIONS_PER_RECORDER_MAX:
-        raise StandardsRefusal(
-            refusal_commit_observation_recorder_cap(
-                commit_lower, COMMIT_OBSERVATIONS_PER_RECORDER_MAX
-            ),
-            status=409,
         )
+        if prev_entry.get('reserved_fail'):
+            reserved_fail_prev.append(prev_entry)
+            if same_p:
+                party_reserved_fail_count += 1
+        else:
+            ordinary_prev.append(prev_entry)
+            if same_p:
+                party_ordinary_count += 1
+                party_ordinary_bytes += len(canonical_bytes(prev_entry))
+
     new_entry = {
         'changed_files': changed_files,
         'tree_files': tree_files,
@@ -4230,11 +4338,60 @@ def record_commit_observation(
         'recorded_by_principal': recorded_by_principal,
         'recorded_at': ts,
     }
-    observations = prev_observations + [new_entry]
-    obs = _fold_commit_observations(commit_lower, observations)
-    if len(canonical_bytes(obs)) + 1 > MAX_COMMIT_OBSERVATION_BYTES:
+
+    if (
+        _is_compact_fail_only_entry(new_entry)
+        and party_reserved_fail_count < COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX
+        and len(reserved_fail_prev) < COMMIT_FAIL_ALLOWANCE_TOTAL_MAX
+    ):
+        reserved_entry = dict(new_entry, reserved_fail=True)
+        obs = _fold_commit_observations(commit_lower, prev_observations + [reserved_entry])
+        if len(canonical_bytes(obs)) + 1 > MAX_COMMIT_OBSERVATION_FILE_BYTES:
+            raise StandardsRefusal(
+                refusal_commit_observation_size_cap(commit_lower, MAX_COMMIT_OBSERVATION_FILE_BYTES),
+                status=409,
+            )
+        store.write_commit_observation(commit_lower, obs)
+        return obs
+
+    ordinary_refusal = None
+    if len(ordinary_prev) >= COMMIT_OBSERVATIONS_MAX:
+        ordinary_refusal = refusal_commit_observation_cap(commit_lower, COMMIT_OBSERVATIONS_MAX)
+    elif party_ordinary_count >= COMMIT_OBSERVATIONS_PER_RECORDER_MAX:
+        ordinary_refusal = refusal_commit_observation_recorder_cap(
+            commit_lower, COMMIT_OBSERVATIONS_PER_RECORDER_MAX
+        )
+    elif (
+        party_ordinary_bytes + len(canonical_bytes(new_entry))
+        > COMMIT_OBSERVATIONS_PER_PARTY_MAX_BYTES
+    ):
+        ordinary_refusal = refusal_commit_observation_party_bytes_cap(
+            commit_lower, COMMIT_OBSERVATIONS_PER_PARTY_MAX_BYTES
+        )
+    else:
+        ordinary_obs = _fold_commit_observations(commit_lower, ordinary_prev + [new_entry])
+        if len(canonical_bytes(ordinary_obs)) + 1 > MAX_COMMIT_OBSERVATION_BYTES:
+            ordinary_refusal = refusal_commit_observation_size_cap(
+                commit_lower, MAX_COMMIT_OBSERVATION_BYTES
+            )
+
+    if ordinary_refusal is not None:
+        if (
+            _is_compact_fail_only_entry(new_entry)
+            and party_reserved_fail_count >= COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX
+        ):
+            raise StandardsRefusal(
+                refusal_commit_fail_allowance_cap(
+                    commit_lower, COMMIT_FAIL_ALLOWANCE_PER_PARTY_MAX
+                ),
+                status=409,
+            )
+        raise StandardsRefusal(ordinary_refusal, status=409)
+
+    obs = _fold_commit_observations(commit_lower, prev_observations + [new_entry])
+    if len(canonical_bytes(obs)) + 1 > MAX_COMMIT_OBSERVATION_FILE_BYTES:
         raise StandardsRefusal(
-            refusal_commit_observation_size_cap(commit_lower, MAX_COMMIT_OBSERVATION_BYTES),
+            refusal_commit_observation_size_cap(commit_lower, MAX_COMMIT_OBSERVATION_FILE_BYTES),
             status=409,
         )
     store.write_commit_observation(commit_lower, obs)
