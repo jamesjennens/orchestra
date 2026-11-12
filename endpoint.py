@@ -1706,7 +1706,10 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                 out,_=native.split(native.run(native.argv(root,path,actor,['show',tid,'--json','--include-comments']),environment(root)))
                 return out
             git_obs=review_standards.inspect_review_git_prelock(
-                root,path,name,args,request.get('attachments',{}),_show_single_prelock)
+                root,path,name,args,request.get('attachments',{}),_show_single_prelock,
+                actor=actor,operators=operators,
+                coordinator_writes=rules['coordinator_writes'],owners=owners,
+                verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name))
         def work_effect():
             read_context = {}
             if action in ('work', 'wait') and args[:1] != ['summary']:

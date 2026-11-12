@@ -678,7 +678,13 @@ class InProcessBackend:
     @staticmethod
     def _standards_error(err):
         status = getattr(err, 'status', 422) or 422
-        code = {403: 'forbidden', 404: 'not_found', 409: 'conflict', 422: 'invalid'}.get(status, 'invalid')
+        code = {
+            403: 'forbidden',
+            404: 'not_found',
+            409: 'conflict',
+            422: 'invalid',
+            503: 'unavailable',
+        }.get(status, 'invalid')
         failure = HttpError(status, code, str(err), 'StandardsRefusal: ' + str(err))
         failure.nothing_done = True
         return failure
@@ -796,29 +802,40 @@ class InProcessBackend:
                 and payload.get('operation') in ('approve', 'request-changes', 'recommend'):
             pre_contrib = None
             needed_paths = ()
+            skip_prelock_git = False
             with self.service.store.lock:
+                if authorize is not None:
+                    authorize()
+                if result_key is not None and self.service.has_result(result_key):
+                    WRITTEN.at = self.service.result_written_at(result_key) or False
+                    return self.service.result_get(result_key)
                 std_ro = self._standards_store(project_id, writable=False)
                 if std_ro.inspect_register_raw()[0] == 'active':
-                    records = self.state.get('contributions', {}).get(payload.get('task_id')) or []
-                    contribs = [r for r in records if r.get('kind') == 'contribution']
-                    if contribs:
-                        import review_standards
-                        last_c = contribs[-1]
-                        pre_contrib = {
-                            'comment_id': last_c['id'],
-                            'commit': last_c['commit'],
-                            'delivery': dict(last_c.get('delivery') or {}),
-                        }
-                        needed_checks = []
-                        if isinstance(payload.get('checks'), list):
-                            needed_checks.extend(payload['checks'])
-                        adopt_id = payload.get('adopt_recommendation')
-                        if isinstance(adopt_id, str) and adopt_id:
-                            chk_st, rec_b = std_ro.read_recommendation_checks(adopt_id)
-                            if chk_st == 'ok' and isinstance(rec_b, dict) and isinstance(rec_b.get('checks'), list):
-                                needed_checks.extend(rec_b['checks'])
-                        needed_paths = review_standards.collect_citation_paths_from_checks(needed_checks)
-            if pre_contrib is not None and (
+                    import review_standards
+                    if isinstance(payload.get('checks'), list) and len(payload['checks']) > review_standards.CHECKS_MAX:
+                        skip_prelock_git = True
+                    else:
+                        records = self.state.get('contributions', {}).get(payload.get('task_id')) or []
+                        contribs = [r for r in records if r.get('kind') == 'contribution']
+                        if contribs:
+                            last_c = contribs[-1]
+                            pre_contrib = {
+                                'comment_id': last_c['id'],
+                                'commit': last_c['commit'],
+                                'delivery': dict(last_c.get('delivery') or {}),
+                            }
+                            needed_checks = []
+                            if isinstance(payload.get('checks'), list):
+                                needed_checks.extend(payload['checks'])
+                            adopt_id = payload.get('adopt_recommendation')
+                            if isinstance(adopt_id, str) and adopt_id:
+                                chk_st, rec_b = std_ro.read_recommendation_checks(adopt_id)
+                                if chk_st == 'ok' and isinstance(rec_b, dict) and isinstance(rec_b.get('checks'), list):
+                                    needed_checks.extend(rec_b['checks'])
+                            needed_paths = review_standards.collect_citation_paths_from_checks(needed_checks)
+                            if payload.get('operation') in ('request-changes', 'recommend') and not needed_paths:
+                                skip_prelock_git = True
+            if not skip_prelock_git and pre_contrib is not None and (
                 pre_contrib['delivery'].get('kind') != 'bundle'
                 or self.get_delivery_roots()
                 or self.serving_repos.get(project_id)
@@ -1729,7 +1746,9 @@ class InProcessBackend:
                                 and prelock_git.get('contribution_id') == cid
                                 and prelock_git.get('commit') == ccommit else {}
                             )
-                            tree_avail = bool(eff_git.get('tree_available'))
+                            git_tree_avail = bool(eff_git.get('tree_available'))
+                            git_timed_out = bool(eff_git.get('inspect_timed_out') or eff_git.get('lock_timed_out'))
+                            tree_avail = git_tree_avail
                             tree_files = dict(eff_git.get('tree_files') or {})
                             tree_recorders = None
                             if not tree_avail and commit_obs and isinstance(commit_obs.get('tree_files'), dict):
@@ -1744,6 +1763,7 @@ class InProcessBackend:
                                 commit=ccommit, contribution_id=cid, valid_item_ids=frozenset(valid_ids),
                                 tree_available=tree_avail, tree_files=tree_files,
                                 commit_obs=commit_obs, tree_recorders=tree_recorders,
+                                git_timed_out=git_timed_out and not git_tree_avail,
                             )
                 except review_standards.StandardsRefusal as err:
                     raise self._standards_error(err) from None
@@ -3670,13 +3690,19 @@ class EndpointBackend:
             if code == 2:
                 if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str):
                     std_status = reply.get('standards_status')
-                    if std_status in (403, 404, 409, 422):
+                    if std_status in (403, 404, 409, 422, 503):
                         clean = detail
                         for prefix in ('StandardsRefusal: ', 'ValueError: '):
                             if clean.startswith(prefix):
                                 clean = clean[len(prefix):]
                                 break
-                        err_code = {403: 'forbidden', 404: 'not_found', 409: 'conflict', 422: 'invalid'}[std_status]
+                        err_code = {
+                            403: 'forbidden',
+                            404: 'not_found',
+                            409: 'conflict',
+                            422: 'invalid',
+                            503: 'unavailable',
+                        }[std_status]
                         failure = HttpError(std_status, err_code, clean, detail)
                         failure.nothing_done = True
                         raise failure

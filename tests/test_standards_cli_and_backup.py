@@ -48,6 +48,11 @@ def tearDownModule():
     http_auth._DUMMY_VERIFIER = None
 
 
+def _bundle_delivery_path(bpath):
+    s = str(bpath)
+    return 'server:' + s if s.startswith('/') else s
+
+
 class StandardsCliAndBackupTests(Harness):
     """Named CLI, sign-off file export, backup/restore-new, and legacy rollback tests."""
 
@@ -209,16 +214,26 @@ class StandardsCliAndBackupTests(Harness):
         commit_sha, bundle_sha = _make_bundle(repo, bpath, ref='HEAD')
         tid = self.create_task(owner_tok, pid, 'CLI Sign-off Task').data['id']
         self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (pid, tid), {}, token=bob_tok)
-        self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+        deliv_resp = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
             'schema_version': 1, 'operation': 'contribute', 'operation_id': 'op-cli-c1',
             'previous': None, 'supersedes': None, 'repository': 'https://example.invalid/r.git',
             'commit': commit_sha, 'base_commit': commit_sha,
-            'delivery': {'kind': 'bundle', 'path': 'server:' + str(bpath), 'sha256': bundle_sha},
+            'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath), 'sha256': bundle_sha},
             'summary': 'CLI bundle delivery.',
         }, token=bob_tok)
+        self.assertEqual(201, deliv_resp.status, deliv_resp.data)
         brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid), token=owner_tok).data
         cid = brief['review']['contribution']['id']
         prev = brief['review']['latest_id']
+
+        # Validate citation directly against the delivered git bundle BEFORE tree_files is recorded!
+        rec_resp = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'recommend', 'operation_id': 'op-cli-rec1',
+            'contribution': cid, 'commit': commit_sha, 'verdict': 'approve',
+            'summary': 'Verified citation directly from bundle.', 'items': [],
+            'checks': [{'rule_id': 'STD-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['added.py:1-3']}}],
+        }, token=cora_tok)
+        self.assertEqual(201, rec_resp.status, rec_resp.data)
 
         obs_file = self.tmp / 'commit_obs.json'
         obs_file.write_text(json.dumps({
@@ -525,7 +540,7 @@ class StandardsCliAndBackupTests(Harness):
             'task': tid, 'previous': None, 'supersedes': None,
             'repository': 'https://example.invalid/rb.git',
             'commit': commit_sha, 'base_commit': commit_sha,
-            'delivery': {'kind': 'bundle', 'path': 'server:' + str(bpath), 'sha256': bundle_sha},
+            'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath), 'sha256': bundle_sha},
             'summary': 'Delivered rollback test bundle.',
             'declared_tool': 'codex', 'declared_model': 'gpt-5',
         })

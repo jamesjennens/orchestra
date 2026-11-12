@@ -1614,7 +1614,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     if reg_status=='active':
         std_store.reconcile_or_clean_staged(rows)
 
-    from review_workflow import execute as review, project as rw_project, same_party
+    from review_workflow import execute as review, listed_operator_actor, project as rw_project, same_party
     owners_map=owners() if callable(owners) else (owners or {})
     std_ctx=standards_context or {}
     extra_same_party=std_ctx.get('same_party_with_actor')
@@ -1722,7 +1722,9 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                         active_person_checker=active_person_checker)
                     if reg['status']=='active':
                         git_obs=eff_git_obs or {}
-                        tree_avail=bool(git_obs.get('tree_available'))
+                        git_tree_avail=bool(git_obs.get('tree_available'))
+                        git_timed_out=bool(git_obs.get('inspect_timed_out') or git_obs.get('lock_timed_out'))
+                        tree_avail=git_tree_avail
                         tree_files=dict(git_obs.get('tree_files') or {})
                         tree_recorders=None
                         if not tree_avail and commit_obs and isinstance(commit_obs.get('tree_files'),dict):
@@ -1735,7 +1737,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                             std_extracted['checks'],effective_rules=reg['effective_rules'],
                             commit=ccommit,contribution_id=cid,valid_item_ids=valid_ids,
                             tree_available=tree_avail,tree_files=tree_files,
-                            commit_obs=commit_obs,tree_recorders=tree_recorders)
+                            commit_obs=commit_obs,tree_recorders=tree_recorders,
+                            git_timed_out=git_timed_out and not git_tree_avail)
         result=review(rows,task,actor,cleaned_payload,run, operators=operators, journal=path,
                       review_writes=review_writes, independent_approval=independent_approval,
                       coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
@@ -1751,6 +1754,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                         and review_standards.has_approve_operation_id(issue_row,cleaned_payload.get('contribution'),op_id))
         staged_signoff=None
         if (not already_landed
+                and not (coordinator_writes and not verified_web_authority
+                         and not listed_operator_actor(actor,operators,owners))
                 and review_standards._is_valid_identity(op_id)
                 and not rstate.get('pending_requests')
                 and not rstate.get('withdrawal')

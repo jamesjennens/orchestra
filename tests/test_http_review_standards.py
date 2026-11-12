@@ -89,6 +89,11 @@ def _make_bundle(repo_dir, out_path, ref='HEAD'):
     return commit, sha256
 
 
+def _bundle_delivery_path(bpath):
+    s = str(bpath)
+    return 'server:' + s if s.startswith('/') else s
+
+
 def _rule(
     rule_id='STD-1',
     owner='usr_0000000000000001',
@@ -426,7 +431,7 @@ class _HttpStandardsMixin:
             'repository': 'https://example.invalid/repo.git',
             'commit': commit,
             'base_commit': commit,
-            'delivery': {'kind': 'bundle', 'path': 'server:' + str(bpath), 'sha256': sha},
+            'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath), 'sha256': sha},
             'summary': 'Delivered bundle.',
         }
         if declared_tool:
@@ -1108,7 +1113,7 @@ class _HttpStandardsMixin:
             'schema_version': 1, 'operation': 'contribute', 'operation_id': 'op-m2b-deliv',
             'previous': None, 'supersedes': None, 'repository': 'https://example.invalid/r.git',
             'commit': commit2, 'base_commit': commit2,
-            'delivery': {'kind': 'bundle', 'path': 'server:' + str(bpath2), 'sha256': bsha2},
+            'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath2), 'sha256': bsha2},
             'summary': 'Deliver secret/k.py.',
         }, token=cora_bot)
         self.assertEqual(201, deliv2.status, deliv2.data)
@@ -1847,12 +1852,18 @@ class _HttpStandardsMixin:
         self.assertEqual('staged', so_staged.data['status'])
         self.assertEqual(op_s1b, so_staged.data['operation_id'])
 
-        # Remove obstruction and retry -> commits sign-off cleanly!
+        # Retrying WHILE STILL OBSTRUCTED must still answer 503 (pins O21 / X-R4-7)!
+        res_still_503 = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid4), app4_body,
+            token=oscar_tok, headers={'Idempotency-Key': 'idem-r4-s1b-still-obstructed'},
+        )
+        self.assertEqual(503, res_still_503.status, res_still_503.data)
+
+        # Remove ONLY the sign-off obstruction (leaving .http-operations* untouched — Opus NOTE-3)
+        # and retry with a fresh Idempotency-Key -> commits sign-off cleanly!
         if self.is_endpoint_backend:
             so_dir = self.canonical_root / 'projects' / pid / '.standards' / 'signoffs'
             (so_dir / rs._signoff_committed_filename(cid4, op_s1b)).rmdir()
-            for jf in (self.canonical_root / 'projects' / pid).glob('.http-operations*'):
-                jf.unlink()
         else:
             self.backend.state['standards'][pid]['signoffs'].pop('%s:%s' % (cid4, op_s1b), None)
 
@@ -1907,6 +1918,186 @@ class _HttpStandardsMixin:
             )
             self.assertEqual(201, r_ok5.status, r_ok5.data)
             self.assertEqual(op_156, r_ok5.data['sign_off']['operation_id'])
+
+    def test_r5_dotted_ids_fail_with_lists_prelock_bound_and_nonregular_signoffs_on_http(self):
+        """Pin r5 m1c-dotted-ids, s1c-fail-with-lists, and s2c-prelock-bound on both HTTP backends."""
+        pid = self.pid
+        _, alice_tok = self.create_person('alice_r5', 'contributor', pid)
+        _, oscar_tok = self.create_person('oscar_r5', 'coordinator', pid)
+        _, olga_tok = self.create_person('olga_r5', 'coordinator', pid)
+        _, ver_tok = self.create_person('ver_r5', 'coordinator', pid)
+
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0,
+            'reason': 'Create r5 HTTP register.',
+            'rules': [
+                _rule('JUDG-1', owner=self.owner_uid, severity='must'),
+                _rule(
+                    'STD-50', owner=self.owner_uid, severity='must',
+                    check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'},
+                ),
+            ],
+        }, token=self.owner_tok).status)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {
+            'mode': 'block', 'reason': 'Block gate for r5 HTTP',
+        }, token=self.owner_tok).status)
+
+        # 1) m1c-dotted-ids: approvals whose operation_id contains '.staged.', '.committed.', and trailing '.'
+        #    count in reviewer_must_not_applicable_total AND survive 25h reconcile_or_clean_staged!
+        tid1, cid1, prev1, commit1 = self.deliver_task_bundle(pid, alice_tok, {'app.py': 'x = 1\ny = 2\n'}, title='R5 Dotted 1')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=ver_tok).status)
+
+        op_dot1 = 'op.staged.first.approve.'
+        r_dot1 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': op_dot1,
+            'previous': prev1, 'contribution': cid1, 'summary': 'Approve with .staged. and trailing dot.',
+            'checks': [{'rule_id': 'JUDG-1', 'result': 'not_applicable', 'reason': 'No slice indexing.'}],
+        }, token=oscar_tok)
+        self.assertEqual(201, r_dot1.status, r_dot1.data)
+        self.assertEqual(1, r_dot1.data['sign_off']['reviewer_must_not_applicable_total'])
+
+        tid2, cid2, prev2, commit2 = self.deliver_task_bundle(pid, alice_tok, {'app2.py': 'x = 2\ny = 3\n'}, title='R5 Dotted 2')
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=ver_tok).status)
+
+        op_dot2 = 'op.committed.second.staged.'
+        if self.is_endpoint_backend:
+            with mock.patch.object(rs.HostStandardsStore, 'commit_signoff', side_effect=rs.SignoffCommitError('crash-dot')):
+                r_crash = self.request(
+                    'POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2),
+                    {
+                        'schema_version': 1, 'operation': 'approve', 'operation_id': op_dot2,
+                        'previous': prev2, 'contribution': cid2, 'summary': 'Crash on dotted op_id.',
+                        'checks': [{'rule_id': 'JUDG-1', 'result': 'not_applicable', 'reason': 'Constants only.'}],
+                    },
+                    token=oscar_tok, headers={'Idempotency-Key': 'idem-r5-dot-crash'},
+                )
+            self.assertEqual(503, r_crash.status, r_crash.data)
+            # Advance mtimes > 24h on ALL files in signoffs/ (including committed op_dot1!) and run reconcile:
+            so_dir = self.canonical_root / 'projects' / pid / '.standards' / 'signoffs'
+            old_t = time.time() - (26 * 3600)
+            for f in so_dir.iterdir():
+                if f.is_file():
+                    os.utime(str(f), (old_t, old_t))
+            # Trigger reconcile via a fresh task delivery (twice so >24h cleanup also sees promoted files):
+            self.deliver_task_bundle(pid, alice_tok, {'t1.py': 'a = 1\n'}, title='R5 Reconcile 1')
+            for f in so_dir.iterdir():
+                if f.is_file():
+                    os.utime(str(f), (old_t, old_t))
+            self.deliver_task_bundle(pid, alice_tok, {'t2.py': 'a = 2\n'}, title='R5 Reconcile 2')
+        else:
+            r_dot2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+                'schema_version': 1, 'operation': 'approve', 'operation_id': op_dot2,
+                'previous': prev2, 'contribution': cid2, 'summary': 'Approve with .committed. and .staged.',
+                'checks': [{'rule_id': 'JUDG-1', 'result': 'not_applicable', 'reason': 'Constants only.'}],
+            }, token=oscar_tok)
+            self.assertEqual(201, r_dot2.status, r_dot2.data)
+
+        # Both dotted sign-offs are 200 (never 404 after 25h!) and N/A total counts BOTH approvals (2)!
+        so_get1 = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid1), token=oscar_tok)
+        so_get2 = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid2), token=oscar_tok)
+        self.assertEqual(200, so_get1.status, so_get1.data)
+        self.assertEqual(200, so_get2.status, so_get2.data)
+        self.assertEqual(op_dot1, so_get1.data['operation_id'])
+        self.assertEqual(op_dot2, so_get2.data['operation_id'])
+        self.assertEqual(2, so_get1.data['reviewer_must_not_applicable_total'])
+        self.assertEqual(2, so_get2.data['reviewer_must_not_applicable_total'])
+
+        # Non-regular entry in signoffs/ on EndpointBackend keeps N/A tally == 2 and surfaces warning!
+        if self.is_endpoint_backend:
+            so_dir = self.canonical_root / 'projects' / pid / '.standards' / 'signoffs'
+            stray = so_dir / 'stray-dir'
+            stray.mkdir()
+            try:
+                so_w = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid1), token=oscar_tok)
+                self.assertEqual(200, so_w.status, so_w.data)
+                self.assertEqual(2, so_w.data['reviewer_must_not_applicable_total'])
+                self.assertTrue(any('signoffs/stray-dir' in w for w in (so_w.data.get('store_warnings') or [])))
+                std_view = self.request('GET', '/v1/projects/%s/standards' % pid, token=oscar_tok)
+                self.assertEqual(200, std_view.status, std_view.data)
+                self.assertTrue(
+                    any('signoffs/stray-dir' in w.get('message', '') for w in std_view.data.get('lint_warnings', []))
+                )
+            finally:
+                stray.rmdir()
+
+        # 2) s1c-fail-with-lists: documented inspect_local_repo_commit -> add CI results -> record-commit
+        #    when ordinary room is full stores failing CI items in reserve and answers stored + dropped!
+        repo3, commit3, bsha3, bpath3 = self.make_repo_and_bundle({'svc.py': 'def f():\n    return 7\n'}, name='r5-s1c')
+        cr3 = self.request('POST', '/v1/projects/%s/tasks' % pid, {'title': 'R5 S1c Flow'}, token=self.owner_tok)
+        tid3 = cr3.data['id']
+        self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (pid, tid3), {}, token=alice_tok)
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid3), {
+            'schema_version': 1, 'operation': 'contribute', 'operation_id': 'op-r5-s1c-c1',
+            'previous': None, 'supersedes': None, 'repository': 'https://example.invalid/r.git',
+            'commit': commit3, 'base_commit': commit3,
+            'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath3), 'sha256': bsha3},
+            'summary': 'Deliver svc.py.',
+        }, token=alice_tok).status)
+        br3 = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid3), token=self.owner_tok).data
+        cid3 = br3['review']['contribution']['id']
+        prev3 = br3['review']['latest_id']
+
+        # Exhaust ver_tok's 32 ordinary observation slots on commit3:
+        for idx in range(rs.COMMIT_OBSERVATIONS_PER_RECORDER_MAX):
+            r_fill = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit3), {
+                'ci_checks': [{'tool': 'lint', 'command': 'lint-%d' % idx, 'exit_code': 0}],
+            }, token=ver_tok)
+            self.assertEqual(201, r_fill.status, r_fill.data)
+
+        # Run documented inspect_local_repo_commit and add failing + passing CI checks in ONE request:
+        inspected3 = rs.inspect_local_repo_commit(repo3, commit3, target_ref='HEAD~0')
+        # Ensure non-empty changed_files + tree_files as produced by inspect_local_repo_commit on a branch:
+        inspected3['changed_files'] = ['svc.py']
+        inspected3['tree_files'] = {'svc.py': {'regular_text': True, 'line_count': 2}}
+        inspected3['ci_checks'] = [
+            {'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 1, 'summary': '1 failed'},
+            {'tool': 'ruff', 'command': 'ruff check', 'exit_code': 0},
+        ]
+        r_s1c = self.request(
+            'POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit3), inspected3, token=ver_tok
+        )
+        self.assertEqual(201, r_s1c.status, r_s1c.data)
+        self.assertTrue(r_s1c.data.get('stored_in_fail_reserve'))
+        self.assertEqual({'failing_ci_checks': 1, 'rule_ids': ['STD-50']}, r_s1c.data.get('stored'))
+        self.assertEqual(['changed_files', 'tree_files', 'passing_ci_checks'], r_s1c.data.get('dropped'))
+
+        # N/A over STD-50 in block mode is refused 422 because the failing CI item landed in reserve!
+        r_na3 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid3), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r5-s1c-na',
+            'previous': prev3, 'contribution': cid3, 'summary': 'Try N/A over s1c reserve fail.',
+            'checks': [
+                {'rule_id': 'JUDG-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['svc.py:1-2']}},
+                {'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Try N/A.'},
+            ],
+        }, token=olga_tok)
+        self.assertEqual(422, r_na3.status, r_na3.data)
+        self.assertIn(rs.refusal_na_over_mechanical_fail('STD-50', commit3), r_na3.data['error']['message'])
+
+        # 3) s2c-prelock-bound: slow-git fake refuses cleanly with 503 ('unavailable') under bounded time!
+        real_git = rs.run_confined_git
+
+        def _slow_git(args, **kw):
+            time.sleep(0.12)
+            return real_git(args, **kw)
+
+        t0 = time.monotonic()
+        with mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 0.25), \
+             mock.patch.object(rs, 'run_confined_git', side_effect=_slow_git):
+            r_slow = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid3), {
+                'schema_version': 1, 'operation': 'recommend', 'operation_id': 'op-r5-slow-rec',
+                'contribution': cid3, 'commit': commit3, 'verdict': 'approve',
+                'summary': 'Slow git citation check.', 'items': [],
+                'checks': [{'rule_id': 'JUDG-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['svc.py:1-2']}}],
+            }, token=olga_tok, headers={'Idempotency-Key': 'idem-r5-slow-git'})
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2.5)
+        self.assertEqual(503, r_slow.status, r_slow.data)
+        self.assertEqual('unavailable', r_slow.data['error']['code'])
+        self.assertIn(rs.refusal_git_inspection_timeout(commit3), r_slow.data['error']['message'])
 
 
 class HttpStandardsInProcessSuite(_HttpStandardsMixin, Harness):
