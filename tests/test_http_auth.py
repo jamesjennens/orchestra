@@ -113,9 +113,15 @@ class AuthCase(unittest.TestCase):
         self.assertTrue(verify_password(hash_password('12345678', minimum=8), '12345678'))
 
     def test_the_service_minimum_applies_to_a_change_and_an_explicit_one_character_minimum(self):
-        # The default is 12 since kittrial-5bb.501; an installation that sets 1 keeps it.
+        # The default is 5 since kittrial-5bb.547; an installation that sets 1 or 12 keeps it.
         admin = self.principal_for(self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
         created = self.service.create_user(admin, 'alex')
+        with self.assertRaises(HttpError) as caught:
+            self.service.change_password(admin, created['id'], None, 'abcd')
+        self.assertEqual(422, caught.exception.status)
+        self.assertEqual('Password must be 5-1024 characters', caught.exception.message)
+        self.service.change_password(admin, created['id'], None, 'abcde')
+        self.assertTrue(self.service.login('alex', 'abcde')['session_token'])
         one = Service(self.store, password_min_length=1)
         one.change_password(admin, created['id'], None, 'x')
         self.assertTrue(one.login('alex', 'x')['session_token'])
@@ -129,6 +135,11 @@ class AuthCase(unittest.TestCase):
         self.assertTrue(verify_password(self.service.state['users'][created['id']]['password'], 'x'))
         service.change_password(admin, created['id'], None, 'long-enough')
         self.assertTrue(self.service.login('alex', 'long-enough')['session_token'])
+        twelve = Service(self.store, password_min_length=12)
+        with self.assertRaises(HttpError) as caught:
+            twelve.change_password(admin, created['id'], None, 'x' * 11)
+        self.assertEqual(422, caught.exception.status)
+        self.assertEqual('Password must be 12-1024 characters', caught.exception.message)
 
     def test_a_whitespace_only_password_is_refused_on_every_surface(self):
         # kittrial-5bb.363 item s2 (coordinator decision): a password of nothing but spaces

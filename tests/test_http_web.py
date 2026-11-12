@@ -2516,6 +2516,8 @@ class PasswordPageCase(unittest.TestCase):
             text = (WEB / 'js' / name).read_text(encoding='utf-8')
             self.assertNotIn('At least 12', text, name)
             self.assertNotIn('length < 12', text, name)
+            self.assertNotIn('At least 5', text, name)
+            self.assertNotIn('length < 5', text, name)
 
     def _observed(self):
         if 'observed' not in _PASSWORD_FORMS_RUN:
@@ -2543,6 +2545,10 @@ class PasswordPageCase(unittest.TestCase):
             'accountWhitespace': 'A password cannot be only spaces.',
             'accountWhitespaceCalls': 0,
             'accountOneCharCalls': 1,
+            'accountHintFive': 'At least 5 characters.',
+            'accountFourChars': 'Use at least 5 characters.',
+            'accountFourCharsCalls': 0,
+            'accountFiveCharsCalls': 1,
             'accountHintRaised': 'At least 8 characters. A short sentence is easier to remember.',
             'accountTooShort': 'Use at least 8 characters.',
             'accountTooShortCalls': 0,
@@ -2555,6 +2561,10 @@ class PasswordPageCase(unittest.TestCase):
             'redeemMismatch': 'The two new passwords do not match.',
             'redeemMismatchCalls': 0,
             'redeemOneCharCalls': 1,
+            'redeemHintFive': 'At least 5 characters.',
+            'redeemFourChars': 'Use at least 5 characters.',
+            'redeemFourCharsCalls': 0,
+            'redeemFiveCharsCalls': 1,
             'redeemHintRaised': 'At least 8 characters.',
             'redeemTooShort': 'Use at least 8 characters.',
             'redeemTooShortCalls': 0,

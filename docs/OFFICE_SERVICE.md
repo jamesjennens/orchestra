@@ -803,8 +803,11 @@ not rewritten when configuration changes.
 ## Password minimum configuration
 
 The same private office JSON accepts `"password_min_length": 8` (a whole number from 1
-through 1024); omission keeps the default of 12 (kittrial-5bb.501; it was 1). It is passed as
-`--password-min-length`. 1024 stays the maximum as a bound on the work one request may ask
+through 1024); omission keeps the default of 5 (kittrial-5bb.547; it was 1 in
+kittrial-5bb.363 and 12 in kittrial-5bb.501). It is passed as `--password-min-length`.
+The external office `orc.sh` (maintained outside this kit by the coordinator) translates
+`PASSWORD_MIN_LENGTH` in `orc.conf` to this JSON key; when `office.json` omits the key,
+the office inherits the kit default of 5. 1024 stays the maximum as a bound on the work one request may ask
 for, not a policy about what a password should look like. The browser account page states
 the configured minimum; the signed-out reset page states no number and shows the server's
 own sentence. A password made only of whitespace is refused on the server with one

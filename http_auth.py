@@ -79,9 +79,10 @@ SCRYPT_DKLEN, SCRYPT_SALT = 32, 16
 #: MIN_PASSWORD (1) up; its default is DEFAULT_PASSWORD_MIN (below). The maximum is a bound on the work
 #: one request may ask for, not a policy about what a password should look like.
 MIN_PASSWORD, MAX_PASSWORD = 1, 1024
-#: The installation's password minimum when nothing sets one (kittrial-5bb.501). MIN_PASSWORD stays the
+#: The installation's password minimum when nothing sets one (kittrial-5bb.547, restoring the
+#: owner's decision; it was 1 in kittrial-5bb.363 and 12 in kittrial-5bb.501). MIN_PASSWORD stays the
 #: lowest value an installation may choose; a password already stored is never checked against either.
-DEFAULT_PASSWORD_MIN = 12
+DEFAULT_PASSWORD_MIN = 5
 
 # Provisional local lifecycle defaults from the reviewed design, all configurable
 # at the Service boundary.
@@ -425,8 +426,8 @@ def validate_password_min_length(value):
     """The installation's password minimum: a whole number from 1 to ``MAX_PASSWORD``.
 
     One rule for the web service flag and the office configuration, so neither clamps
-    a value to the bounds (kittrial-5bb.363). The default is ``DEFAULT_PASSWORD_MIN`` (12,
-    kittrial-5bb.501); an installation may still choose any value from 1.
+    a value to the bounds (kittrial-5bb.363). The default is ``DEFAULT_PASSWORD_MIN`` (5,
+    kittrial-5bb.547); an installation may still choose any value from 1.
     """
     if isinstance(value, bool) or not isinstance(value, int) or not MIN_PASSWORD <= value <= MAX_PASSWORD:
         raise ValueError('password_min_length must be a whole number from %d to %d'
@@ -1233,7 +1234,7 @@ class Service:
         self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
-        #: The installation's password minimum (kittrial-5bb.363), default 12 (kittrial-5bb.501). Every
+        #: The installation's password minimum (kittrial-5bb.363), default 5 (kittrial-5bb.547). Every
         #: writer goes through hash_password/redeem_reset with this value, so the rule
         #: cannot drift between the bootstrap prompt and the web forms.
         self.password_min_length = validate_password_min_length(password_min_length)
