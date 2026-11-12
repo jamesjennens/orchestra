@@ -381,6 +381,7 @@ out.testScreenChecksBeforeNext = screenOf(d) === 'test'
   && /Run the command above, then click Next again\./.test(attr(d, 'data-wizard-check-status', 'true')[0].textContent);
 d.wizard.show('files');
 const beside = attr(d, 'data-folder-beside', 'true')[0];
+out.olderBridgeGuideHasNoExtraWatch = !d.textContent.includes('## Waiting for work (without Orchestra Bridge)');
 out.folderPathBesideTheSaveButton = Boolean(beside) && beside.all((e) => e.getAttribute('data-action') === 'save-files').length === 1
   && beside.all((e) => e.getAttribute('data-folder-path') === 'C:\\Users\\olive\\kestrel').length === 1;
 d.wizard.show('vscode');
@@ -395,7 +396,7 @@ d = await openWizard();
 d.wizard.show('system');   // it resumed the stored screen; the choices are on the first one
 await windowsChoice(d, 'setup-bridge', 'no').dispatch('change');
 out.longPathWithoutCertificateRestricts = JSON.stringify(d.wizard.plan()) === JSON.stringify(
-  ['system', 'role', 'secret', 'restrict', 'test', 'files', 'vscode', 'resume']);
+  ['system', 'role', 'secret', 'restrict', 'rewrite', 'test', 'files', 'vscode', 'resume']);
 await windowsChoice(d, 'setup-os', 'windows').dispatch('change');
 await windowsChoice(d, 'setup-bridge', 'yes').dispatch('change');
 out.shortPathOnWindowsHasNoChmod = !d.wizard.plan().includes('restrict');
@@ -786,9 +787,54 @@ out.bridgeRoutePreselected = windowsChoice(d, 'setup-bridge', 'yes').checked ===
 await windowsChoice(d, 'setup-bridge', 'none').dispatch('change');
 out.noBridgePlanHasNoVsCodeScreen = !d.wizard.plan().includes('vscode') && d.wizard.plan().at(-1) === 'resume';
 out.noBridgeRouteStoredWithoutASecret = JSON.parse(store.get(WIZARD_STORAGE_KEY)).runs === 'none';
+out.noBridgeChoiceExplainsWatch = attr(d, 'data-no-bridge-watch', 'true')[0].hidden === false;
+d.wizard.show('files');
+out.noBridgeSavedGuideHasWatch = d.textContent.includes('## Waiting for work (without Orchestra Bridge)')
+  && d.textContent.includes('Never end the turn idle without a watch running');
+d.wizard.show('system');
+const proxyChoice = attr(d, 'data-noproxy-choice', 'true')[0];
+out.proxyChoiceIsOffByDefault = proxyChoice.checked !== true;
+proxyChoice.checked = true;
+await proxyChoice.dispatch('change');
+out.proxyChoiceStoredWithoutSecret = JSON.parse(store.get(WIZARD_STORAGE_KEY)).noproxy === true
+  && !store.get(WIZARD_STORAGE_KEY).includes(SECRET);
+d.wizard.show('rewrite');
+out.proxyChoiceReachesRewrite = commandText(d, 'rewrite command').includes('noproxy = "127.0.0.1"');
+out.proxyRewriteExplainsRemoval = attr(d, 'data-noproxy-rewrite-notice', 'true')[0].textContent === setupText.NOPROXY_REWRITE_NOTICE;
+d.wizard.show('files');
+out.proxyChoiceReachesGuide = d.textContent.includes('the noproxy option for the server you chose')
+  && !d.textContent.includes('It holds three lines:');
+d.wizard.show('system');
+const proxyOff = attr(d, 'data-noproxy-choice', 'true')[0];
+proxyOff.checked = false;
+await proxyOff.dispatch('change');
+d.wizard.show('rewrite');
+out.proxyOffStillOffersCleanup = !commandText(d, 'rewrite command').includes('noproxy = "127.0.0.1"')
+  && commandText(d, 'rewrite command').includes('noproxy');
+d.wizard.show('system');
+
 out.noBridgeWalkSkipsVsCode = !(await walk(d)).includes('vscode');
 out.noBridgeResumeSaysPasteIntoTheChat = /Paste this into the agent’s chat/.test(shownText(d)) && /never the secret/.test(shownText(d));
 out.olderRouteStillHasVsCode = setupText.screenPlan({ bridge: false, os: 'windows', vscode: true }).includes('vscode');
+// Invalid bridgeServer reaches the rewrite via its own metadata, while the payload
+// retains its valid configured server. Proxy validation must show an error, not throw.
+store.clear();
+const savedOrigin = location.origin;
+location.origin = 'not-a-server';
+d = await openWizard();
+await windowsChoice(d, 'setup-bridge', 'none').dispatch('change');
+const invalidProxy = attr(d, 'data-noproxy-choice', 'true')[0];
+invalidProxy.checked = true;
+await invalidProxy.dispatch('change');
+let rewriteErrorEscaped = false;
+try { d.wizard.show('rewrite'); } catch { rewriteErrorEscaped = true; }
+out.invalidProxyServerShowsRewriteError = !rewriteErrorEscaped && attr(d, 'data-rewrite-error', 'true').length === 1
+  && d.textContent.includes('A valid server address is required for proxy bypass')
+  && !commands(d).includes('rewrite command');
+d.wizard.show('system');
+out.invalidProxyServerKeepsNavigation = screenOf(d) === 'system';
+location.origin = savedOrigin;
+
 // An older stored state (only the boolean) maps to a route: true to Bridge, false to older.
 store.clear();
 store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'role', bridge: false, os: 'windows', role: 'worker' }));

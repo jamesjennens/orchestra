@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-worker-setup-watch-0001",
+  "key": "web.worker-setup-watch",
+  "name": "No-Bridge worker setup supplies a tracked watch and scoped curl proxy option",
+  "aliases": [
+    "agent setup worker wait",
+    "no bridge background watch",
+    "worker agent setup noproxy"
+  ],
+  "summary": "The site guide for a worker without Bridge includes a tool-tracked 60-second wait watch. Setup offers an opt-in host-only noproxy curl-config line and rewrites managed options without duplicating them or changing the authorization header. Coordinator guides include closed HTTP integration examples.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "web/js/agentSetup.js::workerWaitLoop",
+    "web/js/agentSetup.js::integrationExample",
+    "web/js/agentSetup.js::credentialFileCommand"
+  ],
+  "tests": [
+    "tests/test_setup_followups.py",
+    "tests/web_setup_wizard.mjs",
+    "tests/test_http_web.py::AgentSetupDialogCase"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "web",
+    "agents",
+    "setup",
+    "waiting"
+  ]
+}

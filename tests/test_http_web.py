@@ -1754,12 +1754,12 @@ class AgentSetupDialogCase(unittest.TestCase):
         # (the first line only opens the dialog on the screen that shows a fresh secret)
         self.assertEqual(['if (state.secretValue) {', 'state.secretValue = value;',
                           'state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,', 'state.secretValue',
-                          '? secretLinesBlock(payload, state.secretValue, state.os)'],
+                          '? secretLinesBlock(payload, state.secretValue, state.os, state.noproxy)'],
                          [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
                           and not line.strip().startswith('secretValue:')])
         self.assertEqual(2, code.count('secretLinesBlock('))          # the definition and the one call
         block = self.function_body(code, 'secretLinesBlock')
-        self.assertIn('setupText.credentialFileLines(address, fingerprint, secretValue)', block)
+        self.assertIn('setupText.credentialFileLines(address, fingerprint, secretValue, { noproxy })', block)
         self.assertIn("copyButton('Copy', lines, { ariaLabel: 'Copy the credential file text with the secret'", block)
         # It builds the lines from the value it is handed; it never reads a credential record or a
         # .secret property (kittrial-5bb.275).
@@ -2313,6 +2313,17 @@ console.log(JSON.stringify({
         for name, value in observed.items():
             self.assertIs(True, value, 'the wizard reported %s=%r' % (name, value))
         self.assertEqual({
+            'olderBridgeGuideHasNoExtraWatch',
+            'noBridgeChoiceExplainsWatch',
+            'noBridgeSavedGuideHasWatch',
+            'proxyChoiceIsOffByDefault',
+            'proxyChoiceStoredWithoutSecret',
+            'proxyChoiceReachesRewrite',
+            'proxyChoiceReachesGuide',
+            'proxyOffStillOffersCleanup',
+            'proxyRewriteExplainsRemoval',
+            'invalidProxyServerShowsRewriteError',
+            'invalidProxyServerKeepsNavigation',
             'atMostTwoSentencesPerScreen',
             'backHiddenOnTheFirstScreen',
             'backRetracesTheShortPath',
