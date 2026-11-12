@@ -220,7 +220,7 @@ export async function page(ctx, { pid }) {
   const lintBanner = Array.isArray(reg.lint_warnings) && reg.lint_warnings.length
     ? h('div', { class: 'banner', role: 'note' },
       h('div', null, h('strong', null, 'Register lint warnings:'),
-        h('ul', null, reg.lint_warnings.map((w) => h('li', null, w)))))
+        h('ul', null, reg.lint_warnings.map((w) => h('li', null, typeof w === 'string' ? w : ((w && w.message) || JSON.stringify(w)))))))
     : null;
 
   const damagedBanner = reg.status === 'damaged'

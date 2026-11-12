@@ -143,7 +143,8 @@ class HostTracker:
 def _build_admin_standards_parser():
     p = argparse.ArgumentParser(allow_abbrev=False)
     p.add_argument('standards_op', choices=[
-        'show', 'lint', 'notifications', 'put', 'rule-edit',
+        'show', 'history', 'lint', 'draft-list', 'waivers', 'sign-off',
+        'notifications', 'put', 'rule-edit',
         'set-gate', 'waive', 'draft-decide', 'record-commit', 'owner-departed',
     ])
     p.add_argument('--project', required=True)
@@ -158,6 +159,8 @@ def _build_admin_standards_parser():
     p.add_argument('--until', default=None)
     p.add_argument('--draft', default=None)
     p.add_argument('--decision', choices=['accept', 'reject'], default=None)
+    p.add_argument('--status', choices=['pending', 'accepted', 'rejected'], default=None)
+    p.add_argument('--format', choices=['json', 'text', 'markdown'], default='json', dest='std_format')
     p.add_argument('--owner', default=None)
     p.add_argument('--version', type=int, default=None)
     p.add_argument('--expected-version', type=int, default=None, dest='expected_version')
@@ -1657,6 +1660,389 @@ class ReviewStandardsSuite(ReviewStandardsHostCase):
         self.assertTrue(json.loads(replay['stdout']).get('reconciled'))
         tally = rs.derive_reviewer_must_na_counts(self.store(), 'cora-op')
         self.assertEqual(1, tally)
+
+    def test_r2_m1_closed_task_and_second_approve_gated_on_host(self):
+        f = Path(self.tmp.name) / 'reg-m1.json'
+        f.write_text(json.dumps({
+            'expected_version': 0,
+            'reason': 'Gate every approve.',
+            'rules': [_sample_rule('MUST-1', owner='person:alice', severity='must')],
+        }), encoding='utf-8')
+        self.admin_std('put', '--file', str(f), '--actor', 'cora-op')
+        self.admin_std('set-gate', '--mode', 'block', '--actor', 'cora-op', '--reason', 'Block gate')
+
+        tid = self.trackers[self.pid].create_task('Closed and double approve task')
+        repo = Path(self.tmp.name) / 'repo-m1'
+        repo.mkdir()
+        _git(repo, 'init')
+        (repo / 'app.py').write_text('val = 1\n', encoding='utf-8')
+        _git(repo, 'add', 'app.py')
+        _git(repo, 'commit', '-m', 'c1')
+        ans_c, _, _ = self.contribute_bundle(tid, repo, op_id='op-m1-c1')
+        cid = json.loads(ans_c['stdout'])['comment_id']
+
+        # 1) Close task, attempt ungated approve -> MUST be refused (rc 2), reopen -> still awaiting-review!
+        self.trackers[self.pid].run_argv(['update', tid, '--status', 'closed'])
+        closed_app = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-closed-bypass',
+            'task': tid, 'previous': cid, 'contribution': cid, 'summary': 'Bypass while closed.',
+        }, actor='cora-op')
+        self.assertEqual(2, closed_app['returncode'], closed_app)
+        self.assertIn('MUST-1', closed_app['stderr'])
+
+        self.trackers[self.pid].run_argv(['update', tid, '--status', 'open'])
+        r_after_reopen = json.loads(self.endpoint_call('review', [tid, '--json'], actor='cora-op')['stdout'])
+        self.assertEqual('awaiting-review', r_after_reopen['review_state'])
+        self.assertEqual(404, self.endpoint_call('standards', ['sign-off', tid]).get('standards_status'))
+
+        # 2) Valid first approve succeeds and writes sign-off.
+        first_payload = {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-first-ok',
+            'task': tid, 'previous': cid, 'contribution': cid, 'summary': 'First valid approve.',
+            'checks': [{'rule_id': 'MUST-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['app.py:1']}}],
+        }
+        app1 = self.review_op(first_payload, actor='cora-op')
+        self.assertEqual(0, app1['returncode'], app1['stderr'])
+        app1_cid = json.loads(app1['stdout'])['comment_id']
+        so1 = json.loads(self.endpoint_call('standards', ['sign-off', tid])['stdout'])
+        self.assertEqual('op-m1-first-ok', so1['operation_id'])
+
+        # 3) Second approve without checks on already-approved contribution MUST be refused!
+        second_bad = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-second-bad',
+            'task': tid, 'previous': app1_cid, 'contribution': cid, 'summary': 'Second ungated approve.',
+        }, actor='olive-op')
+        self.assertEqual(2, second_bad['returncode'], second_bad)
+        self.assertIn('MUST-1', second_bad['stderr'])
+        so_still_1 = json.loads(self.endpoint_call('standards', ['sign-off', tid])['stdout'])
+        self.assertEqual('op-m1-first-ok', so_still_1['operation_id'])
+
+        # 4) Second approve WITH valid checks succeeds and updates committed sign-off; retry of first still reconciles!
+        app2 = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-second-ok',
+            'task': tid, 'previous': app1_cid, 'contribution': cid, 'summary': 'Second checked approve.',
+            'checks': [{'rule_id': 'MUST-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['app.py:1']}}],
+        }, actor='olive-op')
+        self.assertEqual(0, app2['returncode'], app2['stderr'])
+        so2 = json.loads(self.endpoint_call('standards', ['sign-off', tid])['stdout'])
+        self.assertEqual('op-m1-second-ok', so2['operation_id'])
+        self.assertEqual('olive-op', so2['reviewer']['actor'])
+
+        retry1 = self.review_op(first_payload, actor='cora-op')
+        self.assertEqual(0, retry1['returncode'], retry1['stderr'])
+        self.assertTrue(json.loads(retry1['stdout']).get('reconciled'))
+
+    def test_r2_m2_partial_rerecord_and_predelivery_author_provenance_on_host(self):
+        f = Path(self.tmp.name) / 'reg-m2.json'
+        f.write_text(json.dumps({
+            'expected_version': 0,
+            'reason': 'Provenance per part.',
+            'rules': [
+                _sample_rule('STD-50', owner='person:alice', severity='must',
+                             check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'}),
+                _sample_rule('PATH-1', owner='person:alice', severity='must',
+                             applicability={'paths': ['secret/**']}),
+            ],
+        }), encoding='utf-8')
+        self.admin_std('put', '--file', str(f), '--actor', 'cora-op')
+        self.admin_std('set-gate', '--mode', 'block', '--actor', 'cora-op', '--reason', 'Block gate')
+
+        # (a) Opus M2: cora-op records CI pass; independent ci-verifier records ONLY changed_files.
+        tid1 = self.trackers[self.pid].create_task('Partial rerecord task')
+        repo = Path(self.tmp.name) / 'repo-m2'
+        repo.mkdir()
+        _git(repo, 'init')
+        (repo / 'README.md').write_text('hello\n', encoding='utf-8')
+        _git(repo, 'add', 'README.md')
+        _git(repo, 'commit', '-m', 'c1')
+        ans1, commit1, _ = self.contribute_bundle(tid1, repo, op_id='op-m2-c1')
+        cid1 = json.loads(ans1['stdout'])['comment_id']
+
+        ci_part = Path(self.tmp.name) / 'm2-ci.json'
+        ci_part.write_text(json.dumps({
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }), encoding='utf-8')
+        diff_part = Path(self.tmp.name) / 'm2-diff.json'
+        diff_part.write_text(json.dumps({'changed_files': ['README.md']}), encoding='utf-8')
+
+        self.admin_std('record-commit', '--commit', commit1, '--file', str(ci_part), '--actor', 'cora-op')
+        self.admin_std('record-commit', '--commit', commit1, '--file', str(diff_part), '--actor', 'ci-verifier')
+
+        # cora-op cannot approve relying on her own CI pass even after ci-verifier recorded changed_files!
+        self_app = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m2-cora-self',
+            'task': tid1, 'previous': cid1, 'contribution': cid1, 'summary': 'Laundered CI attempt.',
+        }, actor='cora-op')
+        self.assertEqual(2, self_app['returncode'], self_app)
+        self.assertIn('STD-50 (unverified: no CI result recorded', self_app['stderr'])
+
+        # Independent olive-op CAN approve; sign-off credits STD-50 to cora-op and diff to ci-verifier!
+        indep_app = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m2-olive-ok',
+            'task': tid1, 'previous': cid1, 'contribution': cid1, 'summary': 'Independent approve.',
+        }, actor='olive-op')
+        self.assertEqual(0, indep_app['returncode'], indep_app['stderr'])
+        so1 = json.loads(self.endpoint_call('standards', ['sign-off', tid1])['stdout'])
+        self.assertEqual('ci-verifier', so1['diff_recorded_by'])
+        std50_row = [r for r in so1['checks'] if r['rule_id'] == 'STD-50'][0]
+        self.assertEqual('cora-op', std50_row['evidence']['recorded_by'])
+
+        # (b) Fable MUST-2: author's party records fake changed_files + CI pass BEFORE delivering!
+        s_bob_worker = sessions.execute(
+            self.project_path, self.pid,
+            ['register', '--name', 'Bob Worker', '--request-id', '00000000-0000-4000-8000-000000000011'],
+            lambda: '', principal='person:bob',
+        )['session']['actor']
+        s_bob_ver = sessions.execute(
+            self.project_path, self.pid,
+            ['register', '--name', 'Bob Verifier', '--request-id', '00000000-0000-4000-8000-000000000012'],
+            lambda: '', principal='person:bob',
+        )['session']['actor']
+        self.verifiers.append(s_bob_ver)
+        self._write_deployment()
+
+        (repo / 'secret').mkdir()
+        (repo / 'secret' / 'k.py').write_text('secret = 1\n', encoding='utf-8')
+        _git(repo, 'add', 'secret/k.py')
+        _git(repo, 'commit', '-m', 'touch secret')
+        commit2 = _git(repo, 'rev-parse', 'HEAD')
+
+        tid2 = self.trackers[self.pid].create_task('Pre-delivery launder task', assignee=s_bob_worker)
+        forged = Path(self.tmp.name) / 'm2-forged.json'
+        forged.write_text(json.dumps({
+            'changed_files': ['README.md'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }), encoding='utf-8')
+
+        # Pre-delivery record-commit naming --task tid2 is refused because assignee s_bob_worker is same-party!
+        with self.assertRaises(rs.StandardsRefusal) as cm_task:
+            self.admin_std('record-commit', '--commit', commit2, '--task', tid2, '--file', str(forged), '--actor', s_bob_ver)
+        self.assertEqual(403, cm_task.exception.status)
+
+        # Even if recorded WITHOUT --task before any delivery mentions commit2, evaluation excludes author's party!
+        self.admin_std('record-commit', '--commit', commit2, '--file', str(forged), '--actor', s_bob_ver)
+        bpath2 = self.delivery_root / 'm2-c2.bundle'
+        _, bsha2 = _make_bundle(repo, bpath2)
+        ans_c2 = self.review_op({
+            'schema_version': 1, 'operation': 'contribute', 'operation_id': 'op-m2-c2',
+            'task': tid2, 'previous': None, 'supersedes': None, 'repository': str(repo),
+            'commit': commit2, 'base_commit': commit1,
+            'delivery': {'kind': 'bundle', 'path': str(bpath2), 'sha256': bsha2},
+            'summary': 'Deliver secret change.',
+        }, actor=s_bob_worker)
+        self.assertEqual(0, ans_c2['returncode'], ans_c2['stderr'])
+        cid2 = json.loads(ans_c2['stdout'])['comment_id']
+
+        br2 = json.loads(self.endpoint_call('brief', ['--json', tid2], actor='olive-op')['stdout'])['standards']
+        self.assertEqual('diff_unverified', br2['diff_status'])
+        self.assertIn('PATH-1', [r['id'] for r in br2['conditional_rules']])
+
+        ref2 = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m2-c2-app',
+            'task': tid2, 'previous': cid2, 'contribution': cid2, 'summary': 'Try approving forged pre-delivery CI.',
+        }, actor='olive-op')
+        self.assertEqual(2, ref2['returncode'], ref2)
+        self.assertIn('STD-50 (unverified: no CI result recorded', ref2['stderr'])
+        self.assertIn('PATH-1', ref2['stderr'])
+
+    def test_r2_m3_s1_s2_detach_inherits_empty_put_authority_and_na_over_ci_fail(self):
+        # s1: non-coordinator/non-editor PUT refused even with empty rules at v0 and v1!
+        with self.assertRaises(rs.StandardsRefusal) as cm_s1_v0:
+            rs.put_register(
+                self.store(),
+                {'expected_version': 0, 'reason': 'Viewer empty v1', 'rules': []},
+                actor='person:viewer', author_person='person:viewer',
+                is_person_session=True, is_coordinator_or_owner=False,
+            )
+        self.assertEqual(403, cm_s1_v0.exception.status)
+        self.assertEqual(rs.refusal_put_register_authority(), str(cm_s1_v0.exception))
+        self.assertEqual('none', self.store().inspect_register_raw()[0])
+
+        # m3: child cannot clear or switch inherits while current parent defines any must rule!
+        other_shared_path = self.root / 'projects' / 'shared2'
+        (other_shared_path / '.beads').mkdir(parents=True, exist_ok=True)
+        (other_shared_path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.trackers['shared2'] = HostTracker('shared2')
+
+        sh1 = Path(self.tmp.name) / 'sh1.json'
+        sh1.write_text(json.dumps({
+            'expected_version': 0, 'shared': True, 'reason': 'Shared must',
+            'rules': [_sample_rule('TEAM-1', owner='person:alice', severity='must')],
+        }), encoding='utf-8')
+        self.admin_std('put', '--file', str(sh1), '--actor', 'cora-op', project=self.shared_pid)
+
+        sh2 = Path(self.tmp.name) / 'sh2.json'
+        sh2.write_text(json.dumps({
+            'expected_version': 0, 'shared': True, 'reason': 'Shared should only',
+            'rules': [_sample_rule('OTHER-1', owner='person:alice', severity='should')],
+        }), encoding='utf-8')
+        self.admin_std('put', '--file', str(sh2), '--actor', 'cora-op', project='shared2')
+
+        ch1 = Path(self.tmp.name) / 'ch1.json'
+        ch1.write_text(json.dumps({
+            'expected_version': 0, 'inherits': self.shared_pid, 'reason': 'Inherit shared', 'rules': [],
+        }), encoding='utf-8')
+        self.admin_std('put', '--file', str(ch1), '--actor', 'cora-op')
+
+        for bad_inh in (None, 'shared2'):
+            with self.subTest(new_inherits=bad_inh):
+                bad_f = Path(self.tmp.name) / ('ch-detach-%s.json' % (bad_inh or 'null'))
+                bad_f.write_text(json.dumps({
+                    'expected_version': 1, 'inherits': bad_inh, 'reason': 'Try detaching TEAM-1', 'rules': [],
+                }), encoding='utf-8')
+                with self.assertRaises(rs.StandardsRefusal) as cm_m3:
+                    self.admin_std('put', '--file', str(bad_f), '--actor', 'cora-op')
+                self.assertEqual(422, cm_m3.exception.status)
+                self.assertEqual(
+                    rs.refusal_detach_inherited_must(self.pid, self.shared_pid, ['TEAM-1']),
+                    str(cm_m3.exception),
+                )
+        self.assertEqual(1, self.store().inspect_register_raw()[1]['current_version'])
+
+        # s2: not_applicable refused over recorded CI fail on mechanical must rule; waiver keeps ci_evidence!
+        ch_mech = Path(self.tmp.name) / 'ch-mech.json'
+        ch_mech.write_text(json.dumps({
+            'expected_version': 1, 'inherits': self.shared_pid, 'reason': 'Add MECH-2',
+            'rules': [_sample_rule('MECH-2', owner='person:alice', severity='must',
+                                   check={'kind': 'mechanical', 'tool': 'ruff', 'command': 'ruff check'})],
+        }), encoding='utf-8')
+        self.admin_std('put', '--file', str(ch_mech), '--actor', 'cora-op')
+        self.admin_std('set-gate', '--mode', 'block', '--actor', 'cora-op', '--reason', 'Block gate')
+
+        tid = self.trackers[self.pid].create_task('S2 mechanical fail task')
+        repo = Path(self.tmp.name) / 'repo-s2'
+        repo.mkdir()
+        _git(repo, 'init')
+        (repo / 's2.py').write_text('x = 1\n', encoding='utf-8')
+        _git(repo, 'add', 's2.py')
+        _git(repo, 'commit', '-m', 'c1')
+        ans_c, commit, _ = self.contribute_bundle(tid, repo, op_id='op-s2-c1')
+        cid = json.loads(ans_c['stdout'])['comment_id']
+
+        ci_fail = Path(self.tmp.name) / 's2-fail.json'
+        ci_fail.write_text(json.dumps({
+            'changed_files': ['s2.py'],
+            'ci_checks': [{'rule_id': 'MECH-2', 'tool': 'ruff', 'command': 'ruff check', 'exit_code': 1}],
+        }), encoding='utf-8')
+        self.admin_std('record-commit', '--commit', commit, '--file', str(ci_fail), '--actor', 'ci-verifier')
+
+        na_ref = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-s2-na-ref',
+            'task': tid, 'previous': cid, 'contribution': cid, 'summary': 'Try NA over CI fail.',
+            'checks': [
+                {'rule_id': 'TEAM-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['s2.py:1']}},
+                {'rule_id': 'MECH-2', 'result': 'not_applicable', 'reason': 'Linter flaky today.'},
+            ],
+        }, actor='olive-op')
+        self.assertEqual(2, na_ref['returncode'], na_ref)
+        self.assertIn(rs.refusal_na_over_mechanical_fail('MECH-2', commit), na_ref['stderr'])
+
+        self.admin_std(
+            'waive', '--task', tid, '--rule', 'MECH-2', '--contribution', cid, '--commit', commit,
+            '--reason', 'Known upstream ruff false positive', '--actor', 'olive-op',
+        )
+        ok_app = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-s2-waived-ok',
+            'task': tid, 'previous': cid, 'contribution': cid, 'summary': 'Approved with waiver.',
+            'checks': [{'rule_id': 'TEAM-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['s2.py:1']}}],
+        }, actor='olive-op')
+        self.assertEqual(0, ok_app['returncode'], ok_app['stderr'])
+        so = json.loads(self.endpoint_call('standards', ['sign-off', tid])['stdout'])
+        mech_row = [r for r in so['checks'] if r['rule_id'] == 'MECH-2'][0]
+        self.assertEqual('fail', mech_row['result'])
+        self.assertEqual(1, mech_row['ci_evidence']['exit_code'])
+        self.assertEqual('ci-verifier', mech_row['ci_evidence']['recorded_by'])
+
+    def test_r2_blob_cap_m15_admin_cli_ops_and_symlink_signoffs_resilience(self):
+        # 1) Kills M15 (MAX_BLOB_BYTES cap): > 10 MiB blob in delivered bundle is refused when cited!
+        f = Path(self.tmp.name) / 'reg-blob.json'
+        f.write_text(json.dumps({
+            'expected_version': 0,
+            'reason': 'Citation cap rule.',
+            'rules': [_sample_rule('BLOB-1', owner='person:alice', severity='must')],
+        }), encoding='utf-8')
+        self.admin_std('put', '--file', str(f), '--actor', 'cora-op')
+        self.admin_std('set-gate', '--mode', 'block', '--actor', 'cora-op', '--reason', 'Block gate')
+
+        tid = self.trackers[self.pid].create_task('Oversized blob citation task')
+        repo = Path(self.tmp.name) / 'repo-blob'
+        repo.mkdir()
+        _git(repo, 'init')
+        # 2,120,000 * 5 bytes = 10,600,000 bytes (> 10 MiB MAX_BLOB_BYTES), highly compressible in git pack!
+        (repo / 'huge.txt').write_text('line\n' * 2120000, encoding='utf-8')
+        (repo / 'small.py').write_text('ok = 1\n', encoding='utf-8')
+        _git(repo, 'add', 'huge.txt', 'small.py')
+        _git(repo, 'commit', '-m', 'add huge and small')
+        ans_c, commit, _ = self.contribute_bundle(tid, repo, op_id='op-blob-c1')
+        cid = json.loads(ans_c['stdout'])['comment_id']
+
+        huge_ref = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-blob-huge',
+            'task': tid, 'previous': cid, 'contribution': cid, 'summary': 'Cite >10MiB blob.',
+            'checks': [{'rule_id': 'BLOB-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['huge.txt:1']}}],
+        }, actor='cora-op')
+        self.assertEqual(2, huge_ref['returncode'], huge_ref)
+        self.assertIn(
+            rs.refusal_citation_unresolved('huge.txt:1', 'BLOB-1', commit, 'path is not a regular text file'),
+            huge_ref['stderr'],
+        )
+
+        # Citing small.py:1 succeeds, then verify admin.py standards read ops (history, draft-list, waivers, sign-off)!
+        small_ok = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-blob-small',
+            'task': tid, 'previous': cid, 'contribution': cid, 'summary': 'Cite small.py.',
+            'checks': [{'rule_id': 'BLOB-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['small.py:1']}}],
+        }, actor='cora-op')
+        self.assertEqual(0, small_ok['returncode'], small_ok['stderr'])
+
+        hist = self.admin_std('history')
+        self.assertEqual([1], [v['version'] for v in hist['items']])
+        dlist = self.admin_std('draft-list', '--status', 'pending')
+        self.assertEqual([], dlist['items'])
+        wlist = self.admin_std('waivers', '--task', tid)
+        self.assertEqual([], wlist['items'])
+        so_md = self.admin_std('sign-off', '--task', tid, '--format', 'markdown')
+        self.assertIn('Checked against standards register v1', so_md)
+
+        # 2) Opus N2/N3: symlinked .standards/signoffs never stops contribute/request-changes/respond,
+        #    and approve fails closed with 409 StandardsRefusal!
+        so_dir = self.project_path / '.standards' / 'signoffs'
+        backup_so = self.project_path / '.standards_so_bak'
+        so_dir.rename(backup_so)
+        so_dir.symlink_to(backup_so)
+
+        tid2 = self.trackers[self.pid].create_task('Symlink signoffs task', assignee='worker-bob')
+        (repo / 'small.py').write_text('ok = 2\n', encoding='utf-8')
+        _git(repo, 'add', 'small.py')
+        _git(repo, 'commit', '-m', 'c2')
+        ans_c2, _, _ = self.contribute_bundle(tid2, repo, actor='worker-bob', op_id='op-sym-c2')
+        self.assertEqual(0, ans_c2['returncode'], ans_c2['stderr'])
+        cid2 = json.loads(ans_c2['stdout'])['comment_id']
+
+        rc_ans = self.review_op({
+            'schema_version': 1, 'operation': 'request-changes', 'operation_id': 'op-sym-rc',
+            'task': tid2, 'previous': cid2, 'contribution': cid2, 'summary': 'Fix small.py.',
+            'items': [{'id': 'fix-1', 'text': 'Update value.'}],
+        }, actor='cora-op')
+        self.assertEqual(0, rc_ans['returncode'], rc_ans['stderr'])
+        rc_cid = json.loads(rc_ans['stdout'])['comment_id']
+
+        resp_ans = self.review_op({
+            'schema_version': 1, 'operation': 'respond', 'operation_id': 'op-sym-resp',
+            'task': tid2, 'previous': rc_cid, 'contribution': cid2,
+            'resolutions': [{'request': rc_cid, 'item': 'fix-1', 'reason': 'Updated.', 'evidence': 'small.py:1'}],
+        }, actor='worker-bob')
+        self.assertEqual(0, resp_ans['returncode'], resp_ans['stderr'])
+        resp_cid = json.loads(resp_ans['stdout'])['comment_id']
+
+        sym_app = self.review_op({
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-sym-app',
+            'task': tid2, 'previous': resp_cid, 'contribution': cid2, 'summary': 'Approve with symlinked signoffs.',
+            'checks': [{'rule_id': 'BLOB-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['small.py:1']}}],
+        }, actor='cora-op')
+        self.assertEqual(2, sym_app['returncode'], sym_app)
+        self.assertEqual(409, sym_app.get('standards_status'), sym_app)
+        self.assertEqual(409, sym_app.get('standards_status'))
 
 
 if __name__ == '__main__':

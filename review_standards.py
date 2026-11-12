@@ -418,6 +418,29 @@ def refusal_self_recorded_commit_observation(contribution_id, commit):
     )
 
 
+def refusal_detach_inherited_must(pid, shared_pid, rule_ids):
+    return (
+        "Project %s cannot remove or change 'inherits' from shared project %s while %s defines "
+        "inherited 'must' rule(s) (%s); inherited 'must' rules are read-only in the child."
+        % (pid, shared_pid, shared_pid, ', '.join(rule_ids))
+    )
+
+
+def refusal_put_register_authority():
+    return (
+        "Only a project coordinator, project owner, or named register editor can create or "
+        "replace a project standards register."
+    )
+
+
+def refusal_na_over_mechanical_fail(rule_id, commit):
+    return (
+        "Check record for mechanical 'must' rule %s cannot assert 'not_applicable' when a "
+        "failing CI result is recorded for commit %s; fix the failure or request a single-delivery waiver."
+        % (rule_id, commit)
+    )
+
+
 # -- Time & Digest Helpers ----------------------------------------------------
 
 def utc_now_iso(now=None):
@@ -711,11 +734,14 @@ class HostStandardsStore:
         return ('active', head, versions_map)
 
     def write_version_and_head(self, version_obj, head_obj):
-        versions_dir = self._ensure_subdir('versions')
-        base_dir = self._ensure_subdir()
-        ver_name = 'v%06d.json' % version_obj['version']
-        _atomic_write_json(versions_dir, ver_name, version_obj)
-        _atomic_write_json(base_dir, 'head.json', head_obj)
+        try:
+            versions_dir = self._ensure_subdir('versions')
+            base_dir = self._ensure_subdir()
+            ver_name = 'v%06d.json' % version_obj['version']
+            _atomic_write_json(versions_dir, ver_name, version_obj)
+            _atomic_write_json(base_dir, 'head.json', head_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def read_gate_raw(self):
         root_st = _lstat_or_none(self.root)
@@ -735,11 +761,14 @@ class HostStandardsStore:
             return ('damaged', None, str(exc))
 
     def write_gate(self, gate_obj):
-        base_dir = self._ensure_subdir()
-        _atomic_write_json(base_dir, 'gate.json', gate_obj)
+        try:
+            base_dir = self._ensure_subdir()
+            _atomic_write_json(base_dir, 'gate.json', gate_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def list_drafts(self):
-        if _lstat_or_none(self.root) is None:
+        if not _require_real_dir(self.root, '.standards'):
             return []
         drafts_dir = self.root / 'drafts'
         items = []
@@ -753,19 +782,25 @@ class HostStandardsStore:
     def read_draft(self, draft_id):
         if not isinstance(draft_id, str) or not DRAFT_ID_RE.fullmatch(draft_id):
             return None
-        if _lstat_or_none(self.root) is None:
+        if not _require_real_dir(self.root, '.standards'):
             return None
-        path = self.root / 'drafts' / ('%s.json' % draft_id)
+        drafts_dir = self.root / 'drafts'
+        if not _require_real_dir(drafts_dir, 'drafts'):
+            return None
+        path = drafts_dir / ('%s.json' % draft_id)
         if _lstat_or_none(path) is None:
             return None
         return _read_json_file(path, 'drafts/%s.json' % draft_id)
 
     def write_draft(self, draft_obj):
-        drafts_dir = self._ensure_subdir('drafts')
-        _atomic_write_json(drafts_dir, '%s.json' % draft_obj['id'], draft_obj)
+        try:
+            drafts_dir = self._ensure_subdir('drafts')
+            _atomic_write_json(drafts_dir, '%s.json' % draft_obj['id'], draft_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def list_waivers(self, task_id=None):
-        if _lstat_or_none(self.root) is None:
+        if not _require_real_dir(self.root, '.standards'):
             return []
         waivers_dir = self.root / 'waivers'
         items = []
@@ -779,56 +814,87 @@ class HostStandardsStore:
         return items
 
     def write_waiver(self, waiver_obj):
-        waivers_dir = self._ensure_subdir('waivers')
-        _atomic_write_json(waivers_dir, '%s.json' % waiver_obj['id'], waiver_obj)
+        try:
+            waivers_dir = self._ensure_subdir('waivers')
+            _atomic_write_json(waivers_dir, '%s.json' % waiver_obj['id'], waiver_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def read_commit_observation(self, commit):
         if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
             return None
-        if _lstat_or_none(self.root) is None:
+        if not _require_real_dir(self.root, '.standards'):
             return None
-        path = self.root / 'commits' / ('%s.json' % commit.lower())
+        commits_dir = self.root / 'commits'
+        if not _require_real_dir(commits_dir, 'commits'):
+            return None
+        path = commits_dir / ('%s.json' % commit.lower())
         if _lstat_or_none(path) is None:
             return None
         return _read_json_file(path, 'commits/%s.json' % commit.lower())
 
     def write_commit_observation(self, commit, obs_obj):
-        commits_dir = self._ensure_subdir('commits')
-        _atomic_write_json(commits_dir, '%s.json' % commit.lower(), obs_obj)
+        try:
+            commits_dir = self._ensure_subdir('commits')
+            _atomic_write_json(commits_dir, '%s.json' % commit.lower(), obs_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def read_pin(self, contribution_id):
         identity(str(contribution_id))
-        if _lstat_or_none(self.root) is None:
+        if not _require_real_dir(self.root, '.standards'):
             return None
-        path = self.root / 'pins' / ('%s.json' % contribution_id)
+        pins_dir = self.root / 'pins'
+        if not _require_real_dir(pins_dir, 'pins'):
+            return None
+        path = pins_dir / ('%s.json' % contribution_id)
         if _lstat_or_none(path) is None:
             return None
         return _read_json_file(path, 'pins/%s.json' % contribution_id)
 
+    def _raise_damaged_subdir(self, exc):
+        raise StandardsRefusal(
+            'Standards directory in project %s is damaged (%s); repair or restore .standards/ before reviewing.'
+            % (self.project_id, exc),
+            status=409,
+        ) from None
+
     def write_pin(self, contribution_id, pin_obj):
         identity(str(contribution_id))
-        pins_dir = self._ensure_subdir('pins')
-        _atomic_write_json(pins_dir, '%s.json' % contribution_id, pin_obj)
+        try:
+            pins_dir = self._ensure_subdir('pins')
+            _atomic_write_json(pins_dir, '%s.json' % contribution_id, pin_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def stage_recommendation(self, operation_id, staged_obj):
         identity(str(operation_id))
-        rec_dir = self._ensure_subdir('recommendations')
-        _atomic_write_json(rec_dir, 'op-%s.staged.json' % operation_id, staged_obj)
+        try:
+            rec_dir = self._ensure_subdir('recommendations')
+            _atomic_write_json(rec_dir, 'op-%s.staged.json' % operation_id, staged_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def commit_recommendation(self, operation_id, comment_id, final_obj):
         identity(str(operation_id))
         identity(str(comment_id))
-        rec_dir = self._ensure_subdir('recommendations')
-        _atomic_write_json(rec_dir, '%s.json' % comment_id, final_obj)
-        _safe_unlink(rec_dir, 'op-%s.staged.json' % operation_id)
+        try:
+            rec_dir = self._ensure_subdir('recommendations')
+            _atomic_write_json(rec_dir, '%s.json' % comment_id, final_obj)
+            _safe_unlink(rec_dir, 'op-%s.staged.json' % operation_id)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def read_recommendation_checks(self, comment_id, operation_id=None):
         """Return ``('ok', dict)`` | ``('missing', None)`` | ``('corrupt', detail)``."""
-        if _lstat_or_none(self.root) is None:
-            return ('missing', None)
-        rec_dir = self.root / 'recommendations'
-        if not _require_real_dir(rec_dir, 'recommendations'):
-            return ('missing', None)
+        try:
+            if not _require_real_dir(self.root, '.standards'):
+                return ('missing', None)
+            rec_dir = self.root / 'recommendations'
+            if not _require_real_dir(rec_dir, 'recommendations'):
+                return ('missing', None)
+        except StandardsDamagedError as exc:
+            return ('corrupt', str(exc))
         try:
             identity(str(comment_id))
         except ValueError:
@@ -855,32 +921,35 @@ class HostStandardsStore:
     def stage_signoff(self, contribution_id, operation_id, staged_obj):
         identity(str(contribution_id))
         identity(str(operation_id))
-        so_dir = self._ensure_subdir('signoffs')
-        _atomic_write_json(so_dir, '%s.staged.%s.json' % (contribution_id, operation_id), staged_obj)
+        try:
+            so_dir = self._ensure_subdir('signoffs')
+            _atomic_write_json(so_dir, '%s.staged.%s.json' % (contribution_id, operation_id), staged_obj)
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def commit_signoff(self, contribution_id, operation_id, final_obj):
         identity(str(contribution_id))
         identity(str(operation_id))
-        so_dir = self._ensure_subdir('signoffs')
-        _atomic_write_json(so_dir, '%s.json' % contribution_id, final_obj)
-        _safe_unlink(so_dir, '%s.staged.%s.json' % (contribution_id, operation_id))
+        try:
+            so_dir = self._ensure_subdir('signoffs')
+            _atomic_write_json(so_dir, '%s.json' % contribution_id, final_obj)
+            _safe_unlink(so_dir, '%s.staged.%s.json' % (contribution_id, operation_id))
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def read_signoff(self, contribution_id, approve_operation_id=None):
-        if _lstat_or_none(self.root) is None:
-            return None
-        so_dir = self.root / 'signoffs'
-        if not _require_real_dir(so_dir, 'signoffs'):
+        try:
+            if not _require_real_dir(self.root, '.standards'):
+                return None
+            so_dir = self.root / 'signoffs'
+            if not _require_real_dir(so_dir, 'signoffs'):
+                return None
+        except StandardsDamagedError:
             return None
         try:
             identity(str(contribution_id))
         except ValueError:
             return None
-        committed_path = so_dir / ('%s.json' % contribution_id)
-        if _lstat_or_none(committed_path) is not None:
-            try:
-                return _read_json_file(committed_path, 'signoffs/%s.json' % contribution_id)
-            except StandardsDamagedError:
-                return None
         if approve_operation_id is not None:
             try:
                 identity(str(approve_operation_id))
@@ -895,17 +964,23 @@ class HostStandardsStore:
                     )
                 except StandardsDamagedError:
                     return None
+        committed_path = so_dir / ('%s.json' % contribution_id)
+        if _lstat_or_none(committed_path) is not None:
+            try:
+                return _read_json_file(committed_path, 'signoffs/%s.json' % contribution_id)
+            except StandardsDamagedError:
+                return None
         return None
 
     def list_committed_signoffs(self):
-        if _lstat_or_none(self.root) is None:
-            return []
-        so_dir = self.root / 'signoffs'
-        items = []
         try:
+            if not _require_real_dir(self.root, '.standards'):
+                return []
+            so_dir = self.root / 'signoffs'
             entries = _list_regular_names(so_dir, 'signoffs')
-        except StandardsDamagedError:
+        except (StandardsDamagedError, OSError):
             return []
+        items = []
         for name, _ in entries:
             if not name.endswith('.json') or '.staged.' in name:
                 continue
@@ -917,57 +992,66 @@ class HostStandardsStore:
 
     def reconcile_or_clean_staged(self, rows, now_epoch=None):
         """Promote staged sign-offs/recommendations whose bd comment landed; delete >24h orphans."""
-        if _lstat_or_none(self.root) is None:
+        try:
+            if not _require_real_dir(self.root, '.standards'):
+                return
+        except StandardsDamagedError:
             return
         now_val = time.time() if now_epoch is None else float(now_epoch)
         approve_ops, rec_ops = _extract_tracker_operation_maps(rows)
 
         so_dir = self.root / 'signoffs'
-        if _require_real_dir(so_dir, 'signoffs'):
-            for name, st in _list_regular_names(so_dir, 'signoffs'):
-                if '.staged.' not in name or not name.endswith('.json'):
-                    continue
-                stem = name[:-5]
-                cid, _, op_id = stem.partition('.staged.')
+        try:
+            so_entries = _list_regular_names(so_dir, 'signoffs')
+        except (StandardsDamagedError, OSError):
+            so_entries = ()
+        for name, st in so_entries:
+            if '.staged.' not in name or not name.endswith('.json'):
+                continue
+            stem = name[:-5]
+            cid, _, op_id = stem.partition('.staged.')
+            try:
+                identity(cid)
+                identity(op_id)
+            except ValueError:
+                continue
+            matched = approve_ops.get(op_id)
+            if matched is not None and matched[0] == cid:
                 try:
-                    identity(cid)
-                    identity(op_id)
-                except ValueError:
-                    continue
-                matched = approve_ops.get(op_id)
-                if matched is not None and matched[0] == cid:
-                    try:
-                        staged = _read_json_file(so_dir / name, 'signoffs/%s' % name)
-                        promoted = dict(staged, status='committed', approval_comment_id=matched[1])
-                        self.commit_signoff(cid, op_id, promoted)
-                    except StandardsDamagedError:
-                        pass
-                elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in approve_ops:
-                    _safe_unlink(so_dir, name)
+                    staged = _read_json_file(so_dir / name, 'signoffs/%s' % name)
+                    promoted = dict(staged, status='committed', approval_comment_id=matched[1])
+                    self.commit_signoff(cid, op_id, promoted)
+                except (StandardsDamagedError, StandardsRefusal, OSError):
+                    pass
+            elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in approve_ops:
+                _safe_unlink(so_dir, name)
 
         rec_dir = self.root / 'recommendations'
-        if _require_real_dir(rec_dir, 'recommendations'):
-            for name, st in _list_regular_names(rec_dir, 'recommendations'):
-                if not (name.startswith('op-') and name.endswith('.staged.json')):
-                    continue
-                op_id = name[3:-12]
+        try:
+            rec_entries = _list_regular_names(rec_dir, 'recommendations')
+        except (StandardsDamagedError, OSError):
+            rec_entries = ()
+        for name, st in rec_entries:
+            if not (name.startswith('op-') and name.endswith('.staged.json')):
+                continue
+            op_id = name[3:-12]
+            try:
+                identity(op_id)
+            except ValueError:
+                continue
+            comment_id = rec_ops.get(op_id)
+            if comment_id is not None:
                 try:
-                    identity(op_id)
-                except ValueError:
-                    continue
-                comment_id = rec_ops.get(op_id)
-                if comment_id is not None:
-                    try:
-                        staged = _read_json_file(rec_dir / name, 'recommendations/%s' % name)
-                        promoted = dict(staged, status='committed', recommendation_id=comment_id)
-                        self.commit_recommendation(op_id, comment_id, promoted)
-                    except StandardsDamagedError:
-                        pass
-                elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in rec_ops:
-                    _safe_unlink(rec_dir, name)
+                    staged = _read_json_file(rec_dir / name, 'recommendations/%s' % name)
+                    promoted = dict(staged, status='committed', recommendation_id=comment_id)
+                    self.commit_recommendation(op_id, comment_id, promoted)
+                except (StandardsDamagedError, StandardsRefusal, OSError):
+                    pass
+            elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in rec_ops:
+                _safe_unlink(rec_dir, name)
 
     def read_departed_owners(self):
-        if _lstat_or_none(self.root) is None:
+        if not _require_real_dir(self.root, '.standards'):
             return set()
         path = self.root / 'departed_owners.json'
         if _lstat_or_none(path) is None:
@@ -977,46 +1061,52 @@ class HostStandardsStore:
         return {str(x) for x in owners if isinstance(x, str)}
 
     def mark_owner_departed(self, owner_id, actor, reason, now=None):
-        base_dir = self._ensure_subdir()
-        existing = sorted(self.read_departed_owners() | {owner_id})
-        payload = {
-            'schema_version': SCHEMA_VERSION,
-            'departed_owners': existing,
-            'updated_by': actor,
-            'updated_at': utc_now_iso(now),
-            'reason': reason,
-        }
-        _atomic_write_json(base_dir, 'departed_owners.json', payload)
-        return payload
+        try:
+            base_dir = self._ensure_subdir()
+            existing = sorted(self.read_departed_owners() | {owner_id})
+            payload = {
+                'schema_version': SCHEMA_VERSION,
+                'departed_owners': existing,
+                'updated_by': actor,
+                'updated_at': utc_now_iso(now),
+                'reason': reason,
+            }
+            _atomic_write_json(base_dir, 'departed_owners.json', payload)
+            return payload
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def append_notification(self, entry):
-        base_dir = self._ensure_subdir()
-        items = self.read_notifications()
-        items.append(entry)
-        if len(items) > NOTIFICATIONS_MAX:
-            items = items[-NOTIFICATIONS_MAX:]
-        lines = b''.join(canonical_bytes(item) + b'\n' for item in items)
-        target = base_dir / 'notifications.jsonl'
-        st = _lstat_or_none(target)
-        if st is not None and (stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode)):
-            raise ValueError('Refusing non-regular notifications.jsonl')
-        fd, tmp_path = tempfile.mkstemp(prefix='.tmp-', dir=str(base_dir))
         try:
+            base_dir = self._ensure_subdir()
+            items = self.read_notifications()
+            items.append(entry)
+            if len(items) > NOTIFICATIONS_MAX:
+                items = items[-NOTIFICATIONS_MAX:]
+            lines = b''.join(canonical_bytes(item) + b'\n' for item in items)
+            target = base_dir / 'notifications.jsonl'
+            st = _lstat_or_none(target)
+            if st is not None and (stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode)):
+                raise ValueError('Refusing non-regular notifications.jsonl')
+            fd, tmp_path = tempfile.mkstemp(prefix='.tmp-', dir=str(base_dir))
             try:
-                os.write(fd, lines)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.replace(tmp_path, str(target))
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+                try:
+                    os.write(fd, lines)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp_path, str(target))
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except (StandardsDamagedError, ValueError, OSError) as exc:
+            self._raise_damaged_subdir(exc)
 
     def read_notifications(self):
-        if _lstat_or_none(self.root) is None:
+        if not _require_real_dir(self.root, '.standards'):
             return []
         path = self.root / 'notifications.jsonl'
         if _lstat_or_none(path) is None:
@@ -2045,6 +2135,12 @@ def put_register(
         raise StandardsRefusal('Unknown standards register field(s): %s' % ', '.join(extra), status=422)
 
     status, head, versions_map = store.inspect_register_raw()
+    prev_ver_obj = versions_map[head['current_version']] if status == 'active' else None
+    current_named_editors = set(prev_ver_obj.get('named_editors') or []) if prev_ver_obj else set()
+    is_named_editor = bool(author_person and author_person in current_named_editors)
+    if not (is_coordinator_or_owner or is_named_editor):
+        raise StandardsRefusal(refusal_put_register_authority(), status=403)
+
     if status == 'damaged':
         raise StandardsRefusal(
             'Standards register in project %s is damaged (%s); repair or restore .standards/ first.'
@@ -2052,12 +2148,8 @@ def put_register(
             status=409,
         )
     current_version = 0 if status == 'none' else head['current_version']
-    prev_ver_obj = None if status == 'none' else versions_map[current_version]
 
     _check_expected_version(store.project_id, payload.get('expected_version'), current_version)
-
-    current_named_editors = set(prev_ver_obj.get('named_editors') or []) if prev_ver_obj else set()
-    is_named_editor = bool(author_person and author_person in current_named_editors)
 
     reason = _check_clean_text(payload.get('reason'), 'reason', SUMMARY_REASON_MAX)
 
@@ -2113,49 +2205,43 @@ def put_register(
             named_editors.append(ed)
     named_editors.sort()
 
-    # Check structural edit authority (add/remove/owner change/register settings).
-    if not (is_coordinator_or_owner or is_named_editor):
-        prev_map = {r['id']: r for r in (prev_ver_obj['rules'] if prev_ver_obj else [])}
-        new_map = {r['id']: r for r in normalized_rules}
-        diff_ids = sorted((set(prev_map) ^ set(new_map)))
-        if diff_ids:
-            raise StandardsRefusal(refusal_unauthorized_structural_edit(diff_ids[0]), status=403)
-        for rid, nrule in new_map.items():
-            if nrule['owner'] != prev_map[rid]['owner']:
-                raise StandardsRefusal(refusal_unauthorized_structural_edit(rid), status=403)
-        prev_inherits = prev_ver_obj.get('inherits') if prev_ver_obj else None
-        prev_shared = bool(prev_ver_obj.get('shared')) if prev_ver_obj else False
-        prev_limit = int(prev_ver_obj.get('all_changes_must_limit') or ALL_CHANGES_MUST_DEFAULT) if prev_ver_obj else ALL_CHANGES_MUST_DEFAULT
-        prev_editors = sorted(prev_ver_obj.get('named_editors') or []) if prev_ver_obj else []
-        if (
-            inherits != prev_inherits
-            or shared != prev_shared
-            or limit != prev_limit
-            or named_editors != prev_editors
-        ):
+    prev_inherits = prev_ver_obj.get('inherits') if prev_ver_obj else None
+    if prev_inherits is not None and inherits != prev_inherits:
+        if store.shared_loader is None:
             raise StandardsRefusal(
-                'Only a project coordinator, project owner, or named register editor can modify project register settings.',
-                status=403,
+                'Cannot remove or change inherits from shared project %s while shared register loader is unavailable.'
+                % prev_inherits,
+                status=409,
             )
-        # If only existing rules' non-owner fields changed, check rule ownership for each changed rule!
-        departed = store.read_departed_owners()
-        for rid, nrule in new_map.items():
-            if not _rules_equal_ignoring_meta(nrule, prev_map[rid]):
-                eff_owner = prev_map[rid]['owner']
-                is_dep = eff_owner in departed or (
-                    active_person_checker is not None and not active_person_checker(eff_owner)
+        prev_parent_store = store.shared_loader(prev_inherits)
+        if prev_parent_store is None:
+            raise StandardsRefusal(
+                'Cannot remove or change inherits from shared project %s while %s is unavailable.'
+                % (prev_inherits, prev_inherits),
+                status=409,
+            )
+        pp_status, pp_head, pp_versions = prev_parent_store.inspect_register_raw()
+        if pp_status == 'damaged':
+            raise StandardsRefusal(
+                'Cannot remove or change inherits from shared project %s while its standards register is damaged (%s).'
+                % (prev_inherits, pp_versions),
+                status=409,
+            )
+        if pp_status == 'active':
+            pp_ver = pp_versions[pp_head['current_version']]
+            inherited_must_ids = [
+                r['id'] for r in pp_ver['rules'] if r.get('severity') == 'must'
+            ]
+            if inherited_must_ids:
+                raise StandardsRefusal(
+                    refusal_detach_inherited_must(
+                        store.project_id, prev_inherits, inherited_must_ids
+                    ),
+                    status=422,
                 )
-                if is_dep or author_person != eff_owner:
-                    raise StandardsRefusal(
-                        refusal_unauthorized_rule_edit(
-                            rid, 'coordinator' if is_dep else eff_owner
-                        ),
-                        status=403,
-                    )
 
     parent_ver_obj = None
     if inherits is not None:
-        prev_inherits = prev_ver_obj.get('inherits') if prev_ver_obj else None
         parent_ver_obj = _validate_inheritance_target(
             store,
             inherits,
@@ -2240,6 +2326,11 @@ def edit_rule(
         p_store = store.shared_loader(shared_pid)
         if p_store is not None:
             p_st, p_hd, p_vers = p_store.inspect_register_raw()
+            if p_st == 'damaged':
+                raise StandardsRefusal(
+                    'Shared standards register in project %s is damaged (%s).' % (shared_pid, p_vers),
+                    status=409,
+                )
             if p_st == 'active':
                 parent_ver_obj = p_vers[p_hd['current_version']]
 
@@ -2340,11 +2431,13 @@ def edit_rule(
     }
     store.append_notification(notif_entry)
     note_id = None
-    if notify_coordinator_cb is not None and is_active_rule_owner:
+    if notify_coordinator_cb is not None and not is_coordinator_or_owner:
         note_id = notify_coordinator_cb(notif_text)
-    result['notified_coordinator'] = True
     if not is_coordinator_or_owner:
         result['coordinator_notification_text'] = notif_text
+        result['notified_coordinator'] = bool(note_id) if via == 'web' else True
+    else:
+        result['notified_coordinator'] = False
     if note_id is not None:
         result['coordinator_note_id'] = note_id
     return result
@@ -2577,6 +2670,11 @@ def decide_draft(
         p_store = store.shared_loader(shared_pid)
         if p_store is not None:
             p_st, p_hd, p_vers = p_store.inspect_register_raw()
+            if p_st == 'damaged':
+                raise StandardsRefusal(
+                    'Shared standards register in project %s is damaged (%s).' % (shared_pid, p_vers),
+                    status=409,
+                )
             if p_st == 'active':
                 parent_ver_obj = p_vers[p_hd['current_version']]
 
@@ -2707,7 +2805,7 @@ def decide_draft(
         note_id = None
         if notify_coordinator_cb is not None:
             note_id = notify_coordinator_cb(notif_text)
-        out['notified_coordinator'] = True
+        out['notified_coordinator'] = bool(note_id) if via == 'web' else True
         out['coordinator_notification_text'] = notif_text
         if note_id is not None:
             out['coordinator_note_id'] = note_id
@@ -3384,14 +3482,39 @@ def validate_citation_against_tree(citation, rule_id, commit, tree_available, tr
 
 # -- Verifier Commit & CI Observations (R3, R4, R6) ---------------------------
 
-def _collect_commit_participants(rows_or_tasks, commit_lower, operators=None, journal=None):
-    """Collect ``(authors, assignees, reviewers, approvers)`` across tasks referencing ``commit_lower``."""
+def _collect_commit_participants(rows_or_tasks, commit_lower, operators=None, journal=None, *, task_id=None):
+    """Collect ``(authors, assignees, reviewers, approvers)`` across tasks referencing ``commit_lower`` or ``task_id``."""
     import review_recommendations
 
+    checkpoint_prefix = 'Kind: task-checkpoint-v1\n'
     authors, assignees, reviewers, approvers = set(), set(), set(), set()
     for issue in rows_or_tasks or ():
         if not isinstance(issue, dict) or issue.get('issue_type') == 'event':
             continue
+        if task_id is not None and str(issue.get('id') or '') == str(task_id):
+            if issue.get('assignee'):
+                assignees.add(str(issue['assignee']))
+        for cp in issue.get('checkpoints') or ():
+            if isinstance(cp, dict) and str(cp.get('source_commit') or '').lower() == commit_lower:
+                if issue.get('assignee'):
+                    assignees.add(str(issue['assignee']))
+                cp_actor = cp.get('actor') or cp.get('author')
+                if cp_actor:
+                    authors.add(str(cp_actor))
+        for cmt in issue.get('comments') or ():
+            if not isinstance(cmt, dict):
+                continue
+            ctxt = cmt.get('text')
+            if isinstance(ctxt, str) and ctxt.startswith(checkpoint_prefix):
+                try:
+                    cp_doc = parse_json(ctxt[len(checkpoint_prefix):])
+                except ValueError:
+                    cp_doc = None
+                if isinstance(cp_doc, dict) and str(cp_doc.get('source_commit') or '').lower() == commit_lower:
+                    if issue.get('assignee'):
+                        assignees.add(str(issue['assignee']))
+                    if cmt.get('author'):
+                        authors.add(str(cmt['author']))
         # Handle both canonical bd rows and InProcessBackend task dicts
         if 'review_records' in issue and isinstance(issue.get('review_records'), list):
             recs_list = issue['review_records']
@@ -3499,6 +3622,250 @@ def _collect_commit_participants(rows_or_tasks, commit_lower, operators=None, jo
     return authors, assignees, reviewers, approvers
 
 
+def _normalize_commit_observations_list(obs_doc):
+    """Return an append-only list of per-recorder observation entries from ``obs_doc``."""
+    if not isinstance(obs_doc, dict):
+        return []
+    raw_list = obs_doc.get('observations')
+    if isinstance(raw_list, list):
+        out = []
+        for entry in raw_list:
+            if isinstance(entry, dict):
+                out.append(dict(entry))
+        return out
+    # Legacy single-object observation fallback
+    has_any = (
+        obs_doc.get('changed_files') is not None
+        or obs_doc.get('tree_files') is not None
+        or obs_doc.get('ci_checks') is not None
+    )
+    if not has_any:
+        return []
+    rec_by = obs_doc.get('recorded_by')
+    rec_uid = obs_doc.get('recorded_by_user_id')
+    rec_prin = obs_doc.get('recorded_by_principal')
+    rec_at = obs_doc.get('recorded_at')
+    ci_items = None
+    if isinstance(obs_doc.get('ci_checks'), list):
+        ci_items = []
+        for c in obs_doc['ci_checks']:
+            if isinstance(c, dict):
+                stamped = dict(c)
+                stamped.setdefault('recorded_by', rec_by)
+                stamped.setdefault('recorded_by_user_id', rec_uid)
+                stamped.setdefault('recorded_by_principal', rec_prin)
+                stamped.setdefault('recorded_at', rec_at)
+                ci_items.append(stamped)
+    return [{
+        'changed_files': list(obs_doc['changed_files']) if isinstance(obs_doc.get('changed_files'), list) else None,
+        'tree_files': dict(obs_doc['tree_files']) if isinstance(obs_doc.get('tree_files'), dict) else None,
+        'ci_checks': ci_items,
+        'recorded_by': rec_by,
+        'recorded_by_user_id': rec_uid,
+        'recorded_by_principal': rec_prin,
+        'recorded_at': rec_at,
+    }]
+
+
+def _entry_matches_party(entry_or_item, exclude_party):
+    if exclude_party is None or not isinstance(entry_or_item, dict):
+        return False
+    for k in ('recorded_by', 'recorded_by_user_id', 'recorded_by_principal'):
+        cand = entry_or_item.get(k)
+        if isinstance(cand, str) and cand and exclude_party(cand):
+            return True
+    return False
+
+
+def _fold_commit_observations(commit_lower, observations, *, exclude_party=None):
+    """Fold ``observations`` preserving per-part provenance and excluding disallowed parties."""
+    kept_entries = []
+    changed_files = None
+    changed_files_recorded_by = None
+    changed_files_recorded_at = None
+    merged_tree_files = None
+    tree_files_recorded_by = None
+    tree_files_recorders = {}
+    ci_order = []
+    ci_by_key = {}
+    latest_entry = None
+
+    for entry in observations or ():
+        if not isinstance(entry, dict):
+            continue
+        if _entry_matches_party(entry, exclude_party):
+            continue
+        kept_entries.append(entry)
+        latest_entry = entry
+        rec_by = entry.get('recorded_by')
+        rec_uid = entry.get('recorded_by_user_id')
+        rec_prin = entry.get('recorded_by_principal')
+        rec_at = entry.get('recorded_at')
+
+        if isinstance(entry.get('changed_files'), list):
+            changed_files = list(entry['changed_files'])
+            changed_files_recorded_by = rec_by
+            changed_files_recorded_at = rec_at
+
+        if isinstance(entry.get('tree_files'), dict):
+            if merged_tree_files is None:
+                merged_tree_files = {}
+            for p, meta in entry['tree_files'].items():
+                if isinstance(meta, dict):
+                    merged_tree_files[p] = dict(meta)
+                    tree_files_recorders[p] = rec_by
+            tree_files_recorded_by = rec_by
+
+        if isinstance(entry.get('ci_checks'), list):
+            for raw_item in entry['ci_checks']:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = dict(raw_item)
+                item.setdefault('recorded_by', rec_by)
+                item.setdefault('recorded_by_user_id', rec_uid)
+                item.setdefault('recorded_by_principal', rec_prin)
+                item.setdefault('recorded_at', rec_at)
+                if _entry_matches_party(item, exclude_party):
+                    continue
+                key = (
+                    ('rule', item['rule_id'])
+                    if item.get('rule_id')
+                    else ('cmd', item.get('tool'), item.get('command'))
+                )
+                if key not in ci_by_key:
+                    ci_order.append(key)
+                ci_by_key[key] = item
+
+    if not kept_entries:
+        return None
+
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'commit': commit_lower,
+        'changed_files': changed_files,
+        'changed_files_recorded_by': changed_files_recorded_by,
+        'changed_files_recorded_at': changed_files_recorded_at,
+        'tree_files': merged_tree_files,
+        'tree_files_recorded_by': tree_files_recorded_by,
+        'tree_files_recorders': tree_files_recorders,
+        'ci_checks': [ci_by_key[k] for k in ci_order],
+        'recorded_by': latest_entry.get('recorded_by'),
+        'recorded_by_user_id': latest_entry.get('recorded_by_user_id'),
+        'recorded_by_principal': latest_entry.get('recorded_by_principal'),
+        'recorded_at': latest_entry.get('recorded_at'),
+        'observations': kept_entries,
+    }
+
+
+def _collect_task_contribution_participants(issue, contribution):
+    """Collect author, assignee, reviewer, and approver actors for one task/contribution."""
+    participants = set()
+    cid = None
+    commit_lower = None
+    if isinstance(contribution, dict):
+        for k in ('author', 'actor'):
+            if isinstance(contribution.get(k), str) and contribution[k]:
+                participants.add(contribution[k])
+        cid_raw = contribution.get('comment_id') or contribution.get('id')
+        if cid_raw:
+            cid = str(cid_raw)
+        if contribution.get('commit'):
+            commit_lower = str(contribution['commit']).lower()
+    if isinstance(issue, dict):
+        if isinstance(issue.get('assignee'), str) and issue['assignee']:
+            participants.add(issue['assignee'])
+        import review_recommendations as _rec_mod
+        import review_workflow as _rw_mod
+
+        for comment in issue.get('comments') or ():
+            if not isinstance(comment, dict):
+                continue
+            c_author = comment.get('author')
+            raw = comment.get('text')
+            if not isinstance(raw, str) or not isinstance(c_author, str) or not c_author:
+                continue
+            if raw.startswith(_rw_mod.PREFIX):
+                try:
+                    rec = parse_json(raw[len(_rw_mod.PREFIX):])
+                except ValueError:
+                    rec = None
+                if isinstance(rec, dict):
+                    op = rec.get('operation')
+                    if op == 'contribute' and (
+                        (cid and str(comment.get('id') or '') == cid)
+                        or (commit_lower and str(rec.get('commit') or '').lower() == commit_lower)
+                    ):
+                        participants.add(c_author)
+                    elif op in ('request-changes', 'approve') and cid and str(rec.get('contribution') or '') == cid:
+                        participants.add(c_author)
+            elif raw.startswith(_rec_mod.PREFIX):
+                try:
+                    rec = parse_json(raw[len(_rec_mod.PREFIX):])
+                except ValueError:
+                    rec = None
+                if isinstance(rec, dict) and cid and str(rec.get('contribution') or '') == cid:
+                    participants.add(c_author)
+        for rec in (issue.get('review_records') or issue.get('contributions') or ()):
+            if not isinstance(rec, dict):
+                continue
+            r_actor = rec.get('actor') or rec.get('author')
+            if not isinstance(r_actor, str) or not r_actor:
+                continue
+            r_kind = rec.get('kind') or rec.get('operation')
+            if r_kind in ('contribution', 'contribute') and (
+                (cid and str(rec.get('id') or '') == cid)
+                or (commit_lower and str(rec.get('commit') or '').lower() == commit_lower)
+            ):
+                participants.add(r_actor)
+            elif r_kind in ('request-changes', 'approve') and cid and str(rec.get('contribution_id') or rec.get('contribution') or '') == cid:
+                participants.add(r_actor)
+        for rec in issue.get('recommendations') or ():
+            if not isinstance(rec, dict):
+                continue
+            r_actor = rec.get('actor') or rec.get('author')
+            if isinstance(r_actor, str) and r_actor and cid and str(rec.get('contribution_id') or rec.get('contribution') or '') == cid:
+                participants.add(r_actor)
+    return participants
+
+
+def filter_commit_observation_for_evaluation(
+    obs,
+    *,
+    issue=None,
+    contribution=None,
+    extra_actors=(),
+    same_party_with_actor=None,
+    same_party_pair=None,
+):
+    """Fold ``obs`` excluding any observation part recorded by author, assignee, reviewer, or approver party."""
+    if not isinstance(obs, dict):
+        return None
+    commit_lower = str(obs.get('commit') or '').lower()
+    participants = _collect_task_contribution_participants(issue, contribution)
+    for act_val in extra_actors or ():
+        if isinstance(act_val, str) and act_val:
+            participants.add(act_val)
+
+    def _is_excluded(cand):
+        if not isinstance(cand, str) or not cand:
+            return False
+        if callable(same_party_with_actor) and same_party_with_actor(cand):
+            return True
+        cand_key = author_key(cand)
+        for part in participants:
+            if cand_key and cand_key == author_key(part):
+                return True
+            if callable(same_party_pair) and same_party_pair(cand, part):
+                return True
+        return False
+
+    return _fold_commit_observations(
+        commit_lower,
+        _normalize_commit_observations_list(obs),
+        exclude_party=_is_excluded,
+    )
+
+
 def record_commit_observation(
     store,
     commit,
@@ -3525,16 +3892,10 @@ def record_commit_observation(
     if payload.get('commit') is not None and str(payload['commit']).lower() != commit_lower:
         raise StandardsRefusal('Payload commit does not match URL/CLI commit %s' % commit_lower, status=422)
 
-    authors, assignees, reviewers, approvers = _collect_commit_participants(
-        rows_or_tasks, commit_lower, operators=operators, journal=journal
-    )
-    for other_actor in (authors | assignees | reviewers | approvers):
-        if same_party_checker(other_actor):
-            raise StandardsRefusal(refusal_commit_observation_authority(commit_lower), status=403)
-
     allowed = {
         'schema_version',
         'commit',
+        'task_id',
         'target_ref',
         'merge_base',
         'changed_files',
@@ -3544,6 +3905,30 @@ def record_commit_observation(
     extra = sorted(set(payload) - allowed)
     if extra:
         raise StandardsRefusal('Unknown commit observation field(s): %s' % ', '.join(extra), status=422)
+
+    task_id_val = payload.get('task_id')
+    if task_id_val is not None:
+        if not isinstance(task_id_val, str) or not task_id_val.strip():
+            raise StandardsRefusal('task_id must be a non-empty task id string', status=422)
+        task_id_val = task_id_val.strip()
+        try:
+            identity(task_id_val)
+        except ValueError as exc:
+            raise StandardsRefusal('Invalid task_id: %s' % exc, status=422) from None
+        if rows_or_tasks:
+            matched_tasks = [
+                r for r in rows_or_tasks
+                if isinstance(r, dict) and r.get('issue_type') != 'event' and str(r.get('id') or '') == task_id_val
+            ]
+            if not matched_tasks:
+                raise StandardsRefusal('Task %s not found.' % task_id_val, status=404)
+
+    authors, assignees, reviewers, approvers = _collect_commit_participants(
+        rows_or_tasks, commit_lower, operators=operators, journal=journal, task_id=task_id_val
+    )
+    for other_actor in (authors | assignees | reviewers | approvers):
+        if same_party_checker(other_actor):
+            raise StandardsRefusal(refusal_commit_observation_authority(commit_lower), status=403)
 
     changed_files = None
     if payload.get('changed_files') is not None:
@@ -3580,11 +3965,13 @@ def record_commit_observation(
                 'line_count': lc if reg_txt else None,
             }
 
-    ci_checks = []
+    ts = utc_now_iso(now)
+    ci_checks = None
     if payload.get('ci_checks') is not None:
         ci_raw = payload['ci_checks']
         if not isinstance(ci_raw, list) or len(ci_raw) > CHECKS_MAX:
             raise StandardsRefusal('ci_checks must be a list of CI check observations', status=422)
+        ci_checks = []
         for item in ci_raw:
             if not isinstance(item, dict):
                 raise StandardsRefusal('Each ci_checks entry must be an object', status=422)
@@ -3614,29 +4001,25 @@ def record_commit_observation(
                 'status': 'pass' if exit_code == 0 else 'fail',
                 'run_id': run_id,
                 'summary': summary,
+                'recorded_by': actor,
+                'recorded_by_user_id': recorded_by_user_id,
+                'recorded_by_principal': recorded_by_principal,
+                'recorded_at': ts,
             })
 
-    ts = utc_now_iso(now)
     existing = store.read_commit_observation(commit_lower)
-    obs = {
-        'schema_version': SCHEMA_VERSION,
-        'commit': commit_lower,
-        'changed_files': (
-            changed_files
-            if changed_files is not None
-            else (existing.get('changed_files') if existing else None)
-        ),
-        'tree_files': (
-            tree_files
-            if tree_files is not None
-            else (existing.get('tree_files') if existing else None)
-        ),
-        'ci_checks': ci_checks if payload.get('ci_checks') is not None else (existing.get('ci_checks') or [] if existing else []),
+    prev_observations = _normalize_commit_observations_list(existing)
+    new_entry = {
+        'changed_files': changed_files,
+        'tree_files': tree_files,
+        'ci_checks': ci_checks,
         'recorded_by': actor,
         'recorded_by_user_id': recorded_by_user_id,
         'recorded_by_principal': recorded_by_principal,
         'recorded_at': ts,
     }
+    observations = (prev_observations + [new_entry])[-256:]
+    obs = _fold_commit_observations(commit_lower, observations)
     store.write_commit_observation(commit_lower, obs)
     return obs
 
@@ -3645,13 +4028,8 @@ def check_reviewer_not_commit_recorder(obs, contribution_id, commit, same_party_
     """Refuse review/approval (#24b) if ``obs`` was recorded by the reviewer/approver's own party."""
     if not isinstance(obs, dict):
         return
-    rec_actors = [
-        obs.get('recorded_by'),
-        obs.get('recorded_by_user_id'),
-        obs.get('recorded_by_principal'),
-    ]
-    for candidate in rec_actors:
-        if isinstance(candidate, str) and candidate and same_party_with_actor(candidate):
+    for entry in _normalize_commit_observations_list(obs):
+        if _entry_matches_party(entry, same_party_with_actor):
             raise StandardsRefusal(
                 refusal_self_recorded_commit_observation(contribution_id, commit),
                 status=403,
@@ -3854,6 +4232,8 @@ def validate_reviewer_checks(
     valid_item_ids,
     tree_available,
     tree_files,
+    commit_obs=None,
+    tree_recorders=None,
 ):
     """Validate reviewer-supplied check records against R6 rules and ``commit``'s tree."""
     if checks_raw is None:
@@ -3910,12 +4290,22 @@ def validate_reviewer_checks(
                         'At most %d citations per check record' % CITATIONS_MAX, status=422
                     )
                 resolved_cites = []
+                cited_paths = []
                 for c in cites_raw:
                     rc = validate_citation_against_tree(
                         c, rid, commit, tree_available, tree_files
                     )
                     resolved_cites.append(rc['citation'])
+                    cited_paths.append(rc['path'])
                 evidence_out = {'kind': 'citations', 'citations': resolved_cites}
+                if isinstance(tree_recorders, dict):
+                    recorders = sorted({
+                        tree_recorders[p] for p in cited_paths if tree_recorders.get(p)
+                    })
+                    if recorders:
+                        evidence_out['tree_recorded_by'] = (
+                            recorders[0] if len(recorders) == 1 else recorders
+                        )
                 if ev_raw.get('note') is not None:
                     evidence_out['note'] = _check_clean_text(
                         ev_raw['note'], 'evidence note', CHECK_REASON_MAX
@@ -3948,6 +4338,12 @@ def validate_reviewer_checks(
             clean_reason = _check_clean_text(
                 reason_raw, 'not_applicable reason', CHECK_REASON_MAX
             )
+            if rule['check']['kind'] == 'mechanical' and rule['severity'] == 'must':
+                ci_chk = _resolve_mechanical_rule_from_ci(rule, commit, commit_obs)
+                if ci_chk['result'] == 'fail':
+                    raise StandardsRefusal(
+                        refusal_na_over_mechanical_fail(rid, commit), status=422
+                    )
             validated[rid] = {
                 'rule_id': rid,
                 'result': 'not_applicable',
@@ -4017,8 +4413,8 @@ def _resolve_mechanical_rule_from_ci(rule, commit, commit_obs):
             'commit': commit,
             'exit_code': matched['exit_code'],
             'run_id': matched.get('run_id'),
-            'recorded_by': commit_obs.get('recorded_by'),
-            'recorded_at': commit_obs.get('recorded_at'),
+            'recorded_by': matched.get('recorded_by') or (commit_obs or {}).get('recorded_by'),
+            'recorded_at': matched.get('recorded_at') or (commit_obs or {}).get('recorded_at'),
         },
     }
 
@@ -4078,6 +4474,7 @@ def evaluate_approval_signoff(
     standing_recommendations=(),
     same_party_with_actor=None,
     same_party_with_recommender=None,
+    same_party_pair=None,
     git_observation=None,
     active_person_checker=None,
     known_ref_keys=None,
@@ -4100,18 +4497,7 @@ def evaluate_approval_signoff(
     commit = str(contribution['commit']).lower()
     gate = get_gate_view(store)
 
-    reg_latest = resolve_effective_register(
-        store,
-        active_person_checker=active_person_checker,
-        known_ref_keys=known_ref_keys,
-    )
-    if reg_latest['status'] == 'damaged':
-        detail = reg_latest.get('damage_detail') or 'unreadable standards register'
-        if gate['mode'] == 'block':
-            raise StandardsRefusal(
-                refusal_damaged_register_block(store.project_id, detail),
-                status=409,
-            )
+    def _damaged_warn_signoff(detail, *, latest_ver=None):
         ts = utc_now_iso(now)
         tool, model = validate_declared_tool_model(
             extracted.get('declared_tool'), extracted.get('declared_model')
@@ -4128,7 +4514,7 @@ def evaluate_approval_signoff(
             'approval_comment_id': None,
             'headline': 'Standards register damaged (approved in warn mode)',
             'register_version': None,
-            'latest_register_version': None,
+            'latest_register_version': latest_ver,
             'newer_register_version_exists': False,
             'shared_project': None,
             'shared_version': None,
@@ -4136,6 +4522,7 @@ def evaluate_approval_signoff(
             'gate_source': gate['source'],
             'would_have_refused': ['damaged_register: %s' % detail],
             'diff_status': 'diff_unverified',
+            'diff_recorded_by': None,
             'reviewer': {
                 'actor': actor,
                 'user_id': actor_user_id,
@@ -4161,6 +4548,20 @@ def evaluate_approval_signoff(
             'created_at': ts,
         }
 
+    reg_latest = resolve_effective_register(
+        store,
+        active_person_checker=active_person_checker,
+        known_ref_keys=known_ref_keys,
+    )
+    if reg_latest['status'] == 'damaged':
+        detail = reg_latest.get('damage_detail') or 'unreadable standards register'
+        if gate['mode'] == 'block':
+            raise StandardsRefusal(
+                refusal_damaged_register_block(store.project_id, detail),
+                status=409,
+            )
+        return _damaged_warn_signoff(detail)
+
     pinned_ver, pinned_shared_ver, author_meta = resolve_pinned_version(store, contribution)
     reg = resolve_effective_register(
         store,
@@ -4176,12 +4577,10 @@ def evaluate_approval_signoff(
                 refusal_damaged_register_block(store.project_id, detail),
                 status=409,
             )
+        return _damaged_warn_signoff(detail, latest_ver=reg_latest.get('version'))
 
-    commit_obs = store.read_commit_observation(commit)
-    if commit_obs is not None and same_party_with_actor is not None:
-        check_reviewer_not_commit_recorder(commit_obs, cid, commit, same_party_with_actor)
-
-    # Resolve adopt_recommendation if present.
+    # Resolve adopt_recommendation first so its recommender's party is also excluded
+    # when filtering commit observations for evaluation.
     adopt_id = extracted.get('adopt_recommendation')
     adopted_checks_list = None
     recommended_by_actor = None
@@ -4216,34 +4615,43 @@ def evaluate_approval_signoff(
                 refusal_invalid_adopt_recommendation(adopt_id, cid, commit), status=422
             )
         recommended_by_actor = matched_rec.get('author') or matched_rec.get('actor')
-        if commit_obs is not None and same_party_with_recommender is not None and recommended_by_actor:
-            check_reviewer_not_commit_recorder(
-                commit_obs,
-                cid,
-                commit,
-                lambda cand: same_party_with_recommender(recommended_by_actor, cand),
-            )
         adopted_checks_list = list(rec_bundle.get('checks') or [])
         rec_tool = rec_bundle.get('declared_tool')
         rec_model = rec_bundle.get('declared_model')
+
+    raw_commit_obs = store.read_commit_observation(commit)
+    eff_pair = same_party_pair if same_party_pair is not None else same_party_with_recommender
+    commit_obs = filter_commit_observation_for_evaluation(
+        raw_commit_obs,
+        issue=issue,
+        contribution=contribution,
+        extra_actors=(actor, actor_user_id, actor_owner_person, recommended_by_actor),
+        same_party_with_actor=same_party_with_actor,
+        same_party_pair=eff_pair,
+    )
 
     # Merge git observation and verifier commit observation.
     git_obs = git_observation or {}
     tree_available = bool(git_obs.get('tree_available'))
     tree_files = dict(git_obs.get('tree_files') or {})
+    tree_recorders = None
     if not tree_available and commit_obs and isinstance(commit_obs.get('tree_files'), dict):
         tree_available = True
         tree_files = dict(commit_obs['tree_files'])
+        tree_recorders = dict(commit_obs.get('tree_files_recorders') or {})
 
     if git_obs.get('diff_status') == 'verified' and git_obs.get('changed_files') is not None:
         diff_status = 'verified'
         changed_files = list(git_obs['changed_files'])
+        diff_recorded_by = 'git'
     elif commit_obs and commit_obs.get('changed_files') is not None:
         diff_status = 'verified'
         changed_files = list(commit_obs['changed_files'])
+        diff_recorded_by = commit_obs.get('changed_files_recorded_by')
     else:
         diff_status = 'diff_unverified'
         changed_files = None
+        diff_recorded_by = None
 
     # Validate adopted checks + direct approver checks.
     combined_checks = {}
@@ -4256,6 +4664,8 @@ def evaluate_approval_signoff(
             valid_item_ids=valid_item_ids,
             tree_available=tree_available,
             tree_files=tree_files,
+            commit_obs=commit_obs,
+            tree_recorders=tree_recorders,
         )
         for rid, val in adopted_map.items():
             val_copy = dict(val, source='adopted-recommendation', recommendation_id=adopt_id)
@@ -4269,6 +4679,8 @@ def evaluate_approval_signoff(
         valid_item_ids=valid_item_ids,
         tree_available=tree_available,
         tree_files=tree_files,
+        commit_obs=commit_obs,
+        tree_recorders=tree_recorders,
     )
     combined_checks.update(direct_checks)
 
@@ -4301,11 +4713,18 @@ def evaluate_approval_signoff(
 
         waiver = active_waivers_by_rule.get(rid)
         reviewer_chk = combined_checks.get(rid)
+        ci_chk = (
+            _resolve_mechanical_rule_from_ci(rule, commit, commit_obs)
+            if rule['check']['kind'] == 'mechanical'
+            else None
+        )
 
         if reviewer_chk is not None:
             resolved_chk = dict(reviewer_chk)
-        elif rule['check']['kind'] == 'mechanical':
-            resolved_chk = _resolve_mechanical_rule_from_ci(rule, commit, commit_obs)
+            if ci_chk is not None and isinstance(resolved_chk.get('evidence'), dict):
+                resolved_chk['evidence'] = dict(resolved_chk['evidence'], ci=ci_chk['evidence'])
+        elif ci_chk is not None:
+            resolved_chk = ci_chk
         else:
             resolved_chk = {
                 'rule_id': rid,
@@ -4327,6 +4746,7 @@ def evaluate_approval_signoff(
             'result': resolved_chk['result'],
             'source': resolved_chk['source'],
             'evidence': resolved_chk['evidence'],
+            'ci_evidence': ci_chk['evidence'] if ci_chk is not None else None,
             'waiver': (
                 {
                     'id': waiver['id'],
@@ -4409,6 +4829,7 @@ def evaluate_approval_signoff(
         'gate_source': gate['source'],
         'would_have_refused': unresolved_must if gate['mode'] == 'warn' else [],
         'diff_status': diff_status,
+        'diff_recorded_by': diff_recorded_by,
         'reviewer': {
             'actor': actor,
             'user_id': actor_user_id,
@@ -4446,9 +4867,12 @@ def validate_and_stage_recommendation_checks(
     contribution,
     operation_id,
     actor,
+    actor_user_id=None,
+    issue=None,
     extracted_fields,
     valid_item_ids,
     same_party_with_actor=None,
+    same_party_pair=None,
     git_observation=None,
     active_person_checker=None,
     now=None,
@@ -4468,9 +4892,15 @@ def validate_and_stage_recommendation_checks(
     cid = str(contribution['comment_id'])
     commit = str(contribution['commit']).lower()
 
-    commit_obs = store.read_commit_observation(commit)
-    if commit_obs is not None and same_party_with_actor is not None:
-        check_reviewer_not_commit_recorder(commit_obs, cid, commit, same_party_with_actor)
+    raw_commit_obs = store.read_commit_observation(commit)
+    commit_obs = filter_commit_observation_for_evaluation(
+        raw_commit_obs,
+        issue=issue,
+        contribution=contribution,
+        extra_actors=(actor, actor_user_id),
+        same_party_with_actor=same_party_with_actor,
+        same_party_pair=same_party_pair,
+    )
 
     pinned_ver, pinned_shared_ver, _ = resolve_pinned_version(store, contribution)
     reg = resolve_effective_register(
@@ -4485,9 +4915,11 @@ def validate_and_stage_recommendation_checks(
     git_obs = git_observation or {}
     tree_available = bool(git_obs.get('tree_available'))
     tree_files = dict(git_obs.get('tree_files') or {})
+    tree_recorders = None
     if not tree_available and commit_obs and isinstance(commit_obs.get('tree_files'), dict):
         tree_available = True
         tree_files = dict(commit_obs['tree_files'])
+        tree_recorders = dict(commit_obs.get('tree_files_recorders') or {})
 
     checks_raw = extracted.get('checks')
     validated_list = None
@@ -4500,6 +4932,8 @@ def validate_and_stage_recommendation_checks(
             valid_item_ids=valid_item_ids,
             tree_available=tree_available,
             tree_files=tree_files,
+            commit_obs=commit_obs,
+            tree_recorders=tree_recorders,
         )
         # Preserve canonical raw-compatible check shape for adopt_recommendation re-validation
         validated_list = []
@@ -4510,7 +4944,12 @@ def validate_and_stage_recommendation_checks(
             if v['result'] == 'not_applicable':
                 out_chk['reason'] = v['evidence']['reason']
             else:
-                out_chk['evidence'] = v['evidence']
+                ev_clean = {
+                    k: val
+                    for k, val in v['evidence'].items()
+                    if k not in ('tree_recorded_by', 'ci')
+                }
+                out_chk['evidence'] = ev_clean
             validated_list.append(out_chk)
 
     tool, model = validate_declared_tool_model(
@@ -4532,6 +4971,49 @@ def validate_and_stage_recommendation_checks(
     }
     store.stage_recommendation(operation_id, staged)
     return staged
+
+
+def _is_valid_identity(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        identity(value)
+        return True
+    except ValueError:
+        return False
+
+
+def has_approve_operation_id(issue, contribution_id, operation_id):
+    """Return True if ``operation_id`` already landed as an ``approve`` on ``contribution_id``."""
+    if not isinstance(issue, dict) or not contribution_id or not _is_valid_identity(operation_id):
+        return False
+    cid = str(contribution_id)
+    for comment in issue.get('comments') or ():
+        if not isinstance(comment, dict):
+            continue
+        raw = comment.get('text')
+        if not isinstance(raw, str) or not raw.startswith(REVIEW_PREFIX):
+            continue
+        try:
+            rec = parse_json(raw[len(REVIEW_PREFIX):])
+        except ValueError:
+            continue
+        if (
+            isinstance(rec, dict)
+            and rec.get('operation') == 'approve'
+            and str(rec.get('contribution') or '') == cid
+            and rec.get('operation_id') == operation_id
+        ):
+            return True
+    for rec in issue.get('review_records') or ():
+        if (
+            isinstance(rec, dict)
+            and rec.get('kind') == 'approve'
+            and str(rec.get('contribution_id') or '') == cid
+            and rec.get('operation_id') == operation_id
+        ):
+            return True
+    return False
 
 
 def find_approve_operation_id(issue, contribution_id):
@@ -4591,32 +5073,51 @@ def read_signoff_for_contribution(store, contribution_id, expected_commit=None, 
 
 # -- Readable Sign-Off Renderers (R8a: "Checked against", never "certified") ---
 
+def _format_ci_summary(ci_ev):
+    if not isinstance(ci_ev, dict):
+        return ''
+    if ci_ev.get('status') == 'unverified':
+        return 'unverified (no CI result recorded for `%s: %s`)' % (
+            ci_ev.get('tool'),
+            ci_ev.get('command'),
+        )
+    return 'CI `%s: %s` exit %s (recorded by %s)' % (
+        ci_ev.get('tool'),
+        ci_ev.get('command'),
+        ci_ev.get('exit_code'),
+        ci_ev.get('recorded_by') or 'verifier',
+    )
+
+
 def _format_evidence_summary(chk):
     ev = chk.get('evidence')
     if not isinstance(ev, dict):
-        return 'none'
-    kind = ev.get('kind')
-    if kind == 'citations':
-        return 'citations: ' + ', '.join(ev.get('citations') or [])
-    if kind == 'command':
-        return 'command `%s` (exit %s)' % (ev.get('command'), ev.get('exit_code'))
-    if kind == 'not_applicable':
-        return 'reason: %s' % ev.get('reason')
-    if kind == 'review_item':
-        return 'review item `%s`' % ev.get('item_id')
-    if kind == 'ci':
-        if ev.get('status') == 'unverified':
-            return 'unverified (no CI result recorded for `%s: %s`)' % (
-                ev.get('tool'),
-                ev.get('command'),
-            )
-        return 'CI `%s: %s` exit %s (recorded by %s)' % (
-            ev.get('tool'),
-            ev.get('command'),
-            ev.get('exit_code'),
-            ev.get('recorded_by') or 'verifier',
-        )
-    return str(ev)
+        summary = 'none'
+        kind = None
+    else:
+        kind = ev.get('kind')
+        if kind == 'citations':
+            summary = 'citations: ' + ', '.join(ev.get('citations') or [])
+            tree_rec = ev.get('tree_recorded_by')
+            if tree_rec:
+                rec_txt = ', '.join(tree_rec) if isinstance(tree_rec, list) else str(tree_rec)
+                summary += ' (tree recorded by %s)' % rec_txt
+        elif kind == 'command':
+            summary = 'command `%s` (exit %s)' % (ev.get('command'), ev.get('exit_code'))
+        elif kind == 'not_applicable':
+            summary = 'reason: %s' % ev.get('reason')
+        elif kind == 'review_item':
+            summary = 'review item `%s`' % ev.get('item_id')
+        elif kind == 'ci':
+            summary = _format_ci_summary(ev)
+        else:
+            summary = str(ev)
+
+    if chk.get('check_kind') == 'mechanical' and kind != 'ci':
+        ci_ev = chk.get('ci_evidence') or (ev.get('ci') if isinstance(ev, dict) else None)
+        if isinstance(ci_ev, dict) and ci_ev.get('status') not in (None, 'unverified'):
+            summary += '; recorded ' + _format_ci_summary(ci_ev)
+    return summary
 
 
 def render_signoff_markdown(signoff):
@@ -4627,6 +5128,9 @@ def render_signoff_markdown(signoff):
         if ver is not None
         else signoff.get('headline') or 'Checked against standards register'
     )
+    diff_line = '- **Diff verification:** `%s`' % signoff.get('diff_status')
+    if signoff.get('diff_recorded_by'):
+        diff_line += ' (recorded by `%s`)' % signoff['diff_recorded_by']
     lines = [
         '# %s' % headline,
         '',
@@ -4634,7 +5138,7 @@ def render_signoff_markdown(signoff):
         '- **Task:** `%s`' % signoff.get('task_id'),
         '- **Delivery:** `%s` (`%s`)' % (signoff.get('contribution_id'), signoff.get('commit')),
         '- **Gate mode:** `%s`' % signoff.get('gate_mode'),
-        '- **Diff verification:** `%s`' % signoff.get('diff_status'),
+        diff_line,
         '- **Recorded at:** `%s`' % signoff.get('created_at'),
     ]
     if signoff.get('newer_register_version_exists'):
@@ -4724,12 +5228,15 @@ def render_signoff_text(signoff):
         if ver is not None
         else signoff.get('headline') or 'Checked against standards register'
     )
+    diff_desc = str(signoff.get('diff_status'))
+    if signoff.get('diff_recorded_by'):
+        diff_desc += ' (by %s)' % signoff['diff_recorded_by']
     lines = [
         headline,
         '  task: %s  delivery: %s  commit: %s'
         % (signoff.get('task_id'), signoff.get('contribution_id'), signoff.get('commit')),
         '  gate: %s  diff: %s  recorded_at: %s'
-        % (signoff.get('gate_mode'), signoff.get('diff_status'), signoff.get('created_at')),
+        % (signoff.get('gate_mode'), diff_desc, signoff.get('created_at')),
     ]
     if signoff.get('newer_register_version_exists'):
         lines.append(
@@ -4774,6 +5281,7 @@ def brief_standards_block(
     full=False,
     git_observation=None,
     active_person_checker=None,
+    same_party_pair=None,
     now=None,
 ):
     """Build the additive ``standards`` block for ``brief``, or ``None`` when no register exists.
@@ -4816,17 +5324,26 @@ def brief_standards_block(
         }
 
     commit = str(contribution.get('commit') or '').lower() if isinstance(contribution, dict) else None
-    commit_obs = store.read_commit_observation(commit) if commit and COMMIT_RE.fullmatch(commit) else None
+    raw_commit_obs = store.read_commit_observation(commit) if commit and COMMIT_RE.fullmatch(commit) else None
+    commit_obs = filter_commit_observation_for_evaluation(
+        raw_commit_obs,
+        issue=issue,
+        contribution=contribution,
+        same_party_pair=same_party_pair,
+    )
     git_obs = git_observation or {}
     if git_obs.get('diff_status') == 'verified' and git_obs.get('changed_files') is not None:
         diff_status = 'verified'
         changed_files = list(git_obs['changed_files'])
+        diff_recorded_by = 'git'
     elif commit_obs and commit_obs.get('changed_files') is not None:
         diff_status = 'verified'
         changed_files = list(commit_obs['changed_files'])
+        diff_recorded_by = commit_obs.get('changed_files_recorded_by')
     else:
         diff_status = 'diff_unverified'
         changed_files = None
+        diff_recorded_by = None
 
     app_entries = evaluate_applicability(
         reg['effective_rules'], issue, changed_files=changed_files, diff_status=diff_status
@@ -4865,6 +5382,8 @@ def brief_standards_block(
         'applicable_rules': applicable,
         'conditional_rules': conditional,
     }
+    if full:
+        block['diff_recorded_by'] = diff_recorded_by
 
     if isinstance(contribution, dict) and (contribution.get('comment_id') or contribution.get('id')):
         cid = str(contribution.get('comment_id') or contribution.get('id'))
@@ -5031,9 +5550,13 @@ def collect_valid_item_ids_for_contribution(issue, contribution_id, payload=None
         # Also support HTTP in-process issue/task shape where review_records / recommendations are lists.
         for rec in issue.get('review_records') or ():
             if isinstance(rec, dict) and str(rec.get('contribution') or rec.get('contribution_id') or '') == cid:
-                for item in rec.get('items') or ():
-                    if isinstance(item, dict) and isinstance(item.get('id'), str) and item['id']:
-                        ids.add(item['id'])
+                r_items = rec.get('items')
+                if r_items:
+                    for item in r_items:
+                        if isinstance(item, dict) and isinstance(item.get('id'), str) and item['id']:
+                            ids.add(item['id'])
+                elif rec.get('kind') == 'request-changes' and rec.get('summary'):
+                    ids.add('item-1')
         for rec in issue.get('recommendations') or ():
             if isinstance(rec, dict) and str(rec.get('contribution') or rec.get('contribution_id') or '') == cid:
                 for item in rec.get('items') or ():
@@ -5829,7 +6352,12 @@ def _web_standards_action_inner(root, path, project, request, authority_config, 
         user_rec = (state.get('users') or {}).get(user_id) or {}
         role = (state.get('memberships') or {}).get(project, {}).get(user_id)
         is_coord_or_owner = bool(user_rec.get('superuser') or role in ('coordinator', 'owner'))
-        is_person_sess = clean_desc.get('via') == 'session'
+        is_person_sess = (
+            clean_desc.get('via') == 'session'
+            and clean_desc.get('credential_id') is None
+            and isinstance(clean_desc.get('session_hash'), str)
+            and bool(clean_desc.get('session_hash'))
+        )
         known_person, active_person, same_party_pair = _build_state_person_helpers(state, project)
         payload = body.get('payload') or {}
 
@@ -5925,7 +6453,13 @@ def _web_standards_action_inner(root, path, project, request, authority_config, 
             def _waive_same_party(other):
                 if review_workflow.same_party(actor, other, host_owners):
                     return True
-                return same_party_pair(actor, other)
+                if user_id and review_workflow.same_party(user_id, other, host_owners):
+                    return True
+                if same_party_pair(actor, other):
+                    return True
+                if user_id and same_party_pair(user_id, other):
+                    return True
+                return False
 
             result = grant_waiver(
                 store,
@@ -5961,6 +6495,11 @@ def _web_standards_action_inner(root, path, project, request, authority_config, 
                     return True
                 return False
 
+            is_ver_or_coord = (
+                True
+                if operation == 'record-commit-verifier'
+                else bool(is_person_sess and is_coord_or_owner)
+            )
             result = record_commit_observation(
                 store,
                 str(body.get('commit') or ''),
@@ -5968,7 +6507,7 @@ def _web_standards_action_inner(root, path, project, request, authority_config, 
                 actor=actor,
                 recorded_by_user_id=user_id,
                 recorded_by_principal=user_id,
-                is_authorized_recorder=True,
+                is_authorized_recorder=is_ver_or_coord,
                 same_party_checker=_rec_same_party,
                 rows_or_tasks=rows,
                 operators=operators,
@@ -6009,6 +6548,64 @@ def admin_standards_command(root, path, project, args, run_bd_fn, operators_list
             reg['gate'] = get_gate_view(store)
         return reg
 
+    if op == 'history':
+        with (path / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            return list_versions(store)
+
+    if op == 'draft-list':
+        with (path / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            return list_drafts_view(store, status_filter=getattr(args, 'status', None))
+
+    if op == 'waivers':
+        if not getattr(args, 'task', None):
+            raise ValueError('--task is required for admin standards waivers')
+        with (path / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            _, issue = _load_single_issue_from_run(_run, args.task, path)
+            rstate = review_workflow.project(issue, operators_list, path)
+            return list_waivers_view(store, args.task, current_contribution=rstate.get('contribution'))
+
+    if op == 'sign-off':
+        if not getattr(args, 'task', None):
+            raise ValueError('--task is required for admin standards sign-off')
+        fmt = getattr(args, 'std_format', None) or 'json'
+        wanted_cid = getattr(args, 'contribution', None)
+        with (path / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            _, issue = _load_single_issue_from_run(_run, args.task, path)
+            rstate = review_workflow.project(issue, operators_list, path)
+            contrib = rstate.get('contribution')
+            if wanted_cid is not None:
+                cid = str(wanted_cid)
+                expected_commit = (
+                    contrib.get('commit')
+                    if isinstance(contrib, dict) and str(contrib.get('comment_id')) == cid
+                    else None
+                )
+            else:
+                if not isinstance(contrib, dict) or not contrib.get('comment_id'):
+                    raise StandardsRefusal('Task %s has no delivery sign-off.' % args.task, status=404)
+                cid = str(contrib['comment_id'])
+                expected_commit = contrib.get('commit')
+            so = read_signoff_for_contribution(
+                store,
+                cid,
+                expected_commit=expected_commit,
+                approve_operation_id=find_approve_operation_id(issue, cid),
+            )
+        if so is None:
+            raise StandardsRefusal(
+                'Task %s has no delivery sign-off for its current contribution.' % args.task,
+                status=404,
+            )
+        if fmt == 'markdown':
+            return render_signoff_markdown(so)
+        if fmt == 'text':
+            return render_signoff_text(so)
+        return so
+
     if op == 'lint':
         with (path / '.coordination.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
@@ -6039,6 +6636,8 @@ def admin_standards_command(root, path, project, args, run_bd_fn, operators_list
             raise StandardsRefusal(refusal_commit_observation_authority(args.commit), status=403)
         raw_text = read_regular_text(args.file, limit=MAX_FILE_BYTES * 2)
         payload = parse_json(raw_text)
+        if isinstance(payload, dict) and getattr(args, 'task', None) and payload.get('task_id') is None:
+            payload = dict(payload, task_id=args.task)
         with (path / '.coordination.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
