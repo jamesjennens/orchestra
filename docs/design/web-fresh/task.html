@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task alpha-7k2 · Orchestra (fresh look mock-up)</title>
+<link rel="stylesheet" href="fresh.css">
+<script>(function(){var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t);document.addEventListener("DOMContentLoaded",function(){var c=document.querySelector(".tabs [aria-current]");if(c)c.parentNode.scrollLeft=c.offsetLeft-16;});})();</script>
+</head>
+<body data-page="task">
+<div class="shell">
+<nav class="rail" aria-label="Main">
+  <a class="brand" href="my-work.html"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect class="tile" width="24" height="24" rx="6"/><rect class="bar" x="5" y="6" width="8" height="2.6" rx="1.3"/><rect class="bar" x="8.5" y="10.7" width="10.5" height="2.6" rx="1.3"/><rect class="bar" x="12" y="15.4" width="7" height="2.6" rx="1.3"/></svg><span class="wordmark">Orchestra</span></a>
+  <div class="nav">
+    <a href="#"><span>My work</span><span class="n you">5</span></a>
+    <a href="#"><span>People</span></a>
+    <a href="#"><span>Agents</span><span class="n you">1</span></a>
+  </div>
+  <div>
+    <div class="rail-label" id="proj-label">Project</div>
+    <button class="switch" type="button" aria-labelledby="proj-label proj-name" aria-haspopup="listbox"><span id="proj-name">Alpha</span><span class="role">coordinator</span><span class="chev" aria-hidden="true">&#9662;</span></button>
+    <div class="nav sub-nav"><a href="#" aria-current="page"><span>Tasks</span><span class="n">17</span></a><a href="#"><span>Reviews</span><span class="n">3</span></a><a href="#"><span>Releases</span></a><a href="#"><span>Requirements</span></a><a href="#"><span>Records</span></a><a href="#"><span>Rooms</span></a><a href="#"><span>Lanes</span></a><a href="#"><span>People</span></a><a href="#"><span>Agents</span></a><a href="#"><span>Settings</span></a><a href="#"><span>Set up</span></a><a href="#"><span>How</span></a></div>
+  </div>
+  <div class="nav">
+    <a href="#"><span>Programs</span></a>
+    <a href="#"><span>Administration</span></a>
+  </div>
+  <div class="rail-foot"><span class="avatar" aria-hidden="true">CL</span><span class="who"><b>Cora Lee</b><span>Account · Sign out</span></span></div>
+</nav>
+<div class="content">
+<header class="topbar">
+  <a class="brand" href="my-work.html"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect class="tile" width="24" height="24" rx="6"/><rect class="bar" x="5" y="6" width="8" height="2.6" rx="1.3"/><rect class="bar" x="8.5" y="10.7" width="10.5" height="2.6" rx="1.3"/><rect class="bar" x="12" y="15.4" width="7" height="2.6" rx="1.3"/></svg><span class="wordmark">Orchestra</span></a>
+  <span class="where">Alpha · alpha-7k2</span>
+  <button class="menu" type="button" aria-label="Open the menu"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</header>
+<main class="main" id="main"><div class="page">
+<header class="page-head">
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="project.html">Alpha</a><span class="sep" aria-hidden="true">/</span><a href="tasks.html">Tasks</a><span class="sep" aria-hidden="true">/</span><span><span class="mono">alpha-7k2</span></span></nav>
+  <div class="ph-title"><h1 id="page-title">Checkout: show delivery estimate before payment</h1><p class="lede"><span class="chip warn">Awaiting review</span>&nbsp; <span class="who-acts you"><b>You</b> act next: read Heron’s contribution, then approve or send back.</span></p></div>
+  <div class="key"><span class="key-num">2 days</span><span class="key-label">waiting for your review</span></div>
+  <div class="ph-action"><a class="btn" href="#">Send back</a><a class="btn primary" href="#">Approve</a></div>
+</header>
+<div class="facts" role="list" aria-label="Where this task stands">
+  <div class="fact done" role="listitem"><span class="k">Claimed</span><span class="v">Carl Novak</span></div>
+  <div class="fact done" role="listitem"><span class="k">Delivered</span><span class="v">by Heron</span></div>
+  <div class="fact now" role="listitem"><span class="k">Review</span><span class="v">waiting · you</span></div>
+  <div class="fact" role="listitem"><span class="k">Integrated</span><span class="v">not yet</span></div>
+</div>
+<div class="detail">
+  <div class="page" style="gap:36px">
+    <section class="section" aria-labelledby="h-want"><h2 id="h-want">What is wanted</h2>
+      <div class="prose"><p>Before the payment step, show the estimated delivery date for the chosen address and shipping option, so people are not surprised after paying.</p>
+      <ul><li>Use the carrier’s estimate; fall back to “3–5 working days”.</li><li>Update when the address or option changes.</li><li>No extra request on the payment page itself.</li></ul></div>
+    </section>
+    <section class="section" aria-labelledby="h-contrib"><h2 id="h-contrib">Contribution</h2>
+      <div class="contrib">
+        <div class="contrib-head"><b>Heron</b><span class="muted">agent of Carl Novak · delivered 2 days ago</span><span class="grow"></span><span class="chip warn">Awaiting review</span></div>
+        <div class="contrib-body"><p>Adds an estimate line under the shipping options and a cached carrier lookup. Two tests added; the existing checkout tests pass.</p>
+          <ul class="files"><li><span class="add">+48</span> <span class="del">−6</span> checkout/estimate.ts</li><li><span class="add">+12</span> <span class="del">−0</span> checkout/estimate.test.ts</li><li><span class="add">+3</span> <span class="del">−1</span> checkout/Shipping.vue</li></ul></div>
+        <div class="contrib-foot"><a class="btn primary" href="#">Approve</a><a class="btn" href="#">Send back with changes</a><a class="btn quiet" href="#">Open the files</a></div>
+      </div>
+    </section>
+    <section class="section" aria-labelledby="h-act"><h2 id="h-act">Activity</h2>
+      <div class="skeleton" role="status" aria-live="polite"><span class="sr">Loading activity…</span>
+        <div class="sk-row"><span class="sk dot"></span><span class="sk-lines"><span class="sk w60"></span><span class="sk w30"></span></span></div>
+        <div class="sk-row"><span class="sk dot"></span><span class="sk-lines"><span class="sk w80"></span><span class="sk w40"></span></span></div>
+        <div class="sk-row"><span class="sk dot"></span><span class="sk-lines"><span class="sk w40"></span><span class="sk w30"></span></span></div>
+      </div>
+    </section>
+  </div>
+  <aside class="side" aria-label="Details">
+    <section class="section"><h2>Details</h2>
+      <dl class="kv"><dt>Priority</dt><dd><span class="pri">P1</span></dd><dt>Assignee</dt><dd>Carl Novak</dd><dt>Reviewer</dt><dd>Cora Lee (you)</dd><dt>Created</dt><dd>4 Nov by Wen Hale</dd><dt>Id</dt><dd class="mono">alpha-7k2</dd></dl>
+    </section>
+    <section class="section"><h2>Files</h2>
+      <div class="state empty"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 13l2.5-7h11L20 13"/><path d="M4 13v5h16v-5h-5a3 3 0 0 1-6 0z"/></svg></span><b>No files attached</b><p>Screenshots and notes for this task go here.</p></div>
+    </section>
+  </aside>
+</div>
+</div></main>
+</div>
+</div>
+<span class="mock-note" aria-hidden="true">Mock-up · made-up data</span>
+</body>
+</html>

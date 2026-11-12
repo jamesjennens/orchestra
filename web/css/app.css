@@ -1,32 +1,35 @@
 /* Orchestra web interface. Same-origin only: no third-party fonts or assets. */
 :root {
-  --ground: #f5f7fa;
+  /* kittrial-5bb.525 slice (a): the fresh-look values on .523's frozen names
+     (docs/design/WEB_FRESH_LOOK.md §8b). Neutrals are warm paper with ink; the accent
+     is for interaction only; state colours only where a state is meant. */
+  --ground: #f6f5f2;
   --surface: #ffffff;
-  --surface-2: #eef2f6;
-  --ink: #17212b;
-  --ink-2: #33414f;
-  --muted: #5a6878;
-  --line: #dce2e9;
-  --line-strong: #c3ccd6;
-  --accent: #2f5bd3;
+  --surface-2: #efede8;
+  --ink: #1d1c21;
+  --ink-2: #3b3942;
+  --muted: #605c67;
+  --line: #e6e3dd;
+  --line-strong: #d3cfc7;
+  --accent: #4b3fc0;
   --accent-ink: #ffffff;
-  --accent-soft: #e6ecfb;
-  --ok: #1e7a4b;
-  --ok-soft: #e3f3ea;
+  --accent-soft: #ecebfb;
+  --ok: #1b6b41;
+  --ok-soft: #e2f1e7;
   --warn: #9a5c00;  /* was a86400: 4.14:1 on warn-soft at 12px bold; 9a5c00 is 4.76:1 */
-  --warn-soft: #fbf0dc;
-  --crit: #b42318;
-  --crit-soft: #fbe6e4;
-  --idle: #7b8794;
-  --idle-soft: #edf0f3;
-  --focus: #2f5bd3;
-  --shadow: 0 1px 2px rgba(23, 33, 43, .06), 0 4px 16px rgba(23, 33, 43, .06);
+  --warn-soft: #fbefd9;
+  --crit: #b0251d;
+  --crit-soft: #fbe7e5;
+  --idle: #5f5b66;
+  --idle-soft: #eeece8;
+  --focus: #4b3fc0;
+  --shadow: 0 1px 2px rgba(29, 28, 33, .05), 0 8px 24px rgba(29, 28, 33, .06);
   --radius: 6px;
-  --rail: 232px;
+  --rail: 248px;
   --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-6: 24px; --s-8: 32px;
-  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
-  --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-  --mono: "Cascadia Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, "Noto Sans", "DejaVu Sans", Arial, sans-serif;
+  --font-display: Charter, "Bitstream Charter", "Sitka Text", Cambria, "Iowan Old Style", Georgia, "Noto Serif", "DejaVu Serif", serif;
+  --mono: "Cascadia Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --t-2xs: 11px;
   --t-xs: 12px;
   --t-sm: 13px;
@@ -34,24 +37,37 @@
   --t-lg: 16px;
   --t-xl: 20px;
   --t-2xl: 24px;
+  /* additions approved 18:13Z (kittrial-5bb.525 plan, open point 3) */
+  --field-line: #8a8691;  /* control edges: 3:1 on surface (WCAG 1.4.11); --line-strong stays for dividers */
+  --info: #0a6178;        /* "in progress": the accent no longer doubles as a state */
+  --info-soft: #dff0f5;
+  --radius-lg: 8px;
+  --measure: 1120px;
+  --s-12: 48px;
+  --t-3xl: 28px;
+  --t-4xl: 36px;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --ground: #0f141a; --surface: #161d25; --surface-2: #1c2530; --ink: #e5ebf1; --ink-2: #c6d0da;
-    --muted: #93a1b0; --line: #26313d; --line-strong: #364453; --accent: #7d9cf0; --accent-ink: #0f141a;
-    --accent-soft: #1f2a44; --ok: #5cc28d; --ok-soft: #16301f; --warn: #e2a44a; --warn-soft: #33260f;
-    --crit: #f07a70; --crit-soft: #3a1a17; --idle: #8a97a5; --idle-soft: #212a34; --focus: #9bb4f5;
-    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 4px 16px rgba(0, 0, 0, .3);
+    --ground: #121116; --surface: #1a1920; --surface-2: #24232b; --ink: #ecebf0; --ink-2: #cac7d1;
+    --muted: #a19daa; --line: #2c2a33; --line-strong: #3b3943; --accent: #aaa4ff; --accent-ink: #121116;
+    --accent-soft: #2b2852; --ok: #6fcf97; --ok-soft: #16301f; --warn: #f0b45a; --warn-soft: #35270f;
+    --crit: #ff8f85; --crit-soft: #3d1b19; --idle: #aaa6b2; --idle-soft: #2a2930; --focus: #c4c0ff;
+    --field-line: #6f6b79; --info: #71c7e0; --info-soft: #13303a;
+    --radius-lg: 8px; --measure: 1120px; --s-12: 48px; --t-3xl: 28px; --t-4xl: 36px;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .35);
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
-  --ground: #0f141a; --surface: #161d25; --surface-2: #1c2530; --ink: #e5ebf1; --ink-2: #c6d0da;
-  --muted: #93a1b0; --line: #26313d; --line-strong: #364453; --accent: #7d9cf0; --accent-ink: #0f141a;
-  --accent-soft: #1f2a44; --ok: #5cc28d; --ok-soft: #16301f; --warn: #e2a44a; --warn-soft: #33260f;
-  --crit: #f07a70; --crit-soft: #3a1a17; --idle: #8a97a5; --idle-soft: #212a34; --focus: #9bb4f5;
-  --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 4px 16px rgba(0, 0, 0, .3);
+  --ground: #121116; --surface: #1a1920; --surface-2: #24232b; --ink: #ecebf0; --ink-2: #cac7d1;
+  --muted: #a19daa; --line: #2c2a33; --line-strong: #3b3943; --accent: #aaa4ff; --accent-ink: #121116;
+  --accent-soft: #2b2852; --ok: #6fcf97; --ok-soft: #16301f; --warn: #f0b45a; --warn-soft: #35270f;
+  --crit: #ff8f85; --crit-soft: #3d1b19; --idle: #aaa6b2; --idle-soft: #2a2930; --focus: #c4c0ff;
+  --field-line: #6f6b79; --info: #71c7e0; --info-soft: #13303a;
+  --radius-lg: 8px; --measure: 1120px; --s-12: 48px; --t-3xl: 28px; --t-4xl: 36px;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .35);
   color-scheme: dark;
 }
 
@@ -65,8 +81,9 @@ body {
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 3px; }
-h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; letter-spacing: -.01em; }
-h1 { font-size: var(--t-2xl); font-weight: 600; line-height: 1.2; }
+h1, h2, h3 { font-family: var(--font); text-wrap: balance; margin: 0; letter-spacing: -.01em; }
+/* the serif is a signature: the h1 only, not every heading (WEB_FRESH_LOOK.md §3) */
+h1 { font-family: var(--font-display); font-size: var(--t-2xl); font-weight: 600; line-height: 1.2; }
 h2 { font-size: var(--t-xl); font-weight: 600; line-height: 1.3; }
 h3 { font-size: var(--t-lg); font-weight: 600; }
 p { margin: 0; max-width: 68ch; }
@@ -153,12 +170,12 @@ button, .btn {
   font: inherit; font-size: var(--t-sm); font-weight: 600; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   min-height: 32px; padding: 0 12px; border-radius: var(--radius);
-  border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink);
+  border: 1px solid var(--field-line); background: var(--surface); color: var(--ink);
 }
 button:hover, .btn:hover { background: var(--surface-2); text-decoration: none; }
 button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, black); }
-button.danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, transparent); }
+button.danger { color: var(--crit); border-color: var(--field-line); }  /* the red text says "danger"; the edge must reach 3:1 (1.4.11) */
 button.danger.solid { background: var(--crit); color: #fff; border-color: var(--crit); }
 button.ghost { border-color: transparent; background: transparent; }
 button.ghost:hover { background: var(--surface-2); }
@@ -167,7 +184,7 @@ button.link { border: 0; background: none; color: var(--accent); padding: 0; min
 label { font-size: var(--t-sm); font-weight: 600; color: var(--ink-2); }
 input, select, textarea {
   font: inherit; color: var(--ink); background: var(--surface);
-  border: 1px solid var(--line-strong); border-radius: var(--radius); padding: 6px 10px; min-height: 34px; width: 100%;
+  border: 1px solid var(--field-line); border-radius: var(--radius); padding: 6px 10px; min-height: 34px; width: 100%;
 }
 input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; min-height: 0; padding: 0; margin: 0; accent-color: var(--accent); flex: none; }
 .check { display: inline-flex; align-items: center; gap: 8px; font-weight: 500; color: var(--ink-2); cursor: pointer; }
@@ -181,7 +198,7 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .toolbar input[type="search"] { max-width: 280px; }
 .toolbar select { width: auto; }
-.seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: var(--radius); overflow: hidden; }
+.seg { display: inline-flex; border: 1px solid var(--field-line); border-radius: var(--radius); overflow: hidden; }
 .seg button { border: 0; border-radius: 0; min-height: 30px; font-weight: 500; }
 .seg button + button { border-left: 1px solid var(--line-strong); }
 .seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
@@ -217,6 +234,7 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
 .chip.warn { background: var(--warn-soft); } .chip.warn::before { background: var(--warn); }
 .chip.crit { background: var(--crit-soft); } .chip.crit::before { background: var(--crit); }
 .chip.accent { background: var(--accent-soft); } .chip.accent::before { background: var(--accent); }
+.chip.info { background: var(--info-soft); } .chip.info::before { background: var(--info); }
 .chip.plain::before { display: none; }
 .role { font-size: var(--t-xs); font-weight: 600; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 6px; line-height: 18px; }
 

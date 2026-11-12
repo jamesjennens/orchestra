@@ -18,7 +18,7 @@ export const FACTS = [
 
 const REVIEW = {
   'none': ['No contribution', ''],
-  'awaiting-review': ['Awaiting review', 'accent'],
+  'awaiting-review': ['Awaiting review', 'warn'],  // kittrial-5bb.525: the accent is not a state
   'changes-requested': ['Changes requested', 'warn'],
   'approved': ['Approved · not integrated', 'ok'],
   'awaiting-integration': ['Awaiting integration', 'ok'],
@@ -29,7 +29,7 @@ const REVIEW = {
   'superseded': ['Superseded', 'plain'],
   'error': ['Needs operator attention', 'crit'],
 };
-const STATUS = { open: ['Open', ''], in_progress: ['In progress', 'accent'], blocked: ['Blocked', 'crit'], closed: ['Closed', 'plain'] };
+const STATUS = { open: ['Open', ''], in_progress: ['In progress', 'info'], blocked: ['Blocked', 'crit'], closed: ['Closed', 'plain'] };
 const PRIORITY = { 0: 'P0', 1: 'P1', 2: 'P2', 3: 'P3', 4: 'P4' };
 
 export function reviewChip(state) {
