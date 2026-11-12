@@ -4105,7 +4105,7 @@ class Service:
                 'settled': {'how': settled['how'], 'at': settled.get('at')} if settled else None,
                 'unread': note['to']['role'] == 'member' and settled is None}
 
-    def write_member_note(self, principal, project, text, reply_to, mode, *, throttle=True):
+    def write_member_note(self, principal, project, text, reply_to, mode, *, throttle=True, allow_any_member=False):
         """Keep one member note in ``project`` (kittrial-5bb.508). Returns ``(note, dropped)``.
 
         ``mode='coordinators'``: a PERSON's session (never an agent's credential) holding contributor, coordinator
@@ -4123,7 +4123,12 @@ class Service:
                 if not self._is_person_session(principal):
                     raise forbidden('Only a person, signed in, writes to the coordinators of a project; an agent '
                                     'cannot start or continue a member note')
-                if role not in self.MEMBER_NOTE_ROLES:
+                allowed_roles = (
+                    ('owner', 'coordinator', 'contributor', 'viewer')
+                    if allow_any_member
+                    else self.MEMBER_NOTE_ROLES
+                )
+                if role not in allowed_roles:
                     raise forbidden('Writing to the coordinators of a project needs the contributor role or above '
                                     'in it; a viewer may only read')
             else:

@@ -2665,7 +2665,7 @@ arrive only with slice 3b.
 
 ## Review standards, waivers, and delivery sign-offs
 
-When a project has a standards register (`head.json` or `versions/` entry), `brief` includes an additive `standards` object (`status`, `register_version`, `gate_mode`, `applicable_rules` for workers, `rules` + `diff_status` + `reviewer_must_na_count` for reviewers, and `sign_off` once approved). Projects with no register omit `standards` completely.
+When a project has a standards register (`head.json` or `versions/` entry), `brief` includes an additive `standards` object (`status`, `register_version`, `latest_register_version`, `gate_mode`, `diff_status`, `applicable_rules`, `conditional_rules`, plus `required_checks`, `active_waived_rules`, and `sign_off` when a delivery exists). Projects with no register omit `standards` completely.
 
 - **Contributor SSH / `client.py` (`standards`):**
   - Read & draft commands: `standards show [--version N] [--effective] [--json]`, `standards history [--json]`, `standards lint [--json]`, `standards draft-list [--status pending|accepted|rejected] [--json]`, `standards draft-propose --file FILE [--reason TEXT] [--json]`, `standards waivers TASK [--json]`, `standards sign-off TASK [--contribution ID] [--format text|json|markdown] [--out PATH]`, `standards notifications [--json]`, and client-local `standards inspect-commit --repo DIR --commit SHA [--target-ref REF]`.

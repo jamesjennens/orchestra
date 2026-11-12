@@ -166,14 +166,20 @@ export async function detail(ctx, { pid, tid }) {
   const advice = review.state === 'awaiting-review' ? review.recommendation : null;
   if (advice) reviewBody.append(recommendationNote(review, advice));
   const stdBlock = brief.standards || null;
-  if (stdBlock && stdBlock.sign_off) {
-    reviewBody.append(signOffCard(ctx, pid, tid, stdBlock.sign_off, stdBlock));
-  } else if (c && ['approved', 'awaiting-integration'].includes(review.state) && ctx.api.taskSignOff) {
-    const asyncSignOffHost = h('div');
-    reviewBody.append(asyncSignOffHost);
-    ctx.api.taskSignOff(pid, tid).then((so) => {
-      if (so && so.contribution_id === c.id) asyncSignOffHost.replaceChildren(signOffCard(ctx, pid, tid, so, stdBlock));
-    }).catch(() => {});
+  if (stdBlock) {
+    let signOffDoc = stdBlock.sign_off || null;
+    const needsFullSignOff = signOffDoc
+      ? !Array.isArray(signOffDoc.checks)
+      : Boolean(c && ['approved', 'awaiting-integration', 'integrated', 'held'].includes(review.state));
+    if (needsFullSignOff && ctx.api && ctx.api.taskSignOff) {
+      const fullSo = await ctx.api.taskSignOff(pid, tid).catch(() => null);
+      if (fullSo && (!c || !fullSo.contribution_id || fullSo.contribution_id === c.id)) {
+        signOffDoc = fullSo;
+      }
+    }
+    if (signOffDoc) {
+      reviewBody.append(signOffCard(ctx, pid, tid, signOffDoc, stdBlock));
+    }
   }
   if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c, review, stdBlock));
   if (!owner && writer && !mine && c && c.author !== ctx.me.id && review.state === 'awaiting-review') reviewBody.append(recommendForm(ctx, pid, tid, c, stdBlock));
@@ -526,6 +532,37 @@ export function commentForm(ctx, pid, tid) {
   return h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, form));
 }
 
+function formatCheckEvidence(ch) {
+  const ev = ch && ch.evidence;
+  let summary = '';
+  if (!ev || typeof ev !== 'object') {
+    summary = 'none';
+  } else if (ev.kind === 'citations') {
+    const cites = Array.isArray(ev.citations) ? ev.citations.join(', ') : '';
+    const treeRec = Array.isArray(ev.tree_recorded_by) ? ev.tree_recorded_by.join(', ') : ev.tree_recorded_by;
+    summary = `citations: ${cites}` + (treeRec ? ` (tree recorded by ${treeRec})` : '');
+  } else if (ev.kind === 'command') {
+    summary = `command ${ev.command || ''} (exit ${ev.exit_code})`;
+  } else if (ev.kind === 'not_applicable') {
+    summary = `reason: ${ev.reason || ''}`;
+  } else if (ev.kind === 'review_item') {
+    summary = `review item ${ev.item_id || ''}`;
+  } else if (ev.kind === 'ci') {
+    if (ev.status === 'unverified') {
+      summary = `unverified (no CI result for ${ev.tool || ''}: ${ev.command || ''})`;
+    } else {
+      summary = `CI ${ev.tool || ''}: ${ev.command || ''} exit ${ev.exit_code} (recorded by ${ev.recorded_by || 'verifier'})`;
+    }
+  } else {
+    summary = JSON.stringify(ev);
+  }
+  const ciEv = ch && (ch.ci_evidence || (ev && ev.ci));
+  if (ch && ch.check_kind === 'mechanical' && (!ev || ev.kind !== 'ci') && ciEv && ciEv.status && ciEv.status !== 'unverified') {
+    summary += `; recorded CI ${ciEv.tool || ''}: ${ciEv.command || ''} exit ${ciEv.exit_code} (recorded by ${ciEv.recorded_by || 'verifier'})`;
+  }
+  return summary;
+}
+
 export function signOffCard(ctx, pid, tid, signOff, standards) {
   const regVer = signOff.register_version;
   const headingText = regVer
@@ -542,11 +579,14 @@ export function signOffCard(ctx, pid, tid, signOff, standards) {
   const checks = Array.isArray(signOff.checks) ? signOff.checks : [];
   const mdHref = ctx.api && ctx.api.taskSignOffMarkdownUrl ? ctx.api.taskSignOffMarkdownUrl(pid, tid) : `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off.md`;
   const jsonHref = `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off`;
+  const diffLabel = signOff.diff_status
+    ? `Diff: ${signOff.diff_status}` + (signOff.diff_recorded_by ? ` (${signOff.diff_recorded_by})` : '')
+    : null;
   return h('div', { class: 'signoff-card stack', 'data-signoff': signOff.contribution_id || '1' },
     h('div', { class: 'chips' },
       h('strong', null, headingText),
       h('span', { class: 'chip ' + (signOff.gate_mode === 'block' ? 'ok' : 'plain') }, `Gate: ${signOff.gate_mode || 'warn'}`),
-      signOff.diff_status ? h('span', { class: 'chip plain' }, `Diff: ${signOff.diff_status}`) : null),
+      diffLabel ? h('span', { class: 'chip plain' }, diffLabel) : null),
     newerNotice,
     wouldRefuse,
     checks.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'standards-table' },
@@ -554,12 +594,20 @@ export function signOffCard(ctx, pid, tid, signOff, standards) {
         h('th', { scope: 'col' }, 'Rule'),
         h('th', { scope: 'col' }, 'Severity'),
         h('th', { scope: 'col' }, 'Result'),
+        h('th', { scope: 'col' }, 'Evidence'),
         h('th', { scope: 'col' }, 'Source / waiver'))),
       h('tbody', null, checks.map((ch) => h('tr', null,
-        h('td', { class: 'mono small' }, ch.rule_id),
+        h('td', { class: 'small' },
+          h('div', { class: 'mono' }, ch.rule_id),
+          ch.statement ? h('div', { class: 'muted' }, ch.statement) : null),
         h('td', null, h('span', { class: 'chip ' + (ch.severity === 'must' ? 'warn' : 'plain') }, ch.severity)),
         h('td', null, h('span', { class: 'chip ' + (ch.result === 'pass' ? 'ok' : ch.result === 'fail' ? 'warn' : 'plain') }, ch.result)),
-        h('td', { class: 'small' }, ch.source || '', ch.waiver ? ` · Waived (${ch.waiver.id})` : '')))))) : null,
+        h('td', { class: 'small' }, formatCheckEvidence(ch)),
+        h('td', { class: 'small' },
+          ch.source || '',
+          ch.waiver
+            ? ` · Waived by ${ch.waiver.granted_by || 'person'}: ${ch.waiver.reason || ch.waiver.id}`
+            : '')))))) : null,
     h('div', { class: 'actions small' },
       h('a', { href: mdHref, download: '' }, 'Download sign-off (.md)'),
       h('a', { href: jsonHref, target: '_blank', rel: 'noopener' }, 'Raw sign-off (JSON)')));

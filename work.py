@@ -1593,7 +1593,6 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     import review_standards
     cleaned_payload,std_extracted=review_standards.strip_standards_fields(payload)
     std_store=review_standards.HostStandardsStore(path,path.name,shared_loader=review_standards.host_shared_loader_for(path))
-    std_store.reconcile_or_clean_staged(rows)
     reg_status,_,_=std_store.inspect_register_raw()
     if reg_status=='none':
         if cleaned_payload.get('operation')=='recommend':
@@ -1610,6 +1609,9 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             # Retry repairs a label update interrupted after the durable review comment.
             run(['update',task,'--remove-label','review-ready','--json'])
         return result
+
+    if reg_status=='active':
+        std_store.reconcile_or_clean_staged(rows)
 
     from review_workflow import execute as review, project as rw_project, same_party
     owners_map=owners() if callable(owners) else (owners or {})
@@ -1656,8 +1658,10 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                         issue_row,contrib['comment_id'],cleaned_payload)
                     staged_rec=review_standards.validate_and_stage_recommendation_checks(
                         std_store,contribution=contrib,operation_id=cleaned_payload['operation_id'],
-                        actor=actor,extracted_fields=std_extracted,valid_item_ids=valid_ids,
-                        same_party_with_actor=_same_party_actor,git_observation=git_observation,
+                        actor=actor,actor_user_id=std_ctx.get('actor_user_id'),issue=issue_row,
+                        extracted_fields=std_extracted,valid_item_ids=valid_ids,
+                        same_party_with_actor=_same_party_actor,same_party_pair=_same_party_pair,
+                        git_observation=git_observation,
                         active_person_checker=active_person_checker)
         try:
             rec_res=recommend(rows,task,actor,cleaned_payload,run,operators=operators,journal=path)
@@ -1703,10 +1707,11 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                 eff_git_obs=(git_observation if isinstance(git_observation,dict)
                              and git_observation.get('contribution_id') in (None,cid)
                              and git_observation.get('commit') in (None,ccommit) else None)
-                commit_obs=std_store.read_commit_observation(ccommit)
-                if commit_obs is not None:
-                    review_standards.check_reviewer_not_commit_recorder(
-                        commit_obs,cid,ccommit,_same_party_actor)
+                raw_commit_obs=std_store.read_commit_observation(ccommit)
+                commit_obs=review_standards.filter_commit_observation_for_evaluation(
+                    raw_commit_obs,issue=issue_row,contribution=contrib,
+                    extra_actors=(actor,std_ctx.get('actor_user_id')),
+                    same_party_with_actor=_same_party_actor,same_party_pair=_same_party_pair)
                 review_standards.validate_declared_tool_model(
                     std_extracted.get('declared_tool'),std_extracted.get('declared_model'))
                 if std_extracted.get('checks') is not None:
@@ -1718,15 +1723,18 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                         git_obs=eff_git_obs or {}
                         tree_avail=bool(git_obs.get('tree_available'))
                         tree_files=dict(git_obs.get('tree_files') or {})
+                        tree_recorders=None
                         if not tree_avail and commit_obs and isinstance(commit_obs.get('tree_files'),dict):
                             tree_avail=True
                             tree_files=dict(commit_obs['tree_files'])
+                            tree_recorders=dict(commit_obs.get('tree_files_recorders') or {})
                         valid_ids=review_standards.collect_valid_item_ids_for_contribution(
                             issue_row,cid,cleaned_payload)
                         review_standards.validate_reviewer_checks(
                             std_extracted['checks'],effective_rules=reg['effective_rules'],
                             commit=ccommit,contribution_id=cid,valid_item_ids=valid_ids,
-                            tree_available=tree_avail,tree_files=tree_files)
+                            tree_available=tree_avail,tree_files=tree_files,
+                            commit_obs=commit_obs,tree_recorders=tree_recorders)
         result=review(rows,task,actor,cleaned_payload,run, operators=operators, journal=path,
                       review_writes=review_writes, independent_approval=independent_approval,
                       coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
@@ -1738,14 +1746,16 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rstate=rw_project(issue_row,operators,path)
         contrib=rstate.get('contribution') or {}
         op_id=cleaned_payload.get('operation_id')
-        already_landed=(isinstance(op_id,str) and op_id
-                        and review_standards.find_approve_operation_id(issue_row,cleaned_payload.get('contribution'))==op_id)
+        already_landed=(review_standards._is_valid_identity(op_id)
+                        and review_standards.has_approve_operation_id(issue_row,cleaned_payload.get('contribution'),op_id))
         staged_signoff=None
         if (not already_landed
+                and review_standards._is_valid_identity(op_id)
+                and not rstate.get('pending_requests')
+                and not rstate.get('withdrawal')
                 and isinstance(contrib,dict)
                 and contrib.get('comment_id')==cleaned_payload.get('contribution')
-                and rstate.get('review_state') in ('awaiting-review','changes-requested')
-                and issue_row.get('status')!='closed'):
+                and cleaned_payload.get('previous')==rstate.get('latest_comment_id')):
             ccommit=str(contrib.get('commit') or '').lower()
             eff_git_obs=(git_observation if isinstance(git_observation,dict)
                          and git_observation.get('contribution_id') in (None,contrib['comment_id'])
@@ -1777,6 +1787,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                 standing_recommendations=standing_recs,
                 same_party_with_actor=_same_party_actor,
                 same_party_with_recommender=_same_party_pair,
+                same_party_pair=_same_party_pair,
                 git_observation=eff_git_obs,
                 active_person_checker=active_person_checker)
             if staged_signoff is not None:

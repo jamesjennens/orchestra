@@ -2707,6 +2707,18 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             brief_git_obs=review_standards.inspect_brief_git_prelock(root,path,name,args,_show_single_brief_prelock)
         def briefing_effect():
             rules=configured_coordinator_rules(root,warnings=run_warnings)
+            std_pair=None
+            std_active=None
+            if action=='brief' and authority_config is not None:
+                import review_standards
+                if review_standards.HostStandardsStore(path,name).inspect_register_raw()[0]!='none':
+                    from http_authority import read_state as _read_auth_state
+                    try:
+                        _astate=_read_auth_state(authority_config.store)
+                        _,std_active,std_pair=review_standards._build_state_person_helpers(_astate,name)
+                    except Exception:
+                        std_pair=None
+                        std_active=None
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
                                                              operators=configured_operators(root),
                                                              verifiers=configured_verifiers(root),
@@ -2714,7 +2726,9 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                                                              owners=owner_loader(path,'independent_approval')
                                                              if rules['independent_approval'] else None,
                                                              identity_names=assignee_display_names(root,path,authority_config),
-                                                             git_observation=brief_git_obs),'stderr':''.join(run_warnings)}
+                                                             git_observation=brief_git_obs,
+                                                             standards_same_party_pair=std_pair,
+                                                             standards_active_person=std_active),'stderr':''.join(run_warnings)}
         with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,

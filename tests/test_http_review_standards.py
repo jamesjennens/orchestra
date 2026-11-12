@@ -814,8 +814,8 @@ class _HttpStandardsMixin:
             'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m18-self',
             'previous': prev, 'contribution': cid, 'summary': 'Approving own CI observation.',
         }, token=rev_tok)
-        self.assertIn(self_app.status, (403, 422), self_app.data)
-        self.assertEqual(rs.refusal_self_recorded_commit_observation(cid, commit), self_app.data['error']['message'])
+        self.assertEqual(422, self_app.status, self_app.data)
+        self.assertIn('unverified: no CI result recorded', self_app.data['error']['message'])
 
         # 3) Independent coordinator indep_coord_tok CAN approve relying on rev_tok's CI observation!
         ok_app = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
@@ -872,8 +872,8 @@ class _HttpStandardsMixin:
                     'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-vrf-' + label,
                     'previous': prev, 'contribution': cid, 'summary': 'Same party as verify issuer.',
                 }, token=tok)
-                self.assertIn(att.status, (403, 422), att.data)
-                self.assertEqual(rs.refusal_self_recorded_commit_observation(cid, commit), att.data['error']['message'])
+                self.assertEqual(422, att.status, att.data)
+                self.assertIn('unverified: no CI result recorded', att.data['error']['message'])
 
         # Independent project owner approves cleanly (201)!
         ok = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
@@ -927,6 +927,397 @@ class _HttpStandardsMixin:
 
         so_get = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid), token=coord_tok)
         self.assertEqual(404, so_get.status)
+
+    def test_r2_m1_closed_task_and_second_approve_gated_on_http(self):
+        pid = self.pid
+        alice_uid, alice_tok = self.create_person('alice_m1', 'contributor', pid)
+        _, cora_tok = self.create_person('cora_m1', 'coordinator', pid)
+        _, cara_tok = self.create_person('cara_m1', 'coordinator', pid)
+        _, cora_agent = self.create_agent(cora_tok, 'cora-m1-agent', [pid], coordinate_in=[pid])
+
+        self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'reason': 'Gate every approve.',
+            'rules': [_rule('MUST-1', owner=alice_uid, severity='must')],
+        }, token=self.owner_tok)
+        self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {'mode': 'block', 'reason': 'block'}, token=self.owner_tok)
+
+        tid, cid, prev, _ = self.deliver_task_bundle(pid, alice_tok, {'m1.py': 'x = 1\n'}, title='M1 HTTP task')
+
+        # 1) Close task -> BOTH coordinator person AND coordinator-granted agent approve MUST be refused 422!
+        ver0 = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid), token=cora_tok).data['task'].get('version')
+        cl_body = {'status': 'closed'}
+        if ver0 is not None:
+            cl_body['version'] = ver0
+        cl = self.request('PATCH', '/v1/projects/%s/tasks/%s' % (pid, tid), cl_body, token=cora_tok)
+        self.assertEqual(200, cl.status, cl.data)
+
+        for label, tok in (('person', cora_tok), ('coord-agent', cora_agent)):
+            with self.subTest(closed_approver=label):
+                bad = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-cl-' + label,
+                    'previous': prev, 'contribution': cid, 'summary': 'Closed bypass attempt.',
+                }, token=tok)
+                self.assertEqual(422, bad.status, bad.data)
+                self.assertIn('MUST-1', bad.data['error']['message'])
+
+        # Reopen -> still awaiting-review and no sign-off!
+        ver1 = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid), token=cora_tok).data['task'].get('version')
+        op_body = {'status': 'open'}
+        if ver1 is not None:
+            op_body['version'] = ver1
+        op = self.request('PATCH', '/v1/projects/%s/tasks/%s' % (pid, tid), op_body, token=cora_tok)
+        self.assertEqual(200, op.status, op.data)
+        br = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid), token=cora_tok).data
+        self.assertEqual('awaiting-review', br['review']['state'])
+        self.assertEqual(404, self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid), token=cora_tok).status)
+
+        # 2) Valid first approve succeeds -> 201!
+        app1 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-http-first',
+            'previous': prev, 'contribution': cid, 'summary': 'First valid approve.',
+            'checks': [{'rule_id': 'MUST-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['m1.py:1']}}],
+        }, token=cora_tok)
+        self.assertEqual(201, app1.status, app1.data)
+
+        br_after_1 = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid), token=cara_tok).data
+        prev2 = br_after_1['review']['latest_id']
+
+        # 3) Second approve without checks on already-approved contribution MUST be refused 422!
+        app2_bad = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-http-second-bad',
+            'previous': prev2, 'contribution': cid, 'summary': 'Second ungated approve.',
+        }, token=cara_tok)
+        self.assertEqual(422, app2_bad.status, app2_bad.data)
+        self.assertIn('MUST-1', app2_bad.data['error']['message'])
+        so_still = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid), token=cara_tok).data
+        self.assertEqual('op-m1-http-first', so_still['operation_id'])
+
+        # 4) Second approve WITH valid checks succeeds 201 and updates sign-off!
+        app2_ok = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m1-http-second-ok',
+            'previous': prev2, 'contribution': cid, 'summary': 'Second checked approve.',
+            'checks': [{'rule_id': 'MUST-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['m1.py:1']}}],
+        }, token=cara_tok)
+        self.assertEqual(201, app2_ok.status, app2_ok.data)
+        so_updated = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid), token=cara_tok).data
+        self.assertEqual('op-m1-http-second-ok', so_updated['operation_id'])
+
+    def test_r2_m2_partial_rerecord_and_predelivery_author_provenance_on_http(self):
+        pid = self.pid
+        alice_uid, alice_tok = self.create_person('alice_m2', 'contributor', pid)
+        olga_uid, olga_tok = self.create_person('olga_m2', 'coordinator', pid)
+        oscar_uid, oscar_tok = self.create_person('oscar_m2', 'coordinator', pid)
+        _, cara_tok = self.create_person('cara_m2', 'coordinator', pid)
+        _, cora_tok = self.create_person('cora_m2', 'coordinator', pid)
+
+        oscar_ver = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'Oscar Verifier',
+        }, token=oscar_tok).data['credential']['secret']
+        cora_ver = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'Cora Verifier',
+        }, token=cora_tok).data['credential']['secret']
+        _, cora_bot = self.create_agent(cora_tok, 'cora-m2-bot', [pid])
+
+        self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'reason': 'M2 provenance.',
+            'rules': [
+                _rule('STD-50', owner=alice_uid, severity='must',
+                      check={'kind': 'mechanical', 'tool': 'pytest', 'command': 'pytest -q'}),
+                _rule('PATH-1', owner=alice_uid, severity='must',
+                      applicability={'paths': ['secret/**']}),
+            ],
+        }, token=self.owner_tok)
+        self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {'mode': 'block', 'reason': 'block'}, token=self.owner_tok)
+
+        # (a) Opus M2: Olga records STD-50 pass; Oscar verify cred records ONLY changed_files.
+        tid1, cid1, prev1, commit1 = self.deliver_task_bundle(pid, alice_tok, {'README.md': 'ok\n'}, title='M2a HTTP')
+        r1 = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=olga_tok)
+        self.assertEqual(201, r1.status, r1.data)
+        r2 = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit1), {
+            'changed_files': ['README.md'],
+        }, token=oscar_ver)
+        self.assertEqual(201, r2.status, r2.data)
+
+        olga_app = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m2a-olga',
+            'previous': prev1, 'contribution': cid1, 'summary': 'Olga self-laundered CI.',
+        }, token=olga_tok)
+        self.assertEqual(422, olga_app.status, olga_app.data)
+        self.assertIn('STD-50 (unverified: no CI result recorded', olga_app.data['error']['message'])
+
+        cara_app = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m2a-cara',
+            'previous': prev1, 'contribution': cid1, 'summary': 'Cara independent approve.',
+        }, token=cara_tok)
+        self.assertEqual(201, cara_app.status, cara_app.data)
+        so1 = cara_app.data['sign_off']
+        self.assertEqual(oscar_uid, so1['diff_recorded_by'])
+        std50_row = [c for c in so1['checks'] if c['rule_id'] == 'STD-50'][0]
+        self.assertEqual(olga_uid, std50_row['evidence']['recorded_by'])
+
+        # (b) Fable MUST-2: Cora's verify cred records fake changed_files + STD-50 pass BEFORE cora-bot delivers!
+        repo2 = self.tmp / 'm2b-repo'
+        repo2.mkdir(parents=True, exist_ok=True)
+        _git(repo2, 'init')
+        (repo2 / 'secret').mkdir(parents=True, exist_ok=True)
+        (repo2 / 'secret' / 'k.py').write_text('key = 1\n', encoding='utf-8')
+        _git(repo2, 'add', '.')
+        _git(repo2, 'commit', '-m', 'secret change')
+        bpath2 = self.delivery_root / 'm2b.bundle'
+        commit2, bsha2 = _make_bundle(repo2, bpath2)
+
+        tid2 = self.create_task(self.owner_tok, pid, 'M2b pre-delivery').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (pid, tid2), {}, token=cora_bot).status)
+
+        # Naming task_id while cora_bot is assignee is refused 403 immediately!
+        pre_with_task = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+            'task_id': tid2,
+            'changed_files': ['README.md'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=cora_ver)
+        self.assertEqual(403, pre_with_task.status, pre_with_task.data)
+
+        # Even if recorded without task_id before delivery, evaluation excludes author's party on brief and approve!
+        pre_no_task = self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit2), {
+            'changed_files': ['README.md'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'pytest', 'command': 'pytest -q', 'exit_code': 0}],
+        }, token=cora_ver)
+        self.assertEqual(201, pre_no_task.status, pre_no_task.data)
+
+        deliv2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'contribute', 'operation_id': 'op-m2b-deliv',
+            'previous': None, 'supersedes': None, 'repository': 'https://example.invalid/r.git',
+            'commit': commit2, 'base_commit': commit2,
+            'delivery': {'kind': 'bundle', 'path': 'server:' + str(bpath2), 'sha256': bsha2},
+            'summary': 'Deliver secret/k.py.',
+        }, token=cora_bot)
+        self.assertEqual(201, deliv2.status, deliv2.data)
+
+        br2 = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (pid, tid2), token=cara_tok).data
+        self.assertEqual('diff_unverified', br2['standards']['diff_status'])
+        self.assertIn('PATH-1', [r['id'] for r in br2['standards']['conditional_rules']])
+
+        cid2 = br2['review']['contribution']['id']
+        prev2 = br2['review']['latest_id']
+        bad_app2 = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-m2b-cara',
+            'previous': prev2, 'contribution': cid2, 'summary': 'Try approving forged pre-delivery CI.',
+        }, token=cara_tok)
+        self.assertEqual(422, bad_app2.status, bad_app2.data)
+        self.assertIn('STD-50 (unverified: no CI result recorded', bad_app2.data['error']['message'])
+        self.assertIn('PATH-1', bad_app2.data['error']['message'])
+
+    def test_r2_m3_s1_s2_inherits_detach_empty_put_and_na_over_ci_fail_on_http(self):
+        pid = self.pid
+        _, viewer_tok = self.create_person('vic_s1', 'viewer', pid)
+        alice_uid, alice_tok = self.create_person('alice_s1', 'contributor', pid)
+        _, oscar_tok = self.create_person('oscar_s2', 'coordinator', pid)
+        _, cara_tok = self.create_person('cara_s2', 'coordinator', pid)
+
+        # Opus N1: project with no register has NO standards_gate field on GET /v1/projects/{pid}!
+        proj0 = self.request('GET', '/v1/projects/%s' % pid, token=viewer_tok).data
+        self.assertNotIn('standards_gate', proj0)
+
+        # s1: viewer and contributor PUT with empty rules at v0 refused 403; status stays 'none'!
+        for label, tok in (('viewer', viewer_tok), ('contributor', alice_tok)):
+            with self.subTest(empty_put_v0=label):
+                r = self.request('PUT', '/v1/projects/%s/standards' % pid, {
+                    'expected_version': 0, 'reason': 'Unprivileged empty v1', 'rules': [],
+                }, token=tok)
+                self.assertEqual(403, r.status, r.data)
+                self.assertEqual(rs.refusal_put_register_authority(), r.data['error']['message'])
+        self.assertEqual('none', self.request('GET', '/v1/projects/%s/standards' % pid, token=viewer_tok).data['status'])
+
+        # m3: shared project with TEAM-1 (must) -> child cannot detach inherits via null or another shared project!
+        sh1_pid = self.new_project('Shared One', 'shone')
+        sh2_pid = self.new_project('Shared Two', 'shtwo')
+        self.request('PUT', '/v1/projects/%s/standards' % sh1_pid, {
+            'expected_version': 0, 'shared': True, 'reason': 'Shared must',
+            'rules': [_rule('TEAM-1', owner=self.owner_uid, severity='must')],
+        }, token=self.owner_tok)
+        self.request('PUT', '/v1/projects/%s/standards' % sh2_pid, {
+            'expected_version': 0, 'shared': True, 'reason': 'Shared should',
+            'rules': [_rule('SH-2', owner=self.owner_uid, severity='should')],
+        }, token=self.owner_tok)
+
+        c_put = self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'inherits': sh1_pid, 'reason': 'Inherit sh1', 'rules': [],
+        }, token=self.owner_tok)
+        self.assertEqual(200, c_put.status, c_put.data)
+
+        # s1 at v1: viewer and contributor still refused 403 on empty PUT!
+        for label, tok in (('viewer', viewer_tok), ('contributor', alice_tok)):
+            with self.subTest(empty_put_v1=label):
+                r = self.request('PUT', '/v1/projects/%s/standards' % pid, {
+                    'expected_version': 1, 'inherits': sh1_pid, 'reason': 'No-op PUT', 'rules': [],
+                }, token=tok)
+                self.assertEqual(403, r.status, r.data)
+
+        for bad_inh in (None, sh2_pid):
+            with self.subTest(detach_inherits=bad_inh):
+                r = self.request('PUT', '/v1/projects/%s/standards' % pid, {
+                    'expected_version': 1, 'inherits': bad_inh, 'reason': 'Detach TEAM-1', 'rules': [],
+                }, token=self.owner_tok)
+                self.assertEqual(422, r.status, r.data)
+                self.assertEqual(
+                    rs.refusal_detach_inherited_must(pid, sh1_pid, ['TEAM-1']),
+                    r.data['error']['message'],
+                )
+
+        # s2: mechanical must rule with recorded exit_code=1 refuses not_applicable; waiver keeps ci_evidence!
+        r_v2 = self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 1, 'inherits': sh1_pid, 'reason': 'Add STD-50',
+            'rules': [_rule('STD-50', owner=alice_uid, severity='must',
+                            check={'kind': 'mechanical', 'tool': 'ruff', 'command': 'ruff check'})],
+        }, token=self.owner_tok)
+        self.assertEqual(200, r_v2.status, r_v2.data)
+        self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {'mode': 'block', 'reason': 'block'}, token=self.owner_tok)
+
+        oscar_ver = self.request('POST', '/v1/projects/%s/worker-credentials' % pid, {
+            'scopes': ['verify'], 'label': 'Oscar S2',
+        }, token=oscar_tok).data['credential']['secret']
+        tid, cid, prev, commit = self.deliver_task_bundle(pid, alice_tok, {'s2.py': 'y = 1\n'}, title='S2 HTTP')
+
+        self.assertEqual(201, self.request('POST', '/v1/projects/%s/standards/commits/%s' % (pid, commit), {
+            'changed_files': ['s2.py'],
+            'ci_checks': [{'rule_id': 'STD-50', 'tool': 'ruff', 'command': 'ruff check', 'exit_code': 1}],
+        }, token=oscar_ver).status)
+
+        na_bad = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-s2-http-na',
+            'previous': prev, 'contribution': cid, 'summary': 'NA over CI fail.',
+            'checks': [
+                {'rule_id': 'TEAM-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['s2.py:1']}},
+                {'rule_id': 'STD-50', 'result': 'not_applicable', 'reason': 'Flaky today.'},
+            ],
+        }, token=cara_tok)
+        self.assertEqual(422, na_bad.status, na_bad.data)
+        self.assertEqual(rs.refusal_na_over_mechanical_fail('STD-50', commit), na_bad.data['error']['message'])
+
+        w = self.request('POST', '/v1/projects/%s/tasks/%s/waivers' % (pid, tid), {
+            'contribution_id': cid, 'commit': commit, 'rule_id': 'STD-50',
+            'reason': 'Tracked upstream ruff issue', 'expiry': {'kind': 'delivery'},
+        }, token=cara_tok)
+        self.assertEqual(201, w.status, w.data)
+
+        ok = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-s2-http-ok',
+            'previous': prev, 'contribution': cid, 'summary': 'Approved with waiver.',
+            'checks': [{'rule_id': 'TEAM-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['s2.py:1']}}],
+        }, token=cara_tok)
+        self.assertEqual(201, ok.status, ok.data)
+        std50_so = [c for c in ok.data['sign_off']['checks'] if c['rule_id'] == 'STD-50'][0]
+        self.assertEqual(1, std50_so['ci_evidence']['exit_code'])
+
+    def test_r2_s4_viewer_owner_notification_and_adopted_fail_recommendation_parity_on_http(self):
+        pid = self.pid
+        vic_uid, vic_tok = self.create_person('vic_s4', 'viewer', pid)
+        _, bob_tok = self.create_person('bob_s4', 'contributor', pid)
+        _, carl_tok = self.create_person('carl_s4', 'contributor', pid)
+        _, cara_tok = self.create_person('cara_s4', 'coordinator', pid)
+
+        self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'reason': 'Viewer rule owner + should rule.',
+            'rules': [
+                _rule('VIC-1', owner=vic_uid, severity='must'),
+                _rule('SHLD-1', owner=self.owner_uid, severity='should'),
+            ],
+        }, token=self.owner_tok)
+
+        # s4a: viewer rule owner edits VIC-1 -> 200, notified_coordinator True, note in coordinator's inbox!
+        patch_res = self.request('PATCH', '/v1/projects/%s/standards/rules/VIC-1' % pid, {
+            'expected_version': 1,
+            'reason': 'Lower VIC-1 to should.',
+            'rule': _rule('VIC-1', owner=vic_uid, severity='should', statement='Viewer updated statement.'),
+        }, token=vic_tok)
+        self.assertEqual(200, patch_res.status, patch_res.data)
+        self.assertTrue(patch_res.data['notified_coordinator'])
+        note_id = patch_res.data.get('coordinator_note_id')
+        self.assertTrue(isinstance(note_id, str) and note_id.startswith('cnote-'), patch_res.data)
+
+        inbox = self.request('GET', '/v1/projects/%s/notes?box=to' % pid, token=cara_tok)
+        self.assertEqual(200, inbox.status, inbox.data)
+        inbox_ids = [n['id'] for n in (inbox.data.get('notes') or inbox.data.get('items') or [])]
+        self.assertIn(note_id, inbox_ids)
+
+        # s4b: recommender records a 'fail' check citing recommendation item 'note-1', and approver adopts it (201 on BOTH backends)!
+        self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {'mode': 'block', 'reason': 'block'}, token=self.owner_tok)
+        tid, cid, prev, commit = self.deliver_task_bundle(pid, bob_tok, {'f.py': 'z = 2\n'}, title='S4b adopt fail')
+
+        rec = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'recommend', 'operation_id': 'op-s4b-rec',
+            'contribution': cid, 'commit': commit, 'verdict': 'approve',
+            'summary': 'Looks good overall; one optional note.',
+            'items': [{'id': 'note-1', 'text': 'Optional style cleanup on f.py:1.'}],
+            'checks': [
+                {'rule_id': 'VIC-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['f.py:1']}},
+                {'rule_id': 'SHLD-1', 'result': 'fail', 'evidence': {'kind': 'review_item', 'item_id': 'note-1'}},
+            ],
+        }, token=carl_tok)
+        self.assertEqual(201, rec.status, rec.data)
+        rec_id = (rec.data.get('recommendation') or rec.data.get('review') or rec.data).get('id') or rec.data.get('comment_id')
+
+        app = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-s4b-app',
+            'previous': prev, 'contribution': cid, 'summary': 'Adopt recommendation with fail note.',
+            'adopt_recommendation': rec_id,
+        }, token=cara_tok)
+        self.assertEqual(201, app.status, app.data)
+        by_rule = {c['rule_id']: c['result'] for c in app.data['sign_off']['checks']}
+        self.assertEqual({'VIC-1': 'pass', 'SHLD-1': 'fail'}, by_rule)
+
+    def test_r2_n1_author_party_waiver_and_direct_backend_person_guards(self):
+        # Kills M13c (author-party waiver over HTTP), M9 (endpoint web-standards person check), and M9b (InProcessBackend person check)!
+        pid = self.pid
+        _, alice_tok = self.create_person('alice_n1', 'contributor', pid)
+        cora_uid, cora_tok = self.create_person('cora_n1', 'coordinator', pid)
+        cora_aid, cora_bot = self.create_agent(cora_tok, 'cora-n1-bot', [pid], coordinate_in=[pid])
+
+        self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0, 'reason': 'Waiver party check.',
+            'rules': [_rule('WN-1', owner=cora_uid, severity='must')],
+        }, token=self.owner_tok)
+
+        tid, cid, _, commit = self.deliver_task_bundle(pid, cora_bot, {'w.py': 'w = 1\n'}, title='N1 waiver party')
+        indep_tid, indep_cid, _, indep_commit = self.deliver_task_bundle(
+            pid, alice_tok, {'indep.py': 'x = 2\n'}, title='N1 independent delivery'
+        )
+        draft_res = self.request('POST', '/v1/projects/%s/standards/drafts' % pid, {
+            'action': 'upsert', 'reason': 'Agent draft', 'rule': _rule('WN-2', owner=cora_uid),
+        }, token=cora_bot)
+        self.assertEqual(201, draft_res.status, draft_res.data)
+        draft_id = (draft_res.data.get('draft') or draft_res.data)['id']
+
+        # M13c: Cora's person session CANNOT waive a rule on her own agent cora_bot's delivery!
+        self_waive = self.request('POST', '/v1/projects/%s/tasks/%s/waivers' % (pid, tid), {
+            'contribution_id': cid, 'commit': commit, 'rule_id': 'WN-1',
+            'reason': 'Waiving own agent delivery', 'expiry': {'kind': 'delivery'},
+        }, token=cora_tok)
+        self.assertEqual(403, self_waive.status, self_waive.data)
+        self.assertIn('Waiver refused for rule WN-1:', self_waive.data['error']['message'])
+        self.assertIn('cannot waive a rule on their own delivery.', self_waive.data['error']['message'])
+
+        # Direct backend-level person-only checks bypassing HTTP handler route guards (kills M9 and M9b)!
+        cred_principal = self.service.authenticate(cora_bot)
+        for route_name, cap, extra_payload in (
+            ('standards.put', http_authority.CAP_READ, {'payload': {'expected_version': 1, 'reason': 'x', 'rules': []}}),
+            ('standards.rule-edit', http_authority.CAP_READ, {'rule_id': 'WN-1', 'payload': {'expected_version': 1, 'reason': 'x', 'rule': _rule('WN-1', owner=cora_uid)}}),
+            ('standards.draft-decide', http_authority.CAP_READ, {'draft_id': draft_id, 'payload': {'decision': 'reject', 'reason': 'x'}}),
+            ('standards.gate-set', http_authority.CAP_COORDINATE, {'payload': {'mode': 'block', 'reason': 'x'}}),
+            ('standards.waiver-grant', http_authority.CAP_READ, {'task_id': indep_tid, 'payload': {'contribution_id': indep_cid, 'commit': indep_commit, 'rule_id': 'WN-1', 'reason': 'x'}}),
+            ('standards.commit-record', http_authority.CAP_COORDINATE, {'operation': 'record-commit-coordinator', 'commit': indep_commit, 'payload': {'changed_files': ['indep.py']}}),
+        ):
+            with self.subTest(direct_backend_route=route_name):
+                with self.assertRaises(http_auth.HttpError) as cm_direct:
+                    self.backend.invoke(
+                        route_name, cred_principal, pid,
+                        dict(actor=cora_aid, **extra_payload),
+                        'op-direct-' + route_name.replace('.', '-'),
+                        capability=cap,
+                    )
+                self.assertEqual(403, cm_direct.exception.status)
 
 
 class HttpStandardsInProcessSuite(_HttpStandardsMixin, Harness):
@@ -1007,6 +1398,23 @@ class WebAndRouteSweepStandardsTests(Harness):
         }, token=self.owner_tok)
         self.assertEqual(201, issued.status, issued.data)
         secret = issued.data['credential']['secret']
+        cred_id = issued.data['credential']['id']
+
+        # Kills MQ directly at http_authority.credential_capabilities and http_authority.decide!
+        cred_rec = self.service.state['credentials'][cred_id]
+        owner_user = self.service.state['users'][self.owner_uid]
+        cred_caps = http_authority.credential_capabilities(self.service.state, cred_rec, owner_user, self.pid)
+        self.assertEqual(frozenset({http_authority.CAP_STANDARDS_VERIFY}), cred_caps)
+        self.assertNotIn(http_authority.CAP_READ, cred_caps)
+        ver_principal = self.service.authenticate(secret)
+        with self.assertRaises(http_authority.AuthorityDenied) as cm_mq:
+            http_authority.decide(
+                self.service.state,
+                http_auth.authority_request(
+                    ver_principal, self.pid, http_authority.CAP_READ, now=self.service._expiry_now()
+                ),
+            )
+        self.assertEqual(403, cm_mq.exception.status)
 
         swept, open_routes = 0, []
         for verb, pattern, name, anonymous, _csrf in http_service.ROUTES:
@@ -1152,6 +1560,166 @@ console.log(JSON.stringify({ pageText, calls }));
         rev_body = by_kind['review'][0][2]
         self.assertEqual('approve', rev_body['operation'])
         self.assertEqual('27', rev_body['adopt_recommendation'])
+
+    def test_web_task_page_fetches_full_signoff_from_compact_brief_and_renders_lint_warning_messages(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        shim_uri = (ROOT / 'tests' / 'web_dom_shim.mjs').as_uri()
+        standards_uri = (WEB / 'js' / 'views' / 'standards.js').as_uri()
+        task_uri = (WEB / 'js' / 'views' / 'task.js').as_uri()
+
+        script = """
+const [shimUrl, standardsUrl, taskUrl] = process.argv.slice(1);
+await import(shimUrl);
+globalThis.window = { isSecureContext: false, location: { origin: 'http://127.0.0.1' } };
+const stdView = await import(standardsUrl);
+const taskView = await import(taskUrl);
+
+let signOffCallsWithReg = 0;
+let signOffCallsNoReg = 0;
+
+// 1) Task page starting from COMPACT brief (sign_off summary has NO checks array -> must fetch taskSignOff!)
+const ctxWithReg = {
+  me: { id: 'usr_1', username: 'cora', display_name: 'Cora' },
+  setDirty() {},
+  render() {},
+  href: (p) => p,
+  api: {
+    project: async (pid) => ({ id: pid, name: 'RegProj', role: 'coordinator', capabilities: ['project.read', 'project.coordinate', 'reviews.approve', 'tasks.write', 'reviews.write'], archived: false }),
+    brief: async () => ({
+      task: { id: 't-1', title: 'Approved Task', status: 'open', priority: 2, assignee: 'usr_2', version: 3 },
+      review: {
+        state: 'approved',
+        latest_id: 'rev_9',
+        contribution: { id: 'con_1', revision: 1, commit: 'a'.repeat(40), author: 'usr_2', summary: 'Fix.' },
+        requests: [],
+      },
+      standards: {
+        status: 'active',
+        register_version: 2,
+        gate_mode: 'block',
+        diff_status: 'verified',
+        applicable_rules: [],
+        conditional_rules: [],
+        sign_off: {
+          headline: 'Checked against standards register v1',
+          register_version: 1,
+          gate_mode: 'block',
+          would_have_refused: [],
+        },
+      },
+      lifecycle: {},
+      depends_on: [],
+    }),
+    history: async () => ({ items: [], next_cursor: null }),
+    taskFiles: async () => ({ files: [] }),
+    taskSignOff: async () => {
+      signOffCallsWithReg += 1;
+      return {
+        contribution_id: 'con_1',
+        register_version: 1,
+        gate_mode: 'block',
+        diff_status: 'verified',
+        diff_recorded_by: 'usr_oscar',
+        would_have_refused: [],
+        checks: [
+          {
+            rule_id: 'STD-1',
+            statement: 'Bounds checked.',
+            severity: 'must',
+            check_kind: 'judgement',
+            result: 'pass',
+            source: 'adopted-recommendation',
+            evidence: { kind: 'citations', citations: ['src/app.py:10-14'] },
+            waiver: null,
+          },
+          {
+            rule_id: 'STD-50',
+            statement: 'Ruff passes.',
+            severity: 'must',
+            check_kind: 'mechanical',
+            result: 'fail',
+            source: 'verifier-recorded',
+            evidence: { kind: 'ci', status: 'fail', tool: 'ruff', command: 'ruff check', exit_code: 1, recorded_by: 'usr_oscar' },
+            ci_evidence: { kind: 'ci', status: 'fail', tool: 'ruff', command: 'ruff check', exit_code: 1, recorded_by: 'usr_oscar' },
+            waiver: { id: 'waiver-77', granted_by: 'usr_cora', reason: 'Legacy lint exemption' },
+          },
+        ],
+      };
+    },
+  },
+};
+
+const taskDom = await taskView.detail(ctxWithReg, { pid: 'p1', tid: 't-1' });
+const taskText = taskDom.textContent;
+
+// 2) Approved task on a project WITHOUT brief.standards -> must NOT call taskSignOff (0 calls)!
+const ctxNoReg = {
+  ...ctxWithReg,
+  api: {
+    ...ctxWithReg.api,
+    brief: async () => ({
+      task: { id: 't-0', title: 'No Reg Task', status: 'open', priority: 2, assignee: 'usr_2', version: 2 },
+      review: {
+        state: 'approved',
+        latest_id: 'rev_1',
+        contribution: { id: 'con_0', revision: 1, commit: 'b'.repeat(40), author: 'usr_2', summary: 'Plain.' },
+        requests: [],
+      },
+      lifecycle: {},
+      depends_on: [],
+    }),
+    taskSignOff: async () => {
+      signOffCallsNoReg += 1;
+      return null;
+    },
+  },
+};
+await taskView.detail(ctxNoReg, { pid: 'p0', tid: 't-0' });
+
+// 3) Standards page with object lint_warnings -> renders message text, never '[object Object]'!
+const ctxLint = {
+  ...ctxWithReg,
+  api: {
+    ...ctxWithReg.api,
+    standards: async () => ({
+      status: 'active',
+      version: 1,
+      gate: { mode: 'warn' },
+      effective_rules: [],
+      rules: [],
+      lint_warnings: [{ code: 'must_count_exceeded', message: 'Register defines 6 all_changes must rules (limit 5).' }],
+    }),
+    standardsDrafts: async () => ({ items: [] }),
+    standardsVersions: async () => ({ items: [] }),
+  },
+};
+const stdDom = await stdView.page(ctxLint, { pid: 'p1' });
+const stdText = stdDom.textContent;
+
+console.log(JSON.stringify({ signOffCallsWithReg, signOffCallsNoReg, taskText, stdText }));
+"""
+        done = run_node_module(self, node, script, shim_uri, standards_uri, task_uri)
+        self.assertEqual(0, done.returncode, done.stderr)
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(1, out['signOffCallsWithReg'])
+        self.assertEqual(0, out['signOffCallsNoReg'])
+        for expected in (
+            'Checked against standards register v1',
+            'STD-1',
+            'Bounds checked.',
+            'citations: src/app.py:10-14',
+            'adopted-recommendation',
+            'STD-50',
+            'Ruff passes.',
+            'CI ruff: ruff check exit 1 (recorded by usr_oscar)',
+            'Waived by usr_cora: Legacy lint exemption',
+            'Diff: verified (usr_oscar)',
+        ):
+            self.assertIn(expected, out['taskText'])
+        self.assertIn('Register defines 6 all_changes must rules (limit 5).', out['stdText'])
+        self.assertNotIn('[object Object]', out['stdText'])
 
 
 if __name__ == '__main__':

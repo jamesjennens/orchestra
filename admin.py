@@ -11499,7 +11499,7 @@ def _main():
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
     a=sub.add_parser('standards',allow_abbrev=False,
                      help='manage project review standards, warn/block gate, waivers, commit observations, and departed owners')
-    a.add_argument('standards_op',choices=['show','lint','notifications','put','rule-edit','set-gate','waive','draft-decide','record-commit','owner-departed'])
+    a.add_argument('standards_op',choices=['show','history','lint','draft-list','waivers','sign-off','notifications','put','rule-edit','set-gate','waive','draft-decide','record-commit','owner-departed'])
     a.add_argument('--project',required=True,action=_OnceFlag)
     a.add_argument('--actor',default=None,action=_OnceFlag)
     a.add_argument('--file',default=None,action=_OnceFlag)
@@ -11512,6 +11512,8 @@ def _main():
     a.add_argument('--until',default=None,action=_OnceFlag)
     a.add_argument('--draft',default=None,action=_OnceFlag)
     a.add_argument('--decision',choices=['accept','reject'],default=None,action=_OnceFlag)
+    a.add_argument('--status',choices=['pending','accepted','rejected'],default=None,action=_OnceFlag)
+    a.add_argument('--format',choices=['json','text','markdown'],default=None,dest='std_format',action=_OnceFlag)
     a.add_argument('--owner',default=None,action=_OnceFlag)
     a.add_argument('--version',type=int,default=None,action=_OnceFlag)
     a.add_argument('--expected-version',type=int,default=None,dest='expected_version',action=_OnceFlag)
@@ -11616,11 +11618,14 @@ def _main():
         import review_standards
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
-        ops_list=operators(root,strict=(args.standards_op not in ('show','lint','notifications')))
+        ops_list=operators(root,strict=(args.standards_op not in ('show','history','lint','draft-list','waivers','sign-off','notifications')))
         vers_list=verifiers(root)
         result=review_standards.admin_standards_command(
             root,path,args.project,args,run_bd,ops_list,vers_list)
-        print(json.dumps(result,sort_keys=True,indent=2,ensure_ascii=False))
+        if isinstance(result,str):
+            print(result,end='' if result.endswith('\n') else '\n')
+        else:
+            print(json.dumps(result,sort_keys=True,indent=2,ensure_ascii=False))
     elif args.command=='set-guidance':
         import fcntl
         from guidance import write_guidance

@@ -1071,7 +1071,11 @@ class InProcessBackend:
         user_rec = (state.get('users') or {}).get(user_id) or {}
         role = (state.get('memberships') or {}).get(project_id, {}).get(user_id)
         is_coord_or_owner = bool(user_rec.get('superuser') or role in ('coordinator', 'owner'))
-        is_person_sess = (principal.via == 'session' and principal.credential_id is None)
+        is_person_sess = (
+            principal.via == 'session'
+            and principal.credential_id is None
+            and bool(getattr(principal, 'session_hash', None))
+        )
         known_person, active_person, same_party_pair = review_standards._build_state_person_helpers(
             state, project_id
         )
@@ -1141,7 +1145,10 @@ class InProcessBackend:
                     store, body, task_id=task_id, contribution=contrib,
                     task_assignee=task.get('assignee'), actor=actor, author_person=user_id,
                     is_person_session=is_person_sess, is_coordinator_or_owner=is_coord_or_owner,
-                    same_party_checker=lambda other: same_party_pair(actor, other),
+                    same_party_checker=lambda other: (
+                        same_party_pair(actor, other)
+                        or (bool(user_id) and same_party_pair(user_id, other))
+                    ),
                     active_person_checker=active_person, pinned_version=pinned_ver,
                     now=self.service._now(),
                 )
@@ -1166,11 +1173,7 @@ class InProcessBackend:
                             status=403,
                         )
                 rows_for_commit = [
-                    dict(
-                        t,
-                        review_records=list(self.state.get('contributions', {}).get(t['id']) or []),
-                        recommendations=list(self.state.get('recommendations', {}).get(t['id']) or []),
-                    )
+                    self._standards_issue_view(t)
                     for t in self._project_rows(project_id)
                 ]
                 return review_standards.record_commit_observation(
@@ -1187,6 +1190,19 @@ class InProcessBackend:
             raise self._standards_error(err) from None
         raise invalid('Backend route is not implemented for HTTP mapping')
 
+    def _standards_issue_view(self, task, contributions=None):
+        tid = task['id']
+        return dict(
+            task,
+            review_records=list(
+                contributions
+                if contributions is not None
+                else (self.state.get('contributions', {}).get(tid) or [])
+            ),
+            recommendations=list(self.state.get('recommendations', {}).get(tid) or []),
+            checkpoints=list(self.state.get('checkpoints', {}).get(tid) or []),
+        )
+
     @staticmethod
     def _refuse_record_anchor_row(task):
         if isinstance(task, dict) and (is_record_anchor(task) or is_merge_slot(task)):
@@ -1196,6 +1212,8 @@ class InProcessBackend:
         import review_standards
         with self.service.store.lock:
             store = self._standards_store(project_id, writable=False)
+            if store.inspect_register_raw()[0] == 'none':
+                return None
             return review_standards.get_gate_view(store)
 
     def standards_read(self, project_id, principal, version=None):
@@ -1640,15 +1658,24 @@ class InProcessBackend:
                     )
                     cid = current[-1]['id']
                     ccommit = current[-1]['commit']
-                    commit_obs = std_w.read_commit_observation(ccommit)
-                    if commit_obs is not None:
-                        review_standards.check_reviewer_not_commit_recorder(
-                            commit_obs, cid, ccommit,
-                            lambda cand: (
-                                same_party_pair(actor, cand)
-                                or (bool(principal.user_id) and same_party_pair(principal.user_id, cand))
-                            ),
-                        )
+                    contrib_view = {
+                        'comment_id': cid,
+                        'commit': ccommit,
+                        'author': current[-1]['actor'],
+                    }
+                    issue_view = self._standards_issue_view(task, contributions)
+                    raw_commit_obs = std_w.read_commit_observation(ccommit)
+                    commit_obs = review_standards.filter_commit_observation_for_evaluation(
+                        raw_commit_obs,
+                        issue=issue_view,
+                        contribution=contrib_view,
+                        extra_actors=(actor, principal.user_id),
+                        same_party_with_actor=lambda cand: (
+                            same_party_pair(actor, cand)
+                            or (bool(principal.user_id) and same_party_pair(principal.user_id, cand))
+                        ),
+                        same_party_pair=same_party_pair,
+                    )
                     review_standards.validate_declared_tool_model(
                         std_extracted.get('declared_tool'), std_extracted.get('declared_model')
                     )
@@ -1668,17 +1695,19 @@ class InProcessBackend:
                             )
                             tree_avail = bool(eff_git.get('tree_available'))
                             tree_files = dict(eff_git.get('tree_files') or {})
+                            tree_recorders = None
                             if not tree_avail and commit_obs and isinstance(commit_obs.get('tree_files'), dict):
                                 tree_avail = True
                                 tree_files = dict(commit_obs['tree_files'])
-                            valid_ids = {r['id'] for r in self._requests(contributions) if r.get('contribution') == cid}
-                            for item_entry in (items if items else blocking):
-                                if item_entry.get('id'):
-                                    valid_ids.add(item_entry['id'])
+                                tree_recorders = dict(commit_obs.get('tree_files_recorders') or {})
+                            valid_ids = review_standards.collect_valid_item_ids_for_contribution(
+                                issue_view, cid, {'items': items if items else blocking}
+                            )
                             review_standards.validate_reviewer_checks(
                                 std_extracted['checks'], effective_rules=reg['effective_rules'],
                                 commit=ccommit, contribution_id=cid, valid_item_ids=frozenset(valid_ids),
                                 tree_available=tree_avail, tree_files=tree_files,
+                                commit_obs=commit_obs, tree_recorders=tree_recorders,
                             )
                 except review_standards.StandardsRefusal as err:
                     raise self._standards_error(err) from None
@@ -1705,6 +1734,7 @@ class InProcessBackend:
                     'commit': ccommit,
                     'author': current[-1]['actor'],
                 }
+                issue_view = self._standards_issue_view(task, contributions)
                 eff_git = (
                     prelock_git if isinstance(prelock_git, dict)
                     and prelock_git.get('contribution_id') == cid
@@ -1724,12 +1754,12 @@ class InProcessBackend:
                         'operation_id': srec.get('operation_id'),
                     })
                 valid_ids = frozenset(
-                    r['id'] for r in self._requests(contributions) if r.get('contribution') == cid
+                    review_standards.collect_valid_item_ids_for_contribution(issue_view, cid)
                 )
                 staged_signoff = review_standards.evaluate_approval_signoff(
                     std_w,
                     task_id=task['id'],
-                    issue=task,
+                    issue=issue_view,
                     contribution=contrib_view,
                     operation_id=eff_op_id,
                     actor=actor,
@@ -1744,6 +1774,7 @@ class InProcessBackend:
                         or (bool(principal.user_id) and same_party_pair(principal.user_id, cand))
                     ),
                     same_party_with_recommender=same_party_pair,
+                    same_party_pair=same_party_pair,
                     git_observation=eff_git,
                     active_person_checker=active_person,
                     now=self.service._now(),
@@ -1865,10 +1896,10 @@ class InProcessBackend:
                     and prelock_git.get('contribution_id') == contribution['id']
                     and prelock_git.get('commit') == contribution['commit'] else None
                 )
-                valid_ids = {r['id'] for r in self._requests(records) if r.get('contribution') == contribution['id']}
-                for item_entry in items:
-                    if item_entry.get('id'):
-                        valid_ids.add(item_entry['id'])
+                issue_view = self._standards_issue_view(task, records)
+                valid_ids = review_standards.collect_valid_item_ids_for_contribution(
+                    issue_view, contribution['id'], {'items': items}
+                )
                 staged_rec = review_standards.validate_and_stage_recommendation_checks(
                     std_w,
                     contribution={
@@ -1878,12 +1909,15 @@ class InProcessBackend:
                     },
                     operation_id=eff_op_id,
                     actor=actor,
+                    actor_user_id=principal.user_id,
+                    issue=issue_view,
                     extracted_fields=std_extracted,
                     valid_item_ids=frozenset(valid_ids),
                     same_party_with_actor=lambda cand: (
                         same_party_pair(actor, cand)
                         or (bool(principal.user_id) and same_party_pair(principal.user_id, cand))
                     ),
+                    same_party_pair=same_party_pair,
                     git_observation=eff_git,
                     active_person_checker=active_person,
                     now=self.service._now(),
@@ -2406,15 +2440,16 @@ class InProcessBackend:
         std_ro = self._standards_store(project_id, writable=False)
         if std_ro.inspect_register_raw()[0] != 'none':
             import review_standards
-            _, active_person, _ = review_standards._build_state_person_helpers(
+            _, active_person, same_party_pair = review_standards._build_state_person_helpers(
                 self.service.state, project_id
             )
             std_block = review_standards.brief_standards_block(
                 std_ro,
-                task,
+                self._standards_issue_view(task),
                 review_block,
                 full=False,
                 active_person_checker=active_person,
+                same_party_pair=same_party_pair,
                 now=self.service._now(),
             )
             if std_block is not None:
@@ -3439,6 +3474,19 @@ class EndpointBackend:
             status = reply['records_status']
             text = (reply.get('stderr') or 'Record operation refused').strip().split('\n')[-1]
             for prefix in ('ValueError: ', 'RecordsRefusal: '):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid'}.get(status, 'unavailable'),
+                              text)
+            error.nothing_done = True
+            raise error
+        if action in ('web-standards', 'standards') and isinstance(reply, dict) and (
+                reply.get('standards_status') or reply.get('records_status')):
+            status = reply.get('standards_status') or reply.get('records_status')
+            text = (reply.get('stderr') or 'Standards operation refused').strip().split('\n')[-1]
+            for prefix in ('ValueError: ', 'StandardsRefusal: '):
                 if text.startswith(prefix):
                     text = text[len(prefix):]
                     break
@@ -5110,10 +5158,13 @@ class EndpointBackend:
         try:
             project = admin.project_dir(Path(self.root), project_id)
         except ValueError:
-            return {'mode': 'warn', 'source': 'default', 'set_by': None, 'set_at': None, 'reason': None, 'warning': None}
+            return None
         if not project.is_dir():
-            return {'mode': 'warn', 'source': 'default', 'set_by': None, 'set_at': None, 'reason': None, 'warning': None}
-        return review_standards.get_gate_view(review_standards.HostStandardsStore(project, project_id))
+            return None
+        store = review_standards.HostStandardsStore(project, project_id)
+        if store.inspect_register_raw()[0] == 'none':
+            return None
+        return review_standards.get_gate_view(store)
 
     def standards_read(self, project_id, principal, version=None):
         body = {'operation': 'read'}
@@ -9936,7 +9987,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['can_set_agent_approval'] = self._may_set_agent_approval(ctx)
         gate_read = getattr(self.backend, 'standards_gate_state', None)
         if gate_read is not None:
-            result['standards_gate'] = gate_read(ctx.params['pid'])
+            gate_val = gate_read(ctx.params['pid'])
+            if gate_val is not None:
+                result['standards_gate'] = gate_val
         return 200, result
 
     def _may_set_agent_approval(self, ctx):
@@ -16559,15 +16612,18 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result
         out = dict(result)
         notif_text = out.pop('coordinator_notification_text', None)
-        if notif_text and out.get('notified_coordinator') and not out.get('coordinator_note_id'):
+        if notif_text and not out.get('coordinator_note_id'):
             try:
                 note, _ = self.service.write_member_note(
-                    ctx.principal, pid, notif_text, None, 'coordinators', throttle=False
+                    ctx.principal, pid, notif_text, None, 'coordinators',
+                    throttle=False, allow_any_member=True,
                 )
                 if isinstance(note, dict) and note.get('id'):
                     out['coordinator_note_id'] = note['id']
             except HttpError:
                 pass
+        if 'notified_coordinator' in out:
+            out['notified_coordinator'] = bool(out.get('coordinator_note_id'))
         return out
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/standards')

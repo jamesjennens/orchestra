@@ -1557,7 +1557,8 @@ def compact_integration(value):
 
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
           independent_approval=False,owners=None,provenance_writes=True,identity_names=None,
-          field_history=None,git_observation=None):
+          field_history=None,git_observation=None,standards_same_party_pair=None,
+          standards_active_person=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -1814,8 +1815,24 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         _jpath=_StdPath(journal)
         _std_store=_review_standards.HostStandardsStore(
             _jpath,project,shared_loader=_review_standards.host_shared_loader_for(_jpath))
-        std_block=_review_standards.brief_standards_block(
-            _std_store,issue,review,full=full,git_observation=git_observation)
+        if _std_store.inspect_register_raw()[0]!='none':
+            from review_workflow import same_party as _rw_same_party
+            _owners_map=owners() if callable(owners) else owners
+            if _owners_map is None:
+                import sessions as _std_sessions
+                try:
+                    _owners_map=_std_sessions.owners(_jpath)
+                except Exception:
+                    _owners_map={}
+            def _std_pair(left,right):
+                if _rw_same_party(left,right,_owners_map):
+                    return True
+                if callable(standards_same_party_pair) and standards_same_party_pair(left,right):
+                    return True
+                return False
+            std_block=_review_standards.brief_standards_block(
+                _std_store,issue,review,full=full,git_observation=git_observation,
+                active_person_checker=standards_active_person,same_party_pair=_std_pair)
     result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(owner_raw or 'unassigned',96),**({'owner_name':clip(owner_name,96),'assigned_to':clip(assigned_to,200)} if owner_name and owner_name!=owner_raw else {}),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
@@ -3014,7 +3031,8 @@ def latest_checkpoint_read(rows,project,task,include_provenance=False):
             'evidence':{'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id'])}}
 
 def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None,
-            independent_approval=False,owners=None,identity_names=None,git_observation=None):
+            independent_approval=False,owners=None,identity_names=None,git_observation=None,
+            standards_same_party_pair=None,standards_active_person=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
     if help_requested(args):
@@ -3096,7 +3114,9 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
                          independent_approval=independent_approval,owners=owners,
                          provenance_writes=checkpoint_writes_enabled(root),
                          identity_names=identity_names,field_history=field_history,
-                         git_observation=git_observation)
+                         git_observation=git_observation,
+                         standards_same_party_pair=standards_same_party_pair,
+                         standards_active_person=standards_active_person)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

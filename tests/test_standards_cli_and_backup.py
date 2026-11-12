@@ -531,6 +531,24 @@ class StandardsCliAndBackupTests(Harness):
         })
         self.assertEqual(0, ep('review', [tid, '@attachment:0'], 'cora-op', {'0': {'flag': '--file', 'text': app_body}})['returncode'])
 
+        # Exercise real admin.py CLI parser on standards history, draft-list, waivers, and sign-off (Opus N5)!
+        def _run_admin_cli(*cli_args):
+            buf = io.StringIO()
+            with mock.patch.object(admin, 'run_bd', side_effect=lambda _r, _p, argv: tracker.run_argv(argv)), \
+                 mock.patch.object(sys, 'argv', ['admin.py', '--root', str(host_root), *cli_args]), \
+                 redirect_stdout(buf):
+                admin.main()
+            return buf.getvalue()
+
+        adm_hist = json.loads(_run_admin_cli('standards', 'history', '--project', pid))
+        self.assertEqual([1], [v['version'] for v in adm_hist['items']])
+        adm_drafts = json.loads(_run_admin_cli('standards', 'draft-list', '--project', pid, '--status', 'pending'))
+        self.assertEqual([], adm_drafts['items'])
+        adm_waivers = json.loads(_run_admin_cli('standards', 'waivers', '--project', pid, '--task', tid))
+        self.assertEqual([], adm_waivers['items'])
+        adm_so_md = _run_admin_cli('standards', 'sign-off', '--project', pid, '--task', tid, '--format', 'markdown')
+        self.assertIn('Checked against standards register v1', adm_so_md)
+
         # Inspect raw stored comments: Kind: contribution-review-v1 MUST NOT contain any standards keys!
         issue = tracker.rows[tid]
         cr_comments = [c for c in issue['comments'] if c['text'].startswith(rw.PREFIX)]
