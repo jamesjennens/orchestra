@@ -4323,11 +4323,12 @@ account) and save. The service-local (disposable) backend has no deployment file
 backend attribute `invites_enabled`, which only a test or a local trial sets.
 
 **Who may invite.** A person signed in to the web page (a session, never an agent or worker credential,
-whatever grant the agent holds) who is a superuser, or whose role in **every** project the invite names
-carries `coordinate` (coordinator or owner): the rule `http_authority.decide` gives a session for
-`coordinate`. A project the inviter cannot see is `404`; one they only contribute to or view is `403`;
-an archived project, or one the backend will not serve, is refused. Note that this lets a project
-coordinator add a contributor by invite, which the Members table leaves to owners.
+whatever grant the agent holds) who could add the member directly today, by the Members table's rule:
+a superuser, or an **owner** of **every** project the invite names (`project.admin`, as
+`Service.set_member` requires). A coordinator who is not an owner may not, so an invite never widens
+who can add people (coordinator's decision on kittrial-5bb.578). It is checked when the invite is made
+and again when it is redeemed. A project the inviter cannot see is `404`; one where they are not an
+owner is `403`; an archived project, or one the backend will not serve, is refused.
 
 | Route | Who | What |
 | --- | --- | --- |

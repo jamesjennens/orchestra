@@ -50,7 +50,7 @@ class Clock:
 
 
 class InviteCase(unittest.TestCase):
-    """A superuser, a coordinator ("cora") of North and South, a contributor of South ("carl"), and
+    """A superuser, an owner ("cora") of North and South, a contributor of South ("carl"), and
     the switch on unless a test turns it off."""
 
     def setUp(self):
@@ -74,7 +74,7 @@ class InviteCase(unittest.TestCase):
         for pid, name in (('north', 'North'), ('south', 'South'), ('west', 'West')):
             status, body = self.call('POST', '/v1/projects', {'project_id': pid, 'name': name}, self.admin)
             self.assertEqual(status, 201, body)
-        self.cora = self.person('cora', {'north': 'coordinator', 'south': 'coordinator'})
+        self.cora = self.person('cora', {'north': 'owner', 'south': 'owner'})
         self.carl = self.person('carl', {'south': 'contributor', 'north': 'contributor'})
 
     def stop(self):
@@ -371,10 +371,23 @@ class WhoMayInviteTests(InviteCase):
         self.invite(username='nina')
         self.assertEqual(self.invite(expect=409, username='NINA')['error']['code'], 'conflict')
 
+    def test_a_coordinator_who_is_not_an_owner_is_refused(self):
+        # Coordinator's decision on kittrial-5bb.578: only who may add a member on the Members table
+        # (an owner, or a superuser) may invite into the project, so invites never widen it.
+        coco = self.person('coco', {'north': 'coordinator', 'south': 'owner'})
+        for projects in (['north'], ['south', 'north']):
+            with self.subTest(projects=projects):
+                answer = self.invite(token=coco, expect=403, projects=projects)
+                self.assertEqual(answer['error']['code'], 'forbidden')
+        self.assertFalse(self.service.state.get('invites'))
+        self.assertEqual([p['id'] for p in self.call('GET', '/v1/invites', token=coco)[1]['projects']], ['south'])
+        self.invite(token=coco, projects=['south'])
+
     def test_an_inviter_who_lost_the_role_since_cannot_have_the_invite_used(self):
+        # An owner made the invite and is now only a coordinator there: the re-check at redeem refuses it.
         token = self.invite(projects=['north'])['token']
         cora = self.service.state['usernames']['cora']
-        status, body = self.call('PUT', '/v1/projects/north/members/%s' % cora, {'role': 'contributor'}, self.admin)
+        status, body = self.call('PUT', '/v1/projects/north/members/%s' % cora, {'role': 'coordinator'}, self.admin)
         self.assertEqual(status, 200, body)
         before = self.snapshot()
         status, body = self.redeem(token)

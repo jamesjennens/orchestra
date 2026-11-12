@@ -32,7 +32,7 @@ import secrets
 import claim_limit
 from http_auth import (AGENT_DEFAULT_SCOPES, HttpError, Principal, Service, _validate_password, conflict,
                        forbidden, hash_password, invalid, new_token, not_found, now_iso, token_hash)
-from http_authority import CAP_COORDINATE, ROLE_CAPABILITIES
+from http_authority import CAP_PROJECT_ADMIN, ROLE_CAPABILITIES
 
 #: How long an invite lives: 72 hours unless the inviter asks for less or more, at most 7 days.
 DEFAULT_HOURS = 72
@@ -169,9 +169,11 @@ def _agent_request(value, projects):
 def _holds(state, user_id, project_id):
     """Whether the account ``user_id`` may invite people into ``project_id`` NOW, from state alone.
 
-    The same rule ``http_authority.decide`` gives a person's session for ``coordinate``: a superuser,
-    or a member whose project role carries ``coordinate`` (coordinator, owner). Used at redemption,
-    where the inviter has no session in the request; creation also passes ``decide`` itself.
+    Only someone who could add the member directly today, by the rule of the Members table
+    (``Service.set_member``: ``project.admin``): a superuser, or a member whose project role carries
+    ``project.admin`` (an owner). A coordinator who is not an owner may not (coordinator's decision on
+    kittrial-5bb.578), so an invite never widens who can add people. Used at redemption, where the
+    inviter has no session in the request; creation also passes ``decide`` itself.
     An archived project takes nobody new.
     """
     user = (state.get('users') or {}).get(user_id)
@@ -181,7 +183,7 @@ def _holds(state, user_id, project_id):
     if user.get('superuser'):
         return True
     role = ((state.get('memberships') or {}).get(project_id) or {}).get(user_id)
-    return CAP_COORDINATE in ROLE_CAPABILITIES.get(role, frozenset())
+    return CAP_PROJECT_ADMIN in ROLE_CAPABILITIES.get(role, frozenset())
 
 
 def invitable_projects(service, principal):
@@ -260,10 +262,10 @@ def create(service, principal, payload, *, usable=None, request_id=None):
         state = service.state
         for pid in projects:
             # The kit's one authority rule: 404 for a project the caller cannot see, 403 for one
-            # whose role does not coordinate (a contributor or viewer).
-            service._check_authority_locked(principal, pid, CAP_COORDINATE)
+            # whose role may not add members (anyone but an owner), as the Members table refuses it.
+            service._check_authority_locked(principal, pid, CAP_PROJECT_ADMIN)
             if not _holds(state, principal.user_id, pid):
-                raise forbidden('You may invite people only to projects you coordinate or own, and not '
+                raise forbidden('You may invite people only to projects you own, and not '
                                 'to an archived project')
             if usable is not None:
                 usable(pid)
