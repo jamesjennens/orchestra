@@ -2134,6 +2134,27 @@ Its warning, and the agent next-actions sentence (whose "and N more" counts from
 total), name the respond record as
 "POST `/v1/projects/{pid}/tasks/{tid}/reviews`, operation respond" and never the client command.
 
+## Same-commit `contribute` while requested changes are active (kittrial-5bb.556)
+
+A new `contribute` (`review TASK --file`) whose case-folded `commit` matches the task's latest
+delivery is refused before any write while that delivery has an active blocking `request-changes`
+not yet settled by an un-invalidated `approve`, a `withdraw`, or the requester resolving or
+downgrading every blocking item (`resolve-item`):
+
+- **Sentence while any blocking item is open**:
+  `this commit was already reviewed and changes were requested; answer the review with respond, or deliver a new commit (review <id>)`
+- **Sentence once all blocking items are answered (`respond`) and awaiting re-review**:
+  `this commit was already reviewed and its requested changes were answered; wait for the reviewer to review it again, or deliver a new commit (review <id>)`
+- **CLI / endpoint envelope and exit status**: exits with status `2` and `ValueError: <sentence>` on
+  stderr; `SameCommitChangesRequested.detail` carries structured key `code:
+  "same-commit-changes-requested"` (`http_status: 409`, `task`, `review_id`, `commit`, `answered`),
+  and the endpoint envelope carries `review_status: 409`, `review_id: "<id>"` and
+  `review_answered: false | true`.
+- **HTTP status and structured key**: `POST /v1/projects/{pid}/tasks/{tid}/reviews` returns HTTP
+  `409` (`error.code: "conflict"`) with `error.message` set to the refusal sentence above and
+  structured `error.detail: {"review_id": "<id>"}` on both HTTP backends. An exact `operation_id`
+  retry of the original `contribute` still reconciles (`201`, `reconciled: true`).
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,

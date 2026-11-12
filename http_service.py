@@ -1255,12 +1255,48 @@ class InProcessBackend:
                 delivery_block = {'kind': 'remote', 'remote': '', 'branch': branch}
             else:
                 delivery_block = {'kind': 'bundle', 'path': '', 'sha256': digest}
+            actor = payload.get('actor') or principal.actor
+            operation_id = payload.get('operation_id')
+            if isinstance(operation_id, str) and operation_id:
+                for stored in contributions:
+                    if stored.get('operation_id') != operation_id:
+                        continue
+                    if (stored.get('kind') == 'contribution'
+                            and stored.get('actor') == actor
+                            and stored.get('commit') == commit
+                            and stored.get('base_commit') == base_commit
+                            and stored.get('repository') == repository
+                            and stored.get('delivery') == delivery_block
+                            and stored.get('bundle_sha256') == digest
+                            and stored.get('branch') == branch
+                            and stored.get('summary') == summary.strip()):
+                        still_open = self._requests(contributions, True)
+                        from review_state import OPEN_ITEMS_MAX, open_items_warnings
+                        every = [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
+                                 for r in still_open]
+                        answer = {'contribution': stored, 'comment_id': stored['id'], 'reconciled': True,
+                                  'task_version': task['version'],
+                                  'open_items': every[:OPEN_ITEMS_MAX], 'open_items_total': len(every)}
+                        if every:
+                            answer['warnings'] = open_items_warnings(
+                                every, task['id'], '/v1/projects/%s/tasks/%s' % (project_id, task['id']))
+                        return answer
+                    raise invalid('Operation ID already used with different payload or actor')
+            current = [r for r in contributions if r['kind'] == 'contribution']
+            if current and commit.lower() == current[-1]['commit'].lower():
+                review_id, answered = self._active_changes_requested_review(contributions, current[-1]['id'])
+                if review_id is not None:
+                    from review_workflow import same_commit_refusal_message
+                    raise conflict(same_commit_refusal_message(review_id, answered=answered),
+                                   {'review_id': review_id})
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
                       'repository': repository, 'delivery': delivery_block,
                       'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
-                      'actor': payload.get('actor') or principal.actor,
+                      'actor': actor,
                       'created_at': now_iso(self.service._now())}
+            if isinstance(operation_id, str) and operation_id:
+                record['operation_id'] = operation_id
             contributions.append(record)
             # Like the canonical projection, a new revision does not resolve requests
             # that need a respond record: they stay open until the contributor responds.
@@ -1312,9 +1348,10 @@ class InProcessBackend:
             items = self._review_items(payload.get('items'), allow_severity=True)
             if isinstance(operation_id, str) and operation_id:
                 for stored in contributions:
-                    if stored.get('kind') != 'request-changes' or stored.get('operation_id') != operation_id:
+                    if stored.get('operation_id') != operation_id:
                         continue
-                    if stored.get('actor') == actor and stored.get('contribution_id') == current[-1]['id'] \
+                    if stored.get('kind') == 'request-changes' and stored.get('actor') == actor \
+                            and stored.get('contribution_id') == current[-1]['id'] \
                             and stored.get('summary') == summary and stored.get('items') == items:
                         return {'review': stored, 'task_version': task['version']}
                     raise invalid('Operation ID already used with different payload or actor')
@@ -1471,6 +1508,44 @@ class InProcessBackend:
                 continue
             newest[author_key(record['actor'])] = record
         return sorted(newest.values(), key=lambda record: (record['after'], record['created_at']), reverse=True)
+
+    @staticmethod
+    def _active_changes_requested_review(records, latest_id):
+        """Return ``(review_id, answered)`` blocking a same-commit ``contribute``, or ``(None, False)``."""
+        after_latest = False
+        blocking = {}
+        for record in records:
+            kind = record.get('kind')
+            if kind == 'contribution':
+                after_latest = (record.get('id') == latest_id)
+                continue
+            if not after_latest or record.get('contribution_id') != latest_id:
+                continue
+            if kind == 'request-changes':
+                items = record.get('items') or (
+                    [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
+                for item in items:
+                    if item.get('severity') != 'note':
+                        blocking[(record['id'], item['id'])] = 'open'
+            elif kind == 'respond':
+                for res in record.get('resolutions') or []:
+                    key = (res['request'], res['item'])
+                    if key in blocking:
+                        blocking[key] = 'responded'
+            elif kind == 'approve':
+                blocking.clear()
+        open_ids = [req_id for (req_id, _), status in blocking.items() if status == 'open']
+        if open_ids:
+            return open_ids[-1], False
+        responded_ids = [req_id for (req_id, _), status in blocking.items() if status == 'responded']
+        if responded_ids:
+            return responded_ids[-1], True
+        return None, False
+
+    @staticmethod
+    def _active_changes_requested_review_id(records, latest_id):
+        """Return the ``request-changes`` id blocking a same-commit ``contribute``, or ``None``."""
+        return InProcessBackend._active_changes_requested_review(records, latest_id)[0]
 
     @staticmethod
     def _requests(records, open_only=False):
@@ -2904,6 +2979,15 @@ class EndpointBackend:
             error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
                                       422: 'invalid'}.get(status, 'unavailable'),
                               (reply.get('stderr') or 'Lifecycle state cannot be read').strip())
+            error.nothing_done = True
+            raise error
+        if action == 'review' and isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                reply.get('review_status') == 409 and isinstance(reply.get('review_id'), str) and reply['review_id']:
+            from review_workflow import same_commit_refusal_message
+            error = conflict(
+                same_commit_refusal_message(reply['review_id'], answered=bool(reply.get('review_answered'))),
+                {'review_id': reply['review_id']},
+            )
             error.nothing_done = True
             raise error
         if action == 'task-file' and isinstance(reply, dict) and reply.get('returncode') == 2 and \
