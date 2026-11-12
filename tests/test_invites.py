@@ -408,7 +408,10 @@ class NothingHalfMadeTests(InviteCase):
     def test_a_password_that_breaks_the_rules_creates_nothing(self):
         token = self.invite(agent={'name': 'Nina bot', 'project': 'north'})['token']
         before = self.snapshot()
-        for bad in ('short', ' ' * 20, 'x' * 1025, None):
+        # Candidate 1112a: one character under the installation's minimum (kittrial-5bb.547 made the default 5, so
+        # 'short' became a valid password); the other cases are unchanged.
+        too_short = 's' * (self.service.password_min_length - 1)
+        for bad in (too_short, ' ' * 20, 'x' * 1025, None):
             with self.subTest(password=repr(bad)[:12]):
                 status, body = self.redeem(token, bad)
                 self.assertEqual(status, 422, body)
