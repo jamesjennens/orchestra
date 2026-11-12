@@ -297,13 +297,21 @@ out.page = {};
     hint: other.map(text), acceptButtons: acceptButtons(page).length,
     membershipWordsBefore: MEMBERSHIP_WORDS.filter((w) => before.includes(w)),
   };
-  await withAttr(page, 'data-action', 'invite-sign-out')[0].dispatch('click');
-  await settle();
-  out.page.other.afterSignOut = { me: ctx.me, hasPassword: Boolean(byId(page, 'invite_password')),
+  // A missing button or form is recorded, not thrown, so the test that names it is the one that fails.
+  const signOut = withAttr(page, 'data-action', 'invite-sign-out')[0];
+  out.page.other.signOutButton = Boolean(signOut);
+  if (signOut) {
+    await signOut.dispatch('click');
+    await settle();
+  }
+  out.page.other.afterSignOut = { me: signOut ? ctx.me : 'no sign-out button', hasPassword: Boolean(byId(page, 'invite_password')),
     username: byId(page, 'invite_username') ? byId(page, 'invite_username').value : null };
-  byId(page, 'invite_password').value = 'correct horse';
-  await withAttr(page, 'data-form', 'invite-sign-in')[0].dispatch('submit');
-  await settle();
+  const signInForm = withAttr(page, 'data-form', 'invite-sign-in')[0];
+  if (signOut && signInForm && byId(page, 'invite_password')) {
+    byId(page, 'invite_password').value = 'correct horse';
+    await signInForm.dispatch('submit');
+    await settle();
+  }
   out.page.other.calls = calls;
   out.page.other.title = title(page);
 }
