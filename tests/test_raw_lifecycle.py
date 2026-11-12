@@ -158,6 +158,33 @@ class RawLifecycleTests(unittest.TestCase):
         self.rejected(['close', '-qf', 'pp-task'], rows=[row(issue_type='event', title='State change: live → passed')])
         self.guard(['close', '-qf', 'pp-task'])
 
+    def test_note_file_attachments_expand_as_note_values_and_preserve_lifecycle_refusals(self):
+        note = ('Reproduction note quoting pp-task-c01a1a35f-317a-7ec6-9f64-e01a71f3312d '
+                'and pp-other-c01a1a519-063f-7a56-988e-4d5e94c8c97b\n' * 120)
+        for note_flag in ('--append-notes', '--notes'):
+            for att_flag in ('--file', '-f'):
+                att = {'0': {'flag': att_flag, 'text': note}}
+                asked = []
+                def reader(tokens, asked=asked):
+                    asked.append(list(tokens))
+                    return [row()]
+                raw.guard(['update', 'pp-task', note_flag, '@attachment:0'], att, reader)
+                self.assertEqual(asked, [['pp-task']])
+                raw.guard(['create', 'ordinary', note_flag, '@attachment:0'], att,
+                          lambda tokens: (_ for _ in ()).throw(AssertionError(tokens)))
+                # Lifecycle refusals stay intact alongside a note attachment.
+                self.rejected(['update', 'pp-task', note_flag, '@attachment:0',
+                               '--add-label=reviewed:passed'], attachments=att)
+                self.rejected(['update', 'pp-task', note_flag, '@attachment:0'],
+                              rows=[row(issue_type='event', title='State change: reviewed → passed')],
+                              attachments=att)
+                self.rejected(['update', 'pp-task', note_flag, '@attachment:0'],
+                              rows=[], attachments=att)
+        # Other value flags followed by a file attachment fail closed in raw_lifecycle.guard too.
+        for bad_flag in ('--description', '--title', '-d'):
+            self.rejected(['update', 'pp-task', bad_flag, '@attachment:0'],
+                          attachments={'0': {'flag': '--file', 'text': 'ordinary'}})
+
 
 if __name__ == '__main__':
     unittest.main()
