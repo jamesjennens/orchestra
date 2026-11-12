@@ -25,7 +25,10 @@ _RESULT = None
 # owner, measured by running that file's `settings` view against the same recording stub as this test
 # (`git show 045a758a:web/js/views/project.js`, run with the .mjs's optional last argument). Kept as a literal so
 # that this test needs no old file.
+# Batch 1 (main cab79679) added .578's invite panel to that page, which reads GET /v1/invites; the rebase onto it
+# moves the panel to People (kittrial-5bb.522 slice 2 on main).
 OLD_SETTINGS_CALLS = [
+    'GET /v1/invites',
     'GET /v1/projects/alpha',
     'GET /v1/projects/alpha/agents',
     'GET /v1/projects/alpha/audit',
@@ -148,7 +151,8 @@ class NoRouteCallChanges(unittest.TestCase):
     def test_each_section_reads_only_what_its_panels_need(self):
         # Stronger than the union: a call moved onto the wrong section (or one added there) shows here.
         owner = observations(self)['owner']
-        self.assertEqual(['GET /v1/projects/alpha', 'GET /v1/projects/alpha/coordination', 'GET /v1/projects/alpha/members'],
+        self.assertEqual(['GET /v1/invites', 'GET /v1/projects/alpha', 'GET /v1/projects/alpha/coordination',
+                          'GET /v1/projects/alpha/members'],
                          owner['people']['calls'])
         self.assertEqual(['GET /v1/projects/alpha', 'GET /v1/projects/alpha/agents', 'GET /v1/projects/alpha/coordination'],
                          owner['agents']['calls'])
