@@ -106,7 +106,7 @@ export function invitePanel(ctx, project) {
           if (!(await confirmDialog({ title: `Withdraw the invite for ${item.display_name}?`, body: 'The link stops working at once.', confirmLabel: 'Withdraw', danger: true }))) return;
           try { await act(e.currentTarget, () => ctx.api.revokeInvite(item.id), { success: 'Invite withdrawn' }); } catch { /* shown */ }
           draw();
-        } }, 'Withdraw') : '')))))];
+        } }, 'Withdraw') : ''))))))];
   }
 
   async function draw() {

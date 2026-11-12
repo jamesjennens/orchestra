@@ -9,6 +9,8 @@ part, its reading of the switch from deployment.private.json, is tested on its o
 import http.client
 import json
 import secrets
+import shutil
+import subprocess
 import sqlite3
 import sys
 import tempfile
@@ -518,6 +520,30 @@ class EndpointSwitchTests(unittest.TestCase):
             with self.assertRaises(http_auth.HttpError) as refused:
                 self.backend(Path(tmp))()
             self.assertEqual(refused.exception.status, 503)
+
+
+class WebPageTests(unittest.TestCase):
+    """The page's modules parse, and the link is built from the answer (node, when it is installed)."""
+
+    NODE = shutil.which('node')
+
+    @unittest.skipIf(NODE is None, 'node is not installed')
+    def test_the_touched_modules_parse_and_the_link_is_the_services_or_this_pages(self):
+        web = KIT / 'web' / 'js'
+        for name in ('views/invites.js', 'views/agents.js', 'views/project.js', 'app.js', 'api.js'):
+            with self.subTest(module=name):
+                run = subprocess.run([self.NODE, '--input-type=module', '--check'], input=(web / name).read_text(encoding='utf-8'),
+                                     capture_output=True, text=True, encoding='utf-8', timeout=60)
+                self.assertEqual(run.returncode, 0, run.stderr[:400])
+        source = (web / 'views' / 'invites.js').read_text(encoding='utf-8')
+        start = source.index('export function inviteLink')
+        body = source[start:source.index('\n}\n', start) + 3].replace('export ', '')
+        script = body + ("console.log(JSON.stringify([inviteLink({token: 'T'}, 'https://here'), "
+                         "inviteLink({token: 'T', link: 'https://pub/#/invite/T'}, 'https://here')]));")
+        run = subprocess.run([self.NODE, '--input-type=module', '-e', script], capture_output=True, text=True,
+                             encoding='utf-8', timeout=60)
+        self.assertEqual(json.loads(run.stdout), ['https://here/#/invite/T', 'https://pub/#/invite/T'], run.stderr[:400])
+        self.assertIn(invites.SHOWN_ONCE.split(':')[0], source)
 
 
 class RestoreTests(unittest.TestCase):
