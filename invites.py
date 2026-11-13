@@ -96,10 +96,8 @@ NO_ACCOUNT = 'No active account with that username'
 SELF = 'To add an agent for yourself use New agent on My agents; an invite is for someone else.'
 NOTHING_TO_DO = ('@%s already has that role or a higher one in every project named, and no agent was asked; '
                  'there is nothing to invite them to.')
-AGENT_NAME_TAKEN = ('@%s already has an agent whose secret file would have this name; choose another agent name.')
 AGENT_NAME_TAKEN_NOW = ('You already have an agent whose secret file would have the name of this invite\'s agent. '
                         'Ask the person who sent it for a new invite; nothing was changed.')
-AGENT_LIMIT = '@%s already has the most agents an account may have (%d).'
 AGENT_LIMIT_NOW = ('You already have the most agents an account may have (%d). Ask the person who sent it for '
                    'a new invite; nothing was changed.')
 PERSON_FIELD = 'person must be "new" or "existing"'
@@ -380,12 +378,9 @@ def create(service, principal, payload, *, usable=None, request_id=None):
             if agent is None and all(_rank((members.get(pid) or {}).get(user_id)) >= _rank(role)
                                      for pid in projects):
                 raise conflict(NOTHING_TO_DO % username)
-            if agent is not None:
-                # Said now so the inviter hears it before sending; judged again at acceptance.
-                if _agent_count(state, user_id) >= AGENT_MAX_PER_OWNER:
-                    raise conflict(AGENT_LIMIT % (username, AGENT_MAX_PER_OWNER))
-                if _agent_name_clash(state, user_id, agent['name']):
-                    raise conflict(AGENT_NAME_TAKEN % username)
+            # The agent limit and an agent-name clash are judged at acceptance only (accept), where
+            # only the named account hears the answer: said here, they would tell the inviter about
+            # that account's agents, in projects the inviter may not see (kittrial-5bb.581 r2, review S2).
         moment = service._expiry_now()
         invites = _invites(service)
         pending = [record for record in invites.values() if status(service, record, moment) == 'pending']
@@ -561,6 +556,10 @@ def public_view(service, token, *, source='local', shared_source=False):
         # kittrial-5bb.581: for an existing account the page says whom it is for and nothing about that
         # account (not whether it is already a member anywhere): the holder of the link may not be them.
         shown['password_min_length'] = service.password_min_length if kind_of(record) == PERSON_NEW else None
+        if kind_of(record) == PERSON_EXISTING:
+            # Not the account's own display name either (kittrial-5bb.581 r2, review S1): only the
+            # username the inviter typed, who invited, the projects, the role and the agent asked.
+            shown['display_name'] = None
         return shown
 
 
@@ -767,23 +766,25 @@ def accept(service, principal, token, *, source='local', shared_source=False, us
                 event.update(invite_id=record['id'], invited_by=inviter, existing_user=user_id,
                              role_before=changed[pid]['before'], role_after=changed[pid]['after'],
                              used_from=record['used_from'], agent_id=record['agent_id'])
+            # The answer is built before the save, so a fault in building it takes the accept back
+            # instead of leaving a used invite whose secret was never shown (kittrial-5bb.581 r2, review N1).
+            public = {
+                'operation': 'invites.accept',
+                'user': {'id': user_id, 'username': user.get('username'),
+                         'display_name': user.get('display_name') or user.get('username')},
+                'projects': [{'id': pid, 'name': (state['projects'].get(pid) or {}).get('name') or pid,
+                              'role': changed[pid]['after'], 'role_before': changed[pid]['before']}
+                             for pid in record['projects']],
+                'invited_by_name': _name_of(service, inviter),
+                'agent': None, 'credential': None, 'setup': None, 'secret_available': False,
+            }
+            if agent is not None:
+                public.update(agent=service.agent_view(agent, principal),
+                              credential=dict(service.credential_view(credential), secret=secret, secret_available=True),
+                              setup=service.agent_setup(agent, secret), secret_available=True)
+            stored = dict(public, credential=dict(service.credential_view(credential), secret_available=False)
+                          if credential is not None else None, setup=None, secret_available=False,
+                          note='The secret was shown once, when the invite was accepted; it cannot be shown again. '
+                               'Issue a new credential on the agent\'s card if it was lost.')
             change.save()
-        public = {
-            'operation': 'invites.accept',
-            'user': {'id': user_id, 'username': user.get('username'),
-                     'display_name': user.get('display_name') or user.get('username')},
-            'projects': [{'id': pid, 'name': (state['projects'].get(pid) or {}).get('name') or pid,
-                          'role': changed[pid]['after'], 'role_before': changed[pid]['before']}
-                         for pid in record['projects']],
-            'invited_by_name': _name_of(service, inviter),
-            'agent': None, 'credential': None, 'setup': None, 'secret_available': False,
-        }
-        if agent is not None:
-            public.update(agent=service.agent_view(agent, principal),
-                          credential=dict(service.credential_view(credential), secret=secret, secret_available=True),
-                          setup=service.agent_setup(agent, secret), secret_available=True)
-        stored = dict(public, credential=dict(service.credential_view(credential), secret_available=False)
-                      if credential is not None else None, setup=None, secret_available=False,
-                      note='The secret was shown once, when the invite was accepted; it cannot be shown again. '
-                           'Issue a new credential on the agent\'s card if it was lost.')
         return public, stored

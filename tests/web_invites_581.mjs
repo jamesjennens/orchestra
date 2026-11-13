@@ -210,7 +210,7 @@ for (const [name, view] of [['overview', project.overview], ['people', project.p
 
 // -- the invite page, for an existing account -----------------------------------------------------------------------
 const TOKEN = 'tok-581-abcdefghijklmnopqrstuvwxyz';
-const EXISTING = { person: 'existing', username: 'ivy', display_name: 'Ivy Tan', invited_by_name: 'Olga',
+const EXISTING = { person: 'existing', username: 'ivy', display_name: null, invited_by_name: 'Olga',
   projects: [{ id: 'north', name: 'North' }, { id: 'south', name: 'South' }, { id: 'west', name: 'West' }],
   agent: null, expires_at: daysFromNow(3), password_min_length: null };
 const ACCEPTED = { operation: 'invites.accept', user: { id: 'usr_ivy', username: 'ivy', display_name: 'Ivy Tan' },
@@ -347,6 +347,17 @@ out.page = {};
   await settle();
   out.page.newPerson.calls = calls;
   out.page.newPerson.title = title(page);
+}
+// A new person's invite with a reviewer agent: the page names the agent's role (kittrial-5bb.581 r2, review N4).
+{
+  const agents = {};
+  for (const role of ['reviewer', 'worker']) {
+    const NEW = { person: 'new', username: 'lena', display_name: 'Lena Park', invited_by_name: 'Olga', projects: [{ id: 'north', name: 'North' }],
+      agent: { name: 'Lena bot', project: 'north', role, claim_limit: 1 }, expires_at: daysFromNow(3), password_min_length: 12 };
+    const { page } = await openPage({ invite: NEW });
+    agents[role] = withAttr(page, 'data-invite-agent', 'true').map(text);
+  }
+  out.page.newPersonAgent = agents;
 }
 
 // -- the upgraded banner --------------------------------------------------------------------------------------------

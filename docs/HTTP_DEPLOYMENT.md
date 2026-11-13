@@ -4422,7 +4422,7 @@ owner is `403`; an archived project, or one the backend will not serve, is refus
 | `POST /v1/invites/{id}/revoke` | its inviter or a superuser | withdraws a pending invite (anyone else: `404`) |
 | `POST /v1/invites/view` | anyone holding the token, switch on | `{token}`: who invites whom, the projects, the agent, the expiry and the password minimum |
 | `POST /v1/invites/redeem` | anyone holding the token of a **new-person** invite, switch on | `{token, password}`; `201` with the account, the projects and, with an agent, the agent, its credential's secret and the set-up payload of New agent, **once** |
-| `POST /v1/invites/accept` | the **named existing account's own session** (CSRF, `Idempotency-Key`), switch on | `{token}`; `201` with the account, each project's `role` and `role_before` and, with an agent, the agent, its credential's secret and the set-up payload, **once**; an exact retry answers `200` without the secret |
+| `POST /v1/invites/accept` | the **named existing account's own session** (CSRF; `Idempotency-Key` optional), switch on | `{token}`; `201` with the account, each project's `role` and `role_before` and, with an agent, the agent, its credential's secret and the set-up payload, **once**; an exact retry answers `200` without the secret |
 
 The username is checked as an account's is (2-64 characters of letters, digits, `. _ @ -`), and must not
 belong to an account or to another pending invite. The expiry is 72 hours unless `expires_hours` says
@@ -4474,14 +4474,17 @@ It may also name the same one agent as a new-person invite (`worker` or `reviewe
 account's id (`user_id`), never a password. These are refused when the invite is made:
 - yourself: `422`, "To add an agent for yourself use New agent on My agents; an invite is for someone else.";
 - a `display_name`: `422`;
-- an account that already has the named role or higher in every project, with no agent asked: `409`;
-- an agent name that shares the account's secret file with one of its agents: `409`, without naming that agent;
-- an account at its agent limit: `409`.
+- an account that already has the named role or higher in every project, with no agent asked: `409`.
+
+The agent's name and the account's agent limit are not judged when the invite is made. They are judged
+only when the named account accepts, and only that person hears the answer: said to the inviter, they
+would tell them about the account's agents, in projects the inviter may not see.
 
 **The view** of such a link (`POST /v1/invites/view`, anonymous) says what a new-person invite's says:
 the inviter, the username it is for, the projects, the role named, the agent and the expiry. It says
-nothing about the account itself, not even whether it is already a member anywhere, because the holder
-of a link may not be that person. `password_min_length` is `null`.
+nothing about the account itself, not its display name (`display_name` is `null`) and not whether it is
+already a member anywhere, because the holder of a link may not be that person. `password_min_length` is
+`null`.
 
 **Accepting.** Only `POST /v1/invites/accept` serves this kind. It is not anonymous, it is CSRF-checked
 and it goes through the operation journal like every web write. The anonymous `POST /v1/invites/redeem`
@@ -4504,8 +4507,9 @@ The inviter's right is judged again from present state:
 - every project needs `_holds` and must still be served;
 - an `owner` role needs the inviter still a superuser.
 
-Either failing is `409 invite_stale`. An agent name or the agent limit reached since then is `409`, with
-nothing changed. Any refusal or failure, a failed save included, takes all of it back. Each use writes
+Either failing is `409 invite_stale`. An agent name that shares the account's secret file with one of its
+agents, or the account at its agent limit, is `409`, with nothing changed. Any refusal or failure, a
+failed save included, takes all of it back. Each use writes
 `invites.redeemed` into every named project's audit with `existing_user` (a new-person redeem says
 `new_user`), `role_before` and `role_after`. The secret reaches only the accepting person, in that one
 answer; the inviter's list shows the status and the memberships, never a secret.

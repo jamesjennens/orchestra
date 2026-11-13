@@ -124,19 +124,23 @@ class CreateTests(ExistingCase):
             with self.subTest(agent=agent):
                 self.assertEqual(self.existing(expect=403, agent=agent)['error']['message'], invites.WORKER_ONLY)
 
-    def test_an_agent_name_erin_already_uses_is_refused_without_naming_her_agent(self):
+    def test_an_agent_name_erin_already_uses_is_not_judged_at_create_only_at_accept(self):
+        # kittrial-5bb.581 r2 (review S2): the inviter learns nothing about erin's agents. A clashing
+        # name is made like any other; only erin, accepting, hears the clash.
         # erin is not a member anywhere yet, so her own agent is granted no project.
         status, body = self.call('POST', '/v1/agents', {'name': 'Erin Bot'}, self.erin)
         self.assertEqual(status, 201, body)
         theirs = body['agent']['id']
-        answer = self.existing(expect=409, agent={'name': 'erin-bot', 'project': 'north'})
-        self.assertEqual(answer['error']['message'], invites.AGENT_NAME_TAKEN % 'erin')
+        answer = self.existing(agent={'name': 'erin-bot', 'project': 'north'})
         self.assertNotIn(theirs, json.dumps(answer))
+        status, body = self.accept(answer['token'], self.erin)
+        self.assertEqual((status, body['error']['message']), (409, invites.AGENT_NAME_TAKEN_NOW))
 
-    def test_the_agent_limit_is_said_at_create(self):
+    def test_the_agent_limit_is_not_said_at_create_only_at_accept(self):
         with mock.patch.object(invites, 'AGENT_MAX_PER_OWNER', 0):
-            answer = self.existing(expect=409, agent={'name': 'Erin bot', 'project': 'north'})
-        self.assertEqual(answer['error']['message'], invites.AGENT_LIMIT % ('erin', 0))
+            answer = self.existing(agent={'name': 'Erin bot', 'project': 'north'})
+            status, body = self.accept(answer['token'], self.erin)
+        self.assertEqual((status, body['error']['message']), (409, invites.AGENT_LIMIT_NOW % 0))
 
     def test_nothing_to_do_is_refused(self):
         self.set_role('north', 'erin', 'coordinator')
@@ -174,9 +178,22 @@ class ViewTests(ExistingCase):
         self.assertEqual(set(shown), {'person', 'status', 'display_name', 'username', 'projects', 'role', 'agent',
                                       'invited_by_name', 'created_at', 'expires_at', 'generated_at',
                                       'password_min_length'})
+        self.assertIsNone(shown['display_name'])
         text = json.dumps(shown)
         for leak in ('viewer', 'member', self.erin_id, 'before', 'after'):
             self.assertNotIn(leak, text)
+
+    def test_the_anonymous_view_does_not_carry_the_accounts_own_display_name(self):
+        # kittrial-5bb.581 r2 (review S1): an account whose display name differs from its username.
+        status, body = self.call('POST', '/v1/accounts', {'username': 'alma', 'display_name': 'Alma Hidden-Surname'},
+                                 self.admin)
+        self.assertEqual(status, 201, body)
+        token = self.existing(username='alma', role='coordinator',
+                              agent={'name': 'Alma bot', 'project': 'north'})['token']
+        status, shown = self.view(token)
+        self.assertEqual(status, 200, shown)
+        self.assertEqual((shown['username'], shown['display_name']), ('alma', None))
+        self.assertNotIn('Hidden', json.dumps(shown))
 
 
 class AcceptTests(ExistingCase):
@@ -211,6 +228,13 @@ class AcceptTests(ExistingCase):
         listed = self.call('GET', '/v1/invites', token=self.cora)[1]
         self.assertNotIn(secret, json.dumps(listed))
         self.assertNotIn(secret, json.dumps(self.service.state['invites']))
+
+    def test_a_reviewer_agent_is_made_a_reviewer(self):
+        # kittrial-5bb.581 r2 (review S3, MA10): the asked role reaches the agent made at accept.
+        answer = self.existing(agent={'name': 'Erin reviewer', 'project': 'north', 'role': 'reviewer'})
+        status, done = self.accept(answer['token'], self.erin)
+        self.assertEqual(status, 201, done)
+        self.assertEqual(self.service.state['agents'][done['agent']['id']]['role'], 'reviewer')
 
     def test_a_higher_role_is_kept_and_an_owner_is_never_touched(self):
         self.set_role('north', 'erin', 'coordinator')
@@ -309,6 +333,36 @@ class AcceptRefusalTests(ExistingCase):
         self.assertEqual((status, body['error']['code'], body['error']['message']), (409, 'invite_stale', invites.STALE))
         self.assertEqual(self.full_snapshot(), before)
 
+    def test_the_inviter_no_longer_an_owner_of_the_first_project_makes_it_stale(self):
+        # kittrial-5bb.581 r2 (review S3, MA3): every project is judged again, not only the last.
+        token = self.existing(agent={'name': 'Erin bot', 'project': 'south'})['token']
+        self.set_role('north', 'cora', 'coordinator')
+        before = self.full_snapshot()
+        status, body = self.accept(token, self.erin)
+        self.assertEqual((status, body['error']['code']), (409, 'invite_stale'), body)
+        self.assertEqual(self.full_snapshot(), before)
+        self.assertIsNone(self.record(token)['used_at'])
+
+    def test_the_backends_usability_check_is_run_again_at_accept_for_each_project(self):
+        # kittrial-5bb.581 r2 (review S3, MA1): the twin of .578's test_x3 for accept.
+        token = self.existing(agent={'name': 'Erin bot', 'project': 'north'})['token']
+        for refused in ('north', 'south'):
+            with self.subTest(refused=refused):
+                asked = []
+
+                def unusable(handler, project_id):
+                    asked.append(project_id)
+                    if project_id == refused:
+                        raise http_auth.HttpError(409, 'conflict', 'This record cannot be served')
+                before = self.full_snapshot()
+                with mock.patch.object(http_service.ApiHandler, '_require_usable', unusable):
+                    status, body = self.accept(token, self.erin)
+                self.assertEqual((status, body['error']['code']), (409, 'invite_stale'), body)
+                self.assertIn(refused, asked)
+                self.assertEqual(self.full_snapshot(), before)
+                self.assertIsNone(self.record(token)['used_at'])
+        self.assertEqual(self.accept(token, self.erin)[0], 201)
+
     def test_an_archived_project_makes_it_stale(self):
         token = self.existing()['token']
         self.assertEqual(self.call('POST', '/v1/projects/south/archive', {}, self.admin)[0], 200)
@@ -402,6 +456,24 @@ class AllOrNothingTests(ExistingCase):
         self.assertFalse([e for e in self.service.state['audit'][audit_before:] if e['outcome'] == 'committed'])
         self.assertIsNone(self.record(token)['used_at'])
         self.assertEqual(self.accept(token, self.erin)[0], 201)
+
+    def test_a_failure_building_the_answer_takes_everything_back(self):
+        # kittrial-5bb.581 r2 (review N1): the answer is built before the save, so a fault there
+        # leaves no used invite whose secret was never shown.
+        self.set_role('north', 'erin', 'viewer')
+        token = self.existing(agent={'name': 'Erin bot', 'project': 'south'})['token']
+        before = self.full_snapshot()
+
+        def broken(*args, **kwargs):
+            raise RuntimeError('the set-up step failed')
+        with mock.patch.object(self.service, 'agent_setup', broken):
+            status, body = self.accept(token, self.erin)
+        self.assertEqual(status, 500, body)
+        self.assertEqual(self.full_snapshot(), before)
+        self.assertIsNone(self.record(token)['used_at'])
+        status, done = self.accept(token, self.erin)
+        self.assertEqual(status, 201, done)
+        self.assertTrue(done['credential']['secret'])
 
     def test_a_failed_save_leaves_neither_memory_nor_the_file_changed(self):
         self.set_role('north', 'erin', 'viewer')

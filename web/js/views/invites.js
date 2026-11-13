@@ -367,7 +367,7 @@ export function invitePage(ctx, token) {
     body.replaceChildren(
       h('p', null, `${invite.invited_by_name} invites ${invite.display_name} to Orchestra, with the username @${invite.username}.`),
       h('p', { class: 'small' }, 'Projects (as a contributor): ', (invite.projects || []).map((p) => p.name).join(', ')),
-      agent ? h('p', { class: 'small', 'data-invite-agent': 'true' }, `A worker agent, “${agent.name}”, is made for you in ${projectName(agent.project)} (claim limit ${agent.claim_limit}), with its credential. Its secret is shown once, on the next screen.`) : '',
+      agent ? h('p', { class: 'small', 'data-invite-agent': 'true' }, `A ${agent.role || 'worker'} agent, “${agent.name}”, is made for you in ${projectName(agent.project)} (claim limit ${agent.claim_limit}), with its credential. Its secret is shown once, on the next screen.`) : '',
       h('p', { class: 'small muted' }, 'This link works once and expires ', time(invite.expires_at), '.'),
       form,
       h('p', { class: 'auth-foot' }, 'Already have an account? ', toSignIn));

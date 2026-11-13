@@ -232,6 +232,13 @@ class TheInvitePageForANewPerson(unittest.TestCase):
         self.assertEqual([['viewInvite', TOKEN], ['redeemInvite', TOKEN, 'a good long password']], seen['calls'])
         self.assertEqual('Your account is ready', seen['title'])
 
+    def test_the_new_person_pages_agent_line_names_the_agents_role(self):
+        # kittrial-5bb.581 r2 (review N4): a reviewer agent is not called a worker agent.
+        seen = observations(self)['page']['newPersonAgent']
+        self.assertEqual(1, len(seen['reviewer']))
+        self.assertTrue(seen['reviewer'][0].startswith('A reviewer agent, “Lena bot”, is made for you in North'), seen)
+        self.assertTrue(seen['worker'][0].startswith('A worker agent, “Lena bot”'), seen)
+
 
 class TheUpgradedBanner(unittest.TestCase):
 
