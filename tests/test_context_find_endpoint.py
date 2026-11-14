@@ -103,6 +103,29 @@ class EndpointFindTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'start the search again'):
                 self.execute()
 
+    def test_reader_acceptance_uses_the_same_operator_view_as_bound_scope(self):
+        from test_reference_records import ReferenceCase, OPERATOR
+        fixture = ReferenceCase('runTest')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.propose(statement='orthogonal accepted reference')
+        fixture.accept(1, fixture.sha(1))
+        self.rows = fixture.native.rows
+        observations = []
+        def live_operators(root):
+            result = [OPERATOR] if not observations else []
+            observations.append(result)
+            return result
+        with mock.patch.object(self.endpoint, 'configured_operators', side_effect=live_operators):
+            try:
+                result = self.execute(self.request(['orthogonal', '--kind', 'ref', '--json']))
+            except ValueError as error:
+                self.assertIn('start the search again', str(error))
+                return
+        answer = json.loads(result['stdout'])
+        self.assertEqual(1, answer['total'])
+        self.assertEqual('draft', answer['items'][0]['trust_class'])
+
     def test_unknown_generation_has_no_cursor(self):
         self.snapshot.stop()
         with mock.patch('read_cache.cached_export_snapshot', return_value={'rows': self.rows, 'generation': None}):

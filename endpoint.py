@@ -1563,7 +1563,6 @@ def find_read(root, path, name, request, key_projects=None, key_principal=None):
     if options.get('help'):
         return {'returncode': 0, 'stdout': json.dumps(context_find.help_payload(), indent=2) + '\n',
                 'stderr': ''}
-    operators = configured_operators(root)
     warnings = []
 
     def run(args):
@@ -1584,6 +1583,7 @@ def find_read(root, path, name, request, key_projects=None, key_principal=None):
 
     with held_coordination_lock(path, shared=True):
         scope = scope_now()
+        operators = scope['operators']
         if options.get('cursor'):
             token = context_find._untoken(options['cursor'])
             if token['scope'] != context_find._digest(scope) or token['project'] != name:
