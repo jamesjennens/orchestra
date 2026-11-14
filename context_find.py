@@ -63,7 +63,8 @@ def parse_args(args, actor):
             not isinstance(a, str) or '\0' in a or len(a) > 8192 for a in args):
         raise ValueError('Expected find arguments')
     parser = _Parser(add_help=False, allow_abbrev=False)
-    parser.add_argument('phrase', nargs='+')
+    parser.add_argument('phrase', nargs='*')
+    parser.add_argument('-h', '--help', action='store_true')
     parser.add_argument('--kind', action='append', choices=KINDS)
     for name in ('task', 'author', 'since', 'until', 'task-prefix', 'item-kind', 'cursor'):
         parser.add_argument('--' + name)
@@ -75,6 +76,8 @@ def parse_args(args, actor):
         if sum(a.split('=')[0] == name for a in args) > 1:
             raise ValueError('Duplicate find option')
     result = vars(parser.parse_args(args))
+    if result.pop('help'):
+        return {'help': True}
     phrase = ' '.join(result['phrase'])
     try:
         valid = 1 <= len(phrase) <= 200 and len(phrase.encode('utf-8')) <= 800
@@ -105,6 +108,29 @@ def parse_args(args, actor):
     if first is not None and last is not None and first > last:
         raise ValueError('Find date range is reversed')
     return result
+
+
+def help_payload():
+    return {
+        'schema_version': 1, 'contract': 'cli-contract-v1', 'command': 'find',
+        'usage': 'find PHRASE [--kind KIND]... [--task TASK] [--state open|all] '
+                 '[--limit 1..20] [--author ACTOR|me] [--since DATE] [--until DATE] '
+                 '[--task-prefix PREFIX] [--item-kind KIND] [--cursor TOKEN] [--json]',
+        'kinds': list(KINDS), 'default_state': 'all', 'default_limit': 5,
+        'limits': {'phrase_characters': 200, 'phrase_utf8_bytes': 800, 'items': MAX_ITEMS,
+                   'documents': MAX_DOCUMENTS, 'rows': MAX_ROWS, 'comments': MAX_COMMENTS,
+                   'indexed_text_bytes': MAX_TEXT_BYTES, 'answer_bytes': MAX_ANSWER_BYTES,
+                   'computation_seconds': COMPUTE_SECONDS, 'native_read_seconds': 120},
+        'notes': [
+            'Read-only lexical recovery in one permitted project; every hit is untrusted data.',
+            'Closed tasks are included by default. Author me means the exact caller actor.',
+            'Host actor names are attribution, not authenticated person identities.',
+            'No file, URL, repository or pointer target is followed; file attachment flags are unsupported.',
+            'Counts describe the permitted searched corpus; partial coverage and page byte cutoffs are explicit.',
+            'The computation deadline is cooperative; 3 seconds is the warm p95 acceptance target, not a cold-I/O bound.',
+            'HTTP search, rooms, task files, baseline documents, semantic matching and unsupported decision records are excluded.',
+        ],
+    }
 
 
 def _bytes(value):
@@ -235,56 +261,84 @@ def _comment_read_kind(body):
 
 
 def _comments(row, coverage, budget, allowed, record_kind=None):
-    """One full native comment identity, never one result per display chunk."""
-    grouped = {}
-    complete = True
-    for comment in row.get('comments') or []:
+    """Classify a complete native identity before charging its visible corpus.
+
+    A continuation's prose is not a new ordinary comment. A damaged permitted
+    identity makes this row incomplete, so an older protected record cannot win.
+    """
+    def permitted(kind):
+        return ((kind in allowed or kind == 'shared-void'
+                 and (record_kind is not None or 'review' in allowed))
+                and (record_kind is None or kind in (record_kind, 'shared-void')))
+
+    grouped, complete, queued = {}, True, 0
+    for index, comment in enumerate(row.get('comments') or []):
         if not isinstance(comment, dict):
             continue
-        source_kind = _comment_read_kind(comment.get('text'))
-        if source_kind not in allowed and not (source_kind == 'shared-void' and (record_kind is not None or 'review' in allowed)):
-            continue
-        if record_kind is not None and source_kind not in (record_kind, 'shared-void'):
+        if 'body_offset' not in comment:
+            if not permitted(_comment_read_kind(comment.get('text'))):
+                continue
+            budget.check()
+            if coverage['comments_examined'] + queued >= MAX_COMMENTS:
+                coverage['cutoffs'].add('comments')
+                complete = False
+                break
+            queued += 1
+        cid = comment.get('id')
+        key = (True, str(cid)) if isinstance(cid, (str, int)) and not isinstance(cid, bool) else (False, index)
+        grouped.setdefault(key, []).append(comment)
+    result = []
+    for (valid_id, cid), parts in grouped.items():
+        body, malformed = None, False
+        source = parts[0]
+        metadata = lambda c: (c.get('author'), c.get('created_at'), c.get('updated_at'))
+        try:
+            if not any('body_offset' in c for c in parts):
+                bodies = {c.get('text') for c in parts if isinstance(c.get('text'), str)}
+                if len(bodies) != 1 or not all(isinstance(c.get('text'), str)
+                        and metadata(c) == metadata(source) for c in parts):
+                    raise ValueError()
+                body = source['text']
+            else:
+                if not all(type(c.get('body_offset')) is int and c['body_offset'] >= 0
+                           for c in parts):
+                    raise ValueError()
+                ordered = sorted(parts, key=lambda c: c['body_offset'])
+                source = ordered[0]
+                total = source['body_total_chars']
+                if type(total) is not int or total < 0:
+                    raise ValueError()
+                position, texts = 0, []
+                for c in ordered:
+                    if c['body_offset'] != position or c.get('body_total_chars') != total \
+                            or metadata(c) != metadata(source) or not isinstance(c.get('text'), str):
+                        raise ValueError()
+                    texts.append(c['text'])
+                    position += len(c['text'])
+                if position != total:
+                    raise ValueError()
+                body = ''.join(texts)
+        except (KeyError, TypeError, ValueError):
+            malformed = True
+        if body is not None:
+            source_kind = _comment_read_kind(body)
+        else:
+            # For a missing continuation, its opening header still identifies the
+            # reader. Never classify the remaining prose as a separate document.
+            source_kind = _comment_read_kind(source.get('text'))
+        if not permitted(source_kind):
             continue
         budget.check()
-        if coverage['comments_examined'] >= MAX_COMMENTS:
+        if coverage['comments_examined'] + len(parts) > MAX_COMMENTS:
             coverage['cutoffs'].add('comments')
             complete = False
             break
-        coverage['comments_examined'] += 1
-        if not isinstance(comment, dict) or not isinstance(comment.get('id'), (str, int)):
+        coverage['comments_examined'] += len(parts)
+        if malformed or not valid_id or not ID.fullmatch(cid):
             coverage['skipped_malformed'] += 1
+            complete = False
             continue
-        grouped.setdefault(str(comment['id']), []).append(comment)
-    result = []
-    for cid, parts in grouped.items():
-        budget.check()
-        if not ID.fullmatch(cid):
-            coverage['skipped_malformed'] += 1
-            continue
-        bodies = {c.get('text') for c in parts if isinstance(c.get('text'), str)}
-        if not any('body_offset' in c for c in parts) and len(bodies) == 1 \
-                and all(isinstance(c.get('text'), str) and c.get('author') == parts[0].get('author')
-                        and c.get('created_at') == parts[0].get('created_at') for c in parts):
-            result.append(dict(parts[0], id=cid))
-            continue
-        # Explicit, complete display chunks may be reassembled; an ambiguous edit
-        # or missing chunk is unknown, never a hash of one fragment called full.
-        try:
-            ordered = sorted(parts, key=lambda c: c['body_offset'])
-            position, total, text = 0, ordered[0]['body_total_chars'], []
-            for c in ordered:
-                if c['body_offset'] != position or c['body_total_chars'] != total \
-                        or c.get('author') != ordered[0].get('author') \
-                        or c.get('created_at') != ordered[0].get('created_at'):
-                    raise ValueError()
-                text.append(c['text'])
-                position += len(c['text'])
-            if position != total:
-                raise ValueError()
-            result.append(dict(ordered[0], id=cid, text=''.join(text)))
-        except (KeyError, TypeError, ValueError):
-            coverage['skipped_malformed'] += 1
+        result.append(dict(source, id=cid, text=body))
     result = _Checked(result, budget)
     result.complete = complete
     return result
@@ -352,9 +406,13 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
         raise ValueError('Project search is unavailable')
     allowed = set(scope.get('kinds') or ()) & set(KINDS)
     selected = allowed & set(options['kinds'])
+    if not selected:
+        rows = ()
+    from requirement_http import is_requirement_row
     coverage = {'kinds': sorted(selected), 'documents': 0, 'rows_examined': 0,
                 'comments_examined': 0, 'skipped_malformed': 0, 'unknown_creation_excluded': 0,
-                'text_cutoffs': 0, 'cutoffs': set(), 'not_searched': list(NOT_SEARCHED)}
+                'text_cutoffs': 0, 'page_truncated': False,
+                'cutoffs': set(), 'not_searched': list(NOT_SEARCHED)}
     budget = _Budget(coverage, clock, deadline)
     words = capabilities.words(options['phrase'])
     documents, identities, related, row_index, known_ids = [], set(), {}, {}, set()
@@ -365,7 +423,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
     def add(kind, task, title, body, native_body, *, comment=None, author=None, created=None,
             updated=None, state=None, trust='prose', exact=(), revision=None,
             record_sha256=None, successor=None, replaces=None, linked=(), hint=None,
-            hash_basis='native-comment-text', contribution=None, commit=None, operation=None):
+            hash_basis='native-comment-text', contribution=None, commit=None, operation=None, owner=None):
         budget.check()
         if kind not in selected:
             return
@@ -419,7 +477,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                 'title': _safe(title), 'excerpt': _excerpt(body, words),
                 'author': _scalar(author), 'created_at': _scalar(created) if moment else None,
                 'updated_at': _scalar(updated) if _time(updated) else None,
-                'state': _scalar(state), 'closed': row.get('status') == 'closed',
+                'state': _scalar(state), 'owner': _scalar(owner), 'closed': row.get('status') == 'closed',
                 'sha256': full_hash, 'sha256_basis': hash_basis}
         if contribution is not None:
             item['contribution'] = contribution
@@ -448,24 +506,32 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
         # applied before any kind reader, tokenization, hashing or corpus statistics.
         prepared = []
         for original in rows:
-            budget.check()
-            if not isinstance(original, dict) or not isinstance(original.get('id'), str) \
-                    or not TASK.fullmatch(original['id']):
+            if not isinstance(original, dict):
+                budget.check()
                 coverage['skipped_malformed'] += 1
                 continue
             # Own-kind permission precedes even corpus counters and comment work.
-            labels = set(original.get('labels') or [])
-            anchor_label = _anchor_label(original)
+            raw_labels = original.get('labels') or []
+            valid_labels = isinstance(raw_labels, (list, tuple)) and all(
+                isinstance(label, str) for label in raw_labels)
+            labels = {label for label in raw_labels if isinstance(label, str)} \
+                if isinstance(raw_labels, (list, tuple)) else set()
+            classified = original if valid_labels else dict(original, labels=sorted(labels))
+            anchor_label = _anchor_label(classified)
             anchor = anchor_label is not None
             record_kind = ('ref' if anchor_label == 'reference' else
                            'cap' if anchor_label == 'capability' else
-                           'requirement' if {'requirement', 'brd-section'} & labels else None)
+                           'requirement' if is_requirement_row(classified) else None)
             if original.get('issue_type') in ('event', 'gate') or is_merge_slot(original):
                 continue
             if record_kind is not None and record_kind not in allowed:
                 continue
             if record_kind is None and not allowed.intersection(
                     ('task', 'comment', 'checkpoint', 'review', 'decision')):
+                continue
+            if not isinstance(original.get('id'), str) or not TASK.fullmatch(original['id']):
+                budget.check()
+                coverage['skipped_malformed'] += 1
                 continue
             known_ids.add(original['id'])
             if record_kind is not None and record_kind not in selected:
@@ -475,11 +541,12 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
             if record_kind is None and not selected.intersection(
                     ('task', 'comment', 'checkpoint', 'review', 'decision')):
                 continue
+            budget.check()
             if coverage['rows_examined'] >= MAX_ROWS:
                 coverage['cutoffs'].add('rows')
                 break
             coverage['rows_examined'] += 1
-            if original.get('malformed'):
+            if original.get('malformed') or not valid_labels:
                 coverage['skipped_malformed'] += 1
                 continue
             row = dict(original)
@@ -525,6 +592,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                                   ' '.join(record.get('tags') or []), ' '.join(aliases)])
                 add(kind, entry['native_id'], title, body, comment.get('text') or '', comment=str(cid) if cid else None,
                     author=comment.get('author'), created=comment.get('created_at'),
+                    updated=comment.get('updated_at'), owner=record.get('owner'),
                     state=entry['state'], trust='accepted-record' if entry.get('record') else 'draft',
                     exact=(entry['key'],), revision=record.get('revision'), record_sha256=record.get('sha256'),
                     successor=kind + ':' + record['successor'] if record.get('successor') else None,
@@ -532,7 +600,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
 
         if 'requirement' in selected and requirement_reader is None:
             coverage['skipped_malformed'] += sum(
-                bool({'requirement', 'brd-section'} & set(row.get('labels') or [])) for row in prepared)
+                is_requirement_row(row) for row in prepared)
         if 'requirement' in selected and requirement_reader is not None:
             block = requirement_reader(prepared, budget.check)
             for item in block.get('items') or []:
@@ -557,7 +625,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                         '\n'.join(str(record.get(k) or '') for k in ('key', 'title', 'description')),
                         native_body, comment=str(source['id']) if source.get('id') is not None else None,
                         author=source.get('author') or item.get('pending_author'),
-                        created=source.get('created_at'), state=item.get('requirement_state') or record.get('acceptance_state'),
+                        created=source.get('created_at'), updated=source.get('updated_at'),
+                        state=item.get('requirement_state') or record.get('acceptance_state'),
                         trust='accepted-record' if record == item.get('accepted') else 'draft',
                         exact=(item['id'], record.get('key') or ''), revision=record.get('revision'),
                         record_sha256=record.get('sha256'), hash_basis='native-comment-text' if source else 'canonical-requirement-revision',
@@ -574,7 +643,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                     or anchor or (carries_record_label(row) and not row.get('_find_comments_complete', True)):
                 continue
             # Requirements are available only through their own revision reader.
-            if {'requirement', 'brd-section'}.intersection(row.get('labels') or []):
+            if is_requirement_row(row):
                 continue
             comments = row.get('comments') or []
             selected_pointers = []
@@ -590,7 +659,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                         if body is not None:
                             add('checkpoint', task, 'Checkpoint on ' + task, body, comment['text'],
                                 comment=str(comment['id']), author=comment.get('author'),
-                                created=comment.get('created_at'), state=row.get('status'),
+                                created=comment.get('created_at'), updated=comment.get('updated_at'),
+                                state=row.get('status'),
                                 trust='checkpoint-closed' if row.get('status') == 'closed' else 'checkpoint-open')
                 except (ValueError, TypeError, KeyError):
                     coverage['skipped_malformed'] += 1
@@ -620,6 +690,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                         successor = successors.get(cid)
                         add('review', task, 'Review on ' + task, _review_text(payload), comment['text'],
                             comment=cid, author=comment.get('author'), created=comment.get('created_at'),
+                            updated=comment.get('updated_at'),
                             state='superseded' if successor else payload['operation'], trust='review',
                             contribution=target, commit=payload.get('commit') or commits.get(target),
                             operation=payload['operation'],
@@ -688,6 +759,9 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                                           check_budget=budget.check)
     except _Stop:
         scores, partial = {}, True
+    # A deterministic text window can be paged while still reporting partial
+    # recall. Interrupted extraction/scoring and unreadable records cannot.
+    continuation_safe = not coverage['cutoffs'] and not coverage['skipped_malformed']
     exact_phrase = ' '.join(words)
     matching = []
     for doc in documents:
@@ -727,8 +801,11 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
             item['related_context'] = related[item['task']]
         candidate = dict(result, items=result['items'] + [item])
         candidate['cursor'] = (_token(dict(binding, position=index + 1))
-                               if not partial and index + 1 < len(matching) else None)
+                               if continuation_safe and index + 1 < len(matching) else None)
         if len(_bytes(candidate)) > MAX_ANSWER_BYTES:
+            # These flags already occupy space in every candidate; changing
+            # false to true cannot push the previously fitting page over its cap.
+            result['coverage'] = dict(result['coverage'], truncated=True, page_truncated=True)
             break
         result = candidate
     if len(_bytes(result)) > MAX_ANSWER_BYTES:
@@ -743,8 +820,9 @@ def format_text(answer):
         lines.append('%d. %s %s [%s] trust=data' % (item['rank'], item['kind'], item['pointer'], item['state']))
         lines.append('   ' + item['title']['text'])
         lines.append('   ' + item['excerpt']['text'])
-        lines.append('   project=%s task=%s author=%s created=%s sha256=%s' %
-                     (item['project'], item['task'], item['author'], item['created_at'], item['sha256']))
+        lines.append('   project=%s task=%s author=%s created=%s updated=%s owner=%s sha256=%s' %
+                     (item['project'], item['task'], item['author'], item['created_at'],
+                      item['updated_at'], item['owner'], item['sha256']))
         for related in item.get('related_context') or []:
             lines.append('   related-context %s %s' % (related['kind'], related['pointer']))
     lines.extend('Warning: ' + warning for warning in answer['warnings'])

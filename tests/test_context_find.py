@@ -63,6 +63,25 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(before[key], after[key], key)
         self.assertEqual(before['watermark']['generation'], after['watermark']['generation'])
 
+    def test_hidden_reference_rows_do_not_consume_visible_computation_budget(self):
+        def virtual_clock():
+            ticks = iter(n / 100 for n in range(10000))
+            return lambda: next(ticks)
+        visible = row()
+        hidden = [row('sample-hidden-%d' % n, labels=['reference', 'reference-key:hidden.%d' % n])
+                  for n in range(300)]
+        before = search([visible], kinds=['task'], clock=virtual_clock())
+        after = search(hidden + [visible], kinds=['task'], clock=virtual_clock())
+        for key in ('total', 'coverage', 'items', 'cursor', 'stale'):
+            self.assertEqual(before[key], after[key], key)
+        self.assertEqual(before['watermark']['generation'], after['watermark']['generation'])
+
+    def test_malformed_labels_are_unknown_without_losing_visible_matches(self):
+        result = search([row(), row('sample-bad', labels=[{}], malformed=True)])
+        self.assertEqual(1, result['total'])
+        self.assertEqual('partial', result['stale'])
+        self.assertEqual(1, result['coverage']['skipped_malformed'])
+
     def test_long_comment_chunks_are_one_hit_and_hash_full_body(self):
         body = 'Prefix\n' + 'long data ' * 1100 + ' orthogonal report tail'
         chunks = [comment(body[:5000], body_offset=0, body_total_chars=len(body)),
@@ -73,6 +92,17 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), item['sha256'])
         self.assertIn('orthogonal', item['excerpt']['text'])
         self.assertLessEqual(len(item['excerpt']['text']), 200)
+
+    def test_hidden_review_chunks_do_not_change_visible_comment_statistics(self):
+        body = 'Kind: contribution-review-v1\n' + 'orthogonal protected content ' * 30
+        chunks = [comment(body[:90], 'hidden-review', body_offset=0, body_total_chars=len(body)),
+                  comment(body[90:], 'hidden-review', body_offset=90, body_total_chars=len(body))]
+        visible = comment('orthogonal ordinary evidence')
+        before = search([row(text='', comments=[visible])], kinds=['comment'])
+        after = search([row(text='', comments=[visible, *chunks])], kinds=['comment'])
+        for key in ('total', 'coverage', 'items', 'cursor', 'stale'):
+            self.assertEqual(before[key], after[key], key)
+        self.assertEqual(before['watermark']['generation'], after['watermark']['generation'])
 
     def test_duplicate_complete_comments_are_one_hit(self):
         c = comment('orthogonal')
@@ -118,6 +148,28 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(24, len(set(got)))
         with self.assertRaises(ValueError):
             search(data, args=['--limit', '21'])
+
+    def test_answer_byte_cutoff_is_reported_without_losing_the_next_hit(self):
+        data = [row('sample-%02d' % n, text='orthogonal ' + '\U0001f600' * 150) for n in range(24)]
+        result = search(data, args=['--limit', '20'])
+        self.assertLess(len(result['items']), 20)
+        self.assertTrue(result['coverage']['truncated'])
+        self.assertTrue(result['coverage']['page_truncated'])
+        self.assertFalse(result['total_is_lower_bound'])
+        self.assertEqual('current', result['stale'])
+        next_page = search(data, args=['--limit', '20', '--cursor', result['cursor']])
+        self.assertEqual(len(result['items']) + 1, next_page['items'][0]['rank'])
+
+    def test_deterministic_long_text_windows_keep_a_usable_cursor(self):
+        data = [row('sample-%02d' % n, text='background ' * 1000 + 'orthogonal') for n in range(7)]
+        result = search(data, args=['--limit', '1'])
+        self.assertEqual('partial', result['stale'])
+        self.assertTrue(result['total_is_lower_bound'])
+        self.assertEqual(7, result['coverage']['text_cutoffs'])
+        self.assertIsNotNone(result['cursor'])
+        next_page = search(data, args=['--limit', '1', '--cursor', result['cursor']])
+        self.assertEqual(2, next_page['items'][0]['rank'])
+        self.assertNotEqual(result['items'][0]['pointer'], next_page['items'][0]['pointer'])
 
     def test_every_kind_is_data_and_escapes_before_clip(self):
         dirty = '\x1b\x85\u202e\u2028' * 80 + 'orthogonal'
@@ -187,6 +239,16 @@ class TypedReaderTests(unittest.TestCase):
         self.assertEqual('partial', result['stale'])
         self.assertTrue(result['total_is_lower_bound'])
 
+    def test_incomplete_checkpoint_chunks_do_not_expose_older_checkpoint(self):
+        data = self.checkpoint_rows()
+        body = briefing.PREFIX + '{"summary":"orthogonal new checkpoint"}'
+        data[0]['comments'].append(comment(body[:35], 'incomplete-new',
+                                           body_offset=0, body_total_chars=len(body)))
+        result = search(data, args=['--kind', 'checkpoint'])
+        self.assertEqual(0, result['total'])
+        self.assertEqual('partial', result['stale'])
+        self.assertIsNone(result['cursor'])
+
     def test_task_related_context_is_typed_same_task_and_not_counted(self):
         import test_briefing as fixture
         data = self.checkpoint_rows()
@@ -240,6 +302,12 @@ class TypedReaderTests(unittest.TestCase):
         result = search(data, args=['--kind', 'task'])
         self.assertEqual(0, result['total'])
         self.assertTrue(result['total_is_lower_bound'])
+
+    def test_legacy_requirement_types_use_only_their_own_reader(self):
+        for kind in ('requirement', 'brd-section'):
+            with self.subTest(kind=kind):
+                data = [row(issue_type=kind, comments=[comment('orthogonal requirement evidence')])]
+                self.assertEqual(0, search(data, kinds=['task', 'comment'])['total'])
 
     def test_document10001_reports_truncated(self):
         with mock.patch.object(find, 'MAX_DOCUMENTS', 10):

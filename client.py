@@ -351,7 +351,12 @@ def _wire(project,actor,args,action,path,document=None):
             else:normalized.append(token)
             position+=1
         args=normalized
-    converted,attachments = _attachments(args)
+    if action == 'find':
+        # Find accepts literal arguments only. Unsupported file flags must reach
+        # its closed parser without opening a local file in this standalone client.
+        converted, attachments = list(args), {}
+    else:
+        converted,attachments = _attachments(args)
     if document is not None:
         # The design document's exact text (kittrial-5bb.418), never read through a text-mode file.
         key=str(len(attachments));attachments[key]={'flag':'--document','text':document}

@@ -906,6 +906,13 @@ def read(project_path, project, args, run, operators=None):
     return read_snapshot(project_path, project, args, rows, run, operators)
 
 
+def is_requirement_row(row):
+    """The served reader's row selection, shared by snapshot consumers."""
+    labels = ['requirement', 'brd-section']
+    return bool(records.TYPE_LABELS.intersection(row.get('labels') or [])
+                or row.get('issue_type') in labels or record_json.selected(row, labels))
+
+
 def read_snapshot(project_path, project, args, rows, run, operators=None, check_budget=None):
     """The existing requirement read projection over a caller's loaded snapshot.
 
@@ -916,7 +923,6 @@ def read_snapshot(project_path, project, args, rows, run, operators=None, check_
         raise ValueError('Use requirements list, get ID or brd')
     if len(args) != (2 if args[0] == 'get' else 1):
         raise ValueError('Unexpected requirements read argument')
-    labels = ['requirement', 'brd-section']
     from requirement_terminal import pending_ids, projection, scan
     receipts, damaged = scan(project_path, project)
     pending, pending_error = pending_ids(project_path, project, rows, receipts=receipts, damaged=damaged)
@@ -924,8 +930,7 @@ def read_snapshot(project_path, project, args, rows, run, operators=None, check_
     for row in rows:
         if check_budget is not None:
             check_budget()
-        if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
-                or row.get('issue_type') in labels or record_json.selected(row, labels)):
+        if not is_requirement_row(row):
             continue
         try:
             if row.get('malformed'):

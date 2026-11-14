@@ -1560,6 +1560,9 @@ def find_read(root, path, name, request, key_projects=None, key_principal=None):
     if set(request) - {'project', 'actor', 'action', 'args', 'attachments'} \
             or request.get('attachments'):
         raise ValueError('Find accepts only its documented read arguments')
+    if options.get('help'):
+        return {'returncode': 0, 'stdout': json.dumps(context_find.help_payload(), indent=2) + '\n',
+                'stderr': ''}
     operators = configured_operators(root)
     warnings = []
 

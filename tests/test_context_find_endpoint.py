@@ -2,7 +2,10 @@
 import copy
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -46,6 +49,16 @@ class EndpointFindTests(unittest.TestCase):
         self.assertEqual(1, self.cache.call_count)
         self.assertLessEqual(len(answer['stdout'].encode()), 16384)
         self.assertEqual([], self.case.tracker.writes)
+
+    def test_configured_help_is_json_without_a_native_read(self):
+        answer = self.execute(self.request(['--help']))
+        self.assertEqual(0, answer['returncode'])
+        body = json.loads(answer['stdout'])
+        self.assertEqual('cli-contract-v1', body['contract'])
+        self.assertEqual('find', body['command'])
+        self.assertEqual(5, body['default_limit'])
+        self.cache.assert_not_called()
+        self.assertEqual([], self.case.tracker.calls)
 
     def test_denied_project_before_native_read_missing_and_existing_identical(self):
         messages = []
@@ -122,6 +135,47 @@ class EndpointFindTests(unittest.TestCase):
 
 
 class ClientFindTests(unittest.TestCase):
+    def test_copied_client_has_find_help_without_application_modules(self):
+        with tempfile.TemporaryDirectory() as root:
+            copied = Path(root) / 'client.py'
+            shutil.copyfile(ROOT / 'client.py', copied)
+            answer = subprocess.run([sys.executable, '-I', str(copied), 'find', '--help'],
+                                    cwd=root, text=True, capture_output=True, timeout=15)
+        self.assertEqual(0, answer.returncode, answer.stderr)
+        for option in ('--author', '--task-prefix', '--cursor', '--item-kind'):
+            self.assertIn(option, answer.stdout)
+
+    @unittest.skipUnless(os.name == 'posix', 'Local endpoint transport requires POSIX paths')
+    def test_copied_client_local_transport_keeps_find_arguments_literal(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            copied, endpoint = root / 'client.py', root / 'endpoint.py'
+            shutil.copyfile(ROOT / 'client.py', copied)
+            endpoint.write_text('import json,sys\np=json.load(sys.stdin)\n'
+                                'print(json.dumps(dict(returncode=0,stdout=json.dumps(p),stderr="")))\n')
+            config = root / 'config.json'
+            config.write_text(json.dumps(dict(transport='local', python=sys.executable,
+                                              endpoint=str(endpoint), root=str(root))))
+            local_file = root / 'private.txt'
+            local_file.write_text('This stays local and is never attached.')
+            args = ['orthogonal', '--file', str(local_file)]
+            answer = subprocess.run([sys.executable, '-I', str(copied), '--config', str(config),
+                                     '--project', 'sample', '--actor', ACTOR, '--', 'find', *args],
+                                    cwd=root, text=True, capture_output=True, timeout=15)
+        self.assertEqual(0, answer.returncode, answer.stderr)
+        payload = json.loads(answer.stdout)
+        self.assertEqual('find', payload['action'])
+        self.assertEqual(args, payload['args'])
+        self.assertEqual({}, payload['attachments'])
+
+    def test_find_does_not_open_a_local_file_from_an_unsupported_option(self):
+        import client
+        arguments = ['orthogonal', '--file', '/not-a-file-that-find-may-read']
+        with mock.patch.object(Path, 'read_text', side_effect=AssertionError('find opened a file')):
+            payload = json.loads(client._wire('sample', ACTOR, arguments, 'find', None))
+        self.assertEqual(arguments, payload['args'])
+        self.assertEqual({}, payload['attachments'])
+
     def test_dispatch_and_help_remain_self_contained(self):
         import client
         self.assertIn('find', client.CLIENT_ACTIONS)
