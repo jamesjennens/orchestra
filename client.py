@@ -1727,6 +1727,8 @@ CONTRIBUTOR_COMMANDS = (
     ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
     ('wait', 'block until something is your move, then print it and its fingerprint'),
+    ('find PHRASE [--kind KIND] [--task TASK] [--state open|all] [--limit N] [--cursor TOKEN] [--json]',
+     'bounded, permission-first topic search in this project'),
     ('ready', 'the tasks nobody holds that you may claim'),
     ('files list|get|put ...', "a task's files over SSH: list them, get one by its sha256 into a folder, put one"),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
@@ -1784,7 +1786,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
-                  'wait','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
+                  'wait','find','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
                   'coordinator')
 
 
@@ -1846,6 +1848,9 @@ def help_requested(args):
 
 
 _COMMAND_HELP_USAGE = {
+    'find': 'find PHRASE [--kind KIND]... [--task TASK] [--state open|all] [--limit 1..20] '
+            '[--author ACTOR|me] [--since DATE] [--until DATE] [--task-prefix PREFIX] '
+            '[--item-kind KIND] [--cursor TOKEN] [--json]',
     'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
             '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
             ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]'

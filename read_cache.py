@@ -364,18 +364,27 @@ def cached_export_rows(root, path, run, name=None):
     The returned list is a freshly parsed object each call - downstream readers
     may mark and replace rows - so no state is shared between requests.
     """
+    return cached_export_snapshot(root, path, run, name)['rows']
+
+
+def cached_export_snapshot(root, path, run, name=None):
+    """Rows and the private cache key observed before their read, with one HEAD query.
+
+    The key is a source freshness hint, not a caller-visible scope or authority.
+    A caller needing an end-of-computation check must re-read the generation.
+    """
     if name is None:
         name = path.name
     key = project_generation(root, name)
     if key is None:
         import record_json
-        return record_json.loads_rows(run(['export', '--all']))
+        return {'rows': record_json.loads_rows(run(['export', '--all'])), 'generation': None}
     cache = _cache_directory(path)
     if cache is not None:
         rows = _cached_rows(cache, key)
         if rows is not None:
-            return rows
-    return _miss(path, key, run)
+            return {'rows': rows, 'generation': key}
+    return {'rows': _miss(path, key, run), 'generation': key}
 
 
 #: One task's ``bd history`` answer is cached beside the export (kittrial-5bb.354), in

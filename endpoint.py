@@ -1252,6 +1252,7 @@ READ_ONLY_ACTIONS={
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
     # and nothing is written, so it takes the project lock SHARED like the work read itself.
     'wait':_read_only_always,
+    'find':_read_only_always,
     'bd':lambda args,operation:not is_mutating_invocation(args),
     # The integration check (kittrial-5bb.374) is a read with no identity: it must never
     # take the project lock exclusively or write.
@@ -1513,6 +1514,117 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
     return result,''.join(run_warnings)
 
 
+def find_read(root, path, name, request, key_projects=None, key_principal=None):
+    """Host/contributor search; no HTTP descriptor or caller-provided corpus."""
+    import context_find
+    import time
+    import decision_attest
+    import requirement_http
+    import read_cache
+    from http_authority import read_state
+    actor = request['actor']
+    options = context_find.parse_args(request.get('args', []), actor)
+    if set(request) - {'project', 'actor', 'action', 'args', 'attachments'} \
+            or request.get('attachments'):
+        raise ValueError('Find accepts only its documented read arguments')
+    operators = configured_operators(root)
+    warnings = []
+
+    def run(args):
+        stdout, warning = native.split(native.run(native.argv(root, path, actor, args), environment(root)))
+        if warning:
+            warnings.append(warning)
+        return stdout
+
+    def scope_now():
+        key_project_refusal(request, key_projects)
+        key_principal_refusal(request, path, key_principal)
+        return {'project': name, 'projects': [name], 'actor': actor,
+                'route': 'confined' if key_principal is not None else 'host',
+                'principal': key_principal,
+                'key_projects': sorted(key_projects) if key_projects is not None else None,
+                'kinds': list(context_find.KINDS),
+                'operators': sorted(configured_operators(root))}
+
+    with held_coordination_lock(path, shared=True):
+        scope = scope_now()
+        if options.get('cursor'):
+            token = context_find._untoken(options['cursor'])
+            if token['scope'] != context_find._digest(scope) or token['project'] != name:
+                raise ValueError(context_find.RESTART)
+        snapshot = read_cache.cached_export_snapshot(root, path, run, name)
+        rows = snapshot['rows']
+
+        def snapshot_run(args):
+            # The own-kind requirement recovery reader occasionally asks for native
+            # membership. A complete healthy export answers that same read without
+            # a second native request; an unreadable row cannot prove absence.
+            if not args or args[0] != 'list' or any(row.get('malformed') for row in rows):
+                raise ValueError('Snapshot membership cannot be proved')
+            labels = [args[i + 1] for i, value in enumerate(args[:-1]) if value == '--label']
+            types = [args[i + 1] for i, value in enumerate(args[:-1]) if value == '--type']
+            selected = [row for row in rows if all(label in (row.get('labels') or []) for label in labels)
+                        and (not types or row.get('issue_type') in types)]
+            return json.dumps([{'id': row['id']} for row in selected])
+
+        def requirements(prepared, check_budget):
+            return requirement_http.read_snapshot(path, name, ['list'], prepared, snapshot_run,
+                                                  operators, check_budget=check_budget)
+
+        decision_stamps = {}
+        def decision(row):
+            view = decision_attest.read_answer(row, name, read_state(root / 'http-state.json'), operators, path)
+            decision_stamps[row['id']] = (row, tuple(view.get(k) for k in
+                                        ('attestation', 'attested_by', 'attestation_id')))
+            return view
+
+        deadline = time.monotonic() + context_find.COMPUTE_SECONDS
+        answer = context_find.search(rows, name, actor, options, scope, operators=operators,
+                                     project_path=path, requirement_reader=requirements,
+                                     decision_reader=decision, deadline=deadline)
+        current = read_cache.project_generation(root, name)
+        if snapshot['generation'] is None or current is None:
+            answer['stale'] = 'unknown'
+            answer['cursor'] = None
+        elif current != snapshot['generation']:
+            # Compare permitted views, not HEADs: an excluded kind changing must
+            # not invalidate the caller's cursor or reveal a different watermark.
+            fresh = read_cache.cached_export_snapshot(root, path, run, name)
+            rows = fresh['rows']
+            checked = context_find.search(rows, name, actor, dict(options, cursor=None), scope,
+                                          operators=operators, project_path=path,
+                                          requirement_reader=requirements, decision_reader=decision,
+                                          deadline=deadline)
+            if checked['stale'] == 'partial':
+                answer['stale'] = 'partial'
+                answer['total_is_lower_bound'] = True
+                answer['coverage']['truncated'] = True
+                answer['warnings'].append('The changed source could not be checked completely within the budget.')
+                answer['cursor'] = None
+            elif checked['watermark']['generation'] != answer['watermark']['generation']:
+                answer['stale'] = 'lagging'
+                answer['cursor'] = None
+        for row, stamp in decision_stamps.values():
+            view = decision_attest.read_answer(row, name, read_state(root / 'http-state.json'), operators, path)
+            if tuple(view.get(k) for k in ('attestation', 'attested_by', 'attestation_id')) != stamp:
+                answer['stale'] = 'lagging'
+                answer['cursor'] = None
+        if scope_now() != scope:
+            raise ValueError(context_find.RESTART)
+        # A freshness warning may have been added after the ranked page was fit.
+        # Partial/raced answers already have no continuation, never skip a page hit.
+        while len(context_find._bytes(answer)) > context_find.MAX_ANSWER_BYTES and answer['items']:
+            answer['items'].pop()
+            answer['coverage']['truncated'] = True
+        if len(context_find._bytes(answer)) > context_find.MAX_ANSWER_BYTES:
+            raise ValueError('Find answer bounds could not be met')
+        if options['json']:
+            output = context_find._bytes(answer).decode('utf-8')
+        else:
+            output = context_find.format_text(answer)
+        return {'returncode': 0, 'stdout': output, 'stderr': warning_text(warnings)}
+
+
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
     key_project_refusal(request,key_projects)
     # kittrial-5bb.454 (the trust boundary): an HTTP-shaped actor, or a look-alike, is refused on every action of a
@@ -1630,6 +1742,10 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         if frame is None or authority_config is not None:
             raise ValueError('%s is a framed request: use the client\'s files command over SSH'%action)
         return framed_files(root,path,actor,request,frame)
+    if action == 'find':
+        if authority_config is not None:
+            raise ValueError('HTTP find is not implemented; use the host or confined contributor read')
+        return find_read(root, path, name, request, key_projects, key_principal)
     if action in ('handoff','review','work','wait'):
         from work import execute as work_execute
         args=request.get('args',[])
@@ -3636,6 +3752,8 @@ CONTRIBUTOR_COMMANDS = (
     ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
     ('wait', 'block until something is your move, then print it and its fingerprint'),
+    ('find PHRASE [--kind KIND] [--task TASK] [--state open|all] [--limit N] [--cursor TOKEN] [--json]',
+     'bounded, permission-first topic search in this project'),
     ('ready', 'the tasks nobody holds that you may claim'),
     ('files list|get|put ...', "a task's files over SSH: list them, get one by its sha256 into a folder, put one"),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
@@ -3693,7 +3811,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
-                  'wait','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
+                  'wait','find','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
                   'coordinator')
 
 

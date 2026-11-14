@@ -903,11 +903,27 @@ def read(project_path, project, args, run, operators=None):
     # tracker has no requirement/brd-section issue types, so its unreadable-row
     # membership probes must use the supported label filters.
     rows = record_json.classify(records.read_rows(run), run, labels)
+    return read_snapshot(project_path, project, args, rows, run, operators)
+
+
+def read_snapshot(project_path, project, args, rows, run, operators=None, check_budget=None):
+    """The existing requirement read projection over a caller's loaded snapshot.
+
+    Receipt, governance, acceptance and recovery rules are shared with ``read``.
+    ``run`` remains the own-kind reader's explicit native-read boundary.
+    """
+    if not isinstance(args, list) or args[:1] not in (['list'], ['brd'], ['get']):
+        raise ValueError('Use requirements list, get ID or brd')
+    if len(args) != (2 if args[0] == 'get' else 1):
+        raise ValueError('Unexpected requirements read argument')
+    labels = ['requirement', 'brd-section']
     from requirement_terminal import pending_ids, projection, scan
     receipts, damaged = scan(project_path, project)
     pending, pending_error = pending_ids(project_path, project, rows, receipts=receipts, damaged=damaged)
     items, decisions = [], []
     for row in rows:
+        if check_budget is not None:
+            check_budget()
         if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
                 or row.get('issue_type') in labels or record_json.selected(row, labels)):
             continue
