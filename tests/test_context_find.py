@@ -202,6 +202,21 @@ class SearchTests(unittest.TestCase):
         self.assertEqual('data', marked['trust'])
         self.assertNotIn('accepted', marked)
 
+    def test_prose_revision_names_do_not_invent_supersession(self):
+        result = search([row(text='', comments=[
+            comment('orthogonal r1 report, see r2 for a newer answer', 'prose-r1'),
+            comment('orthogonal r2 replaces the previous report', 'prose-r2')])], args=['--kind', 'comment'])
+        self.assertEqual(2, result['total'])
+        for item in result['items']:
+            self.assertNotIn('superseded_by', item)
+            self.assertNotIn('replaces', item)
+            self.assertEqual('prose', item['trust_class'])
+
+    def test_ascii_excerpt_is_at_most200_characters(self):
+        result = search([row(text='orthogonal ' + 'x' * 1000)])
+        self.assertEqual(200, len(result['items'][0]['excerpt']['text']))
+        self.assertGreater(result['items'][0]['excerpt']['omitted_chars'], 0)
+
     def test_time_budget_stops_nonmatching_corpus(self):
         ticks = iter([0, 0.5, 0.8, 1.2, 2.1] + [3] * 200)
         result = search([row('sample-%d' % n, text='nonmatching') for n in range(20)], clock=lambda: next(ticks))
