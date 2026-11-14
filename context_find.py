@@ -272,12 +272,15 @@ def _comments(row, coverage, budget, allowed, record_kind=None):
                 and (record_kind is None or kind in (record_kind, 'shared-void')))
 
     grouped, complete, queued = {}, True, 0
+    classified = {}
     for index, comment in enumerate(row.get('comments') or []):
         if not isinstance(comment, dict):
             continue
         if 'body_offset' not in comment:
-            if not permitted(_comment_read_kind(comment.get('text'))):
+            source_kind = _comment_read_kind(comment.get('text'))
+            if not permitted(source_kind):
                 continue
+            classified[id(comment)] = source_kind
             budget.check()
             if coverage['comments_examined'] + queued >= MAX_COMMENTS:
                 coverage['cutoffs'].add('comments')
@@ -287,7 +290,7 @@ def _comments(row, coverage, budget, allowed, record_kind=None):
         cid = comment.get('id')
         key = (True, str(cid)) if isinstance(cid, (str, int)) and not isinstance(cid, bool) else (False, index)
         grouped.setdefault(key, []).append(comment)
-    result = []
+    result, read_kinds, comment_kinds = [], set(), {}
     for (valid_id, cid), parts in grouped.items():
         body, malformed = None, False
         source = parts[0]
@@ -321,7 +324,7 @@ def _comments(row, coverage, budget, allowed, record_kind=None):
         except (KeyError, TypeError, ValueError):
             malformed = True
         if body is not None:
-            source_kind = _comment_read_kind(body)
+            source_kind = classified[id(source)] if id(source) in classified else _comment_read_kind(body)
         else:
             # For a missing continuation, its opening header still identifies the
             # reader. Never classify the remaining prose as a separate document.
@@ -339,8 +342,12 @@ def _comments(row, coverage, budget, allowed, record_kind=None):
             complete = False
             continue
         result.append(dict(source, id=cid, text=body))
+        read_kinds.add(source_kind)
+        comment_kinds[cid] = source_kind
     result = _Checked(result, budget)
     result.complete = complete
+    result.read_kinds = read_kinds
+    result.comment_kinds = comment_kinds
     return result
 
 
@@ -495,10 +502,11 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
             item['replaces'] = [p for p in replaces if isinstance(p, str)
                                 and briefing.CONTEXT_POINTER_RE.fullmatch(p)][:3]
         identities.add(identity)
-        documents.append({'id': _digest(identity), 'item': item,
+        doc_id = _digest(identity)
+        documents.append({'id': doc_id, 'item': item,
                           'indexed': indexed, 'exact': tuple(exact),
                           'at': moment.timestamp() if moment else 0,
-                          'bm25': capabilities.bm25_document(_digest(identity),
+                          'bm25': capabilities.bm25_document(doc_id,
                                     identity_parts, [indexed])})
 
     try:
@@ -647,7 +655,12 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                 continue
             comments = row.get('comments') or []
             selected_pointers = []
-            if 'checkpoint' in selected or ('task' in selected and 'checkpoint' in allowed):
+            # Reuse only prefix classifications from this request, never reader
+            # authority. Damaged identities still go through the unknown path.
+            read_kinds = row['comments'].read_kinds
+            incomplete = not row.get('_find_comments_complete', True)
+            if ('checkpoint' in read_kinds or incomplete) and (
+                    'checkpoint' in selected or ('task' in selected and 'checkpoint' in allowed)):
                 try:
                     state = briefing.checkpoint_state(row, normalize=False)
                     if state['invalid'] or not row.get('_find_comments_complete', True):
@@ -664,7 +677,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                                 trust='checkpoint-closed' if row.get('status') == 'closed' else 'checkpoint-open')
                 except (ValueError, TypeError, KeyError):
                     coverage['skipped_malformed'] += 1
-            if 'review' in selected or ('task' in selected and 'review' in allowed):
+            if (read_kinds.intersection(('review', 'shared-void')) or incomplete) and (
+                    'review' in selected or ('task' in selected and 'review' in allowed)):
                 try:
                     if not row.get('_find_comments_complete', True):
                         raise ValueError('Incomplete review source')
@@ -726,7 +740,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                 for comment in comments:
                     budget.check()
                     body = comment.get('text')
-                    if not isinstance(body, str) or is_record_comment(body) or reserved_match(body):
+                    if row['comments'].comment_kinds[str(comment['id'])] != 'comment':
                         continue
                     first_line = next((line.strip() for line in body.splitlines() if line.strip()), '')
                     marker = first_line.startswith(('Decision:', 'Kind: decision'))
