@@ -82,6 +82,35 @@ class SearchTests(unittest.TestCase):
         self.assertEqual('partial', result['stale'])
         self.assertEqual(1, result['coverage']['skipped_malformed'])
 
+    def test_malformed_comment_containers_and_members_are_partial(self):
+        for bad in ('orthogonal', {}, True, [None], [7], ['orthogonal']):
+            with self.subTest(bad=bad):
+                data = row()
+                data['comments'] = bad
+                result = search([data])
+                self.assertEqual('partial', result['stale'])
+                self.assertTrue(result['total_is_lower_bound'])
+                self.assertGreater(result['coverage']['skipped_malformed'], 0)
+                self.assertIsNone(result['cursor'])
+                self.assertEqual(0, search([data], args=['--kind', 'comment'])['total'])
+
+    def test_unreadable_comments_cannot_change_task_only_scope_statistics(self):
+        before = search([row()], kinds=['task'])
+        for bad in ('orthogonal', {}, True, [None], [7]):
+            with self.subTest(bad=bad):
+                data = row()
+                data['comments'] = bad
+                after = search([data], kinds=['task'])
+                for field in ('total', 'coverage', 'items', 'cursor', 'stale'):
+                    self.assertEqual(before[field], after[field], field)
+                self.assertEqual(before['watermark']['generation'], after['watermark']['generation'])
+
+    def test_unknown_record_comment_container_does_not_become_task_prose(self):
+        data = row(labels=['reference'])
+        data['comments'] = True
+        result = search([data], args=['--kind', 'task'])
+        self.assertEqual(0, result['total'])
+        self.assertEqual('partial', result['stale'])
     def test_long_comment_chunks_are_one_hit_and_hash_full_body(self):
         body = 'Prefix\n' + 'long data ' * 1100 + ' orthogonal report tail'
         chunks = [comment(body[:5000], body_offset=0, body_total_chars=len(body)),

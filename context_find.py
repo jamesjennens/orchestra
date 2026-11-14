@@ -223,7 +223,10 @@ def _anchor_label(row):
         if label in ('reference', 'capability') and any(
                 isinstance(value, str) and value.startswith(label + '-key:') for value in labels):
             return label
-    for comment in row.get('comments') or []:
+    comments = row.get('comments')
+    if not isinstance(comments, (list, tuple)):
+        comments = ()
+    for comment in comments:
         if not isinstance(comment, dict):
             continue
         classified = record_comment_kind(comment.get('text'))
@@ -274,8 +277,26 @@ def _comments(row, coverage, budget, allowed, record_kind=None):
 
     grouped, complete, queued = {}, True, 0
     classified = {}
-    for index, comment in enumerate(row.get('comments') or []):
+    visible_comments = any(permitted(kind) for kind in KINDS if kind != 'task')
+    comments = row.get('comments')
+    if comments is None:
+        comments = ()
+    elif not isinstance(comments, (list, tuple)):
+        complete = False
+        if visible_comments:
+            budget.check()
+            coverage['skipped_malformed'] += 1
+        comments = ()
+    for index, comment in enumerate(comments):
         if not isinstance(comment, dict):
+            complete = False
+            if visible_comments:
+                budget.check()
+                if coverage['comments_examined'] + queued >= MAX_COMMENTS:
+                    coverage['cutoffs'].add('comments')
+                    break
+                coverage['comments_examined'] += 1
+                coverage['skipped_malformed'] += 1
             continue
         if 'body_offset' not in comment:
             source_kind = _comment_read_kind(comment.get('text'))
