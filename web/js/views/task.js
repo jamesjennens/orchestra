@@ -633,7 +633,9 @@ export function signOffCard(ctx, pid, tid, signOff, standards) {
   const mdHref = ctx.api && ctx.api.taskSignOffMarkdownUrl ? ctx.api.taskSignOffMarkdownUrl(pid, tid) : `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off.md`;
   const jsonHref = `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/sign-off`;
   const diffLabel = signOff.diff_status
-    ? `Diff: ${signOff.diff_status}` + (signOff.diff_recorded_by ? ` (${signOff.diff_recorded_by})` : '')
+    ? `Diff: ${signOff.diff_status}`
+      + (signOff.diff_recorded_by ? ` (${signOff.diff_recorded_by})` : '')
+      + (signOff.git_inspection_timed_out ? ' · git inspection timed out' : '')
     : null;
   const earlierFold = earlier.length
     ? h('details', { class: 'fold', 'data-earlier-signoffs': String(earlier.length) },
@@ -651,6 +653,7 @@ export function signOffCard(ctx, pid, tid, signOff, standards) {
               h('strong', null, `Approved by ${prevActor}`),
               prev && prev.created_at ? h('span', { class: 'muted' }, prev.created_at) : null,
               h('span', { class: 'chip plain' }, `Gate: ${(prev && prev.gate_mode) || 'warn'}`),
+              prev && prev.git_inspection_timed_out ? h('span', { class: 'chip plain' }, 'git inspection timed out') : null,
               h('span', { class: 'chip plain' }, `must N/A: ${prevNa} (${prevNaTotal} total)`)),
             prevWould,
             renderSignOffChecksTable(prev && prev.checks));

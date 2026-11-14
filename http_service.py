@@ -1759,7 +1759,8 @@ class InProcessBackend:
                                 std_w.commit_signoff(stored['contribution_id'], operation_id, so)
                             except (review_standards.SignoffCommitError, review_standards.StandardsDamagedError, OSError) as err:
                                 raise UncertainOutcome(
-                                    'Approval committed, but sign-off could not be finalized: %s' % err
+                                    'Approval committed, but sign-off could not be finalized: %s'
+                                    % review_standards._safe_store_exception_reason(err, 'signoffs')
                                 ) from None
                         ans['sign_off'] = so
                         if so.get('would_have_refused'):
@@ -1828,6 +1829,7 @@ class InProcessBackend:
                         reg = review_standards.resolve_effective_register(
                             std_w, version=pinned_ver, shared_version_override=pinned_shared,
                             active_person_checker=active_person,
+                            include_signoff_warnings=False,
                         )
                         if reg['status'] == 'active':
                             eff_git = (
@@ -1970,7 +1972,8 @@ class InProcessBackend:
                 std_w.commit_signoff(current[-1]['id'], eff_op_id, final_so)
             except (review_standards.SignoffCommitError, review_standards.StandardsDamagedError, OSError) as err:
                 raise UncertainOutcome(
-                    'Approval committed, but sign-off could not be finalized: %s' % err
+                    'Approval committed, but sign-off could not be finalized: %s'
+                    % review_standards._safe_store_exception_reason(err, 'signoffs')
                 ) from None
             answer['sign_off'] = final_so
             if final_so.get('would_have_refused'):

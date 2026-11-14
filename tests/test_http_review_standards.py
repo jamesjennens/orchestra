@@ -26,6 +26,7 @@ import test_http_review_fixes
 from test_http_review_fixes import Harness
 from test_http_web import WEB, run_node_module
 from test_lane_nudge_carrier import fill
+from test_review_standards import _kill_pid_best_effort, _make_child_spawning_slow_git, _wait_pid_dead
 
 _ORIG_HASH_PASSWORD = http_auth.hash_password
 _ORIG_TMP_ROOT = test_http_review_fixes.TMP_ROOT
@@ -2099,6 +2100,224 @@ class _HttpStandardsMixin:
         self.assertEqual('unavailable', r_slow.data['error']['code'])
         self.assertIn(rs.refusal_git_inspection_timeout(commit3), r_slow.data['error']['message'])
 
+    def test_r6_http_warn_mode_timeout_child_git_kill_no_host_paths_and_prelock_auth(self):
+        """Pin r6 m1d-warn-mode-timeout, s1d-orphan-index-pack, s2d-no-host-paths, and P15/P14/P14b on HTTP."""
+        pid = self.pid
+        _, alice_tok = self.create_person('alice_r6', 'contributor', pid)
+        _, oscar_tok = self.create_person('oscar_r6', 'coordinator', pid)
+        _, olga_tok = self.create_person('olga_r6', 'coordinator', pid)
+
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0,
+            'reason': 'Create r6 HTTP register (warn mode default).',
+            'rules': [
+                _rule('ALLMUST-1', owner=self.owner_uid, severity='must', applicability={'all_changes': True}),
+                _rule('PATHMUST-2', owner=self.owner_uid, severity='must', applicability={'paths': ['svc.py']}),
+                _rule('PATHSHOULD-3', owner=self.owner_uid, severity='should', applicability={'paths': ['svc.py']}),
+            ],
+        }, token=self.owner_tok).status)
+
+        tid1, cid1, prev1, commit1 = self.deliver_task_bundle(
+            pid, alice_tok, {'svc.py': 'alpha = 1\nbeta = 2\n'}, title='R6 Warn Timeout 1'
+        )
+
+        # 1) P15 (InProcessBackend) and P14 + P14b (EndpointBackend):
+        #    Unauthorized / concurrently-revoked callers MUST NOT trigger pre-lock inspect_delivery_git!
+        if not self.is_endpoint_backend:
+            alice_principal = self.service.authenticate(alice_tok)
+            with mock.patch.object(rs, 'inspect_delivery_git', wraps=rs.inspect_delivery_git) as spy_git:
+                with self.assertRaises(http_service.HttpError) as cm_p15:
+                    self.backend.invoke(
+                        'reviews.add',
+                        alice_principal,
+                        pid,
+                        {
+                            'schema_version': 1,
+                            'operation': 'approve',
+                            'operation_id': 'op-r6-p15-inv',
+                            'task_id': tid1,
+                            'previous': prev1,
+                            'contribution': cid1,
+                            'summary': 'Unauthorized approve.',
+                        },
+                        'idem-r6-p15-inv',
+                        target=tid1,
+                        authorize=lambda: self.service.check_authority(
+                            alice_principal, pid, http_authority.CAP_APPROVE
+                        ),
+                    )
+                self.assertEqual(403, cm_p15.exception.status)
+                self.assertEqual(0, spy_git.call_count)
+
+            # Also pin concurrent revocation over a real HTTP POST /reviews (between _mutate_unlocked and store.lock):
+            rev_uid, rev_coord_tok = self.create_person('revcoord_r6', 'coordinator', pid)
+            orig_basis = http_service.ApiHandler._basis_sentence_in
+
+            def _revoke_before_invoke(handler_self, *a, **kw):
+                res = orig_basis(handler_self, *a, **kw)
+                # Revoke revcoord_r6's project membership via official DELETE before backend.invoke enters store.lock:
+                self.request('DELETE', '/v1/projects/%s/members/%s' % (pid, rev_uid), token=self.owner_tok)
+                return res
+
+            with mock.patch.object(rs, 'inspect_delivery_git', wraps=rs.inspect_delivery_git) as spy_git2, \
+                 mock.patch.object(http_service.ApiHandler, '_basis_sentence_in', _revoke_before_invoke):
+                r_rev = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-p15-http',
+                    'previous': prev1, 'contribution': cid1, 'summary': 'Revoked mid-flight.',
+                }, token=rev_coord_tok, headers={'Idempotency-Key': 'idem-r6-p15-http'})
+            self.assertIn(r_rev.status, (403, 404), r_rev.data)
+            self.assertEqual(0, spy_git2.call_count)
+        else:
+            dep_path = self.canonical_root / 'deployment.private.json'
+            orig_dep = dep_path.read_text(encoding='utf-8')
+            try:
+                dep_cfg = json.loads(orig_dep)
+                dep_cfg['coordinator_writes'] = True
+                dep_cfg['operators'] = ['olive']
+                dep_path.write_text(json.dumps(dep_cfg), encoding='utf-8')
+                self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {
+                    'mode': 'block', 'reason': 'Temp block for P14/P14b',
+                }, token=self.owner_tok).status)
+                with mock.patch.object(rs, 'inspect_delivery_git', wraps=rs.inspect_delivery_git) as spy_git_ep, \
+                     mock.patch.object(rs, 'evaluate_approval_signoff', wraps=rs.evaluate_approval_signoff) as spy_eval_ep:
+                    ep_ans = self.backend._ask(
+                        'review', pid, 'unlisted-sam', [tid1, '@attachment:0'],
+                        {'0': {'flag': '--file', 'text': json.dumps({
+                            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-p14-ep',
+                            'task': tid1, 'previous': prev1, 'contribution': cid1,
+                            'summary': 'Unlisted SSH approve.',
+                        })}},
+                        operation_id=None, authority=None, require_authority=False,
+                        route=None, check_usable=True, timeout=10,
+                    )
+                self.assertEqual(2, ep_ans['returncode'])
+                self.assertEqual('coordinator-rule', ep_ans.get('refused'))
+                self.assertEqual(0, spy_git_ep.call_count)
+                self.assertEqual(0, spy_eval_ep.call_count)
+                self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {
+                    'mode': 'warn', 'reason': 'Back to warn mode',
+                }, token=self.owner_tok).status)
+            finally:
+                dep_path.write_text(orig_dep, encoding='utf-8')
+
+        # 2) m1d-warn-mode-timeout + s1d-orphan-index-pack over HTTP on BOTH backends:
+        #    Under a real child-spawning slow git wrapper on unbundle, warn-mode plain approve
+        #    MUST land 201 (NEVER 503!), record git_inspection_timed_out=True and would_have_refused,
+        #    and kill all child processes!
+        pid_log = self.tmp / 'http-r6-pids.txt'
+        fake_git = _make_child_spawning_slow_git(self.tmp, pid_log, slow_subcmd='unbundle')
+        spawned_pids = []
+        try:
+            with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
+                 mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 0.35):
+                r_warn = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-warn-ok',
+                    'previous': prev1, 'contribution': cid1,
+                    'summary': 'Plain warn-mode approve under slow unbundle.',
+                }, token=olga_tok, headers={'Idempotency-Key': 'idem-r6-warn-ok'})
+            self.assertEqual(201, r_warn.status, r_warn.data)
+            self.assertTrue(r_warn.data['sign_off']['git_inspection_timed_out'])
+            self.assertEqual('diff_unverified', r_warn.data['sign_off']['diff_status'])
+            self.assertEqual(
+                [
+                    'ALLMUST-1 (missing check record)',
+                    'PATHMUST-2 (diff_unverified: missing check record or commit diff)',
+                ],
+                r_warn.data['sign_off']['would_have_refused'],
+            )
+            spawned_pids = [int(x) for x in pid_log.read_text(encoding='utf-8').splitlines() if x.strip()]
+            self.assertGreaterEqual(len(spawned_pids), 1)
+            for cpid in spawned_pids:
+                self.assertTrue(_wait_pid_dead(cpid, timeout=1.5), 'Child PID %d survived HTTP timeout!' % cpid)
+        finally:
+            for cpid in spawned_pids:
+                _kill_pid_best_effort(cpid)
+
+        r_so1 = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid1), token=alice_tok)
+        self.assertEqual(200, r_so1.status, r_so1.data)
+        self.assertTrue(r_so1.data['git_inspection_timed_out'])
+        r_md1 = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off.md' % (pid, tid1), token=alice_tok)
+        self.assertEqual(200, r_md1.status)
+        self.assertIn('(pre-lock git inspection timed out)', r_md1.body.decode('utf-8'))
+
+        # Block mode under timeout: missing checks -> 422 (NOT 503); citation check -> 503, then SAME key -> 201!
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards/gate' % pid, {
+            'mode': 'block', 'reason': 'Block gate for timeout matrix',
+        }, token=self.owner_tok).status)
+        tid2, cid2, prev2, commit2 = self.deliver_task_bundle(
+            pid, alice_tok, {'svc.py': 'alpha = 2\nbeta = 3\n'}, title='R6 Block Timeout 2'
+        )
+        spawned_pids2 = []
+        try:
+            with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
+                 mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 0.35):
+                r_blk_missing = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-blk-missing',
+                    'previous': prev2, 'contribution': cid2, 'summary': 'Missing checks under timeout.',
+                }, token=oscar_tok, headers={'Idempotency-Key': 'idem-r6-blk-missing'})
+                self.assertEqual(422, r_blk_missing.status, r_blk_missing.data)
+
+                r_blk_cite = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-blk-cite',
+                    'previous': prev2, 'contribution': cid2, 'summary': 'Cited checks under timeout.',
+                    'checks': [
+                        {'rule_id': 'ALLMUST-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['svc.py:1-2']}},
+                        {'rule_id': 'PATHMUST-2', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['svc.py:1-2']}},
+                    ],
+                }, token=oscar_tok, headers={'Idempotency-Key': 'idem-r6-blk-cite-retry'})
+                self.assertEqual(503, r_blk_cite.status, r_blk_cite.data)
+                self.assertIn(rs.refusal_git_inspection_timeout(commit2), r_blk_cite.data['error']['message'])
+            spawned_pids2 = [int(x) for x in pid_log.read_text(encoding='utf-8').splitlines() if x.strip()]
+            for cpid in spawned_pids2:
+                self.assertTrue(_wait_pid_dead(cpid, timeout=1.5))
+        finally:
+            for cpid in spawned_pids2:
+                _kill_pid_best_effort(cpid)
+
+        # Retry with the EXACT SAME Idempotency-Key once git is fast again -> lands 201!
+        r_blk_retry = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+            'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-blk-cite',
+            'previous': prev2, 'contribution': cid2, 'summary': 'Cited checks under timeout.',
+            'checks': [
+                {'rule_id': 'ALLMUST-1', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['svc.py:1-2']}},
+                {'rule_id': 'PATHMUST-2', 'result': 'pass', 'evidence': {'kind': 'citations', 'citations': ['svc.py:1-2']}},
+            ],
+        }, token=oscar_tok, headers={'Idempotency-Key': 'idem-r6-blk-cite-retry'})
+        self.assertEqual(201, r_blk_retry.status, r_blk_retry.data)
+
+        # 3) s2d-no-host-paths over HTTP for a contributor member (R5L reproduction):
+        if self.is_endpoint_backend and hasattr(os, 'geteuid') and os.geteuid() != 0:
+            so_dir = self.canonical_root / 'projects' / pid / '.standards' / 'signoffs'
+            committed_files = sorted(p for p in so_dir.iterdir() if p.is_file() and p.name.endswith('.json'))
+            self.assertGreaterEqual(len(committed_files), 2)
+            # Make tid2's sign-off file mode 0o000 while contributor alice reads tid1's sign-off and register:
+            tid2_so_file = [p for p in committed_files if cid2 in p.name or 'blk-cite' in p.name][0]
+            os.chmod(str(tid2_so_file), 0o000)
+            try:
+                g_so = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off' % (pid, tid1), token=alice_tok)
+                g_md = self.request('GET', '/v1/projects/%s/tasks/%s/sign-off.md' % (pid, tid1), token=alice_tok)
+                g_reg = self.request('GET', '/v1/projects/%s/standards' % pid, token=alice_tok)
+                self.assertEqual(200, g_so.status)
+                self.assertEqual(200, g_md.status)
+                self.assertEqual(200, g_reg.status)
+                combined = json.dumps(g_so.data) + '\n' + g_md.body.decode('utf-8') + '\n' + json.dumps(g_reg.data)
+                self.assertNotIn(str(self.canonical_root), combined)
+                self.assertNotIn(str(self.tmp), combined)
+                self.assertIn('cannot be read: permission denied', combined)
+            finally:
+                os.chmod(str(tid2_so_file), 0o600)
+
+            # Also test signoffs/ at mode 0o300 (cannot scan signoffs: permission denied):
+            os.chmod(str(so_dir), 0o300)
+            try:
+                g_reg2 = self.request('GET', '/v1/projects/%s/standards' % pid, token=alice_tok)
+                self.assertEqual(200, g_reg2.status)
+                raw_reg2 = json.dumps(g_reg2.data)
+                self.assertNotIn(str(self.canonical_root), raw_reg2)
+                self.assertIn('cannot scan signoffs: permission denied', raw_reg2)
+            finally:
+                os.chmod(str(so_dir), 0o755)
+
 
 class HttpStandardsInProcessSuite(_HttpStandardsMixin, Harness):
     """All HTTP standards scenarios against InProcessBackend."""
@@ -2432,6 +2651,8 @@ const ctxWithReg = {
             operation_id: 'op-prev-1',
             created_at: '2026-11-11T12:00:00Z',
             gate_mode: 'warn',
+            diff_status: 'diff_unverified',
+            git_inspection_timed_out: true,
             must_not_applicable_count: 1,
             reviewer_must_not_applicable_total: 1,
             would_have_refused: ['STD-50 (unverified)'],
@@ -2456,7 +2677,15 @@ const ctxWithReg = {
 };
 
 const taskDom = await taskView.detail(ctxWithReg, { pid: 'p1', tid: 't-1' });
-const taskText = taskDom.textContent;
+const timeoutCard = taskView.signOffCard(ctxWithReg, 'p1', 't-1', {
+  contribution_id: 'con_to',
+  register_version: 1,
+  gate_mode: 'warn',
+  diff_status: 'diff_unverified',
+  git_inspection_timed_out: true,
+  checks: [],
+}, { register_version: 1 });
+const taskText = taskDom.textContent + ' | ' + timeoutCard.textContent;
 
 // 2) Approved task on a project WITHOUT brief.standards -> must NOT call taskSignOff (0 calls)!
 const ctxNoReg = {
@@ -2523,6 +2752,7 @@ console.log(JSON.stringify({ signOffCallsWithReg, signOffCallsNoReg, taskText, s
             'Diff: verified (usr_oscar)',
             'Earlier approvals on this delivery (1)',
             'Approved by usr_oscar',
+            'Diff: diff_unverified · git inspection timed out',
             'must N/A: 1 (1 total)',
             'Warn mode — would have refused: STD-50 (unverified)',
             'reason: Docs only',

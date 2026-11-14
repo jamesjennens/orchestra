@@ -8,12 +8,15 @@ refusing, canonicalizable). Host filesystem reads and writes refuse symlinks via
 """
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import fnmatch
 import hashlib
+import json
 import os
 import posixpath
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -52,6 +55,7 @@ BUNDLE_FETCH_LOCK_NAME = '.standards-bundle-fetch.lock'
 BUNDLE_LOCK_WAIT_SECONDS = 15.0
 BUNDLE_INSPECT_MAX_SECONDS = 8.0
 BUNDLE_INSPECT_SEMAPHORE = threading.BoundedSemaphore(1)
+GIT_EXECUTABLE = 'git'
 STAGED_TTL_SECONDS = 24 * 3600
 
 MAX_FILE_BYTES = 512 * 1024
@@ -198,7 +202,7 @@ class BundleLockTimeoutError(RuntimeError):
     """Raised when the installation-wide bundle fetch lock wait times out."""
 
 
-class BundleInspectTimeoutError(ValueError):
+class BundleInspectTimeoutError(Exception):
     """Raised when pre-lock git inspection exceeds its bounded time budget."""
 
 
@@ -580,18 +584,79 @@ def _ensure_real_dir(base_dir, *parts):
     return cur
 
 
+def _os_error_reason(exc):
+    if isinstance(exc, PermissionError) or getattr(exc, 'errno', None) in (errno.EACCES, errno.EPERM):
+        return 'permission denied'
+    if isinstance(exc, FileNotFoundError) or getattr(exc, 'errno', None) == errno.ENOENT:
+        return 'file not found'
+    if isinstance(exc, IsADirectoryError) or getattr(exc, 'errno', None) == errno.EISDIR:
+        return 'is a directory'
+    if isinstance(exc, NotADirectoryError) or getattr(exc, 'errno', None) == errno.ENOTDIR:
+        return 'not a directory'
+    err_no = getattr(exc, 'errno', None)
+    if err_no is not None:
+        try:
+            msg = os.strerror(err_no)
+            if msg:
+                return msg.lower()
+        except (OSError, ValueError):
+            pass
+    return type(exc).__name__.lower()
+
+
+def _read_file_error_reason(exc):
+    if isinstance(exc, OSError):
+        return _os_error_reason(exc)
+    if isinstance(exc, UnicodeDecodeError):
+        return 'invalid UTF-8'
+    if isinstance(exc, json.JSONDecodeError):
+        return 'invalid JSON'
+    if isinstance(exc, ValueError):
+        msg = str(exc)
+        if 'exceeds its byte bound' in msg:
+            return 'exceeds byte bound'
+        if 'not a regular file' in msg:
+            return 'not a regular file'
+        if 'changed while opening' in msg:
+            return 'changed while opening'
+        return 'invalid JSON'
+    return type(exc).__name__.lower()
+
+
+def _safe_store_exception_reason(exc, default_label='.standards'):
+    if isinstance(exc, (StandardsDamagedError, StandardsRefusal, SignoffCommitError)):
+        return str(exc)
+    if isinstance(exc, OSError):
+        return '%s: %s' % (default_label, _os_error_reason(exc))
+    if isinstance(exc, ValueError):
+        msg = str(exc)
+        if msg.endswith('is not a regular directory') or msg.startswith('Refusing non-regular '):
+            return msg
+        return '%s: invalid store entry' % default_label
+    return '%s: %s' % (default_label, type(exc).__name__.lower())
+
+
 def _list_regular_names(dir_path, label):
     if not _require_real_dir(dir_path, label):
         return []
     names = []
-    with os.scandir(str(dir_path)) as it:
-        for entry in it:
-            if entry.name.startswith('.tmp-'):
-                continue
+    try:
+        with os.scandir(str(dir_path)) as it:
+            entries = list(it)
+    except OSError as exc:
+        raise StandardsDamagedError('cannot scan %s: %s' % (label, _os_error_reason(exc))) from exc
+    for entry in entries:
+        if entry.name.startswith('.tmp-'):
+            continue
+        try:
             st = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode):
-                raise StandardsDamagedError('%s/%s is not a regular file' % (label, entry.name))
-            names.append((entry.name, st))
+        except OSError as exc:
+            raise StandardsDamagedError(
+                '%s/%s cannot be stat-checked: %s' % (label, entry.name, _os_error_reason(exc))
+            ) from exc
+        if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode):
+            raise StandardsDamagedError('%s/%s is not a regular file' % (label, entry.name))
+        names.append((entry.name, st))
     names.sort(key=lambda item: item[0])
     return names
 
@@ -609,14 +674,16 @@ def _scan_regular_names_tolerant(dir_path, label):
         with os.scandir(str(dir_path)) as it:
             entries = sorted(list(it), key=lambda e: e.name)
     except OSError as exc:
-        return [], ['cannot scan %s: %s' % (label, exc)]
+        return [], ['cannot scan %s: %s' % (label, _os_error_reason(exc))]
     for entry in entries:
         if entry.name.startswith('.tmp-'):
             continue
         try:
             st = entry.stat(follow_symlinks=False)
         except OSError as exc:
-            warnings.append('%s/%s cannot be stat-checked: %s' % (label, entry.name, exc))
+            warnings.append(
+                '%s/%s cannot be stat-checked: %s' % (label, entry.name, _os_error_reason(exc))
+            )
             continue
         if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode):
             warnings.append('%s/%s is not a regular file' % (label, entry.name))
@@ -635,7 +702,9 @@ def _read_json_file(file_path, label, *, limit=MAX_FILE_BYTES):
         raw = read_regular_text(str(file_path), limit=limit)
         data = parse_json(raw)
     except (OSError, UnicodeDecodeError, ValueError) as exc:
-        raise StandardsDamagedError('%s cannot be read: %s' % (label, exc)) from exc
+        raise StandardsDamagedError(
+            '%s cannot be read: %s' % (label, _read_file_error_reason(exc))
+        ) from exc
     if not isinstance(data, dict):
         raise StandardsDamagedError('%s is not a JSON object' % label)
     return data
@@ -789,7 +858,9 @@ def held_bundle_fetch_lock(lock_dir, wait_seconds=BUNDLE_LOCK_WAIT_SECONDS):
             try:
                 fd = os.open(str(lock_path), flags, 0o600)
             except OSError as exc:
-                raise ValueError('Cannot open bundle fetch lock file: %s' % exc) from exc
+                raise ValueError(
+                    'Cannot open bundle fetch lock file: %s' % _os_error_reason(exc)
+                ) from exc
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode) or _is_reparse_point(opened):
                 os.close(fd)
@@ -866,7 +937,11 @@ class HostStandardsStore:
                             continue
                         version_entries.append(entry)
             except OSError as exc:
-                return ('damaged', None, 'cannot scan .standards/versions: %s' % exc)
+                return (
+                    'damaged',
+                    None,
+                    'cannot scan .standards/versions: %s' % _os_error_reason(exc),
+                )
 
         if head_st is None and not version_entries:
             return ('none', None, None)
@@ -881,7 +956,13 @@ class HostStandardsStore:
                 raise StandardsDamagedError('versions/ is empty while head.json names v%d' % current)
             versions_map = {}
             for entry in sorted(version_entries, key=lambda e: e.name):
-                st = entry.stat(follow_symlinks=False)
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise StandardsDamagedError(
+                        'versions/%s cannot be stat-checked: %s'
+                        % (entry.name, _os_error_reason(exc))
+                    ) from exc
                 if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISREG(st.st_mode):
                     raise StandardsDamagedError('versions/%s is not a regular file' % entry.name)
                 m = re.fullmatch(r'v(\d{6})\.json', entry.name)
@@ -1027,7 +1108,7 @@ class HostStandardsStore:
     def _raise_damaged_subdir(self, exc):
         raise StandardsRefusal(
             'Standards directory in project %s is damaged (%s); repair or restore .standards/ before reviewing.'
-            % (self.project_id, exc),
+            % (self.project_id, _safe_store_exception_reason(exc, '.standards')),
             status=409,
         ) from None
 
@@ -1123,7 +1204,8 @@ class HostStandardsStore:
             _safe_unlink(so_dir, staged_name)
         except (StandardsDamagedError, ValueError, OSError) as exc:
             raise SignoffCommitError(
-                'Cannot finalize committed sign-off in project %s (%s)' % (self.project_id, exc)
+                'Cannot finalize committed sign-off in project %s (%s)'
+                % (self.project_id, _safe_store_exception_reason(exc, 'signoffs'))
             ) from None
 
     def read_signoff(self, contribution_id, approve_operation_id=None):
@@ -1211,7 +1293,7 @@ class HostStandardsStore:
             if not _require_real_dir(self.root, '.standards'):
                 return [], []
         except (StandardsDamagedError, OSError) as exc:
-            return [], [str(exc)]
+            return [], [_safe_store_exception_reason(exc, '.standards')]
         so_dir = self.root / 'signoffs'
         entries, warnings = _scan_regular_names_tolerant(so_dir, 'signoffs')
         items = []
@@ -1256,12 +1338,12 @@ class HostStandardsStore:
         try:
             if not _require_real_dir(self.root, '.standards'):
                 return []
-        except StandardsDamagedError as exc:
-            return [str(exc)]
+        except (StandardsDamagedError, OSError) as exc:
+            return [_safe_store_exception_reason(exc, '.standards')]
         now_val = time.time() if now_epoch is None else float(now_epoch)
         approve_ops, rec_ops = _extract_tracker_operation_maps(rows)
         landed_staged_names = set()
-        for l_op, (l_cid, _) in approve_ops.items():
+        for (l_cid, l_op) in approve_ops:
             try:
                 landed_staged_names.add(_signoff_staged_filename(l_cid, l_op))
             except ValueError:
@@ -1290,16 +1372,16 @@ class HostStandardsStore:
                 if now_val - st.st_mtime >= STAGED_TTL_SECONDS:
                     _safe_unlink(so_dir, name)
                 continue
-            matched = approve_ops.get(op_id)
-            if matched is not None and matched[0] == cid and isinstance(staged, dict):
+            matched_comment_id = approve_ops.get((cid, op_id))
+            if matched_comment_id is not None and isinstance(staged, dict):
                 try:
-                    promoted = dict(staged, status='committed', approval_comment_id=matched[1])
+                    promoted = dict(staged, status='committed', approval_comment_id=matched_comment_id)
                     self.commit_signoff(cid, op_id, promoted)
                     if _lstat_or_none(so_dir / name) is not None:
                         _safe_unlink(so_dir, name)
                 except (StandardsDamagedError, StandardsRefusal, SignoffCommitError, OSError) as exc:
-                    warnings.append(str(exc))
-            elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in approve_ops:
+                    warnings.append(_safe_store_exception_reason(exc, 'signoffs/%s' % name))
+            elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and (cid, op_id) not in approve_ops:
                 _safe_unlink(so_dir, name)
 
         rec_dir = self.root / 'recommendations'
@@ -1320,7 +1402,7 @@ class HostStandardsStore:
                     promoted = dict(staged, status='committed', recommendation_id=comment_id)
                     self.commit_recommendation(op_id, comment_id, promoted)
                 except (StandardsDamagedError, StandardsRefusal, OSError) as exc:
-                    warnings.append(str(exc))
+                    warnings.append(_safe_store_exception_reason(exc, 'recommendations/%s' % name))
             elif now_val - st.st_mtime >= STAGED_TTL_SECONDS and op_id not in rec_ops:
                 try:
                     rec_doc = _read_json_file(rec_dir / name, 'recommendations/%s' % name)
@@ -1391,14 +1473,19 @@ class HostStandardsStore:
         path = self.root / 'notifications.jsonl'
         if _lstat_or_none(path) is None:
             return []
-        raw = read_regular_text(str(path), limit=MAX_FILE_BYTES * 2)
-        items = []
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            parsed = parse_json(line)
-            if isinstance(parsed, dict):
-                items.append(parsed)
+        try:
+            raw = read_regular_text(str(path), limit=MAX_FILE_BYTES * 2)
+            items = []
+            for line in raw.splitlines():
+                if not line.strip():
+                    continue
+                parsed = parse_json(line)
+                if isinstance(parsed, dict):
+                    items.append(parsed)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise StandardsDamagedError(
+                'notifications.jsonl cannot be read: %s' % _read_file_error_reason(exc)
+            ) from exc
         return items
 
 
@@ -1755,6 +1842,9 @@ class DictStandardsStore:
             if not isinstance(so_map[k], dict)
         ]
 
+    def scan_committed_signoffs(self):
+        return self.list_committed_signoffs(), self.list_signoff_warnings()
+
     def read_departed_owners(self):
         bucket = self._bucket(write=False)
         if not isinstance(bucket, dict):
@@ -1813,7 +1903,7 @@ def _extract_tracker_operation_maps(rows):
                     op_id = rec.get('operation_id')
                     contrib = rec.get('contribution')
                     if isinstance(op_id, str) and isinstance(contrib, str):
-                        approve_ops[op_id] = (contrib, cid)
+                        approve_ops[(contrib, op_id)] = cid
             elif raw.startswith(review_recommendations.PREFIX):
                 try:
                     rec = parse_json(raw[len(review_recommendations.PREFIX):])
@@ -2129,6 +2219,7 @@ def resolve_effective_register(
     shared_version_override=None,
     active_person_checker=None,
     known_ref_keys=None,
+    include_signoff_warnings=True,
 ):
     """Resolve the project's register (and single-hop shared parent if ``inherits`` is set).
 
@@ -2374,7 +2465,7 @@ def resolve_effective_register(
             ),
         })
 
-    if hasattr(store, 'list_signoff_warnings'):
+    if include_signoff_warnings and hasattr(store, 'list_signoff_warnings'):
         for bad_so in store.list_signoff_warnings():
             lint_warnings.append({
                 'code': 'damaged_signoff_entry',
@@ -3317,6 +3408,7 @@ def grant_waiver(
         store,
         version=pinned_version,
         active_person_checker=active_person_checker,
+        include_signoff_warnings=False,
     )
     if reg['status'] == 'damaged':
         raise StandardsRefusal(
@@ -3423,14 +3515,50 @@ def _cleanup_temp_git_dir(tmpdir):
 
     def _on_rm_error(func, path, _exc_info):
         try:
-            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
-            func(path)
-        except OSError:
+            if func in (os.unlink, os.remove, os.rmdir):
+                st = os.lstat(path)
+                if not stat.S_ISLNK(st.st_mode):
+                    mode = stat.S_IWRITE | stat.S_IREAD
+                    if stat.S_ISDIR(st.st_mode):
+                        mode |= stat.S_IEXEC
+                    os.chmod(path, mode)
+                func(path)
+        except Exception:
             pass
 
     try:
         shutil.rmtree(str(tmpdir), onerror=_on_rm_error)
+    except Exception:
+        pass
+
+
+def _kill_git_process_tree(proc):
+    """Terminate ``proc`` and any child processes (such as ``git index-pack``) on timeout."""
+    if proc is None:
+        return
+    if os.name == 'nt':
+        try:
+            subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
     except OSError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
@@ -3451,7 +3579,7 @@ def run_confined_git(
             raise BundleInspectTimeoutError('git inspection exceeded time budget')
         eff_timeout = min(eff_timeout, rem)
     cmd = [
-        'git',
+        GIT_EXECUTABLE,
         '--no-optional-locks',
         '--literal-pathspecs',
         '-c',
@@ -3461,25 +3589,45 @@ def run_confined_git(
         '-c',
         'core.hooksPath=/dev/null',
     ] + [str(a) for a in args]
+    popen_kwargs = {
+        'cwd': str(cwd) if cwd is not None else None,
+        'stdin': subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.PIPE,
+    }
+    if os.name == 'nt':
+        popen_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+    else:
+        popen_kwargs['start_new_session'] = True
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd is not None else None,
-            input=stdin_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=eff_timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise BundleInspectTimeoutError('git timed out: %s' % exc) from exc
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError('git failed: %s' % exc) from exc
+        raise ValueError('git failed: %s' % type(exc).__name__) from exc
+    try:
+        out_bytes, err_bytes = proc.communicate(input=stdin_bytes, timeout=eff_timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_git_process_tree(proc)
+        raise BundleInspectTimeoutError('git timed out after %.2fs' % eff_timeout) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        if proc.poll() is None:
+            _kill_git_process_tree(proc)
+        raise ValueError('git failed: %s' % type(exc).__name__) from exc
+    except BaseException:
+        if proc.poll() is None:
+            _kill_git_process_tree(proc)
+        raise
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
     if proc.returncode != 0:
-        err = proc.stderr.decode('utf-8', errors='replace').strip()
-        out = proc.stdout.decode('utf-8', errors='replace').strip()
+        err = err_bytes.decode('utf-8', errors='replace').strip()
+        out = out_bytes.decode('utf-8', errors='replace').strip()
         raise ValueError(err or out or ('git exited %d' % proc.returncode))
-    return proc.stdout if raw else proc.stdout.decode('utf-8', errors='replace')
+    return out_bytes if raw else out_bytes.decode('utf-8', errors='replace')
 
 
 def _count_blob_lines(raw_bytes):
@@ -3746,21 +3894,19 @@ def inspect_delivery_git(
                 resolved_path, handle_fd, size = resolve_delivery_bundle_path(
                     recorded_path, delivery_roots
                 )
+                verify_served_bundle(
+                    resolved_path,
+                    handle_fd,
+                    size,
+                    expected_sha256,
+                    commit,
+                    max_bytes=max_bundle_bytes,
+                    git=lambda g_args: run_confined_git(g_args, deadline=lock_deadline),
+                )
                 try:
-                    verify_served_bundle(
-                        resolved_path,
-                        handle_fd,
-                        size,
-                        expected_sha256,
-                        commit,
-                        max_bytes=max_bundle_bytes,
-                        git=lambda g_args: run_confined_git(g_args, deadline=lock_deadline),
-                    )
-                finally:
-                    try:
-                        os.close(handle_fd)
-                    except OSError:
-                        pass
+                    os.close(handle_fd)
+                except OSError:
+                    pass
                 tmpdir = tempfile.mkdtemp(prefix='std-bundle-')
                 run_confined_git(['init', '--bare', '--quiet', tmpdir], deadline=lock_deadline)
                 if serving_info is not None:
@@ -4913,7 +5059,7 @@ def resolve_pinned_version(store, contribution):
 
 def record_contribution_pin(store, contribution_id, commit, *, declared_tool=None, declared_model=None, now=None):
     """Write ``pins/<contribution_id>.json`` at ``contribute`` time ONLY when register is active."""
-    reg = resolve_effective_register(store)
+    reg = resolve_effective_register(store, include_signoff_warnings=False)
     if reg['status'] != 'active':
         return None
     tool, model = validate_declared_tool_model(declared_tool, declared_model)
@@ -5155,13 +5301,19 @@ def _resolve_mechanical_rule_from_ci(rule, commit, commit_obs):
     }
 
 
-def derive_reviewer_must_na_counts(store, reviewer_actor, *, extra_signoff=None):
+def derive_reviewer_must_na_counts(
+    store, reviewer_actor, *, extra_signoff=None, committed_signoffs=None
+):
     """Derive per-reviewer ``must`` ``not_applicable`` tally from committed sign-offs (no separate counter file)."""
     target_key = author_key(reviewer_actor)
     if not target_key:
         return 0
     seen_pairs = set()
-    all_signoffs = list(store.list_committed_signoffs())
+    all_signoffs = (
+        list(committed_signoffs)
+        if committed_signoffs is not None
+        else list(store.list_committed_signoffs())
+    )
     if isinstance(extra_signoff, dict):
         all_signoffs.append(extra_signoff)
     for so in all_signoffs:
@@ -5288,6 +5440,7 @@ def evaluate_approval_signoff(
         store,
         active_person_checker=active_person_checker,
         known_ref_keys=known_ref_keys,
+        include_signoff_warnings=False,
     )
     if reg_latest['status'] == 'damaged':
         detail = reg_latest.get('damage_detail') or 'unreadable standards register'
@@ -5305,6 +5458,7 @@ def evaluate_approval_signoff(
         shared_version_override=pinned_shared_ver,
         active_person_checker=active_person_checker,
         known_ref_keys=known_ref_keys,
+        include_signoff_warnings=False,
     )
     if reg['status'] == 'damaged':
         detail = reg.get('damage_detail') or 'unreadable pinned standards version'
@@ -5426,13 +5580,9 @@ def evaluate_approval_signoff(
     )
     combined_checks.update(direct_checks)
 
-    if git_timed_out and diff_status != 'verified' and any(
-        bool(r['applicability'].get('paths') or r['applicability'].get('languages'))
-        for r in reg['effective_rules']
-    ):
-        raise StandardsRefusal(refusal_git_inspection_timeout(commit), status=503)
-
-    # Evaluate R4 applicability and waivers.
+    # Evaluate R4 applicability and waivers (a timed-out pre-lock git inspection without
+    # verifier changed_files falls back to the documented diff_unverified route and is
+    # recorded on the sign-off so warn mode never refuses and block mode honors checks/waivers).
     app_entries = evaluate_applicability(
         reg['effective_rules'], issue, changed_files=changed_files, diff_status=diff_status
     )
@@ -5578,6 +5728,7 @@ def evaluate_approval_signoff(
         'would_have_refused': unresolved_must if gate['mode'] == 'warn' else [],
         'diff_status': diff_status,
         'diff_recorded_by': diff_recorded_by,
+        'git_inspection_timed_out': bool(git_timed_out),
         'reviewer': {
             'actor': actor,
             'user_id': actor_user_id,
@@ -5656,6 +5807,7 @@ def validate_and_stage_recommendation_checks(
         version=pinned_ver,
         shared_version_override=pinned_shared_ver,
         active_person_checker=active_person_checker,
+        include_signoff_warnings=False,
     )
     if reg['status'] != 'active':
         return None
@@ -5816,7 +5968,9 @@ def find_approve_operation_id(issue, contribution_id):
     return ops[-1] if ops else None
 
 
-def _refresh_signoff_view(store, so, status_and_head=None):
+def _refresh_signoff_view(
+    store, so, status_and_head=None, *, committed_signoffs=None, signoff_warnings=None
+):
     out = dict(so)
     out.pop('earlier_sign_offs', None)
     status, head = (
@@ -5827,12 +5981,20 @@ def _refresh_signoff_view(store, so, status_and_head=None):
     if status == 'active' and out.get('register_version') is not None:
         out['latest_register_version'] = head['current_version']
         out['newer_register_version_exists'] = int(out['register_version']) < head['current_version']
+    if committed_signoffs is None and signoff_warnings is None and hasattr(store, 'scan_committed_signoffs'):
+        committed_signoffs, signoff_warnings = store.scan_committed_signoffs()
     rev = out.get('reviewer') or {}
     tally_actor = rev.get('recommended_by') or rev.get('actor')
     if tally_actor:
-        out['reviewer_must_not_applicable_total'] = derive_reviewer_must_na_counts(store, tally_actor)
-    if hasattr(store, 'list_signoff_warnings'):
-        so_warnings = store.list_signoff_warnings()
+        out['reviewer_must_not_applicable_total'] = derive_reviewer_must_na_counts(
+            store, tally_actor, committed_signoffs=committed_signoffs
+        )
+    if signoff_warnings is not None or hasattr(store, 'list_signoff_warnings'):
+        so_warnings = (
+            list(signoff_warnings)
+            if signoff_warnings is not None
+            else store.list_signoff_warnings()
+        )
         if so_warnings:
             out['store_warnings'] = so_warnings
         else:
@@ -5863,8 +6025,14 @@ def read_signoffs_for_contribution(
         seen_ops.add(str(so.get('operation_id') or op_id))
         raw_items.append(so)
 
+    if hasattr(store, 'scan_committed_signoffs'):
+        committed_all, so_warnings = store.scan_committed_signoffs()
+    else:
+        committed_all = store.list_committed_signoffs()
+        so_warnings = store.list_signoff_warnings() if hasattr(store, 'list_signoff_warnings') else None
+
     extra_committed = []
-    for so in store.list_committed_signoffs():
+    for so in committed_all:
         if not isinstance(so, dict) or str(so.get('contribution_id') or '') != cid:
             continue
         if exp_lower is not None and str(so.get('commit') or '').lower() != exp_lower:
@@ -5895,7 +6063,16 @@ def read_signoffs_for_contribution(
     if not raw_items:
         return []
     status_and_head = store.inspect_register_raw()[:2]
-    return [_refresh_signoff_view(store, item, status_and_head) for item in raw_items]
+    return [
+        _refresh_signoff_view(
+            store,
+            item,
+            status_and_head,
+            committed_signoffs=committed_all,
+            signoff_warnings=so_warnings,
+        )
+        for item in raw_items
+    ]
 
 
 def read_signoff_for_contribution(
@@ -5997,6 +6174,8 @@ def render_signoff_markdown(signoff):
     diff_line = '- **Diff verification:** `%s`' % signoff.get('diff_status')
     if signoff.get('diff_recorded_by'):
         diff_line += ' (recorded by `%s`)' % signoff['diff_recorded_by']
+    if signoff.get('git_inspection_timed_out'):
+        diff_line += ' (pre-lock git inspection timed out)'
     lines = [
         '# %s' % headline,
         '',
@@ -6128,6 +6307,8 @@ def render_signoff_text(signoff):
     diff_desc = str(signoff.get('diff_status'))
     if signoff.get('diff_recorded_by'):
         diff_desc += ' (by %s)' % signoff['diff_recorded_by']
+    if signoff.get('git_inspection_timed_out'):
+        diff_desc += ' (git inspection timed out)'
     lines = [
         headline,
         '  task: %s  delivery: %s  commit: %s'
@@ -6228,6 +6409,7 @@ def brief_standards_block(
         version=pinned_ver,
         shared_version_override=pinned_shared_ver,
         active_person_checker=active_person_checker,
+        include_signoff_warnings=False,
     )
     if reg['status'] == 'damaged':
         return {

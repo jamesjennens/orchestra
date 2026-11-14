@@ -1724,7 +1724,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                     pinned_ver,pinned_shared,_=review_standards.resolve_pinned_version(std_store,contrib)
                     reg=review_standards.resolve_effective_register(
                         std_store,version=pinned_ver,shared_version_override=pinned_shared,
-                        active_person_checker=active_person_checker)
+                        active_person_checker=active_person_checker,
+                        include_signoff_warnings=False)
                     if reg['status']=='active':
                         git_obs=eff_git_obs or {}
                         git_tree_avail=bool(git_obs.get('tree_available'))
