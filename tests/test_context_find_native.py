@@ -1,5 +1,6 @@
 """Native freshness and a measured local-client warm path, in an owned runtime."""
 import hashlib
+from collections import Counter
 import json
 import math
 import os
@@ -211,10 +212,23 @@ class NativeFindTests(unittest.TestCase):
             part.write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in batch))
             began = time.monotonic()
             self.native(['import', str(part), '--json'])
-            self.emit(dict(sample='fixture-import-%02d' % (start // 200), rows=len(batch),
-                           imported_so_far=start + len(batch), seconds=time.monotonic() - began))
+            self.emit(dict(sample='fixture-import-%02d' % (start // 200), input_rows=len(batch),
+                           input_rows_so_far=start + len(batch), seconds=time.monotonic() - began))
         self.owned_records('perf', rows[0]['id'])
         native_rows = self.case.export_rows()
+        expected_ids = {row['id'] for row in rows}
+        actual_bulk = [row for row in native_rows if row['id'] in expected_ids]
+        self.assertEqual(3400, len(actual_bulk))
+        classes = Counter()
+        for row in actual_bulk:
+            for item in row['comments']:
+                text = item['text']
+                kind = ('checkpoint' if text.startswith(briefing.PREFIX) else
+                        'contribution' if text.startswith(review_workflow.PREFIX) else
+                        'lane-envelope' if text.startswith('Kind: lane-state-v1\n') else 'ordinary')
+                classes[kind] += 1
+        self.assertEqual(dict(ordinary=3400, checkpoint=400, contribution=200,
+                              **{'lane-envelope': 3400}), dict(classes))
         for row in [row for row in native_rows if row['id'] in {r['id'] for r in rows[400:405]}]:
             source = next(comment for comment in row['comments']
                           if comment['text'].startswith(review_workflow.PREFIX))
@@ -230,6 +244,7 @@ class NativeFindTests(unittest.TestCase):
                        imported_bytes=len(raw), imported_sha256=hashlib.sha256(raw).hexdigest(),
                        ordinary_comments=3400, excluded_lane_envelopes=3400,
                        current_checkpoints=400, contribution_records=200, actual_approvals=5,
+                       actual_imported_comment_classes=dict(classes),
                        actual_rows=len(exported), actual_comments=sum(len(row.get('comments') or []) for row in exported)))
         cold, cold_measure = self.measure('scale-cold', 'headwater')
         self.assertEqual(1, cold_measure.get('exports'), cold_measure)
