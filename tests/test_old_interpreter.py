@@ -44,7 +44,7 @@ STARTED_UNDER_3_6 = ('activity.py', 'bootstrap.py', 'export_requirements.py', 'p
 #: proposal_records.py, waiting.py) — a library can be copied beside a program — so only the ``__main__`` block is required.
 MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names.py', 'bd_refusals.py', 'briefing.py',
            'claiming.py',  # kittrial-5bb.352: library-only (no __main__ block); imported by work/waiting/endpoint/http_service
-           'claim_limit.py',
+           'claim_limit.py', 'context_find.py',
            'capability_misses.py', 'capability_records.py', 'capability_verification.py', 'credential_store.py',
            'endpoint_process.py', 'feedback.py', 'field_history.py',  # kittrial-5bb.354: library-only; imported by briefing and http_service
            'field_limits.py',

@@ -91,6 +91,32 @@ class EndpointFindTests(unittest.TestCase):
                 self.execute()
         self.assertGreaterEqual(len(calls), 3)
 
+    def test_live_operator_scope_change_refuses_the_answer(self):
+        original = context_find.search
+        current = []
+        def search(*args, **kwargs):
+            answer = original(*args, **kwargs)
+            current.append('new-operator')
+            return answer
+        with mock.patch.object(self.endpoint, 'configured_operators', side_effect=lambda root: list(current)), \
+                mock.patch.object(context_find, 'search', side_effect=search):
+            with self.assertRaisesRegex(ValueError, 'start the search again'):
+                self.execute()
+
+    def test_unknown_generation_has_no_cursor(self):
+        self.snapshot.stop()
+        with mock.patch('read_cache.cached_export_snapshot', return_value={'rows': self.rows, 'generation': None}):
+            result = self.execute(self.request(['orthogonal', '--limit', '1', '--json']))
+        answer = json.loads(result['stdout'])
+        self.assertEqual('unknown', answer['stale'])
+        self.assertIsNone(answer['cursor'])
+
+    def test_native_source_failure_cannot_become_a_current_empty_answer(self):
+        self.cache.side_effect = ValueError('Native snapshot unavailable')
+        with self.assertRaisesRegex(ValueError, 'Native snapshot unavailable'):
+            self.execute()
+        self.assertEqual([], self.case.tracker.writes)
+
     def test_visible_write_during_search_is_lagging_and_cannot_paginate(self):
         calls = []
         def snapshot(*args, **kwargs):

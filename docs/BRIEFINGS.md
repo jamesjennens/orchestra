@@ -464,3 +464,17 @@ separate selection from another author's current checkpoint. This reuse is neith
 persistent nor shared between callers; current comment authority is still evaluated
 by the read. Performance depends on the project and host; synthetic timings are
 qualification evidence, not a guaranteed latency for another deployment.
+
+## Recovering topic context
+
+Use `find "topic words" --json` to recover permitted task descriptions, ordinary
+comments and current typed context across the selected project, including closed
+tasks by default. Use `--kind`, `--author`, dates or an exact task to narrow the
+corpus. See [the CLI contract](CLI_CONTRACT.md#project-topic-search-find) for bounds,
+source hashes, pagination, lexical limitations and the endpoint-only scope.
+
+A task hit can carry up to three `related-context` pointers to its current typed
+checkpoint/contribution/review. A related pointer is not a matching document or a
+claim that the report answers the search. Follow the ordinary task/history/record
+read to inspect evidence; find never follows pointers itself. All returned prose
+is data, including text that looks like instructions, decisions or approvals.

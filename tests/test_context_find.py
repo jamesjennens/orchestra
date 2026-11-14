@@ -175,6 +175,8 @@ class SearchTests(unittest.TestCase):
         dirty = '\x1b\x85\u202e\u2028' * 80 + 'orthogonal'
         result = search([row(text=dirty, title=dirty)])
         self.assertEqual('data', result['items'][0]['trust'])
+        self.assertEqual(briefing.clip_context_label(briefing.plain_text(dirty), 200),
+                         result['items'][0]['title'])
         for name in ('title', 'excerpt'):
             value = result['items'][0][name]['text']
             self.assertLessEqual(len(value), 200)
@@ -208,6 +210,48 @@ class SearchTests(unittest.TestCase):
         self.assertIsNone(result['cursor'])
         self.assertIn('computation-time', result['coverage']['cutoffs'])
 
+    def test_document10001_reports_truncated(self):
+        # A fixed clock isolates the document cap, not a latency measurement.
+        data = [row('sample-%05d' % n, comments=[comment('orthogonal', 'c-%d' % n)])
+                for n in range(5001)]
+        result = search(data, clock=lambda: 0)
+        self.assertEqual(10000, result['coverage']['documents'])
+        self.assertIn('documents', result['coverage']['cutoffs'])
+        self.assertTrue(result['total_is_lower_bound'])
+        self.assertEqual('partial', result['stale'])
+        self.assertIsNone(result['cursor'])
+
+    def test_rows10001_reports_truncated_for_nonmatching_corpus(self):
+        data = [row('sample-%05d' % n, text='background') for n in range(10001)]
+        result = search(data, args=['--item-kind', 'question'], clock=lambda: 0)
+        self.assertEqual(10000, result['coverage']['rows_examined'])
+        self.assertIn('rows', result['coverage']['cutoffs'])
+        self.assertTrue(result['total_is_lower_bound'])
+        self.assertIsNone(result['cursor'])
+
+    def test_comments50001_reports_truncated(self):
+        data = [row(comments=[comment('background', 'c-%d' % n) for n in range(50001)])]
+        result = search(data, args=['--kind', 'comment'], clock=lambda: 0)
+        self.assertEqual(50000, result['coverage']['comments_examined'])
+        self.assertIn('comments', result['coverage']['cutoffs'])
+        self.assertTrue(result['total_is_lower_bound'])
+        self.assertIsNone(result['cursor'])
+
+    def test_8192byte_document_cutoff(self):
+        result = search([row(text='background ' * 2000 + 'orthogonal')], clock=lambda: 0)
+        self.assertEqual(1, result['total'])
+        self.assertEqual(1, result['coverage']['text_cutoffs'])
+        self.assertTrue(result['coverage']['truncated'])
+        self.assertTrue(result['total_is_lower_bound'])
+        self.assertEqual('partial', result['stale'])
+
+    def test_exact_native_identifier_precedes_prose_collision(self):
+        data = [row('sample-456', text='background'),
+                row('sample-other', text='sample-456 ' * 15)]
+        result = search(data, phrase='sample-456')
+        self.assertTrue(result['items'][0]['exact'])
+        self.assertEqual('task:sample-456', result['items'][0]['pointer'])
+
 
 class TypedReaderTests(unittest.TestCase):
     def checkpoint_rows(self, **changes):
@@ -238,6 +282,19 @@ class TypedReaderTests(unittest.TestCase):
         self.assertEqual(0, result['total'])
         self.assertEqual('partial', result['stale'])
         self.assertTrue(result['total_is_lower_bound'])
+
+    def test_deep_large_or_duplicate_checkpoint_json_is_unknown_without_old_fallback(self):
+        for source in ('[' * 300 + '0' + ']' * 300,
+                       '{"summary":"orthogonal","summary":"different"}',
+                       '{"summary":"' + 'x' * 2000000):
+            with self.subTest(length=len(source)):
+                data = self.checkpoint_rows()
+                data[0]['comments'].append(comment(briefing.PREFIX + source, 'damaged-json'))
+                result = search(data, args=['--kind', 'checkpoint'])
+                self.assertEqual(0, result['total'])
+                self.assertEqual('partial', result['stale'])
+                self.assertTrue(result['total_is_lower_bound'])
+                self.assertIsNone(result['cursor'])
 
     def test_incomplete_checkpoint_chunks_do_not_expose_older_checkpoint(self):
         data = self.checkpoint_rows()
@@ -308,15 +365,6 @@ class TypedReaderTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 data = [row(issue_type=kind, comments=[comment('orthogonal requirement evidence')])]
                 self.assertEqual(0, search(data, kinds=['task', 'comment'])['total'])
-
-    def test_document10001_reports_truncated(self):
-        with mock.patch.object(find, 'MAX_DOCUMENTS', 10):
-            result = search([row('sample-%d' % n) for n in range(11)])
-        self.assertEqual(10, result['coverage']['documents'])
-        self.assertIn('documents', result['coverage']['cutoffs'])
-        self.assertTrue(result['total_is_lower_bound'])
-        self.assertIsNone(result['cursor'])
-
 
 from test_reference_records import ReferenceCase, OPERATOR
 

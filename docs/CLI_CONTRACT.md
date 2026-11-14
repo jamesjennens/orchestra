@@ -2688,3 +2688,94 @@ names its accepted replacement in `replacement` (or null when none is readable);
 asserted when coverage is incomplete. No field grants a role, a read or runtime
 registration. Interface schema verification and `breaking-without-version` evidence
 arrive only with slice 3b.
+
+## Project topic search (`find`)
+
+`find PHRASE [--kind KIND]... [--task ID] [--state open|all] [--limit N]
+[--author ACTOR|me] [--since DATE] [--until DATE] [--task-prefix PREFIX]
+[--item-kind KIND] [--cursor TOKEN] [--json]` is a read-only endpoint/client
+command. Quote a multiword phrase. `find --help` needs no project data read.
+The default is all task states, including closed tasks, and five results; the
+maximum page request is twenty. The phrase must contain words and fit both 200
+characters and 800 UTF-8 bytes. Options are literal values, never regular
+expressions, glob patterns, commands or filesystem paths.
+
+Kinds are `ref`, `cap`, `decision`, `checkpoint`, `review`, `task`, `comment` and
+`requirement`. The corpus includes task titles, descriptions and acceptance
+criteria, ordinary comments, the current valid checkpoint, structured review
+history and records exposed by each kind's own reader. It does not resurrect an
+older checkpoint behind a broken chain, treat an ACK as approval, or index raw
+machine-record comments as prose. Events, gates and internal record anchors do
+not become task hits. A record's active/draft/retired state and explicit
+supersession links come from its own reader. Draft and accepted requirement
+revisions can both be returned when that reader exposes them.
+
+The trusted endpoint establishes one project's current read scope before
+extracting or ranking documents. A request cannot supply its own corpus,
+permission set, principal or record acceptance. The confined-key route checks
+project/principal bindings again before returning. The host route attributes
+`--author me` to the exact supplied actor; it does not authenticate a person from
+that claim. Other actors of the same person are not `me`. No pointer, URL,
+repository, task attachment or other project is followed. This slice has no HTTP
+search route. Future HTTP parity must use live project/credential grants, the
+same corpus and ranking for equal rights, and recheck authority before returning;
+an unsupported backend must say unavailable rather than silently change corpus.
+
+`--task` accepts an exact native ID, or a short `.NNN` that uniquely resolves
+inside this project. A literal `--task-prefix` narrows native IDs.
+`--since` and `--until` use known source creation times: a calendar date is UTC,
+with an inclusive start and exclusive next-day end; offset-aware instants compare
+inclusively. Unknown creation times are excluded under a date filter and counted
+in permitted coverage. Edited times are reported separately. `--item-kind`
+selects typed open items in the current checkpoint; it is not prose inference.
+These filters and the requested kinds, state, actor and limit bind the cursor.
+
+Ranking puts an exact normalized native ID or record key first, then uses the
+shared capability BM25 tokenization, stemming and field scoring. Trust class,
+a decision-like prose hint, source time and stable identity break ties in that
+order. A `Decision:` marker is only a prose tie hint; it creates no decision,
+approval or accepted authority. Supersession is never guessed from revision
+names or prose. Task hits may include at most three separately labelled
+`related-context` pointers to their own typed current checkpoint/contribution/
+review. These are not lexical hits and do not inflate the match total.
+
+JSON uses `find-v1`. Every hit has `trust:data`, with a separate `trust_class`,
+project/task identity, a typed pointer, bounded title/excerpt, source author and
+available creation/edited/owner metadata, and a full-source SHA-256 with an
+explicit hash basis. A hash identifies the named source representation, not its
+truth or authority. Titles and excerpts escape controls and direction marks
+before clipping to 200 characters; text output folds line breaks. Evidence text
+remains data. Results do not answer a question or promise that evidence is current
+policy. Lexical search cannot infer a paraphrase with no matching terms.
+
+Bounds: 10,000 documents, 10,000 permitted rows, 50,000 permitted comments,
+8,192 indexed text bytes per document, 20 hits per page, 16,384 canonical JSON
+answer bytes, and a cooperative two-second extraction/scoring budget. Long text
+uses a deterministic query-centred window; hashes still cover the complete
+source. Native I/O is separate: the existing native subprocess timeout is 120
+seconds **per command**, and a HEAD query has a 30-second timeout. These are not
+an aggregate cold-read deadline. Warm performance is validated with twenty
+completed native calls on a corpus of at least 3,400 rows and 7,400 comments, with
+a three-second nearest-rank p95 target; partial answers never satisfy that target.
+
+Coverage reports searched kinds, documents, rows/comments examined, malformed
+sources, unknown creation times, text cutoffs and cutoff reasons. `total` counts
+matched permitted documents within that coverage. Interrupted/incomplete
+extraction or scoring returns `stale:partial`, a lower-bound total and no cursor.
+A deterministic text-window cutoff can be paged while reporting partial recall.
+An answer-byte page cutoff is separately flagged and keeps the first unreturned
+hit for the next page without making a complete corpus total a lower bound.
+Excluded kinds do not contribute scores, totals, coverage or the visible
+watermark. Rooms, file contents, baseline documents, unsupported decision-record
+families, other projects and semantic answers are explicitly not searched.
+
+One authorized cached export snapshot supplies the corpus; warm calls do not
+re-export an unchanged native source. No search index or cross-call corpus memo
+is written. The cursor binds project, query/filters, live scope, ranking version
+and the permitted source projection. A changed visible source/scope refuses an
+old cursor with a restart message. A write racing a read is rechecked against the
+permitted projection; visible change is `lagging`, incomplete recheck is
+`partial`, and unprovable generation is `unknown`. Such answers do not paginate.
+A hidden source-only change does not expose its HEAD or invalidate an otherwise
+identical permitted projection. `current` describes the checked snapshot, not a
+transactional promise against a later write.

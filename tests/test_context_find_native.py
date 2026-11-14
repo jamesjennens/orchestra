@@ -114,7 +114,7 @@ class NativeFindTests(unittest.TestCase):
                        kind='requirement', parent=parent, key='R01' if prefix == 'fresh' else 'R99',
                        title='Headwater requirement', description='A headwater native requirement.',
                        acceptance_state='draft')
-        requirement_records.apply_native(payload, 'worker', self.native, self.project)
+        return requirement_records.apply_native(payload, 'worker', self.native, self.project)
 
     def test_generation_changes_and_reads_never_mutate_native_records(self):
         import briefing
@@ -143,10 +143,31 @@ class NativeFindTests(unittest.TestCase):
         checkpoint('quenvora')
         self.assertEqual(1, self.find('fresh-checkpoint-two', 'quenvora', '--kind', 'checkpoint', exports=1)['total'])
         self.assertEqual(0, self.find('fresh-checkpoint-old', 'zorandel', '--kind', 'checkpoint', exports=0)['total'])
-        self.owned_records('fresh', task)
+        requirement = self.owned_records('fresh', task)
         for index, kind in enumerate(('ref', 'cap', 'requirement')):
             answer = self.find('fresh-' + kind, 'headwater', '--kind', kind, exports=1 if index == 0 else 0)
             self.assertEqual(1, answer['total'], (kind, answer))
+
+        # Change the actual native acceptance state, not just the task labels or
+        # a modeled reader response. The own reader must expose the new revision.
+        self.assertEqual('draft', answer['items'][0]['trust_class'])
+        config_path = self.root / 'deployment.private.json'
+        settings = json.loads(config_path.read_text())
+        settings['operators'] = ['op']
+        config_path.write_text(json.dumps(settings))
+        import requirement_records
+        payload = dict(schema_version=1, operation_id='fresh-req-accepted', operation='revise',
+                       kind='requirement', task=requirement['id'], key='R01', revision=2,
+                       title='Headwater requirement', description='Accepted headwater native requirement.',
+                       acceptance_state='accepted', acceptance=dict(owners=['owner-a'],
+                       approvers=['owner-a'], policy='any-owner', decision_id='fresh-decision',
+                       evidence='An explicit native acceptance fixture.'))
+        requirement_records.apply_native(payload, 'op', lambda args: self.native(args, actor='op'),
+                                         self.project, operator=True, operators=['op'])
+        accepted = self.find('fresh-requirement-accepted', 'headwater', '--kind', 'requirement', exports=1)
+        self.assertEqual(1, accepted['total'])
+        self.assertEqual('accepted-record', accepted['items'][0]['trust_class'])
+        self.assertEqual(2, accepted['items'][0]['revision'])
 
         before = self.case.export_rows()
         head = read_cache.project_generation(self.root, 'pp')

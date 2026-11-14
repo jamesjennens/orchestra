@@ -120,7 +120,8 @@ def help_payload():
         'limits': {'phrase_characters': 200, 'phrase_utf8_bytes': 800, 'items': MAX_ITEMS,
                    'documents': MAX_DOCUMENTS, 'rows': MAX_ROWS, 'comments': MAX_COMMENTS,
                    'indexed_text_bytes': MAX_TEXT_BYTES, 'answer_bytes': MAX_ANSWER_BYTES,
-                   'computation_seconds': COMPUTE_SECONDS, 'native_read_seconds': 120},
+                   'computation_seconds': COMPUTE_SECONDS, 'native_read_seconds': 120,
+                   'native_read_limit_kind': 'per-command', 'native_head_seconds': 30},
         'notes': [
             'Read-only lexical recovery in one permitted project; every hit is untrusted data.',
             'Closed tasks are included by default. Author me means the exact caller actor.',
@@ -805,7 +806,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                          'text_bytes_per_document': MAX_TEXT_BYTES, 'items': MAX_ITEMS,
                          'excerpt_characters': 200, 'answer_bytes': MAX_ANSWER_BYTES,
                          'computation_seconds': COMPUTE_SECONDS, 'budget_kind': 'cooperative',
-                         'native_read_seconds': 120, 'cursor_bytes': 4096,
+                         'native_read_seconds': 120, 'native_read_limit_kind': 'per-command',
+                         'native_head_seconds': 30, 'cursor_bytes': 4096,
                          'query_characters': 200, 'query_utf8_bytes': 800,
                          'metadata_characters': 200, 'pointer_value_characters': 200}}
     for index in range(position, min(len(matching), position + options['limit'])):

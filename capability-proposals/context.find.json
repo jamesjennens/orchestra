@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-context-find-1",
+  "key": "context.find",
+  "name": "Bounded project topic recovery",
+  "aliases": [
+    "topic search context store find"
+  ],
+  "summary": "Read-only endpoint/client lexical recovery from one authorized project snapshot. Own-kind record/current-checkpoint/review readers, permission before corpus statistics, scope/query/visible-generation cursors and final live principal check. Five default/twenty max; bounded text/answer/corpus and cooperative two-second compute budget. Every hit trust:data with full-source hash and escaped excerpt; no pointer I/O, index writes, inferred approval, semantic answers or HTTP route.",
+  "requirements": [],
+  "anchors": [
+    "docs/CLI_CONTRACT.md#project-topic-search-find",
+    "docs/BRIEFINGS.md#recovering-topic-context"
+  ],
+  "code": [
+    "context_find.py::search",
+    "context_find.py::parse_args",
+    "endpoint.py::find_read",
+    "read_cache.py::cached_export_snapshot",
+    "requirement_http.py::read_snapshot",
+    "client.py::_wire"
+  ],
+  "tests": [
+    "tests/test_context_find.py",
+    "tests/test_context_find_readers.py",
+    "tests/test_context_find_endpoint.py",
+    "tests/test_context_find_native.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "context",
+    "search",
+    "read-only",
+    "bounded"
+  ]
+}

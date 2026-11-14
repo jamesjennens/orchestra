@@ -224,7 +224,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('artifacts.py', 'capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py',
+    GUARDED_ONLY = ('artifacts.py', 'capability_records.py', 'capability_verification.py', 'context_find.py', 'feedback.py', 'guidance.py',
                     'keyed_entries.py', 'project_creation.py', 'recovery.py', 'requirement_baseline_records.py',
                     'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py',
                     'decision_attest.py', 'delegations.py', 'host_notes.py', 'work.py')
@@ -287,6 +287,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The seventeenth (kittrial-5bb.500 r2) reads the LIVE state to name what the restore changes;
             # an unreadable one is said so, and the copy kept aside still holds it.
             'admin.py': 17,
+            'context_find.py': 1,  # bounded, duplicate-field-refusing continuation token
             # D2: bounded native history, review VOID and preserved target payload.
             'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
