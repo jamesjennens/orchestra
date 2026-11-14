@@ -203,7 +203,16 @@ class NativeFindTests(unittest.TestCase):
         raw = ''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in rows).encode()
         imported = self.root / 'synthetic-find-input.jsonl'
         imported.write_bytes(raw)
-        self.native(['import', str(imported), '--json'])
+        # Setup uses bounded native imports. The full fixture and the measured
+        # calls are unchanged; no one import must seed every comment at once.
+        for start in range(0, len(rows), 200):
+            batch = rows[start:start + 200]
+            part = self.root / 'synthetic-find-batch.jsonl'
+            part.write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in batch))
+            began = time.monotonic()
+            self.native(['import', str(part), '--json'])
+            self.emit(dict(sample='fixture-import-%02d' % (start // 200), rows=len(batch),
+                           imported_so_far=start + len(batch), seconds=time.monotonic() - began))
         self.owned_records('perf', rows[0]['id'])
         native_rows = self.case.export_rows()
         for row in [row for row in native_rows if row['id'] in {r['id'] for r in rows[400:405]}]:
