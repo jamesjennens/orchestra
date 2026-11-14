@@ -2,7 +2,7 @@
 // owner opens this page they see which agent has something to do and which folder to
 // open in VS Code to resume it. Agents themselves read work over the REST API.
 import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
-import { pageHead, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
+import { pageHead, setPageKey, empty, field, setFieldError, formValues, act, errorState, describe, loading } from '../ui.js';
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
@@ -15,7 +15,7 @@ export const ATTENTION = {
   // could not be read is never headed "Could take more work".
   error: ['Could not read its work', 'crit'],
   unknown: ['Work read incomplete', 'warn'],
-  idle: ['Could take more work', 'accent'],
+  idle: ['Could take more work', ''],
   working: ['Working', ''],
   waiting: ['Waiting for review', 'ok'],
   blocked: ['Blocked', 'crit'],
@@ -74,6 +74,35 @@ function ownedBy(ctx, raw) {
 function manages(ctx, raw) {
   const owner = ownerId(raw);
   return Boolean(ctx.me && (ctx.me.superuser || owner === ctx.me.id));
+}
+
+// Only “Mine” when a superuser could also see other owners' agents, or when this
+// list already shows more than one owner (kittrial-5bb.561; kept for unit checks — the
+// page itself now decides caller-level in mineShown(), stable across pages).
+export function ownersOf(agents) {
+  return [...new Set((agents || []).map((a) => ownerId(a)).filter(Boolean))];
+}
+
+export function showMineFilter(ctx, agents) {
+  return Boolean(ctx.me && (agents || []).length && (ctx.me.superuser || ownersOf(agents).length > 1));
+}
+
+function ownerLine(agent) {
+  // n1(a) (kittrial-5bb.561 r2): the agent_view payload (http_auth.py agent_view) always
+  // carries owner/owner_display_name, so the shared card never prints 'unknown owner · no id'
+  // from a real My work payload; the fallback stays for payloads that lack them
+  // (the demo mock agentView uses owner_id/owner_name only).
+  const name = agent.owner_display_name || agent.owner_name || ownerId(agent) || 'unknown owner';
+  const id = ownerId(agent);
+  return id && id !== name ? `${name} (${id}) · ${agent.id || 'no id'}` : `${name} · ${agent.id || 'no id'}`;
+}
+
+function hasActed(raw) {
+  // The cheapest existing fact that means “has acted” (kittrial-5bb.561): an agent
+  // that has called in even once carries last_seen_at (http_auth.py agent_view,
+  // stamped on each successful credential call). actor is always present (it names
+  // the attribution label) so it cannot mean this; agent_history would.
+  return Boolean(raw && raw.last_seen_at);
 }
 
 // What an agent may do (kittrial-5bb.208). The server keeps it on the agent record: `scopes`, and in
@@ -167,7 +196,8 @@ export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
   const rest = agent.items && agent.items.length ? agent.items.slice(1) : [];
   return h('article', { class: 'agent-card' + (agent.attention === 'feedback' ? ' needs' : '') },
     h('div', { class: 'agent-head' },
-      h('div', null, h('h3', null, agent.display_name), h('div', { class: 'small muted' }, agent.tool || 'Agent', agent.last_seen_at ? [' · last active ', time(agent.last_seen_at)] : ' · not connected yet')),
+      h('div', null, h('h3', null, agent.display_name), h('div', { class: 'small muted' }, agent.tool || 'Agent', agent.last_seen_at ? [' · last active ', time(agent.last_seen_at)] : ' · not connected yet'),
+        h('div', { class: 'small muted', 'data-agent-owner': ownerId(raw) || '', 'data-agent-id': raw.id || agent.id || '' }, ownerLine(raw))),
       attentionChip(agent.attention)),
     next,
     rest.length ? h('ul', { class: 'agent-items' }, rest.map((i) => h('li', null,
@@ -177,12 +207,35 @@ export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
       agent.attention === 'idle' && !nextText ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
     lean ? null : resumeBlock(agent, folder, compact),
     lean ? null : createdByNote(raw),
+    manages(ctx, raw) ? disableNotDeleteHint(raw) : null,
     credentialsOf(raw).some((c) => c.expires_soon && works(c)) ? h('div', { class: 'banner warn', role: 'status' }, 'A credential expires within seven days. Extend it under What it may do; its existing secret keeps working.') : null,
     compact || lean ? null : scopesLine(raw),
     compact ? null : credentialCountLine(raw),
     manages(ctx, raw) ? h('div', { class: 'copy-row' },
       h('button', { type: 'button', 'aria-label': 'Set up the folder for ' + agent.display_name, onclick: (event) => reopenSetup(ctx, raw.id, event.currentTarget) }, 'Set up folder')) : null,
     compact || lean ? null : projectsLine(agent));
+}
+
+// Only shown on an agent that has acted: it says deletion loses history, so prefer
+// disabling. An agent that never called in (no last_seen_at) gets no hint.
+export function disableNotDeleteHint(raw) {
+  return hasActed(raw) ? h('p', { class: 'small muted', 'data-disable-not-delete': raw.id || '' },
+    'Its contributions and reviews stay attributed to it; disable it instead of deleting it.') : null;
+}
+
+// A same-spelling, case-insensitive match among the LOADED agents (kittrial-5bb.561):
+// cross-owner reuse stays allowed, so it only warns (with the owner named) plus a
+// confirm — never refuses. The server's own 409 (secret-file clash) stays the backstop.
+export function duplicateNamed(agents, name) {
+  const clean = String(name || '').trim().toLowerCase();
+  if (!clean) return null;
+  return (agents || []).find((a) => String(a.name || '').toLowerCase() === clean) || null;
+}
+
+export function duplicateWarning(dup) {
+  const who = dup.owner_display_name || ownerId(dup) || 'another account';
+  const id = dup.id ? ` (${dup.id})` : '';
+  return `“${dup.name}” is already used by ${who}${id}. Reusing the name is allowed, but creates confusion in reviews and attribution. Create “${dup.name}” anyway?`;
 }
 
 // Open by itself when the agent has something the owner must see: more than one working credential
@@ -196,24 +249,86 @@ export async function list(ctx) {
   // The page's structure is there at once, in its final order; the agents and the accounts fill in
   // their own places (kittrial-5bb.456 item 1), so nothing below them is pushed down later.
   const host = h('div', { class: 'stack', 'data-agents-host': '', 'aria-busy': 'true' },
-    h('div', { class: 'panel', 'data-agents-loading': '', role: 'status', style: 'min-height: 6rem' }, h('div', { class: 'panel-body muted' }, 'Loading your agents…')));
+    // The skeleton in the agents' own place (kittrial-5bb.525 slice e): it says so to a screen
+    // reader, and the cards replace it where it stands (kittrial-5bb.456 item 1).
+    h('div', { class: 'panel', 'data-agents-loading': '' }, h('div', { class: 'panel-body' }, loading('Loading your agents…'))));
   let unconfirmedOnly = false;
   let cursor = null;
+  let mineOnly = true;
   const previous = [];
   const pendingReleases = new Map();
-  const filter = ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
-    h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
+  const loaded = { items: [], total: 0, owners: [], probed: false };
+  function mineFilter(items) {
+    return h('div', { class: 'copy-row', role: 'group', 'aria-label': 'Whose agents to show', 'data-mine-filter': '' },
+      mineButton('Mine', mineOnly), mineButton('All', !mineOnly));
+  }
+  function mineButton(label, active) {
+    const showingMine = label === 'Mine';
+    return h('button', { type: 'button', class: active ? 'primary' : 'ghost', 'aria-pressed': String(Boolean(active)),
+      'data-mine-choice': label, onclick: () => { mineOnly = showingMine; load(); } }, label);
+  }
+  function visibleItems() {
+    // Mine is a caller-level view, not a page-level one (kittrial-5bb.561 r2): an audit view
+    // (superuser + inferred/unknown-scopes box ticked) shows every loaded row, and Mine
+    // itself is stable across pages (decided from all owners the caller may see, not the page).
+    if (unconfirmedOnly && ctx.me && ctx.me.superuser) return loaded.items;
+    return mineOnly && mineShown() && ctx.me
+      ? loaded.items.filter((a) => ownerId(a) === ctx.me.id) : loaded.items;
+  }
+  function mineShown() {
+    if (!ctx.me || !loaded.items.length) return false;
+    if (ctx.me.superuser) return true;
+    if (loaded.owners.length > 1) return true;
+    // Caller-level, not page-level: with more agents than fit on this page, another
+    // page may carry another owner — probe the whole list once (kittrial-5bb.561 r2).
+    // A slow or failed probe keeps the page's own answer (owners of this page).
+    if (loaded.total > loaded.items.length && !loaded.probed) {
+      loaded.probed = true;
+      ctx.api.agents().then((listed) => {
+        if (!listed || !Array.isArray(listed.items)) return;
+        for (const owner of ownersOf(listed.items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
+        load();
+      }).catch(() => {});
+    }
+    return ownersOf(loaded.items).length > 1;
+  }
+  // The header (kittrial-5bb.525 slice b): the key is the server's total of the agents this list
+  // reads (data.total), filled when the read returns; the next action takes the reader to the
+  // "Add an agent" form further down this page.
+  const head = pageHead({ title: 'My agents', lede: 'One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.',
+    key: 'pending', actions: h('button', { type: 'button', class: 'primary', 'data-next-action': 'add-agent', onclick: () => {
+      const input = document.getElementById('a-name');
+      if (!input) return;
+      input.scrollIntoView({ block: 'center' });
+      input.focus({ preventScroll: true });
+    } }, 'Add an agent') });
+  const filter = h('div', { class: 'stack' },
+    ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
+      h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
       unconfirmedOnly = event.target.checked;
       cursor = null;
       previous.length = 0;
       load();
-    } }), 'Show agents with inferred or unknown scopes') : null;
+    } }), 'Show agents with inferred or unknown scopes') : null);
   async function load() {
     let data;
-    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
+    // The agents' region is busy while it is read, every time (kittrial-5bb.525 e r2), and not after a failure.
+    host.setAttribute('aria-busy', 'true');
+    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { setPageKey(head, null); host.replaceChildren(errorState(error, load)); return; } finally { host.removeAttribute('aria-busy'); }
     const items = data.items;
+    loaded.items = items;
+    loaded.total = data.total || items.length;
+    // The filter is caller-level: keep every owner the caller may see, across pages, so the
+    // Mine/All choice never appears on one page and vanishes on the next (kittrial-5bb.561 r2).
+    for (const owner of ownersOf(items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
+    setPageKey(head, typeof data.total === 'number' ? { num: data.total,
+      label: unconfirmedOnly ? 'with inferred or unknown scopes' : data.total === 1 ? 'agent' : 'agents', source: 'agents.total' } : null);
     host.removeAttribute('aria-busy');
-    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
+    const showFilter = mineShown();
+    const shown = visibleItems();
+    const scopeNote = (ctx.me && ctx.me.superuser && unconfirmedOnly)
+      ? h('p', { class: 'small muted', 'data-audit-note': 'true' }, 'Showing every loaded agent (audit view): the Mine filter is off while this box is ticked.') : null;
+    host.replaceChildren(showFilter ? mineFilter(loaded.items) : null, scopeNote, shown.length ? h('div', { class: 'agent-grid' }, shown.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
       h('details', { class: 'agent-details', 'data-agent-details': a.id, open: needsDetails(a) || pendingReleases.has(a.id) ? true : null },
         h('summary', null, 'Details and settings'),
         h('div', { class: 'stack' }, ...agentCardMore(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
@@ -221,7 +336,7 @@ export async function list(ctx) {
           manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
-      h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
+      h('span', { class: 'small muted' }, mineOnly && showFilter && !(ctx.me && ctx.me.superuser && unconfirmedOnly) ? `${shown.length} shown on this page of ${data.total} agents` : `${shown.length} shown of ${data.total} agents`),
       previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
       data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
   }
@@ -387,7 +502,7 @@ export async function list(ctx) {
           h('input', { type: 'checkbox', disabled: true, 'aria-label': `${p.name} (not available to ${ownerName})` }),
           h('span', null, `${ownerName} is not a member of ${p.name}: `,
             ctx.me && (ctx.me.superuser || p.role === 'owner')
-              ? h('a', { href: ctx.href(`/p/${p.id}/settings`) }, "add them under the project's Members first")
+              ? h('a', { href: ctx.href(`/p/${p.id}/people`) }, "add them under the project's Members first")
               : "add them under the project's Members first")))),
       h('div', null, h('button', { type: 'submit' }, 'Save projects')));
     form.addEventListener('submit', async (event) => {
@@ -493,6 +608,24 @@ export async function list(ctx) {
     if (name.length < 2) return setFieldError(form, 'a-name', 'Give the agent a name of at least 2 characters.');
     setFieldError(form, 'a-name', '');
     const chosen = [...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value);
+    // The duplicate-name check sees every name the new agent's account already uses
+    // (kittrial-5bb.561 r2): the new agent's owner is the chosen account for a superuser,
+    // else the caller. Falls back to the loaded page when that read fails.
+    const targetOwner = ownerField ? v['a-owner'] : (ctx.me && ctx.me.id);
+    let pool = loaded.items;
+    let poolNote = 'among the agents shown';
+    try {
+      const listed = await ctx.api.agents();
+      if (listed && Array.isArray(listed.items)) {
+        pool = listed.items.filter((a) => !targetOwner || ownerId(a) === targetOwner);
+        poolNote = 'among every agent name that account uses';
+      }
+    } catch { pool = loaded.items; }
+    const dup = duplicateNamed(pool, name);
+    if (dup) {
+      const warned = await confirmDialog({ title: 'An agent already has this name', body: duplicateWarning(dup) + ` (checked ${poolNote}).`, confirmLabel: 'Create anyway' });
+      if (!warned) return;
+    }
     // A name whose secret file would clash with another of your agents (409), or an
     // invalid name (422), is explained next to the name field in the server's words.
     const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen, ...(ownerField ? { owner: v['a-owner'] } : {}) }), {
@@ -506,7 +639,7 @@ export async function list(ctx) {
   });
 
   const page = h('div', { class: 'stack' },
-    pageHead({ title: 'My agents', lede: 'One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.' }),
+    head,
     filter, host,
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add an agent')), h('div', { class: 'panel-body' }, form)));
   if (ownerField) {
@@ -635,6 +768,54 @@ function fileBlock(title, text, folder, relative) {
     h('pre', { class: 'json' }, text));
 }
 
+// kittrial-5bb.578: one text as a file the browser saves (the credential file, agent.json, AGENT.md).
+function downloadText(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  const link = h('a', { href: url, download: name });
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// kittrial-5bb.578: what the signed-out invite page offers ONCE, straight after the invite made the
+// account's pre-approved agent: the same credential lines and folder files New agent's dialog gives
+// (the certificate too, when the service has one), without the wizard, which needs a session. The
+// secret lives in this node only; the page keeps it nowhere else.
+export async function inviteSetupBlock(ctx, created, secret) {
+  const certificate = await agentCertificate(ctx);
+  const payload = setupText.secretlessPayload(created, location.origin);
+  PAYLOAD_META.set(payload, { certificate, bridgeServer: location.origin });
+  const os = setupText.detectOs();
+  const files = [['agent.json', setupText.agentJson(payload)],
+    ['AGENT.md', setupText.agentGuide(payload, { hasCertificate: Boolean(certificate) })]];
+  const lines = setupText.credentialFileLines(location.origin, certificate ? certificate.sha256 : null, secret);
+  const saveStatus = h('p', { class: 'small', role: 'status', hidden: true });
+  const folderButton = canSaveToFolder() ? h('button', { type: 'button', 'data-action': 'save-files', onclick: async () => {
+    try {
+      const result = await saveSetupFiles(files);
+      if (!result.cancelled) { saveStatus.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.`; saveStatus.hidden = false; }
+    } catch (error) { saveStatus.textContent = 'Could not save the files: ' + ((error && error.message) || 'unknown error'); saveStatus.hidden = false; }
+  } }, 'Save .orchestra files to the agent folder…') : null;
+  return h('section', { class: 'stack', 'data-invite-setup': 'true' },
+    h('h2', { class: 'small' }, `Your agent ${payload.name}`),
+    secretNotice(false),
+    secretLinesBlock(payload, secret, os),
+    h('div', { class: 'copy-row' },
+      h('button', { type: 'button', class: 'primary', 'data-action': 'download-credential',
+        onclick: () => downloadText(payload.secretFile.name, lines) }, 'Download the credential file'),
+      certificate ? h('button', { type: 'button', 'data-action': 'save-certificate',
+        onclick: () => saveCertificate(certificate, payload.certificateFile) }, 'Save the certificate') : null),
+    h('p', { class: 'small', 'data-download-warning': 'true' }, 'This file holds a secret. Run Orchestra Bridge: Set up in VS Code next: it moves this file out of Downloads and deletes the copy. If you don’t use the Bridge, move it yourself and empty it from Downloads.'),
+    h('p', { class: 'small muted' }, 'The two files below hold no secret; they go in the agent’s folder under .orchestra/.'),
+    h('div', { class: 'copy-row' }, folderButton,
+      ...files.map(([name, text]) => h('button', { type: 'button', 'data-action': 'download-' + name,
+        onclick: () => downloadText(name, text) }, 'Download ' + name))),
+    saveStatus,
+    more(fileBlock(setupText.CONFIG_PATH, files[0][1], null, setupText.CONFIG_PATH),
+      fileBlock(setupText.GUIDE_PATH, files[1][1], null, setupText.GUIDE_PATH)));
+}
+
 // One line per curl error the person may see when the test fails (kittrial-5bb.275 & .328).
 export const CURL_ERROR_LINES = Object.freeze({
   2: 'curl exit 2 / cacert does not exist: either <your-name> was left in the credential file (run the command on “Add the certificate path”) or the certificate is still in Downloads without its leading dot (run the command on “Move the certificate”).',
@@ -734,6 +915,7 @@ function writeWizardStorage(state) {
       runs: state.runs,
       os: state.os,
       role: state.role || 'worker',
+      noproxy: state.noproxy === true,
     }));
   } catch { /* ignore storage errors */ }
 }
@@ -775,7 +957,7 @@ const SCREEN_TITLES = Object.freeze({
   'cert-move': 'Move the certificate',
   secret: 'Save your secret',
   restrict: 'Restrict the file',
-  rewrite: 'Add the certificate path',
+  rewrite: 'Update the credential options',
   test: 'Test it',
   files: 'Save the agent’s files',
   vscode: 'Set up in VS Code',
@@ -837,14 +1019,14 @@ function secretNotice(justCreated) {
     h('p', { class: 'small', 'data-secret-save': 'true' }, 'Save this secret now, in the file named below. Never paste it into a chat.'),
     h('p', { class: 'small muted', 'data-secret-once': 'true' }, 'It is shown once and this page does not keep it.'),
     justCreated ? h('p', { class: 'small muted', 'data-secret-later': 'true' },
-      'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Members & settings page first.') : null);
+      'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Agents page first.') : null);
 }
 
-function secretLinesBlock(payload, secretValue, os) {
+function secretLinesBlock(payload, secretValue, os, noproxy = false) {
   const meta = PAYLOAD_META.get(payload) || {};
   const address = meta.bridgeServer || payload.server;
   const fingerprint = (meta.certificate && meta.certificate.sha256) || null;
-  const lines = setupText.credentialFileLines(address, fingerprint, secretValue);
+  const lines = setupText.credentialFileLines(address, fingerprint, secretValue, { noproxy });
   const file = setupText.osSecretFile(payload.secretFile, os);
   const posix = setupText.osKind(os) === 'posix';
   return h('div', { class: 'stack', 'data-secret-lines': 'true' },
@@ -892,9 +1074,9 @@ function issueBlock(ctx, agent, payload, wizard) {
 }
 
 function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
-  const payload = setupText.secretlessPayload(source, location.origin);
+  let payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
-  const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate })]];
+  const files = () => [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate, bridge: state.runs !== 'none', noproxy: state.noproxy })]];
   const folder = payload.workingDirectory;
   // The address the extension must use is the one this page is connected to, not the configured
   // public address, which may be a name that does not resolve from this person's network.
@@ -907,7 +1089,9 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     os: (same && same.os) || setupText.detectOs(),
     runs: setupText.runsFromStored(same),
     bridge: setupText.runsFromStored(same) === 'bridge',
+    noproxy: Boolean(same && same.noproxy),
     role: (same && setupText.BRIDGE_ROLES.includes(same.role) && same.role) || (agent.role === 'reviewer' ? 'reviewer' : 'worker'),
+    coordinatorProject: null,
     screen: 'system',
     stepStartedAt: Date.now(),
     checkVerified: false,
@@ -918,8 +1102,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     issued,
   };
   if (!setupText.OS_CHOICES.some(([v]) => v === state.os)) state.os = 'windows';
-  const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
-  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate });
+  const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
+  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate, noproxy: state.noproxy });
   if (state.secretValue) {
     // A fresh secret exists only while this dialog is open: open where it is saved (Back reaches the
     // system and role screens), never two clicks away from it.
@@ -972,9 +1156,37 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     h('div', { class: 'dialog-foot' }, skipBtn, backBtn, nextBtn, doneBtn));
 
   // ---- the screens -------------------------------------------------------------------------
+  const projectsById = new Map(((ctx && ctx.projects) || []).filter((p) => p && typeof p.id === 'string').map((p) => [p.id, p]));
+  const projectLabel = (pid) => {
+    const found = projectsById.get(pid);
+    return (found && typeof found.name === 'string' && found.name.trim()) ? found.name : pid;
+  };
+  const grantRow = h('div', { class: 'copy-row', 'data-coordinator-grant-row': 'true', hidden: true });
+  function syncGrantRow() {
+    const grantable = payload.coordinateGrantableProjects || [];
+    const pid = state.coordinatorProject;
+    if (!pid || !grantable.includes(pid)) {
+      grantRow.hidden = true;
+      grantRow.replaceChildren();
+      return;
+    }
+    const btn = h('button', {
+      type: 'button',
+      class: 'primary',
+      'data-action': 'grant-coordinator',
+      'data-project': pid,
+      disabled: Boolean(state.grantingCoordinator),
+      onclick: () => grantCoordinatorRole(pid, btn),
+    }, 'Make coordinator of ' + projectLabel(pid));
+    grantRow.replaceChildren(btn);
+    grantRow.hidden = false;
+  }
   function choice(name, value, label, checked, onchange) {
-    return h('label', { class: 'small', 'data-choice': name + ':' + value },
-      h('input', { type: 'radio', name, value, checked, onchange }), ' ', label);
+    const input = h('input', { type: 'radio', name, value, checked, onchange: (event) => {
+      if (typeof input.focus === 'function') input.focus();
+      onchange(event);
+    } });
+    return h('label', { class: 'small', 'data-choice': name + ':' + value }, input, ' ', label);
   }
   const screens = {
     system: () => [
@@ -984,6 +1196,10 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       h('div', { class: 'copy-row', 'data-bridge-choice': 'true' },
         ...RUNS_CHOICES.map(([value, runs, label]) => choice('setup-bridge', value, label, state.runs === runs, () => {
           state.runs = runs; state.bridge = runs === 'bridge'; persist(); showProgress(); }))),
+      h('label', { class: 'small' }, h('input', { type: 'checkbox', 'data-noproxy-choice': 'true', checked: state.noproxy,
+        onchange: (event) => { state.noproxy = event.target.checked; persist(); showProgress(); } }),
+      ' Bypass a command-line proxy for this Orchestra server only (optional).'),
+      h('p', { class: 'small', 'data-no-bridge-watch': 'true', hidden: state.runs !== 'none' }, 'Without the Bridge, keep the background watch in AGENT.md running to receive work.'),
       setupText.osKind(state.os) === 'windows'
         ? h('p', { class: 'small muted', 'data-windows-policy': 'true' }, 'On Windows, if VS Code terminals hang or the agent gets no command output, see “Windows: VS Code terminals hang or show no output” in docs/ONBOARDING.md.')
         : null,
@@ -994,17 +1210,23 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     // saved as its role on Orchestra (a worker/reviewer setting), so there is nothing to choose here.
     role: () => setupText.coordinating(payload) ? [
       h('p', { class: 'small', 'data-role-coordinator': 'true' },
-        `${payload.name} holds the coordinator grant for ${payload.coordinates.join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
-      more(h('p', { class: 'small muted' }, 'The grant is given and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.')),
-    ] : [
-      h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
-      h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
-        "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again."),
-      h('div', { class: 'copy-row', 'data-role-choice': 'true' },
-        choice('setup-role', 'worker', 'Works on tasks', state.role === 'worker', () => saveRole('worker')),
-        choice('setup-role', 'reviewer', 'Reviews deliveries', state.role === 'reviewer', () => saveRole('reviewer'))),
-      more(h('p', { class: 'small muted' }, `This is saved as ${payload.name}’s role on Orchestra. A worker keeps the “Deliver and review” scope, which it needs to deliver its own work; only the reviewer role adds other people’s deliveries to its list.`)),
-    ],
+        `${payload.name} holds the coordinator grant for ${payload.coordinates.map(projectLabel).join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
+      more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Agents page, and removed on the project’s Agents page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
+    ] : (() => {
+      const grantable = payload.coordinateGrantableProjects || [];
+      syncGrantRow();
+      return [
+        h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
+        grantable.length === 0 ? h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
+          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Agents page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.") : null,
+        h('div', { class: 'copy-row', 'data-role-choice': 'true' },
+          choice('setup-role', 'worker', 'Works on tasks', !state.coordinatorProject && state.role === 'worker', () => selectRole('worker')),
+          choice('setup-role', 'reviewer', 'Reviews deliveries', !state.coordinatorProject && state.role === 'reviewer', () => selectRole('reviewer')),
+          ...grantable.map((pid) => choice('setup-role', 'coordinator:' + pid, 'Coordinator of ' + projectLabel(pid), state.coordinatorProject === pid, () => selectCoordinatorProject(pid)))),
+        grantRow,
+        more(h('p', { class: 'small muted' }, `This is saved as ${payload.name}’s role on Orchestra. A worker keeps the “Deliver and review” scope, which it needs to deliver its own work; only the reviewer role adds other people’s deliveries to its list.`)),
+      ];
+    })(),
     'cert-save': () => [
       h('p', { class: 'small' }, 'This server has its own certificate. Save it; the next screen moves it into place.'),
       h('div', { class: 'copy-row' }, h('button', { type: 'button', class: 'primary', 'data-action': 'save-certificate',
@@ -1023,7 +1245,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     secret: () => [
       state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,
       state.secretValue
-        ? secretLinesBlock(payload, state.secretValue, state.os)
+        ? secretLinesBlock(payload, state.secretValue, state.os, state.noproxy)
         : issueBlock(ctx, agent, payload, wizard),
       state.issued ? more(h('p', { class: 'small', 'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ') },
         'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.')) : null,
@@ -1034,23 +1256,32 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       commandLine(setupText.testCommands(payload).posixChmod, 'chmod command'),
     ],
     rewrite: () => {
-      const meta = PAYLOAD_META.get(payload) || {};
-      const comments = setupText.credentialCommentLines(meta.bridgeServer || payload.server, (certificate && certificate.sha256) || null);
-      const rewrite = setupText.credentialFileCommand(payload.secretFile, comments, { certFile: payload.certificateFile, hasCertificate });
-      const posix = setupText.osKind(state.os) === 'posix';
-      return [
-        h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It writes the certificate’s full path into the file, so that curl accepts the server.`),
-        commandLine(posix ? rewrite.posix : rewrite.powershell, 'rewrite command'),
-        more(h('p', { class: 'small muted' }, 'It rewrites only that one file, in place, and prints nothing; the secret stays where it is. Running it twice leaves the same content. If you cannot run it, type your own full path instead of <your-name>:'),
-          h('pre', { class: 'json' }, setupText.credentialFileBody(null, payload.certificateFile, { windows: !posix, hasCertificate: true }).trimEnd())),
-      ];
+      try {
+        const meta = PAYLOAD_META.get(payload) || {};
+        const server = meta.bridgeServer || payload.server;
+        const comments = setupText.credentialCommentLines(server, (certificate && certificate.sha256) || null);
+        const options = { hasCertificate, noproxy: state.noproxy, server };
+        const rewrite = setupText.credentialFileCommand(payload.secretFile, comments, { ...options, certFile: payload.certificateFile });
+        const posix = setupText.osKind(state.os) === 'posix';
+        const body = setupText.credentialFileBody(null, payload.certificateFile, { ...options, windows: !posix }).trimEnd();
+        return [
+          h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It rewrites the managed options in your credential file for the choices you made.`),
+          h('p', { class: 'small', 'data-noproxy-rewrite-notice': 'true' }, setupText.NOPROXY_REWRITE_NOTICE),
+          commandLine(posix ? rewrite.posix : rewrite.powershell, 'rewrite command'),
+          more(h('p', { class: 'small muted' }, 'It rewrites only that one file, in place, and prints nothing; the secret stays where it is. Running it twice leaves the same content. If you cannot run it, type your own full path instead of <your-name>:'),
+            h('pre', { class: 'json' }, body)),
+        ];
+      } catch (error) {
+        return [h('p', { class: 'small error-text', role: 'alert', 'data-rewrite-error': 'true' },
+          'Could not prepare the credential rewrite. ' + ((error && error.message) || 'Check the server address and try again.'))];
+      }
     },
     test: () => {
       const posix = setupText.osKind(state.os) === 'posix';
       const check = setupText.checkCommands(payload, { hasCertificate });
       const plain = setupText.testCommands(payload);
       return [
-        h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It checks the file, then calls Orchestra; it prints the agent’s details when it works.`),
+        h('p', { class: 'small' }, `Paste this into ${osWords(state.os).shell} and press Enter (pasting waits for Enter to run). It checks the file, calls Orchestra, and prints the agent’s details.`),
         commandLine(posix ? check.posix : check.powershell, 'self-check command'),
         more(h('p', { class: 'small muted' }, 'The plain test, without the checks:'),
           h('code', { class: 'path' }, posix ? plain.posix : plain.powershell),
@@ -1061,14 +1292,16 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       h('p', { class: 'small' }, 'Pick the agent’s folder. Two small files are written there; neither holds the secret.'),
       saveFilesRow(),
       more(h('p', { class: 'small muted' }, 'It writes .orchestra/agent.json and .orchestra/AGENT.md and adds .orchestra/ to an existing .gitignore. Or paste this prompt into the agent’s own chat, opened in its folder; it does the same and puts the server address into your credential file:'),
-        h('div', { class: 'copy-row' }, copyButton(SETUP_PROMPT_LABEL, () => setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer }), { what: 'Setup prompt' })),
-        fileBlock(setupText.CONFIG_PATH, files[0][1], folder, setupText.CONFIG_PATH),
-        fileBlock(setupText.GUIDE_PATH, files[1][1], folder, setupText.GUIDE_PATH)),
+        h('div', { class: 'copy-row' }, copyButton(SETUP_PROMPT_LABEL, () => setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy }), { what: 'Setup prompt' })),
+        fileBlock(setupText.CONFIG_PATH, files()[0][1], folder, setupText.CONFIG_PATH),
+        fileBlock(setupText.GUIDE_PATH, files()[1][1], folder, setupText.GUIDE_PATH)),
     ],
     vscode: () => [
       h('p', { class: 'small' }, folder ? 'Open this folder in VS Code (File > Open Folder), then run the command below (' : 'Open the agent’s folder in VS Code (File > Open Folder), then run the command below (',
         h('kbd', null, osWords(state.os).palette), ').'),
       folder ? commandLine(folder, 'folder path') : null,
+      // kittrial-5bb.545: on the Bridge path, the proxy exclusion comes before Set up, for the host this page uses.
+      state.bridge ? h('p', { class: 'small', 'data-bridge-no-proxy': 'true' }, setupText.bridgeNoProxySentence(bridgeServer)) : null,
       commandLine('Orchestra Bridge: Set up', 'VS Code command'),
       more(h('p', { class: 'small muted' }, 'It chooses this agent from your credential file, confirms the server, trusts the certificate by its fingerprint, tests the connection, writes .orchestra/agent.json and .orchestra/AGENT.md and turns watching on. Next checks that the agent reached Orchestra.'),
         hasCertificate ? fingerprintNotes(certificate) : null,
@@ -1101,7 +1334,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       wizard.clearError();
       button.disabled = true;
       try {
-        const result = await saveSetupFiles(files);
+        const result = await saveSetupFiles(files());
         if (!result.cancelled) {
           saveStatus.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.`;
           saveStatus.hidden = false;
@@ -1121,6 +1354,9 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 
   async function saveRole(role) {
     state.role = role;
+    if (dialog.wizard) {
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
+    }
     persist();
     wizard.clearError();
     if (ctx && ctx.api && typeof ctx.api.updateAgent === 'function' && payload.agentId) {
@@ -1129,10 +1365,81 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     }
   }
 
+  async function selectRole(role) {
+    state.coordinatorProject = null;
+    state.rereadFailedProject = null;
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    syncGrantRow();
+    await saveRole(role);
+  }
+
+  function selectCoordinatorProject(pid) {
+    state.coordinatorProject = pid;
+    state.rereadFailedProject = null;
+    wizard.clearError();
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    syncGrantRow();
+  }
+
+  async function grantCoordinatorRole(pid, btn) {
+    if (state.grantingCoordinator) return;
+    state.rereadFailedProject = null;
+    wizard.clearError();
+    checkStatus.hidden = true;
+    checkStatus.textContent = '';
+    if (!ctx || !ctx.api || typeof ctx.api.grantCoordinator !== 'function' || !payload.agentId) return;
+    state.grantingCoordinator = true;
+    if (btn) btn.disabled = true;
+    let fresh;
+    try {
+      await ctx.api.grantCoordinator(pid, payload.agentId);
+      try {
+        fresh = await ctx.api.agent(payload.agentId);
+      } catch (rereadError) {
+        state.rereadFailedProject = pid;
+        const wrapped = new Error(`The coordinator grant for ${projectLabel(pid)} may be saved, but re-reading ${payload.name} failed. Re-open this set-up to re-read before retrying.`);
+        if (rereadError && rereadError.requestId) wrapped.requestId = rereadError.requestId;
+        wizard.showError(wrapped);
+        return;
+      }
+    } catch (error) {
+      wizard.showError(error);
+      return;
+    } finally {
+      state.grantingCoordinator = false;
+      if (btn) btn.disabled = false;
+      if (grantRow.firstChild) grantRow.firstChild.disabled = false;
+    }
+    const freshAgent = (fresh && fresh.agent) || fresh || {};
+    Object.assign(agent, freshAgent);
+    payload = setupText.secretlessPayload({ ...(source || {}), agent }, location.origin);
+    PAYLOAD_META.set(payload, { certificate, bridgeServer });
+    // Candidate 1112a: files() reads the current payload (kittrial-5bb.559), so the re-read agent's
+    // agent.json and AGENT.md follow from the reassignment above; nothing to patch in place.
+    if (dialog.wizard) {
+      dialog.wizard.prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
+    }
+    if (!payload.coordinates.includes(pid)) {
+      if (!(payload.coordinateGrantableProjects || []).includes(pid)) {
+        state.coordinatorProject = null;
+        render();
+        wizard.showError(new Error(`This set-up cannot tell whether ${payload.name} holds a coordinator grant for ${projectLabel(pid)}. Check the project's Agents page.`));
+      } else {
+        syncGrantRow();
+        wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));
+      }
+      return;
+    }
+    state.coordinatorProject = null;
+    render();
+  }
+
   // ---- moving between screens ----------------------------------------------------------------
   function persist() {
     touchKeepAlive();
-    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, os: state.os, role: state.role });
+    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, os: state.os, role: state.role, noproxy: state.noproxy });
   }
 
   // The badge counts the screens of the chosen path; the heading below it is the screen's one title
@@ -1141,6 +1448,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   function showProgress() {
     const list = plan();
     progress.textContent = `Step ${list.indexOf(state.screen) + 1} of ${list.length}`;
+    const watchHint = [...screenNode.querySelectorAll('p')].find((p) => p.getAttribute('data-no-bridge-watch') === 'true');
+    if (watchHint) watchHint.hidden = state.runs !== 'none';
   }
 
   function render() {
@@ -1173,6 +1482,15 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   }
 
   async function next() {
+    if (state.screen === 'role' && state.coordinatorProject && !setupText.coordinating(payload)) {
+      checkStatus.setAttribute('data-check-state', 'failed');
+      checkStatus.textContent = state.rereadFailedProject === state.coordinatorProject
+        ? `The coordinator grant for ${projectLabel(state.coordinatorProject)} may be saved, but re-reading ${payload.name} failed. Re-open this set-up to re-read, or choose another role before continuing.`
+        : `Click “Make coordinator of ${projectLabel(state.coordinatorProject)}” first, or choose another role before continuing.`;
+      checkStatus.hidden = false;
+      skipBtn.hidden = true;
+      return false;
+    }
     if (CHECKED_SCREENS.includes(state.screen) && !state.checkVerified) {
       if (!(await runCheck())) return false;
     }

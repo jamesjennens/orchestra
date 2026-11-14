@@ -183,7 +183,7 @@ its window:
 - The source of a request behind a trusted proxy is the RIGHTMOST address of `X-Forwarded-For`, so the proxy
   must append the client's address (nginx `$proxy_add_x_forwarded_for`), not pass a client's header through.
   Behind a chain of proxies only the last hop's address would be seen.
-- The installation's password minimum is 12 characters unless the operator sets another from 1 to 1024
+- The installation's password minimum is 5 characters unless the operator sets another from 1 to 1024
   (`--password-min-length`). It applies when a password is set; a stored shorter password keeps working.
 
 ### Worker/API credentials

@@ -40,17 +40,22 @@ export function mount(el, ...children) {
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 export function brandMark() {
-  // Five staggered bars: parts entering in turn, the score of an orchestra.
+  // The mark (kittrial-5bb.525 slice d): a rounded tile in the accent holding three bars that
+  // start in turn and overlap, parts entering a score, or a small timeline of work. The bars
+  // take --accent-ink, so the dark theme needs no other artwork. Decorative: aria-hidden.
   const svg = document.createElementNS(SVG_NS, 'svg');
-  svg.setAttribute('viewBox', '0 0 22 22');
+  svg.setAttribute('viewBox', '0 0 24 24');
   svg.setAttribute('class', 'brand-mark');
   svg.setAttribute('aria-hidden', 'true');
-  [[2, 12, 8], [6, 7, 13], [10, 3, 16], [14, 8, 11], [18, 5, 14]].forEach(([x, y, height], i) => {
+  [[0, 0, 24, 24, 6, 'var(--accent)'],
+   [5, 6, 8, 2.6, 1.3, 'var(--accent-ink)'],
+   [8.5, 10.7, 10.5, 2.6, 1.3, 'var(--accent-ink)'],
+   [12, 15.4, 7, 2.6, 1.3, 'var(--accent-ink)']].forEach(([x, y, width, height, rx, fill]) => {
     const rect = document.createElementNS(SVG_NS, 'rect');
     rect.setAttribute('x', x); rect.setAttribute('y', y);
-    rect.setAttribute('width', '2.6'); rect.setAttribute('height', height);
-    rect.setAttribute('rx', '1.3');
-    rect.setAttribute('fill', i === 2 ? 'var(--accent)' : 'var(--ink-2)');
+    rect.setAttribute('width', width); rect.setAttribute('height', height);
+    rect.setAttribute('rx', rx);
+    rect.setAttribute('fill', fill);
     svg.appendChild(rect);
   });
   return svg;

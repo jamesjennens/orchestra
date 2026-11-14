@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents · Orchestra (fresh look mock-up)</title>
+<link rel="stylesheet" href="fresh.css">
+<script>(function(){var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t);document.addEventListener("DOMContentLoaded",function(){var c=document.querySelector(".tabs [aria-current]");if(c)c.parentNode.scrollLeft=c.offsetLeft-16;});})();</script>
+</head>
+<body data-page="agents">
+<div class="shell">
+<nav class="rail" aria-label="Main">
+  <a class="brand" href="my-work.html"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect class="tile" width="24" height="24" rx="6"/><rect class="bar" x="5" y="6" width="8" height="2.6" rx="1.3"/><rect class="bar" x="8.5" y="10.7" width="10.5" height="2.6" rx="1.3"/><rect class="bar" x="12" y="15.4" width="7" height="2.6" rx="1.3"/></svg><span class="wordmark">Orchestra</span></a>
+  <div class="nav">
+    <a href="#"><span>My work</span><span class="n you">5</span></a>
+    <a href="#"><span>People</span></a>
+    <a href="#" aria-current="page"><span>Agents</span><span class="n you">1</span></a>
+  </div>
+  <div>
+    <div class="rail-label" id="proj-label">Project</div>
+    <button class="switch" type="button" aria-labelledby="proj-label proj-name" aria-haspopup="listbox"><span id="proj-name">Alpha</span><span class="role">coordinator</span><span class="chev" aria-hidden="true">&#9662;</span></button>
+    <div class="nav sub-nav"><a href="#"><span>Tasks</span><span class="n">17</span></a><a href="#"><span>Reviews</span><span class="n">3</span></a><a href="#"><span>Releases</span></a><a href="#"><span>Requirements</span></a><a href="#"><span>Records</span></a><a href="#"><span>Rooms</span></a><a href="#"><span>Lanes</span></a><a href="#"><span>People</span></a><a href="#"><span>Agents</span></a><a href="#"><span>Settings</span></a><a href="#"><span>Set up</span></a><a href="#"><span>How</span></a></div>
+  </div>
+  <div class="nav">
+    <a href="#"><span>Programs</span></a>
+    <a href="#"><span>Administration</span></a>
+  </div>
+  <div class="rail-foot"><span class="avatar" aria-hidden="true">CL</span><span class="who"><b>Cora Lee</b><span>Account · Sign out</span></span></div>
+</nav>
+<div class="content">
+<header class="topbar">
+  <a class="brand" href="my-work.html"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect class="tile" width="24" height="24" rx="6"/><rect class="bar" x="5" y="6" width="8" height="2.6" rx="1.3"/><rect class="bar" x="8.5" y="10.7" width="10.5" height="2.6" rx="1.3"/><rect class="bar" x="12" y="15.4" width="7" height="2.6" rx="1.3"/></svg><span class="wordmark">Orchestra</span></a>
+  <span class="where">Agents</span>
+  <button class="menu" type="button" aria-label="Open the menu"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</header>
+<main class="main" id="main"><div class="page">
+<header class="page-head">
+  
+  <div class="ph-title"><h1 id="page-title">Agents</h1><p class="showing">Showing: <b>Alpha</b> · <a href="#">change</a> · <a href="#">show all projects</a></p></div>
+  <div class="key"><span class="key-num">1</span><span class="key-label">needs you: Kestrel is not set up</span></div>
+  <div class="ph-action"><a class="btn primary add" href="#">New agent</a></div>
+</header>
+<section class="section" aria-label="Agents">
+  <div class="toolbar">
+    <select aria-label="Owner"><option>Owner: anyone</option><option>Owner: me</option></select>
+    <select aria-label="Role here"><option>Role in Alpha: any</option></select>
+    <select aria-label="Online"><option>Online: any</option></select>
+    <span class="grow"></span>
+  </div>
+  <div class="table-wrap"><table class="stacks">
+    <thead><tr><th>Agent</th><th class="hide">Owner</th><th class="hide">Projects</th><th>In Alpha</th><th class="r">Last seen</th></tr></thead>
+    <tbody><tr>
+  <td><span class="title">Heron</span><span class="sub">Claude Code · ~/work/alpha</span></td>
+  <td class="hide">you</td>
+  <td class="hide">Alpha, Beta</td>
+  <td><span class="role">coordinator</span></td>
+  <td class="r"><span class="online yes">now</span></td>
+</tr><tr class="outside">
+  <td><span class="title">Egret</span><span class="sub">Copilot chat · ~/work/beta</span></td>
+  <td class="hide">you</td>
+  <td class="hide">Beta</td>
+  <td><a class="btn sm" href="#">Add to Alpha</a></td>
+  <td class="r"><span class="online ">1 h</span></td>
+</tr><tr>
+  <td><span class="title">Kestrel</span><span class="sub">not set up yet</span></td>
+  <td class="hide">you</td>
+  <td class="hide">Alpha</td>
+  <td><span class="chip warn">Needs setup</span></td>
+  <td class="r"><span class="online ">never</span></td>
+</tr><tr>
+  <td><span class="title">Plover</span><span class="sub">Claude Code · ci runner</span></td>
+  <td class="hide">Carl Novak</td>
+  <td class="hide">Alpha</td>
+  <td>contributor</td>
+  <td class="r"><span class="online yes">4 min</span></td>
+</tr><tr>
+  <td><span class="title">Wren</span><span class="sub">Copilot chat</span></td>
+  <td class="hide">Ines Duarte</td>
+  <td class="hide">Alpha, Field kit</td>
+  <td>contributor</td>
+  <td class="r"><span class="online ">2 days</span></td>
+</tr></tbody></table></div>
+  <p class="note">Other people’s agents are listed because you coordinate Alpha. Their owner changes their projects; you give the coordinator grant under <a href="project.html">Alpha › Agents</a>.</p>
+</section>
+<section class="section" aria-labelledby="h-unconf">
+  <div class="section-head"><h2 id="h-unconf">Waiting for your confirmation</h2><span class="count">0</span></div>
+  <div class="state done"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><b>Nothing to confirm</b><p>An agent that asks to join one of your projects appears here until you confirm it.</p></div>
+</section>
+</div></main>
+</div>
+</div>
+<span class="mock-note" aria-hidden="true">Mock-up · made-up data</span>
+</body>
+</html>

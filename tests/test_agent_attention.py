@@ -138,8 +138,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(action['whose_move'], 'you')
         route = '/v1/projects/%s/tasks/%s/brief' % (self.project, first)
         self.assertEqual(action['next'],
-                         'This is your work now: 2 outstanding review items. Read `%s`, deliver '
-                         'a revision that supersedes this contribution and respond to each item. '
+                         'This is your work now: 2 outstanding review items. Read `%s` and respond '
+                         'to each item; where an item needs a code change, deliver a new commit '
+                         'that supersedes this contribution; the same commit is refused. '
                          'Open: tests, docs of request %s. Answer each with a respond record '
                          '(POST `%s/reviews`, operation respond).' % (route, request, route[:-len('/brief')]))
         self.assertEqual((data['attention']['state'], data['attention']['counts']['changes_requested'],
@@ -297,7 +298,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         for sentence in (action['next'], row['next']):
             with self.subTest(sentence=sentence):
                 self.assertIn('has already been delivered', sentence)
-                self.assertNotIn('deliver a revision that supersedes', sentence)
+                self.assertNotIn('deliver a new commit that supersedes', sentence)
         # The web agent is given the write route as well, not only the client command's absence.
         self.assertTrue(action['links']['reviews'].endswith('/reviews'))
 

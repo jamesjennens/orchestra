@@ -104,7 +104,10 @@ class LayoutSourceCase(unittest.TestCase):
 
     def test_switch_notice_is_a_toast_not_a_banner(self):
         app = self.read('js/app.js')
-        self.assertIn('toast(fallbackMessage(name, label));', app)
+        # kittrial-5bb.522 r2: the toast also gets switchTarget's reason (t.page) for record pages and /new.
+        # kittrial-5bb.522 r3: the fallback sentence and the 'search not carried' line share one toast.
+        self.assertIn('fallbackMessage(name, label, t.page)', app)
+        self.assertIn("toast(lines.join(' '));", app)
         body = app[app.index('function switchProject('):app.index('function buildShell(')]
         self.assertLess(body.index('const hereSections'), body.index('ctx.go(t.path)'))
         self.assertNotIn("class: 'banner', role: 'status'", app)

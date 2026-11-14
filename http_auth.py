@@ -70,6 +70,7 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
                             clock_trusted, decide, file_lock,
                             actor_person as http_actor_person,
                             actor_parties as full_actor_parties, namespace_holds)
+import http_authority
 
 # Password verifier policy. n=2**14, r=8 needs ~16 MiB per hash; scrypt is the
 # memory-hard scheme available in the standard library without third-party wheels.
@@ -79,9 +80,10 @@ SCRYPT_DKLEN, SCRYPT_SALT = 32, 16
 #: MIN_PASSWORD (1) up; its default is DEFAULT_PASSWORD_MIN (below). The maximum is a bound on the work
 #: one request may ask for, not a policy about what a password should look like.
 MIN_PASSWORD, MAX_PASSWORD = 1, 1024
-#: The installation's password minimum when nothing sets one (kittrial-5bb.501). MIN_PASSWORD stays the
+#: The installation's password minimum when nothing sets one (kittrial-5bb.547, restoring the
+#: owner's decision; it was 1 in kittrial-5bb.363 and 12 in kittrial-5bb.501). MIN_PASSWORD stays the
 #: lowest value an installation may choose; a password already stored is never checked against either.
-DEFAULT_PASSWORD_MIN = 12
+DEFAULT_PASSWORD_MIN = 5
 
 # Provisional local lifecycle defaults from the reviewed design, all configurable
 # at the Service boundary.
@@ -425,8 +427,8 @@ def validate_password_min_length(value):
     """The installation's password minimum: a whole number from 1 to ``MAX_PASSWORD``.
 
     One rule for the web service flag and the office configuration, so neither clamps
-    a value to the bounds (kittrial-5bb.363). The default is ``DEFAULT_PASSWORD_MIN`` (12,
-    kittrial-5bb.501); an installation may still choose any value from 1.
+    a value to the bounds (kittrial-5bb.363). The default is ``DEFAULT_PASSWORD_MIN`` (5,
+    kittrial-5bb.547); an installation may still choose any value from 1.
     """
     if isinstance(value, bool) or not isinstance(value, int) or not MIN_PASSWORD <= value <= MAX_PASSWORD:
         raise ValueError('password_min_length must be a whole number from %d to %d'
@@ -1233,7 +1235,7 @@ class Service:
         self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
-        #: The installation's password minimum (kittrial-5bb.363), default 12 (kittrial-5bb.501). Every
+        #: The installation's password minimum (kittrial-5bb.363), default 5 (kittrial-5bb.547). Every
         #: writer goes through hash_password/redeem_reset with this value, so the rule
         #: cannot drift between the bootstrap prompt and the web forms.
         self.password_min_length = validate_password_min_length(password_min_length)
@@ -2176,18 +2178,22 @@ class Service:
         raise unauthenticated('Authentication required')
 
     # -- live authority --------------------------------------------------------
-    def _refresh_authority(self, principal):
+    def _refresh_authority(self, principal, moment=None):
         """Re-read the live session/credential behind ``principal``.
 
         The caller must hold ``store.lock``. This is the authority half of the
         serializable authorization/revocation boundary: a revocation that commits
         before this call is observed here, so an in-flight mutation can never
         inherit authority the caller has already lost. Derived fields are refreshed
-        from live state rather than trusted from the original request.
+        from live state rather than trusted from the original request. A ``moment``
+        is this request's own :meth:`_expiry_now`; only read routes (and
+        :meth:`create_agent`, under ``store.lock``) pass one; it freezes only the
+        monotone half of expiry; the raw half, revocation, disablement and membership
+        stay live.
         """
         if principal is None:
             raise unauthenticated()
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         if principal.via == 'session':
             session = self.state['sessions'].get(principal.session_hash)
             if session is None or session['revoked'] or self._expired(
@@ -2257,26 +2263,32 @@ class Service:
                 continue
         return frozenset(caps)
 
-    def check_authority(self, principal, project_id, capability, *, allow_self_user=None):
+    def check_authority(self, principal, project_id, capability, *, allow_self_user=None,
+                        moment=None):
         """Authorize one capability against live authority, or raise 401/403/404.
 
         This is the single boundary every route uses. When called inside a mutation
         it runs while ``store.lock`` is held and before the canonical write, so a
         revocation cannot interleave between the check and the write. The decision
         itself is :func:`http_authority.decide`, the same function the canonical
-        endpoint runs immediately before the effect.
+        endpoint runs immediately before the effect. A ``moment`` is this request's
+        own :meth:`_expiry_now`; only read routes (and :meth:`create_agent`, under
+        ``store.lock``) pass one; it freezes only the monotone half of expiry; the raw
+        half, revocation, disablement and membership stay live.
         """
         with self.store.lock:
             return self._check_authority_locked(principal, project_id, capability,
-                                                allow_self_user=allow_self_user)
+                                                allow_self_user=allow_self_user,
+                                                moment=moment)
 
     def _check_authority_locked(self, principal, project_id, capability, *,
-                                allow_self_user=None):
-        self._refresh_authority(principal)
+                                allow_self_user=None, moment=None):
+        moment = self._expiry_now() if moment is None else moment
+        self._refresh_authority(principal, moment=moment)
         try:
             decision = decide(self.state,
                               authority_request(principal, project_id, capability,
-                                                now=self._expiry_now()),
+                                                now=moment),
                               allow_self_user=allow_self_user)
         except AuthorityDenied as denied:
             raise HttpError(denied.status, denied.code, denied.message, denied.detail)
@@ -2416,9 +2428,10 @@ class Service:
                                                          name or ''):
             raise invalid('Project name must be 2-64 characters of letters, digits, space, . _ -')
 
-    def list_projects(self, principal):
+    def list_projects(self, principal, moment=None):
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             if principal.via == 'credential':
                 if principal.agent_id:
                     # An agent credential reads exactly its live grant list, and only the
@@ -2428,18 +2441,18 @@ class Service:
                     visible = []
                     for pid in (agent.get('projects') if agent else []) or []:
                         try:
-                            visible.append(self.project_view(principal, pid))
+                            visible.append(self.project_view(principal, pid, moment=moment))
                         except HttpError:
                             continue
                     return visible
                 pid = principal.credential_project
                 if pid not in self.state['projects']:
                     return []
-                return [self.project_view(principal, pid)]
+                return [self.project_view(principal, pid, moment=moment)]
             visible = []
             for pid in self.state['projects']:
                 if principal.superuser or principal.user_id in self.state['memberships'].get(pid, {}):
-                    visible.append(self.project_view(principal, pid))
+                    visible.append(self.project_view(principal, pid, moment=moment))
             return visible
 
     #: Where a project's repository is (kittrial-5bb.118): a LABEL an owner writes, shown
@@ -2599,8 +2612,8 @@ class Service:
                 self.store.save()
         return {'id': project_id, 'repository': value}
 
-    def project_view(self, principal, project_id):
-        project, role = self.require_project(principal, project_id)
+    def project_view(self, principal, project_id, moment=None):
+        project, role = self.require_project(principal, project_id, moment=moment)
         view = dict(project)
         made = view.get('host_created')
         if isinstance(made, dict) and 'operation' in made:
@@ -2622,7 +2635,7 @@ class Service:
         view['program'] = bool((self.state.get('program_flags') or {}).get(project_id))
         return view
 
-    def require_project(self, principal, project_id, minimum='viewer'):
+    def require_project(self, principal, project_id, minimum='viewer', moment=None):
         """Role/capability gate kept for internal callers.
 
         ``minimum`` maps onto the capability model so a credential can never borrow
@@ -2631,7 +2644,7 @@ class Service:
         """
         capability = {'viewer': CAP_READ, 'contributor': CAP_TASKS,
                       'owner': CAP_PROJECT_ADMIN}.get(minimum, CAP_READ)
-        return self.check_authority(principal, project_id, capability)
+        return self.check_authority(principal, project_id, capability, moment=moment)
 
     def set_member(self, principal, project_id, user_id, role, request_id=None):
         if role not in ROLES:
@@ -2727,13 +2740,13 @@ class Service:
                     and claimed.casefold() != str(principal.user_id).casefold():
                 raise invalid('A credential actor namespace cannot have the shape of an account or agent id '
                               'other than your own account id')
+            moment = self._expiry_now()
             if actor is not None:
                 # One name has one issuer at a time (kittrial-5bb.199 review): with the party
                 # rule on, work under a name is of every account that ever issued it, so a
                 # second account must not be able to take a name that is in use, written
                 # under yet or not. The same account may: that is how it replaces a lane's
                 # credential without a gap, and both are its own party.
-                moment = self._expiry_now()
                 for other in self.state['credentials'].values():
                     if not isinstance(other, dict) or other.get('agent_id') or other.get('project_id') != project_id \
                             or other.get('user_id') == principal.user_id or not self._credential_live(other, moment):
@@ -2751,7 +2764,6 @@ class Service:
             # forward jump that is later corrected does not live late. ``issued_raw`` keeps
             # the real issuance instant, so the TTL still bounds it while the monotone floor
             # is pinned ahead of the corrected host clock.
-            moment = self._expiry_now()
             credential = {
                 'id': 'cred_' + secrets.token_hex(8),
                 'user_id': principal.user_id,
@@ -2820,9 +2832,9 @@ class Service:
             return raw
         return min(float(raw), cap)
 
-    def agent_credential_expiry_view(self, credential):
+    def agent_credential_expiry_view(self, credential, moment=None):
         """Secret-free expiry metadata, also safe for a project's owner controls."""
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         working = self._credential_live(credential, moment)
         expires = self.credential_effective_expiry(credential)
         deadline = expires if isinstance(expires, (int, float)) and \
@@ -2838,7 +2850,7 @@ class Service:
                 'working': bool(working), 'revoked': bool(credential.get('revoked')),
                 'expires_soon': bool(working and remaining is not None and remaining <= 7 * 86400)}
 
-    def credential_view(self, credential):
+    def credential_view(self, credential, moment=None):
         view = {'id': credential['id'], 'project': credential['project_id'],
                 'agent': credential.get('agent_id'),
                 'label': credential['label'], 'scopes': list(credential['scopes']),
@@ -2846,7 +2858,7 @@ class Service:
                 'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
                 'expires_at': now_iso(credential['expires_at'])}
         if credential.get('agent_id'):
-            view.update(self.agent_credential_expiry_view(credential))
+            view.update(self.agent_credential_expiry_view(credential, moment=moment))
         # A waived name is shown as allowed, by whom and when (kittrial-5bb.188 item 4): it is
         # not colliding and it does write. Never actor_rows_checked: the two are distinct.
         if isinstance(credential.get('actor_waived'), dict):
@@ -3107,32 +3119,21 @@ class Service:
     # agent on its next request. ``working_directory`` is a free-text hint for the
     # owner's own machine; the server stores it and never reads it, and only the owner
     # (or a superuser) ever receives it in a response.
-    def agent_approves(self, agent_id, project_id):
+    def agent_approves(self, agent_id, project_id, moment=None):
         """Whether a live credential of the agent may approve in the project now: it holds the
         coordinator grant there and its account is a coordinator or an owner (kittrial-5bb.209).
-        Used to word what the agent is shown; it grants nothing."""
-        from http_authority import credential_capabilities
-        with self.store.lock:
-            agent = self.state['agents'].get(agent_id)
-            if not isinstance(agent, dict) or not agent.get('enabled') or \
-                    project_id not in (agent.get('projects') or []):
-                return False
-            owner = self.state['users'].get(agent.get('owner'))
-            if not isinstance(owner, dict) or owner.get('disabled'):
-                return False
-            moment = self._expiry_now()
-            for credential in self.state.get('credentials', {}).values():
-                if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
-                        credential.get('revoked') or credential.get('expires_at', 0) <= moment:
-                    continue
-                try:
-                    if CAP_APPROVE in credential_capabilities(self.state, credential, owner, project_id):
-                        return True
-                except AuthorityDenied:
-                    continue
-            return False
 
-    def agent_review_standing(self, agent_id, project_id):
+        :func:`http_authority.agent_grant_effective` under the store lock, against the expiry and
+        raw clocks. The review queue uses it to decide what an agent is offered; the same function
+        is the grant step of the by-agent decision, which the approve route and integration ask
+        (kittrial-5bb.560), so it is a gate there."""
+        with self.store.lock:
+            # Candidate 1112a: .521's one request moment (``moment``), judged by .560's agent_grant_effective.
+            return http_authority.agent_grant_effective(self.state, agent_id, project_id,
+                                                        self._expiry_now() if moment is None else moment,
+                                                        self._raw_now())
+
+    def agent_review_standing(self, agent_id, project_id, moment=None):
         """``(may_review, owner_approves)`` for one agent in one project, from live state.
 
         ``may_review``: a live credential of the agent holds the reviews capability there
@@ -3151,7 +3152,7 @@ class Service:
                 return False, False
             role = self.state.get('memberships', {}).get(project_id, {}).get(owner['id'])
             approves = bool(owner.get('superuser')) or CAP_APPROVE in ROLE_CAPABILITIES.get(role, frozenset())
-            moment = self._expiry_now()
+            moment = self._expiry_now() if moment is None else moment
             for credential in self.state.get('credentials', {}).values():
                 if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
                         credential.get('revoked') or credential.get('expires_at', 0) <= moment:
@@ -3427,7 +3428,7 @@ class Service:
             raise invalid('The nudges scope is the nudge carrier\'s alone and is never combined with another scope')
         return tuple(names)
 
-    def agent_scopes(self, agent):
+    def agent_scopes(self, agent, moment=None):
         """What an agent may do, and where that is known from: ``(scopes, source)``.
 
         ``set``: the list on the agent record, written when the agent is made and by a renewal
@@ -3452,7 +3453,7 @@ class Service:
                                                   for scope in stored) or len(stored) != len(set(stored)):
                 return None, 'unknown'
             return tuple(stored), 'inferred' if agent.get('scopes_source') == 'inferred' else 'set'
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
                  for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
         if len(lists) == 1:
@@ -3469,7 +3470,7 @@ class Service:
         return (credential.get('agent_issued_raw', credential.get('issued_raw')) or 0,
                 credential.get('created_at') or '', credential.get('id') or '')
 
-    def _prune_agent_credentials(self, agent):
+    def _prune_agent_credentials(self, agent, moment=None):
         """Delete all but the newest few credentials of the agent that no longer work.
 
         Caller holds ``store.lock`` and saves. Without it the state grew by a record for every
@@ -3478,22 +3479,22 @@ class Service:
         issued and revoked, by whom and when, remains until the shared audit tail's
         fixed AUDIT_LIMIT retention evicts it.
         """
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         dead = sorted((c for c in self._agent_credentials(agent) if not self._credential_live(c, moment)),
                       key=self._credential_age)
         for credential in dead[:max(0, len(dead) - AGENT_DEAD_CREDENTIALS_KEPT)]:
             self.state['credentials'].pop(credential['id'], None)
             self.state['credential_tokens'].pop(credential.get('token_hash'), None)
 
-    def _agent_credentials_shown(self, agent):
+    def _agent_credentials_shown(self, agent, moment=None):
         """What an agent read carries: bounded whether or not anything was pruned yet (a
         credential also stops working by expiry, with no write)."""
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         rows = sorted(self._agent_credentials(agent), key=self._credential_age)
         live = [c for c in rows if self._credential_live(c, moment)]
         dead = [c for c in rows if not self._credential_live(c, moment)][-AGENT_DEAD_CREDENTIALS_KEPT:]
         shown = sorted(live + dead, key=self._credential_age)
-        return [dict(self.credential_view(c), working=self._credential_live(c, moment)) for c in shown]
+        return [dict(self.credential_view(c, moment=moment), working=self._credential_live(c, moment)) for c in shown]
 
     # -- an agent's history (kittrial-5bb.365) ---------------------------------------
     #: The audit actions that make an agent's history, and the word each is shown as.
@@ -3636,11 +3637,12 @@ class Service:
                                                    if event.get('target_credential_ids') is not None else None)})
             return rows
 
-    def agent_view(self, agent, principal):
+    def agent_view(self, agent, principal, moment=None):
         """The owner-visible agent record. The path never leaks to anyone else."""
+        moment = self._expiry_now() if moment is None else moment
         owner_sees_path = bool(principal.superuser or
                                principal.user_id == agent['owner'])
-        scopes, source = self.agent_scopes(agent)
+        scopes, source = self.agent_scopes(agent, moment=moment)
         view = {
             'id': agent['id'], 'name': agent['name'], 'owner': agent['owner'],
             'owner_display_name': self._owner_name(agent['owner']),
@@ -3657,7 +3659,7 @@ class Service:
             'last_seen_at': agent.get('last_seen_at'),
             # Every credential that works (at most AGENT_MAX_CREDENTIALS) and the newest few that
             # do not; ``working`` says which is which (an expired one is not ``revoked``).
-            'credentials': self._agent_credentials_shown(agent),
+            'credentials': self._agent_credentials_shown(agent, moment=moment),
             # What the agent may do, which is what a new credential for it carries when no list
             # is sent (kittrial-5bb.208); null when nothing says. ``scopes_source``: ``set`` (kept on
             # the agent record: given when it was made or by a renewal that sent a list),
@@ -3674,7 +3676,7 @@ class Service:
             # the same; else []. A read for whoever reads the agent record: its account, a
             # superuser, and the agent itself on /v1/agents/me. It says only that they differ:
             # an account may have narrowed its agent on purpose and left the older credential.
-            'scopes_differ': self.agent_scope_differences(agent),
+            'scopes_differ': self.agent_scope_differences(agent, moment=moment),
         }
         if agent.get('created_by'):
             view['created_by'] = agent['created_by']
@@ -3690,9 +3692,51 @@ class Service:
         # has effect now, so the set-up wizard writes a coordinator AGENT.md. Only for the agent's owner
         # (or a superuser) signed in as a person: never for another member, and never for a credential,
         # the agent's own included. Computed live; only projects the owner is a member of.
+        # kittrial-5bb.521: coordinate_grantable_projects lists the unarchived projects on this agent
+        # where THIS caller may newly grant coordination in the set-up wizard (the PUT authority checks,
+        # plus the agent's owner is a project member so agent_coordinates can report the resulting grant,
+        # and no effective grant is already held); empty on credential reads and whenever nothing is
+        # wizard-grantable, and never reveals another project's existence.
         if principal.credential_id is None and (principal.superuser or principal.user_id == agent['owner']):
             view['coordinates'] = self.agent_coordinates(agent)
+            view['coordinate_grantable_projects'] = self.coordinate_grantable_projects(
+                agent, principal, moment=moment)
+        else:
+            view['coordinate_grantable_projects'] = []
         return view
+
+    def coordinate_grantable_projects(self, agent, principal, moment=None):
+        """Unarchived projects on ``agent`` where ``principal`` may newly grant coordination in the set-up wizard (``agent['owner']`` is a project member, no effective grant is already held, and the ``PUT`` coordinator-grant checks pass)."""
+        if principal is None or principal.via == 'credential' or principal.credential_id is not None:
+            return []
+        if not (principal.superuser or principal.user_id == agent.get('owner')):
+            return []
+        if not agent.get('enabled'):
+            return []
+        owner_id = agent.get('owner')
+        with self.store.lock:
+            moment = self._expiry_now() if moment is None else moment
+            found = []
+            for project_id in sorted({p for p in (agent.get('projects') or ()) if isinstance(p, str)}):
+                # Unlike PUT /v1/projects/{pid}/agents/{aid}/coordinator (which allows a superuser
+                # owner who is not in memberships[project_id]), the wizard only offers projects the
+                # agent's owner is a member of, matching agent_coordinates so a grant given in the
+                # wizard is visible on re-read and produces the coordinator's AGENT.md.
+                if owner_id not in self.state.get('memberships', {}).get(project_id, {}):
+                    continue
+                if not self._may_coordinate(project_id, agent):
+                    continue
+                held = coordinator_grant(self.state, project_id, agent['id'])
+                if held is not None and grant_issuer_holds(self.state, project_id, held):
+                    continue
+                try:
+                    project, _ = self._check_authority_locked(principal, project_id, CAP_PROJECT_ADMIN, moment=moment)
+                except HttpError:
+                    continue
+                if isinstance(project, dict) and project.get('archived'):
+                    continue
+                found.append(project_id)
+            return found
 
     def agent_coordinates(self, agent):
         """``[{project, effective}]``: the agent's coordinator grants in projects its owner is a member of."""
@@ -3721,6 +3765,7 @@ class Service:
         expose only id, expiry, working/revoked and seven-day warning, so this owner
         can extend a live key without seeing its label, scopes, path, hash or secret.
         """
+        moment = self._expiry_now()
         view = {
             'id': agent['id'],
             'name': agent['name'],
@@ -3730,8 +3775,8 @@ class Service:
             'enabled': bool(agent.get('enabled')),
             'last_seen_at': agent.get('last_seen_at'),
         }
-        shown = {c['id'] for c in self._agent_credentials_shown(agent)}
-        view['credentials'] = [self.agent_credential_expiry_view(c)
+        shown = {c['id'] for c in self._agent_credentials_shown(agent, moment=moment)}
+        view['credentials'] = [self.agent_credential_expiry_view(c, moment=moment)
                                for c in self._agent_credentials(agent) if c['id'] in shown]
         if project_id is not None:
             # Whether this agent coordinates THIS project (kittrial-5bb.209): who granted it and
@@ -4360,7 +4405,7 @@ class Service:
             if persist: self.store.save()
             return dict(note)
 
-    def note_projects(self, principal):
+    def note_projects(self, principal, moment=None):
         """The projects where ``principal`` coordinates now: a person's owner or coordinator memberships, or an agent's
         projects where its coordinator grant has effect. Each is checked live; at most 50, in order."""
         with self.store.lock:
@@ -4371,10 +4416,13 @@ class Service:
                 candidates = sorted(project for project, members in (self.state.get('memberships') or {}).items()
                                     if isinstance(members, dict)
                                     and members.get(principal.user_id) in ('owner', 'coordinator'))
+        if not candidates:
+            return [], False
+        moment = self._expiry_now() if moment is None else moment
         found = []
         for project in candidates:
             try:
-                self.check_authority(principal, project, CAP_COORDINATE)
+                self.check_authority(principal, project, CAP_COORDINATE, moment=moment)
             except HttpError:
                 continue
             # Review of .447, B2: the account's own role, as the records routes require; a superuser who is only a
@@ -4663,32 +4711,20 @@ class Service:
                     change.save()
             return self.project_agent_view(agent, project_id)
 
-    #: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438).
-    #: ``by-agent``, the default: it may approve the work of ANOTHER personal agent of the same
-    #: person; its own work, its person's own work and its person's worker credentials stay refused.
-    #: ``by-person``: the strict rule of kittrial-5bb.209, every agent of a person is one party.
-    AGENT_APPROVAL_MODES = ('by-agent', 'by-person')
-    AGENT_APPROVAL_DEFAULT = 'by-agent'
+    #: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438); the
+    #: modes and the default live in :mod:`http_authority` (kittrial-5bb.560).
+    AGENT_APPROVAL_MODES = http_authority.AGENT_APPROVAL_MODES
+    AGENT_APPROVAL_DEFAULT = http_authority.AGENT_APPROVAL_DEFAULT
 
     def agent_approval(self, project_id):
         """The project's agent-approval setting: ``{'mode', 'set_by', 'set_at', 'set_by_display_name'}``.
 
         Absent is the default (``by-agent``, nobody set it). A record of any other shape reads as the
         strict ``by-person`` with ``damaged`` true: a damaged setting never lets more through.
+        The decision is :func:`http_authority.agent_approval_mode` (kittrial-5bb.560).
         """
         with self.store.lock:
-            stored = self.state.get('agent_approval')
-            entry = stored.get(project_id) if isinstance(stored, dict) else None
-            if 'agent_approval' not in self.state or (isinstance(stored, dict) and project_id not in stored):
-                return {'mode': self.AGENT_APPROVAL_DEFAULT, 'set_by': None, 'set_at': None,
-                        'set_by_display_name': None}
-            if not isinstance(entry, dict) or entry.get('mode') not in self.AGENT_APPROVAL_MODES:
-                return {'mode': 'by-person', 'set_by': None, 'set_at': None, 'set_by_display_name': None,
-                        'damaged': True}
-            set_by = entry.get('set_by') if isinstance(entry.get('set_by'), str) else None
-            return {'mode': entry['mode'], 'set_by': set_by,
-                    'set_at': entry.get('set_at') if isinstance(entry.get('set_at'), str) else None,
-                    'set_by_display_name': self._owner_name(set_by) if set_by else None}
+            return http_authority.agent_approval_mode(self.state, project_id)
 
     def set_agent_approval(self, principal, project_id, mode):
         """Record the project's agent-approval setting (kittrial-5bb.438): who set it and when.
@@ -4719,56 +4755,74 @@ class Service:
                     change.save()
         return self.agent_approval(project_id)
 
-    def other_agent_of_same_person(self, agent_id, name):
-        """Whether ``name`` was written by ANOTHER personal agent of the account that owns ``agent_id``.
+    def auto_nudge(self, project_id):
+        """The project's automatic lane nudge setting (kittrial-5bb.514): ``{'enabled', 'set_by', 'set_at', 'set_by_display_name'}``.
 
-        A name belongs to an agent when its first segment is that agent's id (``agent`` and ``agent/x``
-        are one actor). The approving agent itself, its account, a worker credential's name and any
-        name of no agent record are not another agent: they answer False, and stay judged by party.
+        Absent is the default (``False``, nobody set it). A record of any other shape reads as off
+        (``enabled: False``) with ``damaged: True``: a damaged setting never types into a lane.
         """
-        if not isinstance(name, str) or not name or not isinstance(agent_id, str) or not agent_id:
-            return False
-        head = name.split('/', 1)[0]
         with self.store.lock:
-            agents = self.state.get('agents') if isinstance(self.state.get('agents'), dict) else {}
-            mine, other = agents.get(agent_id), agents.get(head)
-            return (head.casefold() != agent_id.casefold() and isinstance(mine, dict) and isinstance(other, dict)
-                    and isinstance(mine.get('owner'), str) and other.get('owner') == mine['owner'])
+            stored = self.state.get('auto_nudge')
+            entry = stored.get(project_id) if isinstance(stored, dict) else None
+            if 'auto_nudge' not in self.state or (isinstance(stored, dict) and project_id not in stored):
+                return {'enabled': False, 'set_by': None, 'set_at': None, 'set_by_display_name': None}
+            if not isinstance(entry, dict) or type(entry.get('enabled')) is not bool:
+                return {'enabled': False, 'set_by': None, 'set_at': None, 'set_by_display_name': None,
+                        'damaged': True}
+            set_by = entry.get('set_by') if isinstance(entry.get('set_by'), str) else None
+            return {'enabled': entry['enabled'], 'set_by': set_by,
+                    'set_at': entry.get('set_at') if isinstance(entry.get('set_at'), str) else None,
+                    'set_by_display_name': self._owner_name(set_by) if set_by else None}
+
+    def set_auto_nudge(self, principal, project_id, enabled):
+        """Record the project's automatic lane nudge setting (kittrial-5bb.514): who set it and when.
+
+        The route holds the ``CAP_PROJECT_ADMIN`` boundary (an owner of the project or a superuser);
+        a credential never changes it, so an agent cannot enable automatic nudging.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change automatic lane nudges')
+        if type(enabled) is not bool:
+            raise invalid('auto_nudge must be true or false')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if 'auto_nudge' in self.state and not isinstance(self.state.get('auto_nudge'), dict):
+                raise HttpError(503, 'unavailable',
+                                'The record of automatic-nudge settings in the service state is damaged (it is not '
+                                'an object), so nothing was written. An operator must repair the state file')
+            if not enabled:
+                self.state.setdefault('auto_nudge', {})[project_id] = {
+                    'enabled': False, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
+                self._save_narrowing()
+            else:
+                with self._widening() as change:
+                    change.remember(self.state, 'auto_nudge')
+                    self.state.setdefault('auto_nudge', {})[project_id] = {
+                        'enabled': True, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
+                    change.save()
+        return self.auto_nudge(project_id)
+
+    def other_agent_of_same_person(self, agent_id, name):
+        """Whether ``name`` was written by ANOTHER personal agent of the account that owns ``agent_id``:
+        :func:`http_authority.other_agent_of_same_person` under the store lock (kittrial-5bb.560)."""
+        with self.store.lock:
+            return http_authority.other_agent_of_same_person(self.state, agent_id, name)
 
     def worker_credential_of_same_person(self, agent_id, name, project_id):
-        """Whether ``name`` was written under a WORKER CREDENTIAL of the account that owns ``agent_id`` (kittrial-5bb.519).
-
-        True only when the record shows the name is a worker credential's of that one account O, and
-        nothing else could have written it:
-
-        * a name whose head is neither an account nor an agent id: the issuers of the project's worker
-          credentials whose namespace holds the name are exactly {O}. The set is the one
-          :meth:`actor_parties` computes (``full_actor_parties``), working, revoked or expired
-          credentials alike, so a name O revoked and issued again stays one issuer, and a name another
-          account held once stays shared (False);
-        * ``O/label`` with a non-empty label: a session writes exactly its account id, an agent only
-          its own id, and a worker credential only inside its namespace, so only O's own credential
-          issued with no name can write below O's account id.
-
-        False for everything else: the bare account id (O's own session writes it too), a shared name,
-        the agent itself or any agent id, another account's names, and a name no credential record holds
-        (a name of the host route).
-        """
-        if not all(isinstance(value, str) and value for value in (agent_id, name, project_id)):
-            return False
-        head, _, label = name.partition('/')
+        """Whether ``name`` was written under a WORKER CREDENTIAL of the account that owns ``agent_id``
+        (kittrial-5bb.519): :func:`http_authority.worker_credential_of_same_person` under the store lock
+        (kittrial-5bb.560)."""
         with self.store.lock:
-            agents = self.state.get('agents') if isinstance(self.state.get('agents'), dict) else {}
-            users = self.state.get('users') if isinstance(self.state.get('users'), dict) else {}
-            mine = agents.get(agent_id)
-            owner = mine.get('owner') if isinstance(mine, dict) else None
-            if not isinstance(owner, str) or not owner or head in agents or head.casefold() == agent_id.casefold():
-                return False
-            if head == owner:
-                return bool(label)
-            if head in users:
-                return False
-            return full_actor_parties(self.state, name, project_id) == {owner}
+            return http_authority.worker_credential_of_same_person(self.state, agent_id, name, project_id)
+
+    def by_agent_approval(self, project_id, agent_id, author, assignee, names=None):
+        """``(setting, decision)``: the project's agent-approval setting and
+        :func:`http_authority.by_agent_approval` for agent ``agent_id``, read under ONE hold of the
+        store lock against the expiry clock (kittrial-5bb.560)."""
+        with self.store.lock:
+            return (http_authority.agent_approval_mode(self.state, project_id),
+                    http_authority.by_agent_approval(self.state, project_id, agent_id, author, assignee,
+                                                     self._expiry_now(), names=names, raw_now=self._raw_now()))
 
     def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
         """Delete the agent's coordinator AND release grants in each of ``project_ids``.
@@ -5052,6 +5106,127 @@ class Service:
             for gone in [key for key in beats if key not in registry]:
                 del beats[gone]
         return dict(answer), True
+
+    def carrier_auto_nudge_projects(self, principal):
+        """Projects the carrier's agent is granted where ``auto_nudge`` is on and this carrier is fresh."""
+        with self.store.lock:
+            agent = self._carrier_agent(principal)
+            now = self._now()
+            entry = self._carrier_registry().get(agent['id'])
+            if not isinstance(entry, dict):
+                return []
+            seen = entry.get('seen_ts')
+            if type(seen) not in (int, float) or not (0 <= now - seen <= nudges.CARRIER_WINDOW):
+                return []
+            reached = entry.get('lanes') if isinstance(entry.get('lanes'), list) else []
+            if not reached:
+                return []
+            projects = []
+            for project_id in agent.get('projects') or []:
+                if (project_id in self.state['projects']
+                        and account_in_project(self.state, principal.user_id, project_id)
+                        and self.auto_nudge(project_id)['enabled'] is True):
+                    projects.append(project_id)
+            return projects
+
+    def evaluate_auto_nudges(self, principal, project_id, lanes_payload, request_id=None):
+        """Create eligible automatic ``resume`` nudges for the lanes this carrier reaches in ``project_id``."""
+        import lanes as lanes_mod
+        with self.store.lock:
+            agent = self._carrier_agent(principal)
+            if (project_id not in (agent.get('projects') or [])
+                    or project_id not in self.state['projects']
+                    or not account_in_project(self.state, principal.user_id, project_id)
+                    or not self.auto_nudge(project_id)['enabled']):
+                return []
+            now = self._now()
+            entry = self._carrier_registry().get(agent['id'])
+            if not isinstance(entry, dict):
+                return []
+            seen = entry.get('seen_ts')
+            if type(seen) not in (int, float) or not (0 <= now - seen <= nudges.CARRIER_WINDOW):
+                return []
+            reached = set(entry.get('lanes') if isinstance(entry.get('lanes'), list) else ())
+            if not reached:
+                return []
+            records = self._nudge_records(project_id)
+            changed = nudges.settle(records, now, now_iso, self._carried)
+            all_records = [
+                record
+                for project_records in (self.state.get('nudges') or {}).values()
+                if isinstance(project_records, list)
+                for record in project_records
+                if isinstance(record, dict)
+            ]
+            threshold_minutes = lanes_payload.get('idle_threshold_minutes') if isinstance(lanes_payload, dict) else None
+            threshold_seconds = (threshold_minutes if isinstance(threshold_minutes, int) and threshold_minutes > 0 else 15) * 60
+            created = []
+            for row in (lanes_payload.get('items') if isinstance(lanes_payload, dict) else None) or []:
+                if not isinstance(row, dict):
+                    continue
+                actor = row.get('actor') or row.get('lane')
+                if not isinstance(actor, str) or actor not in reached:
+                    continue
+                if full_actor_parties(self.state, actor, project_id) != {principal.user_id}:
+                    continue
+                if lanes_mod.holder_retired(actor, project=project_id, authority_state=self.state):
+                    continue
+                if nudges.pending_for(records, actor, 'resume', now) is not None:
+                    continue
+                if not nudges.auto_allowed(all_records, actor, now):
+                    continue
+                eligible = nudges.eligible_auto_nudge_entry(row, threshold_seconds, records, actor, now)
+                if eligible is None:
+                    continue
+                fields = {'lane': actor, 'message': 'resume', 'reason': 'stalled-at-prompt', 'note': None}
+                record = nudges.new_record(
+                    project_id, fields, {'kind': 'auto', 'user_id': None, 'agent_id': None},
+                    None, now, now_iso,
+                    episode_task=eligible.get('task'),
+                    episode_write_at=eligible.get('holder_last_write_at'),
+                    episode_started_ts=now - eligible['holder_last_write_seconds'])
+                nudges.note_carrier(record, now)
+                target = self._nudge_records(project_id, create=True)
+                target.append(record)
+                records = target
+                all_records.append(record)
+                created.append(record)
+                self.audit(request_id, None, 'lanes.nudge.auto', 'committed',
+                           project_id=project_id, actor=actor,
+                           reason='resume stalled-at-prompt %s' % eligible.get('task'))
+            if created or changed:
+                self.store.save()
+            return created
+
+    def filter_coordinator_wait_lanes(self, project_id, lanes_payload):
+        """Read-only: apply automatic-nudge ``lane-quiet`` withholding from stored records and the board alone."""
+        with self.store.lock:
+            if not self.auto_nudge(project_id)['enabled'] or not isinstance(lanes_payload, dict):
+                return lanes_payload
+            now = self._now()
+            records = [
+                nudges.effective(record, now, now_iso, self._carried)
+                for record in self._nudge_records(project_id)
+                if isinstance(record, dict)
+            ]
+            all_records = [
+                record
+                for project_records in (self.state.get('nudges') or {}).values()
+                if isinstance(project_records, list)
+                for record in project_records
+                if isinstance(record, dict)
+            ]
+            actors = [
+                row.get('actor') or row.get('lane')
+                for row in (lanes_payload.get('items') or [])
+                if isinstance(row, dict)
+            ]
+            carried = self.carrier_seen_views(project_id, actors)
+            return nudges.withhold_auto_nudge_lanes(
+                lanes_payload, records, all_records, carried, now, now_iso,
+                users=self.state.get('users') or {},
+                agents=self.state.get('agents') or {},
+                carried_fn=self._carried)
 
     def carrier_nudges(self, principal):
         """The carrier's own open requests: ``{id, project, lane, message, message_set}``, nothing else."""
@@ -5339,9 +5514,9 @@ class Service:
                         % (secret_file['windows'], secret_file['posix'], AGENT_SECRET_ENV),
         }
 
-    def agent_scope_differences(self, agent):
+    def agent_scope_differences(self, agent, moment=None):
         """The distinct scope lists of an agent's working credentials, when there is more than one."""
-        moment = self._expiry_now()
+        moment = self._expiry_now() if moment is None else moment
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
                  for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
         return [list(item) for item in sorted(lists)] if len(lists) > 1 else []
@@ -5430,7 +5605,7 @@ class Service:
                      scopes_after=None if after[0] is None else list(after[0]),
                      scopes_source_before=before[1], scopes_source_after=after[1])
 
-    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None, expiry=None):
+    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None, expiry=None, moment=None):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.
 
         With no list it carries exactly what the agent has (:meth:`agent_scopes`), and where
@@ -5439,9 +5614,10 @@ class Service:
         inferred or unknown scopes, with or without a list. Once confirmed, another
         authorized account may narrow them, but widening remains owner-only.
         """
+        moment = self._expiry_now() if moment is None else moment
         requested = self._scope_names(scopes)
         label = self._credential_label(label)
-        has, source = self.agent_scopes(agent)
+        has, source = self.agent_scopes(agent, moment=moment)
         if requested is not None and source in ('inferred', 'unknown') and principal.user_id != agent['owner']:
             raise forbidden(self.SCOPES_OWNER_REQUIRED)
         if requested is None:
@@ -5459,7 +5635,6 @@ class Service:
                                 % (', '.join(has) if has else 'no scopes on record', ', '.join(more)))
         # Twenty that still work. A revoked or expired credential is not counted: counted,
         # the twentieth renewal of an agent was refused for good.
-        moment = self._expiry_now()
         expiry = self._agent_expiry_metadata(moment) if expiry is None else expiry
         if sum(1 for credential in self._agent_credentials(agent)
                if self._credential_live(credential, moment)) >= AGENT_MAX_CREDENTIALS:
@@ -5487,15 +5662,15 @@ class Service:
         credential.update(expiry)
         self.state['credentials'][credential['id']] = credential
         self.state['credential_tokens'][token_hash(secret)] = credential['id']
-        self._prune_agent_credentials(agent)
+        self._prune_agent_credentials(agent, moment=moment)
         return credential, secret
 
-    def agent_creation_owner(self, principal, owner):
+    def agent_creation_owner(self, principal, owner, moment=None):
         """Resolve a real enabled account before inspecting any target grants."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to create an agent')
         with self.store.lock:
-            self.check_authority(principal, None, CAP_AGENTS)
+            self.check_authority(principal, None, CAP_AGENTS, moment=moment)
             if not isinstance(owner, str) or not owner:
                 raise invalid('owner must be an account id')
             if owner != principal.user_id and not principal.superuser:
@@ -5518,8 +5693,9 @@ class Service:
         notes = self._agent_text(notes, 'notes', AGENT_NOTES_MAX)
         clean_role = validate_agent_role(role)
         with self.store.lock:
-            self._refresh_authority(principal)
-            owner_id = self.agent_creation_owner(principal, principal.user_id if owner is None else owner)
+            moment = self._expiry_now()
+            self._refresh_authority(principal, moment=moment)
+            owner_id = self.agent_creation_owner(principal, principal.user_id if owner is None else owner, moment=moment)
             owned = [a for a in self.state['agents'].values()
                      if a['owner'] == owner_id]
             if len(owned) >= AGENT_MAX_PER_OWNER:
@@ -5529,7 +5705,7 @@ class Service:
             # What the agent may do is kept on its record from here on (kittrial-5bb.208): the
             # list asked for, or the default. Judged before anything is written.
             made_with = self._scope_names(scopes) or tuple(AGENT_DEFAULT_SCOPES)
-            expiry = self._agent_expiry_metadata()
+            expiry = self._agent_expiry_metadata(moment)
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {
                 'id': agent_id, 'name': clean_name, 'owner': owner_id,
@@ -5553,11 +5729,11 @@ class Service:
                 self.state['agents'][agent_id] = agent
                 # The grants first, so a project's view of the history includes the first credential.
                 self._audit_project_grants(principal, agent, list(granted or []), request_id)
-                credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
+                credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry, moment=moment)
                 change.created(self.state['credentials'], credential['id'])
                 change.created(self.state['credential_tokens'], credential['token_hash'])
                 self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
-                                             self.agent_scopes(agent), request_id)
+                                             self.agent_scopes(agent, moment=moment), request_id)
                 event = self.audit(request_id, principal, 'agents.created', 'committed',
                                    actor=self.agent_actor(agent))
                 event.update(agent_id=agent_id, owner_id=owner_id, created_by=principal.user_id)
@@ -5565,48 +5741,52 @@ class Service:
             # The one-time secret travels only in this response.
             public = {
                 'operation': 'agents.create',
-                'agent': self.agent_view(agent, principal),
-                'credential': dict(self.credential_view(credential), secret=secret,
+                'agent': self.agent_view(agent, principal, moment=moment),
+                'credential': dict(self.credential_view(credential, moment=moment), secret=secret,
                                    secret_available=True),
                 'setup': self.agent_setup(agent, secret),
                 'secret_available': True,
             }
         return public
 
-    def list_agents(self, principal):
+    def list_agents(self, principal, moment=None):
         """Agents the principal may administer: its own, or every agent for a superuser."""
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agents = [a for a in self.state['agents'].values()
                       if principal.superuser or a['owner'] == principal.user_id]
             agents.sort(key=lambda a: a['id'])
-            return [self.agent_view(a, principal) for a in agents]
+            return [self.agent_view(a, principal, moment=moment) for a in agents]
 
-    def agent_page(self, principal, offset, limit, *, unconfirmed=False):
+    def agent_page(self, principal, offset, limit, *, unconfirmed=False, moment=None):
         """Select a bounded owner-visible page before building credential/card views."""
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agents = [a for a in self.state['agents'].values()
                       if principal.superuser or a['owner'] == principal.user_id]
             if unconfirmed:
-                agents = [a for a in agents if self.agent_scopes(a)[1] != 'set']
+                agents = [a for a in agents if self.agent_scopes(a, moment=moment)[1] != 'set']
             agents.sort(key=lambda a: a['id'])
-            return [self.agent_view(a, principal) for a in agents[offset:offset + limit]], len(agents)
+            return [self.agent_view(a, principal, moment=moment) for a in agents[offset:offset + limit]], len(agents)
 
-    def get_agent(self, principal, agent_id):
+    def get_agent(self, principal, agent_id, moment=None):
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agent = self._agent_owned(principal, agent_id)
-            return self.agent_view(agent, principal)
+            return self.agent_view(agent, principal, moment=moment)
 
-    def agent_for_credential(self, principal):
+    def agent_for_credential(self, principal, moment=None):
         """The agent behind an agent credential, for ``GET /v1/agents/me``."""
         if principal is None or principal.via != 'credential' or not principal.agent_id:
             raise forbidden('An agent credential is required')
         with self.store.lock:
-            self._refresh_authority(principal)
+            moment = self._expiry_now() if moment is None else moment
+            self._refresh_authority(principal, moment=moment)
             agent = self._agent(principal.agent_id)
-            return self.agent_view(agent, principal)
+            return self.agent_view(agent, principal, moment=moment)
 
     def update_agent(self, principal, agent_id, payload, request_id=None):
         if principal is None or principal.via == 'credential':

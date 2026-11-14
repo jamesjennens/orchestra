@@ -53,6 +53,7 @@ async function settle() {
 }
 const block = (page, name) => page.all((e) => e.tagName === 'DIV' && e.attributes['data-agent'])
   .find((e) => e.all((x) => x.tagName === 'H3')[0].textContent === name);
+const choice = (page, label) => page.all((e) => e.tagName === 'BUTTON' && e.attributes['data-mine-choice'] === label)[0] || null;
 const projectForm = (page) => block(page, 'Kestrel').all((e) => e.tagName === 'FORM')
   .find((f) => f.all((x) => x.tagName === 'BUTTON' && x.textContent === 'Save projects')[0]);
 function projectsSeen(page) {
@@ -69,6 +70,9 @@ function projectsSeen(page) {
   };
 }
 async function open(ctx) { const page = await view.list(ctx); await settle(); return page; }
+// The superuser lands on Mine: press All (and wait for the full list) before a
+// caller touches another owner's row. Every caller below opens through this.
+async function openAll(ctx) { const page = await open(ctx); const all = choice(page, 'All'); if (all) { await all.dispatch('click'); await settle(); } return page; }
 async function addMember(project, userId, role) {
   const response = await fetch(base + '/v1/projects/' + project + '/members/' + userId, {
     method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + specs.admin.token },
@@ -78,7 +82,7 @@ async function addMember(project, userId, role) {
 
 // 1. The administrator opens Alex's agent. Alpha is tickable; Beta is greyed with the sentence.
 {
-  const page = await open(who.admin);
+  const page = await openAll(who.admin);
   out.adminBefore = projectsSeen(page);
   out.adminBefore.ownerGrantable = (await who.admin.api.agent(agentId)).owner_grantable_projects;
 }
@@ -93,7 +97,7 @@ async function addMember(project, userId, role) {
 // 3. Add the owner to Beta (as the project's owner does under Members), then grant Beta from the page.
 out.addedMember = await addMember(beta, specs.alex.id, 'contributor');
 {
-  const page = await open(who.admin);
+  const page = await openAll(who.admin);
   out.adminAfter = projectsSeen(page);
   const form = projectForm(page);
   const checkbox = form.all((e) => e.tagName === 'INPUT' && e.attributes.name === 'project' && e.value === beta)[0];

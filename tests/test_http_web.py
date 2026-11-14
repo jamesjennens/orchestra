@@ -322,6 +322,10 @@ class TeamHarness(ServerHarness):
 
     def review(self, token, operation, task=None, **extra):
         body = {'operation': operation}
+        if operation == 'approve':
+            # An approval carries a summary, as the canonical write requires (kittrial-5bb.516: the in-process
+            # backend now refuses a missing one exactly as the endpoint does).
+            body['summary'] = 'Approved.'
         body.update(extra)
         return self.request('POST', self.path('/tasks/%s/reviews' % (task or self.task)), body,
                             token=token)
@@ -1750,12 +1754,18 @@ class AgentSetupDialogCase(unittest.TestCase):
         # (the first line only opens the dialog on the screen that shows a fresh secret)
         self.assertEqual(['if (state.secretValue) {', 'state.secretValue = value;',
                           'state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,', 'state.secretValue',
-                          '? secretLinesBlock(payload, state.secretValue, state.os)'],
+                          '? secretLinesBlock(payload, state.secretValue, state.os, state.noproxy)'],
                          [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
                           and not line.strip().startswith('secretValue:')])
-        self.assertEqual(2, code.count('secretLinesBlock('))          # the definition and the one call
+        # The definition, the dialog's one call, and the invite page's (kittrial-5bb.578), which shows the
+        # secret its redemption has just issued, once, and builds every file from the secretless payload.
+        self.assertEqual(3, code.count('secretLinesBlock('))
+        invite = self.function_body(code, 'inviteSetupBlock')
+        self.assertIn('secretLinesBlock(payload, secret, os)', invite)
+        self.assertIn("['agent.json', setupText.agentJson(payload)]", invite)
+        self.assertNotIn('Storage', invite)
         block = self.function_body(code, 'secretLinesBlock')
-        self.assertIn('setupText.credentialFileLines(address, fingerprint, secretValue)', block)
+        self.assertIn('setupText.credentialFileLines(address, fingerprint, secretValue, { noproxy })', block)
         self.assertIn("copyButton('Copy', lines, { ariaLabel: 'Copy the credential file text with the secret'", block)
         # It builds the lines from the value it is handed; it never reads a credential record or a
         # .secret property (kittrial-5bb.275).
@@ -2309,6 +2319,17 @@ console.log(JSON.stringify({
         for name, value in observed.items():
             self.assertIs(True, value, 'the wizard reported %s=%r' % (name, value))
         self.assertEqual({
+            'olderBridgeGuideHasNoExtraWatch',
+            'noBridgeChoiceExplainsWatch',
+            'noBridgeSavedGuideHasWatch',
+            'proxyChoiceIsOffByDefault',
+            'proxyChoiceStoredWithoutSecret',
+            'proxyChoiceReachesRewrite',
+            'proxyChoiceReachesGuide',
+            'proxyOffStillOffersCleanup',
+            'proxyRewriteExplainsRemoval',
+            'invalidProxyServerShowsRewriteError',
+            'invalidProxyServerKeepsNavigation',
             'atMostTwoSentencesPerScreen',
             'backHiddenOnTheFirstScreen',
             'backRetracesTheShortPath',
@@ -2411,6 +2432,13 @@ console.log(JSON.stringify({
             'vscodeScreenFourth',
             'vscodeScreenHasFolderAndCommand',
             'workerPreselected',
+            # kittrial-5bb.545 (website part): the proxy line before Set up on the Bridge path.
+            'bridgeNoProxyLineBeforeSetUp',
+            'noProxyLineAbsentOffTheBridgePath',
+            'noProxyLineNamesTheHostOfThisPage',
+            'noProxySentencePinned',
+            # kittrial-5bb.550 r2 (review S2): created with a configured public address, macOS chosen.
+            'noProxyLineNamesThisPagesHostOnCreateWithAConfiguredAddress',
             # kittrial-5bb.387: an agent with an effective coordinator grant.
             'coordinatorHasNoRoleChoice',
             'coordinatorRoleKeepsGrantLocation',
@@ -2420,6 +2448,23 @@ console.log(JSON.stringify({
             'coordinatorSetupHintPresentWithoutGrant',
             'noEffectGrantIsAWorker',
             'noEffectGrantShowsCoordinatorHint',
+            # kittrial-5bb.521: making the agent a coordinator from the wizard's role screen,
+            # and the Enter notice on the test screen.
+            'testScreenSaysPasteAndPressEnter',
+            'nonOwnerHasNoCoordinatorChoice',
+            'nonMemberSuperuserProjectOmittedFromWizard',
+            'ownerSeesCoordinatorChoiceForEachGrantableProject',
+            'selectingCoordinatorRadioShowsButtonWithoutGranting',
+            'coordinatorChoiceHoldsNextWithOneLine',
+            'switchingCoordinatorProjectUpdatesButtonWithoutWriting',
+            'switchingBackToWorkerHidesButtonAndRevokesNothing',
+            'radioChangeDuringRefusedPutReenablesNewButton',
+            'refusedCoordinatorGrantShowsErrorAndLeavesWorkerGuide',
+            'rereadWithoutEffectiveGrantSaysSoInOneLine',
+            'rereadWithoutGrantableProjectClearsChoiceAndRerenders',
+            'failedRereadAfterCommittedPutSaysMayBeSavedAndRereadBeforeRetrying',
+            'clickingMakeCoordinatorGrantsAndShowsHeldReadOnly',
+            'clickingMakeCoordinatorUpdatesGuideAndPromptFromStart',
         }, set(observed))
 
 
@@ -2495,6 +2540,8 @@ class PasswordPageCase(unittest.TestCase):
             text = (WEB / 'js' / name).read_text(encoding='utf-8')
             self.assertNotIn('At least 12', text, name)
             self.assertNotIn('length < 12', text, name)
+            self.assertNotIn('At least 5', text, name)
+            self.assertNotIn('length < 5', text, name)
 
     def _observed(self):
         if 'observed' not in _PASSWORD_FORMS_RUN:
@@ -2522,6 +2569,10 @@ class PasswordPageCase(unittest.TestCase):
             'accountWhitespace': 'A password cannot be only spaces.',
             'accountWhitespaceCalls': 0,
             'accountOneCharCalls': 1,
+            'accountHintFive': 'At least 5 characters.',
+            'accountFourChars': 'Use at least 5 characters.',
+            'accountFourCharsCalls': 0,
+            'accountFiveCharsCalls': 1,
             'accountHintRaised': 'At least 8 characters. A short sentence is easier to remember.',
             'accountTooShort': 'Use at least 8 characters.',
             'accountTooShortCalls': 0,
@@ -2534,6 +2585,10 @@ class PasswordPageCase(unittest.TestCase):
             'redeemMismatch': 'The two new passwords do not match.',
             'redeemMismatchCalls': 0,
             'redeemOneCharCalls': 1,
+            'redeemHintFive': 'At least 5 characters.',
+            'redeemFourChars': 'Use at least 5 characters.',
+            'redeemFourCharsCalls': 0,
+            'redeemFiveCharsCalls': 1,
             'redeemHintRaised': 'At least 8 characters.',
             'redeemTooShort': 'Use at least 8 characters.',
             'redeemTooShortCalls': 0,

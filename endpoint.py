@@ -38,7 +38,8 @@ from coordination import is_merge_slot, merge_slot_sentence
 from render import render
 from lifecycle import apply_native
 from version import report
-from reserved_comments import (bd_flag_values, carries_record_label, check_raw_request, comment_target,
+from reserved_comments import (attachment_value_refusal, bd_flag_values, carries_record_label,
+                               check_raw_request, comment_target, expand_bd_attachments,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
@@ -121,7 +122,7 @@ ALLOWED={'list','show','ready','search','count','create','update','close','reope
 # spelling-aware reserved_comments.operator_only_in_args() below.
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
-from field_limits import DESCRIPTION_MAX,DESCRIPTION_TOO_LONG
+from field_limits import DESCRIPTION_MAX,DESCRIPTION_TOO_LONG,NOTES_MAX,NOTES_TOO_LONG
 
 
 def _description_over_limit(args,attachments):
@@ -141,6 +142,38 @@ def _description_over_limit(args,attachments):
                     if len(a)-len(lead)>DESCRIPTION_MAX:return True
                     break
     return False
+
+
+def _notes_over_limit(args,attachments):
+    # create/update only: an inline --notes/--append-notes value, or a --file/-f note attachment, over the bound.
+    if not args or args[0] not in ('create','update'):return False
+    return any(name in ('--append-notes','--notes') and isinstance(value,str) and len(value)>NOTES_MAX
+               for name,value in bd_flag_values(args,attachments))
+
+
+def _validate_bd_attachments(args,attachments):
+    for a in args:
+        if isinstance(a,str) and a.startswith('@attachment:'):
+            item=(attachments or {}).get(a.partition(':')[2]) if isinstance(attachments,dict) else None
+            if not isinstance(item,dict) or item.get('flag') not in FILE_FLAGS or not isinstance(item.get('text'),str):
+                raise ValueError('Invalid attachment')
+            # bd refuses an empty body file; refuse it here, before any native call, so the
+            # caller gets a clear refusal and not an uncertain outcome (review 01a10352).
+            if item['flag']=='--body-file' and not item['text'].strip():
+                raise ValueError('An attached description is empty; send an empty value inline to clear it')
+
+
+def _expand_bd_argv(args,attachments,tmp):
+    _validate_bd_attachments(args,attachments)
+    paths={}
+    for i,a in enumerate(args):
+        if isinstance(a,str) and a.startswith('@attachment:'):
+            key=a.partition(':')[2]
+            item=attachments[key]
+            dest=Path(tmp)/f'{i}.txt'
+            dest.write_text(item['text'],encoding='utf-8')
+            paths[key]=str(dest)
+    return expand_bd_attachments(args,attachments or {},paths=paths)
 
 def _guidance_ack_version(args):
     """The version named by `guidance ack --version VERSION` (kittrial-5bb.99).
@@ -199,7 +232,7 @@ def _native_comments(root,path,actor,task):
     if not isinstance(rows,list):raise ValueError('Unexpected comment read for %s; refusing the label write.'%(task,))
     return rows
 
-def _guard_reserved_labels(root,path,args,actor):
+def _guard_reserved_labels(root,path,args,actor,attachments=None):
     """Read-before-write guard for the reserved label namespace.
 
     Refusing a reserved label *value* is not enough: bd copies parent labels
@@ -210,7 +243,7 @@ def _guard_reserved_labels(root,path,args,actor):
     can neither reach a contributor-created issue nor be removed from an
     operator-created holder.
     """
-    request=label_guard_request(args)
+    request=label_guard_request(args,attachments)
     if request is None:return
     if request['ambiguous']:
         raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content/requirement label namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags and a valid --no-inherit-labels value.')
@@ -393,7 +426,7 @@ def _guard_open_dependency_on_claim(root,path,actor,row):
                          %(row.get('id'),open_dependency_sentence(open_deps) or 'it is blocked by an open dependency'))
 
 
-def _guard_record_anchor_status(root,path,args,actor,rows_read=None):
+def _guard_record_anchor_status(root,path,args,actor,rows_read=None,attachments=None):
     """Read-before-write guard: a status change never moves a record anchor.
 
     A reference/proposal/settings/capability anchor is created closed on purpose and is
@@ -412,7 +445,7 @@ def _guard_record_anchor_status(root,path,args,actor,rows_read=None):
     when given, is filled with that read, so that the next guard on this write need not read
     the same rows again (kittrial-5bb.454 r3).
     """
-    request=status_change_targets(args)
+    request=status_change_targets(args,attachments)
     if request is None:return
     command,targets=request
     if targets is None:
@@ -473,7 +506,7 @@ def _guard_attested_decision(root,path,name,args,actor,authority_config,rows=Non
         if denied is not None:return refused(denied)
     return None
 
-def _guard_record_anchor_title(root,path,args,actor,rows=None):
+def _guard_record_anchor_title(root,path,args,actor,rows=None,attachments=None):
     """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
 
     The kit finds a reference, proposal, settings or capability record by its anchor's
@@ -487,7 +520,7 @@ def _guard_record_anchor_title(root,path,args,actor,rows=None):
     title change on ordinary rows costs no read beyond the one every write makes
     (kittrial-5bb.113). Without ``rows`` every named row is read.
     """
-    targets=title_change_targets(args)
+    targets=title_change_targets(args,attachments)
     if targets is None:return
     if targets=='unnamed':
         raise ValueError('Refusing update --title: name exactly the issue(s) to change; bd would otherwise act on the '
@@ -2900,7 +2933,8 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','assignment_status':422}
     if action=='web-lifecycle':
         from http_authority import (CAP_READ, CAP_COORDINATE, AuthorityDenied,
-                                    actor_parties, decide, file_lock, read_state)
+                                    actor_parties, decide, file_lock, read_state,
+                                    recorded_by_agent_approval)
         from admin import web_lifecycle_mark_writes
         import web_lifecycle
         args=request.get('args',[])
@@ -2944,6 +2978,16 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                 # Same full party policy as HTTP approval, from the configured
                 # store under its held lock. No descriptor supplies this state.
                 return actor_parties(read_state(authority_config.store),label,name)
+            def lifecycle_by_agent(approver,author,assignee):
+                # kittrial-5bb.560: the approve route's by-agent decision, asked again from the
+                # present state when the party sets meet, against the descriptor's clocks (the
+                # web service's _expiry_now and _raw_now). No decision clock: strict; no raw
+                # clock: an agent key with a raw deadline does not count. Never time.time().
+                descriptor=request.get('authority')
+                now=descriptor.get('now') if isinstance(descriptor,dict) else None
+                raw_now=descriptor.get('raw_now') if isinstance(descriptor,dict) else None
+                return recorded_by_agent_approval(read_state(authority_config.store),name,approver,author,assignee,
+                                                  now,raw_now)
             def lifecycle_effect():
                 # The integration check needs the same operators, owners and mark family
                 # read as the writers whose decisions it reports (kittrial-5bb.374).
@@ -2967,16 +3011,17 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                         coordinate=False
                     result=web_lifecycle.read(body['task'],actor,runner,path,coordinate=coordinate,
                                               mark_writes=enabled,operators=operators,owners=owners,
-                                              parties=lifecycle_parties)
+                                              parties=lifecycle_parties,by_agent=lifecycle_by_agent)
                 elif operation=='check':
                     result=web_lifecycle.integration_check(body['task'],actor,runner,path,
                                                            target=body.get('target'),project_name=name,
                                                            operators=operators,owners=owners,
-                                                           parties=lifecycle_parties)
+                                                           parties=lifecycle_parties,by_agent=lifecycle_by_agent)
                 else:
                     result=web_lifecycle.apply(body,actor,runner,path,name,request['operation_id'],
                                                authority=lifecycle_authority,parties=lifecycle_parties,
-                                               mark_writes=enabled,operators=operators,owners=owners)
+                                               mark_writes=enabled,operators=operators,owners=owners,
+                                               by_agent=lifecycle_by_agent)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
                         'stderr':warning_text(run_warnings)}
             with held_coordination_lock(path,shared=coordination_lock_shared(request,'web-lifecycle',args,operation)):
@@ -3596,13 +3641,18 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
     label=reserved_label_in_args(args)
     if label==MERGE_SLOT_LABEL:raise ValueError('The label %s marks the merge slot of a project and is reserved: it is not added, removed or replaced on any task. Only `coordinate` writes it (merge-create restores it on a damaged slot).'%label)
     if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise); `open-item:` labels belong to open item records, which no command writes yet')
+    attachments=request.get('attachments',{})
+    _validate_bd_attachments(args,attachments)
+    bad_value_attachment=attachment_value_refusal(args,attachments)
+    if bad_value_attachment is not None:
+        raise ValueError('Refusing %s: %s. Nothing was written.'%(args[0],bad_value_attachment))
     # bd 1.2.2 accepts the undocumented `create --label` alias of --labels, so a
     # table built only from --help missed a whole label-writing spelling. Every
     # accepted alias is now in the table above; an unresolvable create/update
     # flag could still be another hidden/deprecated alias (or a value-taking
     # flag the scan would misread), so it fails closed here rather than being
     # assumed harmless.
-    unrecognized=unresolved_bd_flags(args)
+    unrecognized=unresolved_bd_flags(args,attachments)
     if unrecognized:raise ValueError('Refusing create/update with unrecognized flag(s) %s: the reserved coordination/requirement label namespace cannot be verified, so no native write was attempted. Pass only documented bd 1.2.2 flags.'%(', '.join(str(token) for token in unrecognized),))
     # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
     # Command-aware: `-f` is --file on comments/create but --force on close, so a
@@ -3614,23 +3664,12 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
     # Checked before any temp file or native mutation; rejected writes leave
     # no native record. Actor/task context binds supported records to the
     # actual request target; unresolvable targets fail closed.
-    check_raw_request(args, request.get('attachments', {}),
+    check_raw_request(args, attachments,
                       actor=actor, task=comment_target(args))
-    if _description_over_limit(args,request.get('attachments',{})):raise ValueError(DESCRIPTION_TOO_LONG)
+    if _description_over_limit(args,attachments):raise ValueError(DESCRIPTION_TOO_LONG)
+    if _notes_over_limit(args,attachments):raise ValueError(NOTES_TOO_LONG)
     with tempfile.TemporaryDirectory(prefix='request-',dir=root) as tmp:
-        attachments=request.get('attachments',{})
-        final=[]
-        for i,a in enumerate(args):
-            if a.startswith('@attachment:'):
-                key=a.partition(':')[2]
-                item=attachments.get(key)
-                if not isinstance(item,dict) or item.get('flag') not in FILE_FLAGS or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
-                # bd refuses an empty body file; refuse it here, before any native call, so the
-                # caller gets a clear refusal and not an uncertain outcome (review 01a10352).
-                if item['flag']=='--body-file' and not item['text'].strip():raise ValueError('An attached description is empty; send an empty value inline to clear it')
-                dest=Path(tmp)/f'{i}.txt';dest.write_text(item['text'],encoding='utf-8')
-                final.extend([item['flag'],str(dest)])
-            else: final.append(a)
+        final=_expand_bd_argv(args,attachments,tmp)
         with held_coordination_lock(path,shared=coordination_lock_shared(request,'bd',args)):
             # kittrial-5bb.333: a NEW assignment's display name is resolved to the actor id
             # before bd sees it, and only here. A value that is already an actor that has
@@ -3687,7 +3726,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             _guard_record_anchor_title(root,path,args,actor,named)
             denied=_guard_attested_decision(root,path,name,args,actor,authority_config,rows=anchor_rows or None)
             if denied is not None:return denied
-            _guard_reserved_labels(root,path,args,actor)
+            _guard_reserved_labels(root,path,args,actor,attachments=attachments)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
                 # When bd itself says no, before it writes, that is a refusal and not an outcome
@@ -4176,12 +4215,17 @@ def main():
         import raw_lifecycle
         if isinstance(e,raw_lifecycle.Refusal):
             answer['stderr']=f'ValueError: {e}\n'
-        from review_workflow import CoordinatorRuleRefusal
+        from review_workflow import CoordinatorRuleRefusal, SameCommitChangesRequested
         if isinstance(e,CoordinatorRuleRefusal):
             # Preserve the host's ValueError sentence while identifying a kit rule
             # refusal explicitly. HTTP never decides this from words in stderr.
             answer['stderr']=f'ValueError: {e}\n'
             answer['refused']='coordinator-rule'
+        if isinstance(e,SameCommitChangesRequested):
+            answer['stderr']=f'ValueError: {e}\n'
+            answer['review_status']=409
+            answer['review_id']=e.review_id
+            answer['review_answered']=bool(e.answered)
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
             # The export could not be read (bd failed, or answered something that is not

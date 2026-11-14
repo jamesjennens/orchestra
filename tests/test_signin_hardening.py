@@ -9,7 +9,7 @@ F1  an invited account costs the same one scrypt as a missing account and a wron
 F2  a password change deletes this account's pending reset values
 F3  per-account and per-source counts beside the pair, keyed by the source group
 F4  password change shares the counts
-    and the installation's password minimum is 12 unless the operator sets another.
+    and the installation's password minimum is 5 unless the operator sets another (kittrial-5bb.547).
 """
 import http.client
 import io
@@ -426,20 +426,58 @@ class MinimumLengthTests(unittest.TestCase):
         self.clock = Clock()
         self.store = Store(self.tmp / 'state.json', clock=self.clock)
 
-    def test_a_default_service_refuses_eleven_characters_and_accepts_twelve(self):
+    def test_the_default_password_minimum_is_five(self):
+        self.assertEqual(http_auth.DEFAULT_PASSWORD_MIN, 5)
+        self.assertEqual(Service(self.store).password_min_length, 5)
+
+    def test_a_four_character_password_is_refused_with_the_existing_sentence(self):
         Service.bootstrap_superuser(self.store, ADMIN, ADMIN_PASSWORD)
         service = Service(self.store)
-        self.assertEqual(service.password_min_length, 12)
         admin = service.authenticate(service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
         user = service.create_user(admin, 'alex')
         with self.assertRaises(HttpError) as caught:
+            service.change_password(admin, user['id'], None, 'abcd')
+        self.assertEqual((caught.exception.status, caught.exception.message),
+                         (422, 'Password must be 5-1024 characters'))
+        reset = service.issue_reset(admin, user['id'])['reset_value']
+        with self.assertRaises(HttpError) as caught:
+            service.redeem_reset(user['id'], reset, 'abcd')
+        self.assertEqual((caught.exception.status, caught.exception.message),
+                         (422, 'Password must be 5-1024 characters'))
+        with self.assertRaises(HttpError) as caught:
+            Service.bootstrap_superuser(Store(self.tmp / 'other.json', clock=self.clock), 'root', 'abcd')
+        self.assertEqual((caught.exception.status, caught.exception.message),
+                         (422, 'Password must be 5-1024 characters'))
+
+    def test_a_five_character_password_is_accepted(self):
+        Service.bootstrap_superuser(self.store, ADMIN, 'abcde')
+        service = Service(self.store)
+        admin_session = service.login(ADMIN, 'abcde')
+        admin = service.authenticate(admin_session['session_token'])
+        user = service.create_user(admin, 'alex')
+        self.assertEqual(service.change_password(admin, user['id'], None, 'abcde')['changed'], True)
+        self.assertTrue(service.login('alex', 'abcde')['session_token'])
+        reset = service.issue_reset(admin, user['id'])['reset_value']
+        self.assertEqual(service.redeem_reset(user['id'], reset, 'fghij')['password_set'], True)
+        self.assertTrue(service.login('alex', 'fghij')['session_token'])
+
+    def test_an_installation_setting_of_twelve_still_refuses_eleven(self):
+        with self.assertRaises(HttpError) as caught:
+            Service.bootstrap_superuser(Store(self.tmp / 'raised-boot.json', clock=self.clock),
+                                        'root', 'x' * 11, password_min_length=12)
+        self.assertEqual((caught.exception.status, caught.exception.message),
+                         (422, 'Password must be 12-1024 characters'))
+        Service.bootstrap_superuser(self.store, ADMIN, 'x' * 12, password_min_length=12)
+        service = Service(self.store, password_min_length=12)
+        self.assertEqual(service.password_min_length, 12)
+        admin = service.authenticate(service.login(ADMIN, 'x' * 12)['session_token'])
+        user = service.create_user(admin, 'alex')
+        with self.assertRaises(HttpError) as caught:
             service.change_password(admin, user['id'], None, 'x' * 11)
-        self.assertEqual((caught.exception.status, caught.exception.message), (422, 'Password must be 12-1024 characters'))
+        self.assertEqual((caught.exception.status, caught.exception.message),
+                         (422, 'Password must be 12-1024 characters'))
         self.assertEqual(service.change_password(admin, user['id'], None, 'x' * 12)['changed'], True)
         self.assertTrue(service.login('alex', 'x' * 12)['session_token'])
-        # The bootstrap default is the same rule.
-        with self.assertRaises(HttpError):
-            Service.bootstrap_superuser(Store(self.tmp / 'other.json', clock=self.clock), 'root', 'x' * 11)
 
     def test_an_installation_that_sets_a_lower_minimum_keeps_it(self):
         Service.bootstrap_superuser(self.store, ADMIN, 'abc', password_min_length=1)
@@ -456,22 +494,24 @@ class MinimumLengthTests(unittest.TestCase):
         old = http_auth.hash_password('abc', n=2 ** 10)                                        # also a weaker, older hash: rehashed on sign-in
         user['password'] = old
         service = Service(self.store)
-        self.assertEqual(service.password_min_length, 12)
+        self.assertEqual(service.password_min_length, 5)
         self.assertEqual(service.login(ADMIN, 'abc')['user']['username'], ADMIN)
         self.assertNotEqual(user['password'], old)                                             # re-hashed, without a length check
         self.assertTrue(http_auth.verify_password(user['password'], 'abc'))
         self.assertEqual(service.login(ADMIN, 'abc')['user']['username'], ADMIN)
 
-    def test_the_service_flag_defaults_to_twelve_and_the_advice_names_it(self):
-        import argparse
-        self.assertEqual(http_service.bootstrap_refusal_advice(HttpError(422, 'invalid', 'Password must be 12-1024 characters')),
+    def test_the_service_flag_defaults_to_five_and_the_advice_names_it(self):
+        self.assertEqual(http_service.bootstrap_refusal_advice(HttpError(422, 'invalid', 'Password must be 5-1024 characters')),
+                         'Run the command again with a password of 5 to 1024 characters.')
+        self.assertEqual(http_service.bootstrap_refusal_advice(HttpError(422, 'invalid', 'Password must be 12-1024 characters'),
+                                                               password_min_length=12),
                          'Run the command again with a password of 12 to 1024 characters.')
         # The flag's default, read from the real parser by asking for its help.
         out = io.StringIO()
         with mock.patch.object(sys, 'stdout', out), self.assertRaises(SystemExit):
             http_service.main(['--help'])
         text = ' '.join(out.getvalue().split())
-        self.assertIn('--password-min-length N the installation password minimum: 1 to 1024 characters (default 12)', text)
+        self.assertIn('--password-min-length N the installation password minimum: 1 to 1024 characters (default 5)', text)
 
     @unittest.skipUnless(sys.platform != 'win32', 'the host bootstrap is POSIX only')
     def test_the_host_bootstrap_prompt_names_the_minimum_and_a_short_password_gets_one_sentence(self):
@@ -482,16 +522,21 @@ class MinimumLengthTests(unittest.TestCase):
 
         def getpass(prompt):
             prompts.append(prompt)
-            return 'short-pass'
+            return 'abcd'
         stderr = io.StringIO()
         with mock.patch('getpass.getpass', getpass), contextlib.redirect_stderr(stderr), \
                 contextlib.redirect_stdout(io.StringIO()):
             code = http_service.main(['--state', str(self.tmp / 'http-state.json'), '--root', str(root),
                                       '--bootstrap-user', 'admin'])
         self.assertEqual(code, 1)
-        self.assertEqual(prompts[0], 'New superuser password (12 to 1024 characters): ')
-        self.assertIn('Password must be 12-1024 characters', stderr.getvalue())
-        self.assertIn('Run the command again with a password of 12 to 1024 characters.', stderr.getvalue())
+        self.assertEqual(prompts[0], 'New superuser password (5 to 1024 characters): ')
+        self.assertIn('Password must be 5-1024 characters', stderr.getvalue())
+        self.assertIn('Run the command again with a password of 5 to 1024 characters.', stderr.getvalue())
+        with mock.patch('getpass.getpass', lambda _prompt: 'abcde'), contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            ok_code = http_service.main(['--state', str(self.tmp / 'http-state-ok.json'), '--root', str(root),
+                                         '--bootstrap-user', 'admin'])
+        self.assertEqual(ok_code, 0)
 
 
 class SharedPairSlowModeTests(ServerCase):

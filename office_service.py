@@ -125,8 +125,8 @@ def service_config(path):
     if 'agent_credential_days' in config:
         validate_agent_credential_days(config['agent_credential_days'])
     # The installation's password minimum (kittrial-5bb.363), refused by the same helper and
-    # the same sentence as the web service's own flag. An omitted key keeps 1 (any non-empty
-    # password); the 1024 maximum is a bound on work per request, not a policy.
+    # the same sentence as the web service's own flag. An omitted key keeps DEFAULT_PASSWORD_MIN
+    # (5, kittrial-5bb.547); the 1024 maximum is a bound on work per request, not a policy.
     if 'password_min_length' in config:
         validate_password_min_length(config['password_min_length'])
     # The session idle and absolute limits (kittrial-5bb.330), refused by the same helper and

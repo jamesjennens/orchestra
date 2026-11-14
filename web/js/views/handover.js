@@ -13,7 +13,7 @@ export const STATE_LABELS = {
 
 // Where a step is fixed, by the server's `fix.page`. Nothing here performs the fix.
 export function fixRoute(page, pid) {
-  return { members: `/p/${pid}/settings`, settings: `/p/${pid}/settings`, 'my-agents': '/agents',
+  return { members: `/p/${pid}/people`, settings: `/p/${pid}/agents`, 'my-agents': '/agents',
     'agent-setup': '/setup', 'handover-note': `/p/${pid}/handover` }[page] || null;
 }
 

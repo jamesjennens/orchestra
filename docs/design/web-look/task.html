@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestra mock-up</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<div class="mock-note">Mock-up with made-up data — look only, not the .522 shell</div>
+<div class="shell">
+  <a class="skip" href="#main">Skip to content</a>
+  <nav class="rail" id="rail" aria-label="Main">
+    <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a>
+    <div class="rail-section"><a class="nav-link" href="#"><span>My work</span><span class="nav-count">3</span></a><a class="nav-link" href="#"><span>My agents</span><span class="nav-count">1</span></a><a class="nav-link" href="#"><span>All projects</span></a></div>
+    <div class="rail-section">
+      <label class="rail-label" for="project-switch">Project</label>
+      <select id="project-switch" class="project-switch" aria-label="Current project">
+        <option value="">Choose a project…</option>
+        <option selected>Order portal</option>
+        <option>Billing</option>
+      </select>
+      <a class="nav-link" href="#"><span>Tasks</span><span class="nav-count">17</span></a><a class="nav-link" href="#"><span>Reviews</span><span class="nav-count">2</span></a><a class="nav-link" href="#"><span>Releases</span></a><a class="nav-link" href="#"><span>Requirements</span></a><a class="nav-link" href="#"><span>Records</span></a><a class="nav-link" href="#"><span>Decisions</span></a><a class="nav-link" href="#"><span>Rooms</span><span class="nav-count">2</span></a>
+    </div>
+    <div class="rail-foot">
+      <div class="who"><span class="avatar" aria-hidden="true">MO</span>
+        <div><div class="who-name">Maya Okafor</div><div class="small muted">@maya</div></div></div>
+      <div class="actions"><a class="btn" href="#">Account</a><button type="button">Sign out</button></div>
+    </div>
+  </nav>
+  <div class="content">
+    <div class="main-top"><button type="button" class="menu-toggle ghost">Menu</button>
+      <a class="brand" href="#"><svg viewBox="0 0 22 22" class="brand-mark" aria-hidden="true"><rect x="2" y="12" width="2.6" height="8" rx="1.3" fill="var(--ink-2)"/><rect x="6" y="7" width="2.6" height="13" rx="1.3" fill="var(--ink-2)"/><rect x="10" y="3" width="2.6" height="16" rx="1.3" fill="var(--accent)"/><rect x="14" y="8" width="2.6" height="11" rx="1.3" fill="var(--ink-2)"/><rect x="18" y="5" width="2.6" height="14" rx="1.3" fill="var(--ink-2)"/></svg><span>Orchestra</span></a></div>
+    <main class="main" id="main" tabindex="-1">
+<div class="stack">
+  <div class="page-head">
+    <div><nav class="crumbs" aria-label="Breadcrumb"><a href="#">Projects</a> / <a href="#">Order portal</a> / <span class="mono">order-11</span></nav>
+      <h1 tabindex="-1">Timed wake-ups on a lane</h1></div>
+    <div class="actions"><button type="button">Edit</button></div>
+  </div>
+  <section class="summary" aria-label="Where this task stands">
+    <div class="chips"><span class="chip accent">In progress</span><span class="chip ok">Approved · not integrated</span><span class="chip plain" title="Priority">P1</span></div>
+    <div class="meta"><span>Updated Nov 5, 16:58</span><span class="mono">order-11</span></div>
+    <p class="next"><b>Next:</b> the coordinator integrates r2 (bb19f62) into main
+      <span class="who-acts">a project owner or coordinator</span></p>
+  </section>
+  <div class="banner info"><a href="#">Record integration evidence</a></div>
+  <div class="detail">
+    <div class="stack">
+      <section class="panel" aria-labelledby="wanted-h">
+        <div class="panel-head"><h2 id="wanted-h">What is wanted</h2></div>
+        <div class="panel-body md">
+          <p>A lane that must act at a set time should be able to say so, and the kit should wake it then.</p>
+          <ul><li>An optional <code>not_before</code> on a lane state, set only by the task's holder.</li>
+            <li>The blocking wait wakes the lane at it; a later record without it clears it.</li></ul>
+          <p>Design first, then the build in slices.</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="brief-h">
+        <div class="panel-head"><h2 class="small" id="brief-h">Brief</h2>
+          <span class="small muted">Checkpoint 41 minutes ago by Lee Park</span></div>
+        <div class="panel-body">
+          <h3 class="small">Where it stands</h3>
+          <p class="prose">r2 (bb19f62) approved by the reviewer after the three items were answered. Full suite green: 8,886 tests OK.</p>
+          <p><strong>Next step:</strong> the coordinator integrates r2 from the bundle.</p>
+          <h3 class="small">Unresolved items <span class="nav-count">1</span></h3>
+          <ul class="open-items">
+            <li><span class="chip plain">question</span> Should the wake survive a server restart?
+              <div class="small muted">Source: session-1f0c…</div></li>
+          </ul>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="review-h">
+        <div class="panel-head"><h2 class="small" id="review-h">Contribution &amp; review</h2><span class="chip ok">Approved · not integrated</span></div>
+        <div class="panel-body">
+          <dl class="kv">
+            <dt>Revision</dt><dd>2</dd>
+            <dt>Commit</dt><dd><code title="bb19f62b5f28984b831b402fbe97933ae61ef2d5">bb19f62</code> <span class="muted">on <code>contrib/kittrial-5bb.509-not-before-wake-r1</code></span></dd>
+            <dt>Based on</dt><dd><code title="c01d067ff690b5585f8214f80e35590e24909c1b">c01d067f</code></dd>
+            <dt>Delivered</dt><dd>Nov 5, 00:04 by Lee Park</dd>
+          </dl>
+          <p class="prose">All three review items answered; the recurring prompts stay under the 2,000-character cap; the pinned attention dict carries the new key.</p>
+          <h3 class="small">Requested changes</h3>
+          <ol class="request-list">
+            <li><span class="chip ok">Resolved</span> Keep the poll prompts within the 2,000-character cap.</li>
+            <li><span class="chip ok">Resolved</span> Pin the new attention key or justify its absence.</li>
+          </ol>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="activity-h">
+        <div class="panel-head"><h2 class="small" id="activity-h">Activity</h2></div>
+        <div class="panel-body">
+          <ol class="timeline">
+            <li><span class="dot ok" aria-hidden="true"></span><div>
+              <div class="event-head"><b>Reviewer</b> · approved the contribution · 6 hours ago</div>
+              <div class="event-body">All three items answered; approving r2.</div></div></li>
+            <li><span class="dot accent" aria-hidden="true"></span><div>
+              <div class="event-head"><b>Lee Park</b> · delivered a contribution · 17 hours ago</div>
+              <div class="event-body">r2 delivered: 4 files, +8 −3, full suite green.</div></div></li>
+            <li><span class="dot warn" aria-hidden="true"></span><div>
+              <div class="event-head"><b>Reviewer</b> · requested a change · 2 days ago</div>
+              <div class="event-body">Three items: prompt length, attention dict, whole suite.</div></div></li>
+            <li><span class="dot" aria-hidden="true"></span><div>
+              <div class="event-head"><b>Lee Park</b> · claimed the task · 6 days ago</div></div></li>
+          </ol>
+        </div>
+      </section>
+      <details class="fold"><summary>Record a checkpoint <span class="fold-hint">for Lee Park, the assignee</span></summary>
+        <div class="fold-body"><p class="empty-line">The form opens here.</p></div></details>
+    </div>
+    <aside class="side" aria-label="Task facts and tools">
+      <section class="panel"><div class="panel-head"><h2 class="small">Details</h2></div>
+        <div class="panel-body"><dl class="kv">
+          <dt>Status</dt><dd><span class="chip accent">In progress</span></dd>
+          <dt>Priority</dt><dd><span class="mono small muted" title="Priority">P1</span></dd>
+          <dt>Assignee</dt><dd>Lee Park</dd>
+          <dt>Created</dt><dd>Oct 28, 10:14</dd>
+          <dt>Updated</dt><dd>Nov 5, 16:58</dd>
+          <dt>ID</dt><dd class="mono">order-11</dd>
+          <dt>Version</dt><dd class="num">6</dd>
+        </dl></div></section>
+      <section class="panel"><div class="panel-head"><h2 class="small">Completion facts</h2></div>
+        <div class="panel-body"><p class="small">Implemented: passed · Tested: passed · Reviewed: passed</p></div></section>
+      <section class="panel"><div class="panel-head"><h2 class="small">Depends on</h2></div>
+        <ul class="panel-body open-items"><li><a href="#">Blocking reads survive a restart</a> <span class="chip accent">In progress</span></li></ul></section>
+      <section class="panel"><div class="panel-head"><h2 class="small">Files</h2></div>
+        <div class="panel-body"><p class="empty-line">No files yet.</p></div></section>
+      <details class="fold"><summary>Owner tools</summary><div class="fold-body"><p class="empty-line">Folded in the mock-up.</p></div></details>
+      <p class="small muted">Viewing a task never marks it read, done or acknowledged.</p>
+    </aside>
+  </div>
+</div>
+    </main>
+  </div>
+</div>
+</body>
+</html>

@@ -29,8 +29,12 @@ kits; all-off native write effects remain compatible.
 - **The web route** judges an agent holding the coordinator grant by person. By default it now
   agrees with the host route for another personal agent of the same person (the project setting
   `agent_approval: by-agent`).
-- **What both routes still refuse on the web:** the agent's own work, its person's own work and
-  work under that person's worker credentials.
+- **What the web route still refuses:** the agent's own work (its sub-workers included), its
+  person's own work under the bare account id, and work under a worker-credential name another
+  account has held. Work under a worker credential of that person issued with a name no other
+  account has held, or under `ACCOUNT/label` below the person's account id (only that person's
+  credential issued with no name can write it), is approved (kittrial-5bb.519), and it integrates
+  under the same decision (kittrial-5bb.560).
 - **Strict projects:** a project an owner set to `by-person` is strict on the web route only.
 - **The record:** an approval written that way carries a fixed sentence at the end of its
   `summary`. The record's field set is unchanged.
@@ -2134,6 +2138,27 @@ Its warning, and the agent next-actions sentence (whose "and N more" counts from
 total), name the respond record as
 "POST `/v1/projects/{pid}/tasks/{tid}/reviews`, operation respond" and never the client command.
 
+## Same-commit `contribute` while requested changes are active (kittrial-5bb.556)
+
+A new `contribute` (`review TASK --file`) whose case-folded `commit` matches the task's latest
+delivery is refused before any write while that delivery has an active blocking `request-changes`
+not yet settled by an un-invalidated `approve`, a `withdraw`, or the requester resolving or
+downgrading every blocking item (`resolve-item`):
+
+- **Sentence while any blocking item is open**:
+  `this commit was already reviewed and changes were requested; answer the review with respond, or deliver a new commit (review <id>)`
+- **Sentence once all blocking items are answered (`respond`) and awaiting re-review**:
+  `this commit was already reviewed and its requested changes were answered; wait for the reviewer to review it again, or deliver a new commit (review <id>)`
+- **CLI / endpoint envelope and exit status**: exits with status `2` and `ValueError: <sentence>` on
+  stderr; `SameCommitChangesRequested.detail` carries structured key `code:
+  "same-commit-changes-requested"` (`http_status: 409`, `task`, `review_id`, `commit`, `answered`),
+  and the endpoint envelope carries `review_status: 409`, `review_id: "<id>"` and
+  `review_answered: false | true`.
+- **HTTP status and structured key**: `POST /v1/projects/{pid}/tasks/{tid}/reviews` returns HTTP
+  `409` (`error.code: "conflict"`) with `error.message` set to the refusal sentence above and
+  structured `error.detail: {"review_id": "<id>"}` on both HTTP backends. An exact `operation_id`
+  retry of the original `contribute` still reconciles (`201`, `reconciled: true`).
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
@@ -2224,6 +2249,7 @@ lists the read-only rounds view's display bounds separately in `rounds_limits`.
 | `checkpoint` | `source_commit` / `branch` | <= 128 / <= 200 characters |
 | `checkpoint` | `open_items` / `resolved` | <= 100 each, within the 80,000-byte record; group them (one open item per theme with an id prefix, resolved ones folded) and link a longer text in a repository document through an item `source` |
 | `create` / `update` | `--description`, `--body-file` | <= 20,000 characters on the native route and on HTTP alike, answered with `Task description is too long`; keep a long text in a repository document and link it from the description |
+| `create` / `update` | `--notes`, `--append-notes` (including `--file` / `-f` attached to either) | <= 20,000 characters, answered with `Task note is too long`; keep a long text in a repository document and link it from the note |
 | `checkpoint` | item `text`/`reason` | <= 400 characters |
 | `checkpoint` | item `source`/`evidence` | <= 240 characters |
 | `checkpoint` | whole payload | <= 80 KB canonical bytes |

@@ -36,7 +36,7 @@ export function coordinationPanel(ctx, project) {
     const operators = data.host_operators || { state: 'unavailable', operators: [] };
     host.replaceChildren(h('section', { class: 'panel', 'data-panel': 'coordination' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Who coordinates'),
-        h('span', { class: 'small muted hide-narrow' }, 'Read only: owners change roles and grants on this page; operators change the installation\'s rules on the server')),
+        h('span', { class: 'small muted hide-narrow' }, 'Read only: owners change roles on People and grants on Agents; operators change the installation\'s rules on the server')),
       h('div', { class: 'panel-body stack' },
         h('div', null, h('h3', { class: 'small' }, 'People'),
           people.length ? h('ul', null, people.map((p) => h('li', { 'data-person': p.user_id },

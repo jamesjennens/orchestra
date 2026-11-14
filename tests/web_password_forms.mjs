@@ -113,6 +113,17 @@ const elementWithId = (id) => { const el = document.createElement('input'); el.s
   out.accountOneCharCalls = calls.length - before;
 }
 {
+  const { form, before } = await accountPage(5);
+  out.accountHintFive = hintOf(form, 'next');
+  fill(form, { current: 'old', next: 'abcd', confirm: 'abcd' });
+  await form.dispatch('submit');
+  out.accountFourChars = errorOf(form, 'next');
+  out.accountFourCharsCalls = calls.length - before;
+  fill(form, { current: 'old', next: 'abcde', confirm: 'abcde' });
+  await form.dispatch('submit');
+  out.accountFiveCharsCalls = calls.length - before;
+}
+{
   const { form, before } = await accountPage(8);
   out.accountHintRaised = hintOf(form, 'next');
   fill(form, { current: 'old', next: 'short', confirm: 'short' });
@@ -151,6 +162,17 @@ async function redeemPage(minimum) {
   fill(form, { account: 'usr_alex', code: 'code', new_password: 'x', confirm_password: 'x' });
   await form.dispatch('submit');
   out.redeemOneCharCalls = calls.length - before;
+}
+{
+  const { form, before } = await redeemPage(5);
+  out.redeemHintFive = hintOf(form, 'new_password');
+  fill(form, { account: 'usr_alex', code: 'code', new_password: 'abcd', confirm_password: 'abcd' });
+  await form.dispatch('submit');
+  out.redeemFourChars = errorOf(form, 'new_password');
+  out.redeemFourCharsCalls = calls.length - before;
+  fill(form, { account: 'usr_alex', code: 'code', new_password: 'abcde', confirm_password: 'abcde' });
+  await form.dispatch('submit');
+  out.redeemFiveCharsCalls = calls.length - before;
 }
 {
   const { form, before } = await redeemPage(8);

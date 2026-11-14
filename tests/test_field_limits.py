@@ -292,5 +292,45 @@ class CommentsListTests(unittest.TestCase):
                     self.assertIn('There is no `comments list`. Use `comments TASK`', str(caught.exception))
 
 
+class NoteFieldLimitTests(unittest.TestCase):
+    def test_notes_max_shares_description_bound(self):
+        self.assertEqual(field_limits.NOTES_MAX, 20000)
+        self.assertEqual(field_limits.NOTES_MAX, field_limits.DESCRIPTION_MAX)
+        self.assertIn('Task note is too long: at most 20000 characters.', field_limits.NOTES_TOO_LONG)
+        self.assertIn('link a longer repository document', field_limits.NOTES_TOO_LONG)
+
+    @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
+    def test_over_long_note_is_refused_before_any_native_call_by_every_spelling(self):
+        import endpoint
+        from unittest.mock import patch
+        limit = field_limits.NOTES_MAX
+        for flag in ('--notes', '--append-notes'):
+            for size, over in ((limit, False), (limit + 1, True)):
+                text = 'n' * size
+                for args, att in (
+                    (['update', 'example-1', flag, text], {}),
+                    (['update', 'example-1', f'{flag}={text}'], {}),
+                    (['update', 'example-1', flag, '@attachment:0'], {'0': {'flag': '--file', 'text': text}}),
+                    (['create', 'title', flag, '@attachment:0'], {'0': {'flag': '-f', 'text': text}}),
+                ):
+                    with self.subTest(flag=flag, size=size, args=args[:3], attached=bool(att)):
+                        self.assertEqual(endpoint._notes_over_limit(args, att), over)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = root / 'projects' / 'example'
+            (project / '.beads').mkdir(parents=True)
+            (project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            with patch.object(endpoint.subprocess, 'run', side_effect=AssertionError('no native call expected')):
+                for args, att in (
+                    (['update', 'example-1', '--append-notes', '@attachment:0'],
+                     {'0': {'flag': '--file', 'text': 'n' * (limit + 1)}}),
+                    (['update', 'example-1', '--notes', 'n' * (limit + 1)], {}),
+                ):
+                    with self.assertRaises(ValueError) as caught:
+                        endpoint.execute(root, {'project': 'example', 'actor': 'alice',
+                                                'action': 'bd', 'args': args, 'attachments': att})
+                    self.assertEqual(str(caught.exception), field_limits.NOTES_TOO_LONG)
+
+
 if __name__ == '__main__':
     unittest.main()

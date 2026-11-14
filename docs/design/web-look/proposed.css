@@ -1,0 +1,137 @@
+/* kittrial-5bb.523 design-system delta on app.css (base: main b08ca8d4).
+   Look only: type, spacing, colour, chips and badges, tables, empty and loading
+   states, focus, dark mode, the 375 px layout. No navigation or page-structure
+   change (that is kittrial-5bb.522's). Loaded AFTER app.css; every rule uses
+   app.css's own tokens, adds no external asset and needs no script.
+   The design note is docs/design/WEB_LOOK_DESIGN.md. */
+
+/* ============================================================ 1. type */
+/* The 11 px caps idiom stays only where it names a structure twice over:
+   table heads and rail labels (.502 §2 "a lot of tiny caps"). */
+:root { --t-2xs: 11px; --t-2xl: 24px; }            /* 26 -> 24: calmer h1 */
+h1 { font-size: var(--t-2xl); }
+th { font-size: var(--t-xs); letter-spacing: .06em; }            /* 11 -> 12 px */
+.fact-name, .resume-label, .req-part > h3 {
+  text-transform: none; letter-spacing: 0; font-size: var(--t-xs); font-weight: 600;
+}
+.page-head h1, .auth-card h1 { overflow-wrap: anywhere; }   /* never one letter per line */
+
+/* ========================================================= 2. spacing */
+/* A 4 px scale (4, 8, 12, 16, 20, 24, 32) replaces the ad-hoc 5/6/9/10/14/18 values,
+   in .502's density direction: tighter panels, rows that breathe with them. */
+:root { --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-6: 24px; --s-8: 32px; }
+/* Scoped wide: at phone width app.css's own 16px 16px 40px (already on this
+   scale) must stand -- an unscoped rule here once overrode it and squeezed
+   .main's content to 319px, less than an agent card's 340px grid floor. */
+@media (min-width: 761px) {
+  .main { padding: 20px 28px 48px; gap: var(--s-4); }            /* was 24/32, gap 20 */
+}
+.stack { gap: var(--s-4); }                                       /* was 20 */
+.detail { gap: var(--s-4); }                                      /* was 20 */
+.detail > .stack { gap: var(--s-3); }
+.rail { gap: 14px; }                                              /* was 18 */
+.panel-body { gap: var(--s-3); }
+.summary { padding: 10px 14px; }                                  /* was 12/16 */
+.form { gap: var(--s-3); }
+.field { gap: var(--s-1); }
+th { padding: 7px 12px; }                                         /* was 8 */
+td { padding: 8px 12px; }                                         /* was 9 */
+
+/* ========================================================== 3. colour */
+/* One AA fix: light warn was 4.14:1 as tone-on-soft text (12 px bold, needs 4.5).
+   #9a5c00 measures 5.38:1 on white and 4.76:1 on warn-soft. Every other token
+   pair passes; the measured table is in the design note. */
+:root { --warn: #9a5c00; }
+
+/* =========================================================== 4. chips */
+/* THE table defect: a state chip ("Approved · not integrated") could not fit its
+   120 px fixed column, so its nowrap text painted into the who-acts cell beside
+   it and clipped at the table's min-width. A chip now wraps instead: at spaces
+   first, then anywhere; the tone dot keeps its own line box. */
+.chip {
+  white-space: normal; max-width: 100%; overflow-wrap: anywhere;
+  border-radius: 8px; padding: 1px 8px; line-height: 18px;
+}
+.chip::before { flex: none; }
+/* A cell's chips sit in normal cell flow: the td KEEPS table-cell display in
+   the wide layout. Overriding it to grid once shrank the cell box to its
+   content, so the row's bottom border drew just under the chip, mid-row
+   (James, step-2 fix 1). Stacking is a phone-layout concern only, where the
+   tr -- not the td -- carries the border. */
+td .chip { display: inline-flex; }
+/* who-acts inside a cell wraps as plain text (.502's rule, refined). */
+td .who-acts { display: inline; white-space: normal; line-height: 1.6; padding: 0; border: 0; }
+td .who-acts::before { content: "→ "; }
+
+/* ========================================================== 5. tables */
+/* Column min-widths never add up to more than the column they must fit in
+   (984 px of main at 1280; 836 px at 900). State column 168 px: "Awaiting
+   review" (160 px at 12 px) and shorter labels stay on one line; composed
+   states ("Changes requested", "Approved · not integrated") fold at the
+   space -- the rule is wrap, never squeeze. Updated column fits
+   "Nov 6, 01:12". */
+@media (min-width: 761px) {
+  .task-list-project, .task-list-work { min-width: 0; }           /* was 900 / 1000 */
+  .task-list-project .task-state-column, .task-list-work .task-state-column { width: 168px; }
+  .task-list-project .task-updated-column, .task-list-work .task-updated-column { width: 96px; }
+  .task-list-project .task-title-column, .task-list-project .task-title-cell { width: auto; min-width: 300px; }
+  .task-list-project .task-next-column { width: auto; min-width: 200px; }
+  .task-list-work .task-title-column, .task-list-work .task-title-cell { width: auto; min-width: 280px; }
+  .task-list-work .task-project-column { width: 110px; }
+  .task-list-work .task-next-column { width: auto; min-width: 200px; }
+}
+/* A card never overflows its container: the 340px grid floor is capped at 100%
+   (min() degrades to one full-width column below 340px of room). */
+.agent-grid { grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); }
+/* Numbers and times right-aligned, tabular (.num in markup; the class is the rule). */
+th.num, td.num { text-align: right; }
+td.task-updated-column { text-align: right; }
+/* The My work table stacks at phone width exactly like the project table
+   (work.js emits no stack-narrow class; the CSS carries the rule). */
+@media (max-width: 760px) {
+  .task-list-work thead { display: none; }
+  .task-list-work tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .task-list-work td { padding: 0; border: 0; }
+  .task-list-work td.task-title-cell { grid-column: 1 / -1; }
+  .task-list-work td.task-state-column { display: grid; grid-template-columns: none; justify-items: start; }
+  .task-list-work td.task-next-column { grid-column: 1 / -1; }
+  /* The project table's own stacking put the state chip BESIDE the title, so a
+     long chip squeezed the title to a few characters a line. Title and chip
+     each take their own full row; the who-acts line follows. */
+  .task-list-project td.task-title-cell, .task-list-project td.task-state-column,
+  .task-list-project td.task-next-column { grid-column: 1 / -1; }
+  .task-list-project td.task-state-column { display: grid; grid-template-columns: none; justify-items: start; }
+}
+
+/* ============================================ 6. empty, loading, focus */
+/* One idiom: a block .empty for a page's whole content, a one-line .empty-line
+   for a group inside it; a loading panel is a panel with muted text and
+   aria-busy, never a blank. Nothing new here: the note pins these as THE rules. */
+.empty { border: 1px dashed var(--line-strong); border-radius: var(--radius); }
+.loading { font-size: var(--t-sm); }
+/* Focus stays a 2 px ring at 2 px offset for keyboard users, on every control,
+   chip row link and row title; nothing removes it. (No rule added; documented.) */
+
+/* The rail is sticky at 100vh, so on a page taller than the viewport its
+   background -- and the column divider -- stopped at the fold (James, step-2
+   fix 2; already so on main). The shell paints the full-height column itself:
+   surface to the rail's edge, the 1px line, then transparent for the main. */
+@media (min-width: 761px) {
+  .shell {
+    background: linear-gradient(90deg,
+      var(--surface) 0 calc(var(--rail) - 1px),
+      var(--line) calc(var(--rail) - 1px) var(--rail),
+      transparent var(--rail));
+  }
+}
+
+/* ================================================= 7. dark and motion */
+/* Dark tokens are unchanged (all pairs pass AA; measured table in the note).
+   Motion: the rail drawer's .18 s transform stays and stops under
+   prefers-reduced-motion, as in app.css. Nothing animates, appears or pulses. */
+
+/* ---- meta (not part of the product delta) ---- */
+/* Marks these four pages as mock-ups when opened from the repo. */
+.mock-note { position: fixed; right: 12px; top: 12px; z-index: 60; background: var(--ink);
+  color: var(--ground); padding: 6px 10px; border-radius: var(--radius); font-size: 12px; }

@@ -226,7 +226,16 @@ else:
                 with self.assertRaisesRegex(ValueError, 'password_min_length'):
                     service_config(self.config)
         self.config.write_text('{"schema_version":1}', encoding='utf-8')
-        self.assertEqual(1, service_config(self.config).get('password_min_length', 1))
+        omitted = service_config(self.config)
+        self.assertNotIn('password_min_length', omitted)
+        omitted_command = web_command(omitted, Path('/tmp/root'), 8443, '/usr/bin/python3',
+                                      Path('/tmp/http_service.py'))
+        self.assertNotIn('--password-min-length', omitted_command)
+        self.config.write_text('{"schema_version":1,"password_min_length":12}', encoding='utf-8')
+        twelve = service_config(self.config)
+        twelve_command = web_command(twelve, Path('/tmp/root'), 8443, '/usr/bin/python3',
+                                     Path('/tmp/http_service.py'))
+        self.assertEqual(12, twelve_command[twelve_command.index('--password-min-length') + 1])
 
     def test_private_root_accepts_a_root_with_a_space(self):
         """kittrial-5bb.220 revision: run/health on an existing runtime with a space in its root

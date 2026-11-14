@@ -1592,7 +1592,7 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertIn('Who: Each member, for their own agent.', steps['agent']['text'])
         self.assertEqual(steps['first-task']['links'], ['#/p/%s/new' % project])
         self.assertEqual(steps['agent']['links'], ['#/agents'])
-        self.assertEqual(steps['members']['links'], ['#/p/%s/settings' % project])
+        self.assertEqual(steps['members']['links'], ['#/p/%s/people' % project])
         # A step still to do leads with the way there; a done one keeps a quiet link.
         self.assertEqual((steps['first-task']['linkTexts'], steps['members']['linkTexts']), (['Go there'], ['Open']))
         # No host behind this service, so it cannot say how its commands begin: the words to replace are named.
@@ -1645,7 +1645,7 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(seen['contributor']['steps'], 0)
         self.assertIn('Only an owner of this project, or a superuser, can see its setup steps.',
                       seen['contributor']['text'])
-        self.assertEqual(seen['routes'], {'members': '/p/p1/settings', 'task': '/p/p1/new', 'agent': '/agents',
+        self.assertEqual(seen['routes'], {'members': '/p/p1/people', 'task': '/p/p1/new', 'agent': '/agents',
                                           'guidance': None})
         self.assertEqual(seen['summary'], ['Nothing is left to do here.', '1 step is left.', '4 steps are left.'])
         # kittrial-5bb.123: a step that could not be checked is said; a token-like value is warned about.

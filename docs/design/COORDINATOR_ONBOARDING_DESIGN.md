@@ -29,7 +29,7 @@
 
 ## 3. The walkthrough
 
-**Where it lives:** one page per project, "Hand this project to a coordinator", linked from Members & settings and from the project's Set-up page (`project_setup.steps`, project_setup.py:128).
+**Where it lives:** one page per project, "Hand this project to a coordinator", linked from the project's People, Agents and Settings pages (Members & settings before kittrial-5bb.522 slice 2) and from the project's Set-up page (`project_setup.steps`, project_setup.py:128).
 
 **One list, two sides:** the owner and the new coordinator see the same ordered list of steps. Each step is checked live from state the server already holds, every time the page is read, and is marked done, to do, waiting on someone, or failed. A failed step says in one plain sentence who fixes it and how. The page never fixes anything by itself; each fix is the existing route behind the step's button.
 
@@ -249,3 +249,32 @@ It gets its own design note when it is scheduled.
 - It does not let the site change installation switches.
 - It does not give the server any view of an agent's PC beyond what the agent itself reports, labelled as its claim.
 - It does not design the requirements-gathering phase (§8).
+
+## 10. The server-recorded approval basis (designed in kittrial-5bb.485; built by kittrial-5bb.515)
+
+*As built (kittrial-5bb.515).* The sections below keep the design's reasoning; this block says what the code does, and where it differs from the design the code wins. Two commits on one branch: A (readers) and B (writers), integrated in two releases.
+
+- **The field.** `approval_basis` on `approve` (`review_workflow.OPTIONAL['approve']`; `APPROVAL_BASIS`, `APPROVAL_BASES` in review_workflow.py). The value is only a token of the closed vocabulary, `same-person-agent` or `same-person-worker-credential` (the worker-credential basis of kittrial-5bb.519); `validate` refuses anything else ("Invalid approval basis"). The setting's mode, who set it and when stay in the audit entry (`same_person_coordinator`, `agent_approval`, `agent_approval_set_by`, `agent_approval_set_at`) and are not copied into the record, so the field needs no length limit beyond the vocabulary.
+- **Only the service writes it.** `check_write_fields(payload, by_service)` refuses the field unless `execute` was given the service's `verified_web_authority`; the host `review` action and `review --file` therefore refuse it. The web route answers 422 to a request body that names it (approve and recommend).
+- **Readers (A).** The projection carries `approval_basis` (`basis`, `text`, `comment_id`, `author`, `timestamp`) only while the approval stands and only from the record's field. `brief` prints an `Approval basis:` line, the endpoint backend and the in-process backend pass it to the task page, which shows it as its own line (class `approval-basis`) apart from the summary. An approval with no field is the old form: its summary is plain text, no line, no badge; the audit stays the authority for those, so the design's idea of showing a line for an old record from the audit entry is NOT built.
+- **The advertisement (A).** `review --help` lists `optional_fields` per operation (`review_workflow.help_optional_fields`); `approve` lists `approval_basis`.
+- **Writers (B).** The web route and the in-process backend write the field instead of appending `SAME_PERSON_APPROVAL`, only when the endpoint backend's `review --help` lists `approval_basis` under `optional_fields.approve`. That is the single gate: there is no release switch. Otherwise the sentence is appended as before, and the text gate stays. An in-process backend is the same kit as the service, so it advertises the field itself.
+- **C (not built).** Once B is released everywhere and no kit appends the sentence, remove `_contains_same_person_approval`, its two uses and the fallback path. Filed as a task; see docs/OPERATIONS.md.
+
+
+Today the server records why an approval was let through (kittrial-5bb.438, `agent_approval: by-agent`) by appending one sentence to the caller's summary (`ApiHandler.SAME_PERSON_APPROVAL`, http_service.py:6916) and refusing a caller-written summary that contains it (`_contains_same_person_approval`). That is a text gate: kittrial-5bb.485 narrows its escapes (NFKD with marks dropped, symbols dropped, all whitespace removed, the length refusal first), but a text gate can only ever be narrowed. The end state has no gate: the basis is a field the server writes and the caller cannot.
+
+**The field.** An additive optional field on the `approve` record, `approval_basis`, added to the optional fields of `approve` (a new `OPTIONAL['approve']` entry beside review_workflow.py:117; `assignee_at_approval`, defined at :194, is today allowed for `approve` by hand at :609-610). Its value is a short token naming the basis, for example `same-person-agent`, plus the setting that allowed it (`by-agent`), who set it and when (the data the audit entry already holds: `agent_approval`, `agent_approval_set_by`, `agent_approval_set_at`). It is length-limited like every record text (field_limits.py). The caller cannot send it: the route refuses the field in a request body, and `execute` stamps it.
+
+**Rollout, readers first, then writers.** The `approve` field set is validated EXACTLY (review_workflow.py:90-118, :593-606). Every reader on a kit without the field refuses a record that carries it ("Invalid review workflow fields"): the host client, an older endpoint during a rollback, and bundles reviewed on another lane. So:
+1. Release the readers: a kit whose `validate` allows the field and whose readers ignore or show it. Nothing writes it yet.
+2. Wait until no supported reader predates step 1 (the host client, every endpoint, every lane that reviews bundles).
+3. Only then release the writer, behind the same release gate as other additive record fields. Adding the field is not rollback-safe once written (the note at review_workflow.py:187-193 says the same of `assignee_at_approval`): rolling the writer back leaves records older readers cannot read, so the writer step is the one with no way back and is its own release.
+
+**Both forms stay readable.** Approvals already written keep the sentence inside their summary and no field. A reader treats a record with the field as authoritative and a record without it as the old form, where the sentence (compared as `_normalize_basis_text` does) is the only evidence. The gate that refuses a caller-written sentence stays for as long as the old form can still be written, that is until the writer step has shipped everywhere and the sentence is no longer appended; after that the sentence is ordinary text and the gate can go.
+
+**What people see.** The task page, the briefing and the review read show the basis as its own line apart from the summary ("Allowed by: coordinator agent of the same person as the delivering agent (project setting: by agent, set by X on D)"), taken from the field and never parsed from the summary. The summary then shows only what the approver wrote, so a caller can no longer pass off text in it as the server's. For an old-form record the same line is shown from the audit entry when there is one, else not shown.
+
+**Residual until then.** Cross-script homoglyphs (a Cyrillic "а" for a Latin "a" in the forged sentence) still pass the text gate, because the comparison does not map confusables. The audit entry (`same_person_coordinator`, written by the server) remains the authority in the meantime. Only the field closes this, since it removes the comparison.
+
+**Not in this note.** Any code, the token's final spelling, and the release dates; it is filed as its own task.

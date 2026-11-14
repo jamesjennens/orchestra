@@ -435,6 +435,105 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
                 answer = self.raw([command, fact['id'], '--json'], actor='op')
                 self.assertEqual(answer['returncode'], 0, answer)
 
+    def test_note_file_attachments_on_readable_task_with_large_comments_and_history(self):
+        """kittrial-5bb.517: `update TASK --append-notes --file ...` and `--notes -f ...`
+        post cleanly on a readable task with >256 KiB of comments, an edited comment, and
+        >256 KiB of history, while keeping lifecycle refusals, non-note value-flag attachment
+        refusals, and the 20,000-character note bound intact."""
+        import admin
+        import field_history
+        import field_limits
+        target = self.target()
+        # Populate >256 KiB of comments, an edited comment, and >256 KiB of history revisions.
+        big_comment = 'Long comment body from another actor. ' * 7500
+        added = endpoint.execute(self.root, dict(
+            project='pp', actor='other-actor', action='bd',
+            args=['comments', 'add', target, '@attachment:0', '--json'],
+            attachments={'0': {'flag': '--file', 'text': big_comment}},
+        ))
+        self.assertEqual(added['returncode'], 0, added)
+        cid = json.loads(added['stdout'])['id']
+        admin.sql(
+            self.root,
+            f"USE pp; UPDATE comments SET text = CONCAT(text, '\\nEdited paragraph.') WHERE id = '{cid}';",
+        )
+        seed_note = (
+            'Earlier note quoting bare entry ids 01a1a6f6-a51e-7000-8000-000000000001 '
+            'and c01a1a6f6-a51e-7000-8000-000000000002 in prose.\n'
+        ) * 75
+        for idx in range(11):
+            updated = self.raw(
+                ['update', target, '--append-notes', f'Note {idx}:\n{seed_note}', '--json'],
+                actor='other-actor',
+            )
+            self.assertEqual(updated['returncode'], 0, updated)
+        hist_out = self.bd('history', target, '--limit', '50', '--json').stdout
+        self.assertGreater(len(hist_out.encode('utf-8')), field_history.HISTORY_MAX_BYTES)
+        shown = self.raw(['show', target, '--json'], actor='mallory')
+        self.assertEqual(shown['returncode'], 0, shown)
+        comments_out = self.raw(['comments', target, '--json'], actor='mallory')
+        self.assertEqual(comments_out['returncode'], 0, comments_out)
+        self.assertGreater(len(comments_out['stdout'].encode('utf-8')), 262144)
+
+        # ~7 KB note quoting task/comment tokens (`pp-x.1-c01...`) via --append-notes --file and -f.
+        note_block = (
+            'Reproduced on pp-5bb.510-c01a1a35f-317a-7ec6-9f64-e01a71f3312d and '
+            'pp-5bb.513-c01a1a519-063f-7a56-988e-4d5e94c8c97b with Dolt SQL.\n'
+        ) * 55
+        self.assertGreater(len(note_block), 6500)
+        for note_flag, att_flag in (('--notes', '--file'), ('--append-notes', '-f')):
+            ans = endpoint.execute(self.root, dict(
+                project='pp', actor='mallory', action='bd',
+                args=['update', target, note_flag, '@attachment:0', '--json'],
+                attachments={'0': {'flag': att_flag, 'text': note_block}},
+            ))
+            self.assertEqual(ans['returncode'], 0, ans)
+        row_after = json.loads(self.raw(['show', target, '--json'], actor='mallory')['stdout'])[0]
+        self.assertIn('pp-5bb.510-c01a1a35f-317a-7ec6-9f64-e01a71f3312d', row_after['notes'])
+        self.assertGreaterEqual(row_after['notes'].count('pp-5bb.510-c01a1a35f-317a-7ec6-9f64-e01a71f3312d'), 110)
+
+        # Lifecycle refusals stay intact alongside a note attachment, and an unreadable row
+        # still refuses with "the affected tasks could not be read completely".
+        self.no_write(
+            ['update', target, '--append-notes', '@attachment:0', '--add-label=reviewed:passed', '--json'],
+            attachments={'0': {'flag': '--file', 'text': 'attempt'}},
+        )
+        with mock.patch.object(endpoint, '_bd_read',
+                               return_value=([{'id': target, 'title': None, 'issue_type': 'task'}], '')):
+            self.no_write(
+                ['update', target, '--append-notes', '@attachment:0', '--json'],
+                regex='affected tasks could not be read completely.*no native write',
+                attachments={'0': {'flag': '--file', 'text': 'attempt'}},
+            )
+
+        # Other value flags followed by a file attachment are refused naming --append-notes and --notes.
+        for bad_flag, att_flag in (('--description', '--file'), ('--title', '-f'), ('-d', '--file')):
+            self.no_write(
+                ['update', target, bad_flag, '@attachment:0', '--json'],
+                regex=r'Refusing update: .*only --append-notes and --notes.*Nothing was written\.',
+                attachments={'0': {'flag': att_flag, 'text': 'never written'}},
+            )
+
+        # Note bound (NOTES_MAX = 20,000): at the bound succeeds; one over is refused before bd runs.
+        at_bound = endpoint.execute(self.root, dict(
+            project='pp', actor='mallory', action='bd',
+            args=['update', target, '--notes', '@attachment:0', '--json'],
+            attachments={'0': {'flag': '--file', 'text': 'n' * field_limits.NOTES_MAX}},
+        ))
+        self.assertEqual(at_bound['returncode'], 0, at_bound)
+        self.assertEqual(
+            len(json.loads(self.raw(['show', target, '--json'], actor='mallory')['stdout'])[0]['notes']),
+            field_limits.NOTES_MAX,
+        )
+        for args, att in (
+            (['update', target, '--append-notes', '@attachment:0', '--json'],
+             {'0': {'flag': '--file', 'text': 'n' * (field_limits.NOTES_MAX + 1)}}),
+            (['update', target, '--notes=' + ('n' * (field_limits.NOTES_MAX + 1)), '--json'], {}),
+            (['create', 'overlong note', '--notes', '@attachment:0', '--json'],
+             {'0': {'flag': '-f', 'text': 'n' * (field_limits.NOTES_MAX + 1)}}),
+        ):
+            self.no_write(args, regex='Task note is too long: at most 20000 characters', attachments=att)
+
 
 if __name__ == '__main__':
     unittest.main()

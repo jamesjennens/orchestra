@@ -52,9 +52,11 @@ this actor first and inspect requested revisions before other existing claims. N
 register a replacement actor to take over work.
 For a delivered contribution, inspect structured changes-requested state and newer
 history for that exact commit first. A task of yours with changes requested is your work
-until you deliver a revision: "nothing changed" never applies to it. Otherwise, if
-nothing new is actionable, leave it unchanged and stop rather than inventing work. Stop
-without acting only when every task of yours is with the reviewer or the coordinator.
+(respond to each item; where an item needs a code change, deliver a new commit that
+supersedes this contribution; the same commit is refused): "nothing changed" never
+applies to it. Otherwise, if nothing new is actionable, leave it unchanged and stop
+rather than inventing work. Stop without acting only when every task of yours is with the
+reviewer or the coordinator.
 
 When you need a decision or information, ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you.
 

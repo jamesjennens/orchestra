@@ -551,6 +551,27 @@ of a kittrial-sized export, as the context index did for find.
      4. its scope covers the record kind, and no later narrowing or revocation excludes it.
 
      Each refusal names its reason.
+
+     Further rules (kittrial-5bb.469):
+     - **Closing is not revoking.** Closing a decision issue does not end its delegation, and
+       reopening one does not bring it back: authority depends only on owner- or operator-written,
+       journaled records, and a contributor can change an issue's status. Only the delegation
+       operation's `revoke` ends it. The delegation list shows each decision's `status` and, for a
+       closed decision still in force, says so.
+     - **An unhonoured comment is listed.** A decision that carries a `Kind: delegation-v1` comment
+       with no valid journal entry (a grant that lost its entry) is listed as not in force, with the
+       reason "has an unhonoured comment", so the owner can record a new decision.
+     - **A retype does not hide a delegation.** A plain host actor can retype a decision issue. A
+       delegation read also accepts an issue carrying the reserved `delegation` label (only the
+       delegation operation adds it; a raw label write or removal is refused). The label keeps a
+       retyped decision readable and revocable; it never creates authority, which still needs an
+       honoured owner record, and the list notes the current type.
+     - **Label first.** The delegation operation adds the label before the native comment, so a
+       crash after the comment leaves a labelled decision the list finds.
+     - **Lookalikes.** A raw comment starting `Kind: delegation-` or `Kind: decision-attest-` without
+       the full `-v1` line is refused like the real prefix; the real records stay visible as comments.
+     - **Many comments slow reads.** A flood of comments on a decision issue slows the reads that
+       check it; a read that times out refuses, so the delegation fails closed.
    - **Tests:** one per refusal, revocation and narrowing on the next write, the grant removed,
      the recorder demoted, a planted lookalike without its journal entry, a person coordinator,
      contributors and viewers unaffected (tests/test_delegations.py and the native delegation

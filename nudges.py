@@ -59,6 +59,13 @@ PERSON_LIMITS = {'gap': 5 * 60, 'lane_hour': 6, 'project_hour': 30}
 AGENT_LIMITS = {'gap': 15 * 60, 'lane_hour': 3, 'agent_hour': 10, 'agents_project_hour': 10}
 HOUR = 3600
 
+#: Automatic lane nudge bounds (design section 4, kittrial-5bb.514): twice the idle threshold with
+#: a 30-minute floor, at most 1 automatic nudge per lane per 6 hours and 2 per 24 hours across projects.
+AUTO_MIN_IDLE_SECONDS = 30 * 60
+AUTO_GAP_SECONDS = 6 * HOUR
+AUTO_DAY_SECONDS = 24 * HOUR
+AUTO_DAY_LIMIT = 2
+
 WAIT_STATES = ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user')
 LANE_LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 CONTROL = re.compile(r'[\x00-\x1f\x7f]')
@@ -122,13 +129,21 @@ def waiting_sentence(snapshot):
     return DECLARED_WAIT % (snapshot.get('waiting_on') or snapshot['state'], snapshot.get('since') or 'an unknown time')
 
 
-def new_record(project_id, fields, requested_by, snapshot, now, iso):
+def new_record(project_id, fields, requested_by, snapshot, now, iso,
+               episode_task=None, episode_write_at=None, episode_started_ts=None):
     """One ``lane-nudge-v1`` record, pending. ``iso`` turns epoch seconds into the stored time text."""
-    return {'schema': SCHEMA, 'id': 'nudge-' + secrets.token_hex(12), 'project': project_id,
-            'lane': fields['lane'], 'message': fields['message'], 'reason': fields['reason'],
-            'note': fields['note'], 'requested_by': requested_by, 'requested_at': iso(now),
-            'requested_ts': now, 'declared_wait': snapshot, 'state': PENDING,
-            'claimed_by': None, 'claim_expires_at': None, 'claim_expires_ts': None, 'outcome_at': None, 'outcome_detail': None}
+    record = {'schema': SCHEMA, 'id': 'nudge-' + secrets.token_hex(12), 'project': project_id,
+              'lane': fields['lane'], 'message': fields['message'], 'reason': fields['reason'],
+              'note': fields['note'], 'requested_by': requested_by, 'requested_at': iso(now),
+              'requested_ts': now, 'declared_wait': snapshot, 'state': PENDING,
+              'claimed_by': None, 'claim_expires_at': None, 'claim_expires_ts': None, 'outcome_at': None, 'outcome_detail': None}
+    if episode_task is not None:
+        record['episode_task'] = episode_task
+    if episode_write_at is not None:
+        record['episode_write_at'] = episode_write_at
+    if episode_started_ts is not None:
+        record['episode_started_ts'] = episode_started_ts
+    return record
 
 
 def _stamp(record):
@@ -200,9 +215,10 @@ def settle(records, now, iso, carried=None):
     drop = [record for record in finished if now - _stamp(record) > KEEP_SECONDS]
     spare = len(records) - len(drop) - KEEP_RECORDS
     if spare > 0:
-        # Only records older than an hour go for the bound: the newest hour still counts toward the
-        # limits. It holds at most 30 persons' and 10 agents' records per project (and a lane's own).
-        kept = [record for record in finished if record not in drop and now - _stamp(record) >= HOUR]
+        # Only records older than an hour (or 24 hours for automatic nudges) go for the bound:
+        # the newest window still counts toward the limits.
+        kept = [record for record in finished if record not in drop
+                and now - _stamp(record) >= (AUTO_DAY_SECONDS if (record.get('requested_by') or {}).get('kind') == 'auto' else HOUR)]
         drop.extend(kept[:spare])
     if drop:
         records[:] = [record for record in records if not any(record is gone for gone in drop)]
@@ -229,10 +245,10 @@ def retry_after(records, lane, kind, agent_id, now):
     # A stamp in the future (the clock stepped back) counts for nothing: it must not block a lane.
     stamps = [(record, stamp) for record, stamp in ((r, _stamp(r)) for r in records if isinstance(r, dict))
               if stamp <= now]
-    # A person's per-lane bounds count persons' records only (an agent's request must not make a
-    # person wait); an agent's count every record on the lane.
+    # A person's per-lane bounds count persons' records only (an agent's or automatic request must
+    # not make a person wait); an agent's count every record on the lane.
     lane_stamps = sorted(stamp for record, stamp in stamps if record.get('lane') == lane
-                         and (kind == 'agent' or (record.get('requested_by') or {}).get('kind') != 'agent'))
+                         and (kind == 'agent' or (record.get('requested_by') or {}).get('kind') not in ('agent', 'auto')))
     waits = []
     if lane_stamps and now - lane_stamps[-1] < limits['gap']:
         waits.append(lane_stamps[-1] + limits['gap'] - now)
@@ -241,12 +257,13 @@ def retry_after(records, lane, kind, agent_id, now):
         waits.append(recent[len(recent) - limits['lane_hour']] + HOUR - now)
 
     def hourly(of_kind, bound, only_agent=None):
+        target_kinds = ('agent',) if of_kind else ('person', None)
         mine = sorted(stamp for record, stamp in stamps if now - stamp < HOUR
-                      and ((record.get('requested_by') or {}).get('kind') == 'agent') == of_kind
+                      and (record.get('requested_by') or {}).get('kind') in target_kinds
                       and (only_agent is None or (record.get('requested_by') or {}).get('agent_id') == only_agent))
         if len(mine) >= bound:
             waits.append(mine[len(mine) - bound] + HOUR - now)
-    # Agents' records never count against persons: each kind has its own project bound.
+    # Agents' and automatic records never count against persons: each kind has its own project bound.
     if kind == 'agent':
         hourly(True, limits['agent_hour'], agent_id)
         hourly(True, limits['agents_project_hour'])
@@ -256,9 +273,11 @@ def retry_after(records, lane, kind, agent_id, now):
 
 
 def display(requested_by, users, agents):
-    """Who asked, as a sentence part: the person's display name, or the agent's name and ``(agent)``."""
+    """Who asked, as a sentence part: the person's display name, ``automatic``, or the agent's name and ``(agent)``."""
     if not isinstance(requested_by, dict):
         return 'unknown'
+    if requested_by.get('kind') == 'auto':
+        return 'automatic'
     if requested_by.get('kind') == 'agent':
         agent = agents.get(requested_by.get('agent_id')) if isinstance(agents, dict) else None
         name = agent.get('name') if isinstance(agent, dict) else None
@@ -284,3 +303,176 @@ def row_view(shown):
         return None
     return {key: shown.get(key) for key in ('id', 'message', 'state', 'requested_at', 'requested_by_display',
                                             'outcome_at', 'outcome_detail')}
+
+
+def auto_threshold_seconds(threshold_seconds):
+    """Twice the idle threshold with a 30-minute floor (design section 4)."""
+    return max(2 * int(threshold_seconds), AUTO_MIN_IDLE_SECONDS)
+
+
+def auto_episode_nudge(records, lane, entry, now, row=None):
+    """The automatic nudge record for ``lane`` in this idle episode, or ``None``.
+
+    An episode resets when the lane writes on the task (changing ``holder_last_write_at`` or
+    making ``holder_last_write_seconds`` / ``last_write_age_seconds`` smaller than the age of
+    the nudge). While the lane has not written since the nudge, the same episode continues even
+    past the 6-hour gap.
+    """
+    write_at = entry.get('holder_last_write_at') if isinstance(entry, dict) else None
+    idle = entry.get('holder_last_write_seconds') if isinstance(entry, dict) else None
+    lane_idle = row.get('last_write_age_seconds') if isinstance(row, dict) else None
+    for record in reversed(records or ()):
+        if not isinstance(record, dict) or record.get('lane') != lane:
+            continue
+        if (record.get('requested_by') or {}).get('kind') != 'auto':
+            continue
+        stamp = _stamp(record)
+        if stamp > now:
+            continue
+        nudge_age = max(0, int(now - stamp))
+        if isinstance(lane_idle, int) and lane_idle < nudge_age:
+            continue
+        if isinstance(idle, int) and idle < nudge_age:
+            continue
+        if write_at is not None and record.get('episode_write_at') is not None:
+            if record.get('episode_task') == entry.get('task') and record.get('episode_write_at') == write_at:
+                return record
+            continue
+        if isinstance(idle, int) and stamp >= now - idle:
+            return record
+    return None
+
+
+def auto_episode_nudged(records, lane, entry, now, row=None):
+    """Whether ``lane`` has already received an automatic nudge in this idle episode."""
+    return auto_episode_nudge(records, lane, entry, now, row=row) is not None
+
+
+def auto_allowed(all_records, lane, now):
+    """Whether ``lane`` is within the 1-per-6h and 2-per-24h automatic nudge caps across projects."""
+    stamps = sorted(_stamp(record) for record in (all_records or ())
+                    if isinstance(record, dict) and record.get('lane') == lane
+                    and (record.get('requested_by') or {}).get('kind') == 'auto'
+                    and _stamp(record) <= now)
+    if not stamps:
+        return True
+    if now - stamps[-1] < AUTO_GAP_SECONDS:
+        return False
+    recent_day = [stamp for stamp in stamps if now - stamp < AUTO_DAY_SECONDS]
+    return len(recent_day) < AUTO_DAY_LIMIT
+
+
+def eligible_auto_nudge_entry(row, threshold_seconds, records, lane, now):
+    """The first held task on ``row`` eligible for an automatic nudge at ``now``, or ``None``.
+
+    Design sections 4 and 5: only ``your_move_idle`` (whose_move ``you``), never on a
+    ``holder_retired`` lane, never on a declared ``waiting-on-*`` of either kind in section 5,
+    never on ``waiting_too_long`` or ``expect_by_passed`` alone, and only after twice the idle
+    threshold (minimum 30 minutes) with at most one automatic nudge per idle episode.
+    """
+    if not isinstance(row, dict) or row.get('holder_retired'):
+        return None
+    if 'holder_retired' in (row.get('flag_tasks') or {}):
+        return None
+    if declared_wait(row) is not None:
+        return None
+    auto_threshold = auto_threshold_seconds(threshold_seconds)
+    lane_age = row.get('last_write_age_seconds')
+    if isinstance(lane_age, int) and lane_age <= auto_threshold:
+        return None
+    held = [entry for entry in (row.get('held') or []) if isinstance(entry, dict)]
+    for entry in held:
+        if auto_episode_nudged(records, lane, entry, now, row=row):
+            return None
+    for entry in held:
+        flags = entry.get('flags') or []
+        if 'your_move_idle' not in flags or 'holder_retired' in flags:
+            continue
+        if entry.get('whose_move') != 'you':
+            continue
+        if entry.get('declared') and entry.get('state') in WAIT_STATES:
+            continue
+        idle = entry.get('holder_last_write_seconds')
+        if not isinstance(idle, int) or idle <= auto_threshold:
+            continue
+        return entry
+    return None
+
+
+def withhold_auto_nudge_lanes(lanes_payload, records, all_records, carried, now, iso,
+                              users=None, agents=None, carried_fn=None):
+    """Return a copy of ``lanes_payload`` with ``your_move_idle`` withheld during an automatic-nudge window.
+
+    Read-only: computed from stored automatic nudge records and the board alone so a coordinator
+    wait never writes state and keeps a stable fingerprint between polls inside the withheld window.
+    Once one threshold has passed after the automatic nudge without the lane writing, ``your_move_idle``
+    is no longer withheld and the settled ``nudge`` row view is attached to the lane row.
+    """
+    if not isinstance(lanes_payload, dict):
+        return lanes_payload
+    threshold_minutes = lanes_payload.get('idle_threshold_minutes')
+    if not isinstance(threshold_minutes, int) or threshold_minutes <= 0:
+        threshold_minutes = 15
+    threshold_seconds = threshold_minutes * 60
+    auto_threshold = auto_threshold_seconds(threshold_seconds)
+    items = []
+    for row in lanes_payload.get('items') or []:
+        if not isinstance(row, dict):
+            items.append(row)
+            continue
+        actor = row.get('actor') or row.get('lane')
+        if (not carried.get(actor) or row.get('holder_retired')
+                or 'holder_retired' in (row.get('flag_tasks') or {})
+                or declared_wait(row) is not None):
+            items.append(row)
+            continue
+        held_entries = [entry for entry in (row.get('held') or []) if isinstance(entry, dict)]
+        episode_record = None
+        for entry in held_entries:
+            found = auto_episode_nudge(records, actor, entry, now, row=row)
+            if found is not None:
+                episode_record = found
+                break
+        withhold_idle = False
+        wake_nudge = None
+        if episode_record is not None:
+            settled = effective(episode_record, now, iso, carried_fn)
+            failed_states = (NOT_DELIVERABLE, CANCELLED, EXPIRED, 'failed', 'unsupported')
+            if now - _stamp(episode_record) < threshold_seconds and settled.get('state') not in failed_states:
+                withhold_idle = True
+            else:
+                wake_nudge = row_view(view(settled, users or {}, agents or {}))
+        else:
+            eligible_entries = [
+                entry for entry in held_entries
+                if 'your_move_idle' in (entry.get('flags') or [])
+                and entry.get('whose_move') == 'you'
+                and isinstance(entry.get('holder_last_write_seconds'), int)
+                and entry['holder_last_write_seconds'] <= auto_threshold + CARRIER_WINDOW
+            ]
+            if eligible_entries and auto_allowed(all_records, actor, now):
+                withhold_idle = True
+        if not withhold_idle and wake_nudge is None:
+            items.append(row)
+            continue
+        new_row = dict(row)
+        if withhold_idle:
+            new_held = []
+            for entry in row.get('held') or []:
+                if isinstance(entry, dict) and 'your_move_idle' in (entry.get('flags') or []):
+                    new_entry = dict(entry)
+                    new_entry['flags'] = [flag for flag in (entry.get('flags') or []) if flag != 'your_move_idle']
+                    new_held.append(new_entry)
+                else:
+                    new_held.append(entry)
+            new_row['held'] = new_held
+            flag_tasks = dict(row.get('flag_tasks') or {})
+            flag_tasks.pop('your_move_idle', None)
+            new_row['flag_tasks'] = flag_tasks
+            new_row['your_move_idle'] = False
+        elif wake_nudge is not None:
+            new_row['nudge'] = wake_nudge
+        items.append(new_row)
+    result = dict(lanes_payload)
+    result['items'] = items
+    return result

@@ -57,9 +57,13 @@ const out = {
     && projectTitle.textContent === title && projectTable && /-webkit-line-clamp:\s*3/.test(clampRule)),
   workClamped: Boolean(workTitle && workTitle.attributes.title === title
     && workTitle.textContent === title && workTable && /-webkit-line-clamp:\s*3/.test(clampRule)),
+  // .523: the desktop tables dropped the fixed 900/1000px min-widths (they forced
+  // the table past the room it gets - 836px of main at a 900px viewport - and
+  // squeezed the state column until its chip ran into the neighbour). Desktop
+  // sizing is now fixed layout + min-width 0 with a 168px state column.
   desktopSizing: /@media\s*\(min-width:\s*761px\)/.test(css)
-    && /\.task-list-project\s*\{\s*min-width:\s*900px;\s*\}/.test(css)
-    && /\.task-list-work\s*\{\s*min-width:\s*1000px;\s*\}/.test(css),
+    && /\.task-list-project, \.task-list-work \{ table-layout: fixed; min-width: 0; \}/.test(css)
+    && /\.task-state-column, \.task-list-work \.task-state-column \{ width: 168px; \}/.test(css),
 };
 if (!out.projectClamped || !out.workClamped || !out.desktopSizing) {
   throw new Error('Task title clamp or desktop table sizing is missing: ' + JSON.stringify(out));

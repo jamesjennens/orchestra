@@ -2710,7 +2710,12 @@ def format_context_pointers(item):
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
     lines=[f'{result["task"]}: {excerpt(result["title"])}',f'Owner: {excerpt(result["owner"])} | Status: {result["status"]}',
-           'Review/contribution: '+json.dumps(result['review'],ensure_ascii=False),
+           'Review/contribution: '+json.dumps(result['review'],ensure_ascii=False)]
+    # kittrial-5bb.515: why the server let the standing approval through, on its own line apart from any
+    # summary; present only when the approval record carries the field.
+    basis=result['review'].get('approval_basis')
+    if isinstance(basis,dict) and isinstance(basis.get('text'),str):lines.append('Approval basis: '+basis['text'])
+    lines+=[
            'Intent: '+excerpt(result['intent']),'Acceptance: '+excerpt(result['acceptance']),
            'Current position: '+result['current_position'],'Next: '+result['next_action']]
     lines.extend(item['message'] for item in (result.get('assignment_notices') or {}).get('items',[]))

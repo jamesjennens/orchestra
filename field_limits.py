@@ -33,3 +33,8 @@ def describe(limits):
 DESCRIPTION_MAX = 20000
 DESCRIPTION_TOO_LONG = ('Task description is too long: at most %d characters. Keep the description short and '
                         'link a longer repository document from it.' % DESCRIPTION_MAX)
+# A note given on create/update (--notes, --append-notes, inline or --file/-f) travels in bd's argv
+# (Linux MAX_ARG_STRLEN is 128 KiB), so it shares DESCRIPTION_MAX (kittrial-5bb.517).
+NOTES_MAX = DESCRIPTION_MAX
+NOTES_TOO_LONG = ('Task note is too long: at most %d characters. Keep the note short and '
+                  'link a longer repository document from it.' % NOTES_MAX)

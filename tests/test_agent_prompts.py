@@ -174,6 +174,8 @@ class PromptCase(unittest.TestCase):
         items = [row('t1', 'changes-requested', ME, pending=['item-1', 'item-2']),
                  row('t2', 'changes-requested', ME)]
         text = prompt([classify(WORKER, items)])['text']
+        self.assertIn('Changes requested on your tasks: respond to each item; where an item needs a code change, '
+                      'deliver a new commit that supersedes this contribution; the same commit is refused:', text)
         self.assertIn('pending request items: item-1, item-2', text)
         self.assertIn('read the task brief for the pending request items', text)
 

@@ -144,26 +144,44 @@ def source_matches(scope, approved):
     return commit
 
 
-def approved_party(approved, issue, parties=None):
+#: The one sentence (409) for an approval of the author's or the current assignee's party.
+OTHER_PARTY_REQUIRED = 'The approval must be from another party than the author and current assignee'
+
+
+def approved_party(approved, issue, parties=None, by_agent=None):
     """The writer's authenticated party checks, after approval and source.
 
     Main's order matters when two checks fail at once: the source sentence and
     its 409 win over the missing-party 503 and the same-party 409.
+
+    ``by_agent(approver, author, assignee)`` (kittrial-5bb.560) is the project's
+    by-agent approval decision (:func:`http_authority.by_agent_approval`, from the
+    present state). It is asked only when the party sets meet, and lets the approval
+    through only when its answer is ``allowed``: a coordinator agent that approved
+    ANOTHER agent of its person, or a worker credential only that person held, while
+    the project's setting is ``by-agent`` and its grant is effective now. Without it
+    the rule is the strict one, exactly as before.
     """
     if not callable(parties):
         raise LifecycleError(503, 'Configured web party ownership is unavailable')
-    approving_party = parties((approved or {}).get('approver'))
-    if (not approving_party or approving_party & parties((approved or {}).get('author'))
-            or (issue.get('assignee') and approving_party & parties(issue['assignee']))):
-        raise LifecycleError(409, 'The approval must be from another party than the author and current assignee')
+    approver = (approved or {}).get('approver')
+    author = (approved or {}).get('author')
+    assignee = issue.get('assignee')
+    approving_party = parties(approver)
+    if not approving_party:
+        raise LifecycleError(409, OTHER_PARTY_REQUIRED)
+    if (approving_party & parties(author)) or (assignee and approving_party & parties(assignee)):
+        decision = by_agent(approver, author, assignee) if callable(by_agent) else None
+        if getattr(decision, 'allowed', False) is not True:
+            raise LifecycleError(409, OTHER_PARTY_REQUIRED)
     return sorted(approving_party)
 
 
-def approved_source(issue, scope, operators=None, owners=None, project=None, parties=None):
+def approved_source(issue, scope, operators=None, owners=None, project=None, parties=None, by_agent=None):
     """Approval, full source commit, parties callable, other party: main's order."""
     approved = standing_approval(issue, operators, owners, project)
     approved['commit'] = source_matches(scope, approved)
-    approved_party(approved, issue, parties)
+    approved_party(approved, issue, parties, by_agent)
     return approved
 
 
@@ -195,7 +213,7 @@ def mark_admission(project, enabled, event_id=None):
 
 
 def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
-         operators=None, owners=None, parties=None):
+         operators=None, owners=None, parties=None, by_agent=None):
     rows = lifecycle.read_event_rows(run)
     issue, state = task_state(rows, task)
     scope = state['scope']
@@ -223,7 +241,7 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
     approval = None
     reason = None
     try:
-        approval = approved_source(issue, scope, operators, owners, project, parties)
+        approval = approved_source(issue, scope, operators, owners, project, parties, by_agent)
         held_slot(run, project, actor, task)
     except LifecycleError as error:
         reason = str(error)
@@ -370,7 +388,7 @@ def _next_steps(issue, state, events, journal, held, project_name):
 
 
 def integration_check(task, actor, run, project, *, target=None, project_name=None,
-                      operators=None, owners=None, parties=None):
+                      operators=None, owners=None, parties=None, by_agent=None):
     """The read-only merge check: the writers' checks, honest gaps, and next writes.
 
     Every allowed/refused decision is the writer's own function and sentence:
@@ -396,7 +414,7 @@ def integration_check(task, actor, run, project, *, target=None, project_name=No
     approval = dict(check='approval', allowed=False, reason=None)
     try:
         approved = standing_approval(issue, operators, owners, project)
-        party = approved_party(approved, issue, parties)
+        party = approved_party(approved, issue, parties, by_agent)
     except LifecycleError as error:
         approval['reason'] = str(error)
     except ValueError as error:
@@ -493,7 +511,7 @@ def integration_check(task, actor, run, project, *, target=None, project_name=No
 
 
 def apply(body, actor, run, project, project_name, operation_id, *, authority,
-          parties, mark_writes=False, operators=None, owners=None):
+          parties, mark_writes=False, operators=None, owners=None, by_agent=None):
     operation, payload = validate(body, actor, operation_id)
     if operation == 'read':
         raise LifecycleError(422, 'Use the lifecycle read path')
@@ -522,7 +540,7 @@ def apply(body, actor, run, project, project_name, operation_id, *, authority,
                                           operators=operators, journal=project)
         except ValueError as error:
             raise LifecycleError(409, str(error)) from None
-        approved_source(issue, payload['scope'], operators, owners, project, parties)
+        approved_source(issue, payload['scope'], operators, owners, project, parties, by_agent)
         held_slot(run, project, actor, body['task'])
     marked = payload['dimension'] == 'integrated' and payload['value'] == 'passed'
     if marked:

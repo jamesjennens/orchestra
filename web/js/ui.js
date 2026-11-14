@@ -18,8 +18,8 @@ export const FACTS = [
 
 const REVIEW = {
   'none': ['No contribution', ''],
-  'awaiting-review': ['Awaiting review', 'accent'],
-  'changes-requested': ['Changes requested', 'warn'],
+  'awaiting-review': ['Awaiting review', 'warn'],  // kittrial-5bb.525: the accent is not a state
+  'changes-requested': ['Changes requested', 'crit'],  // kittrial-5bb.525 (c): sent back
   'approved': ['Approved · not integrated', 'ok'],
   'awaiting-integration': ['Awaiting integration', 'ok'],
   'integrated': ['Integrated', 'ok'],
@@ -29,7 +29,7 @@ const REVIEW = {
   'superseded': ['Superseded', 'plain'],
   'error': ['Needs operator attention', 'crit'],
 };
-const STATUS = { open: ['Open', ''], in_progress: ['In progress', 'accent'], blocked: ['Blocked', 'crit'], closed: ['Closed', 'plain'] };
+const STATUS = { open: ['Open', ''], in_progress: ['In progress', 'info'], blocked: ['Blocked', 'crit'], closed: ['Closed', 'plain'] };
 const PRIORITY = { 0: 'P0', 1: 'P1', 2: 'P2', 3: 'P3', 4: 'P4' };
 
 export function reviewChip(state) {
@@ -61,22 +61,130 @@ export function lifecycleStrip(lifecycle) {
     }));
 }
 
-export function pageHead({ crumbs, title, lede, actions }) {
-  return h('header', { class: 'page-head' },
-    h('div', null,
+// The page header (kittrial-5bb.525 slice b): what this page is (its h1), the page's one key
+// number, and its next action. The key is { num, label, source } when the page already knows
+// it, or 'pending' when the page's own read fills it later through setPageKey. A page with no
+// honest number passes no key and shows none: never a count of the rows on one page, never a
+// guess. `source` names where the number comes from (data-key-source), for the tests.
+export function pageHead({ crumbs, title, lede, actions, key, tabTitle }) {
+  const keyNum = h('span', { class: 'key-num' });
+  const keyLabel = h('span', { class: 'key-label' });
+  const keyNode = key ? h('div', { class: 'page-key', 'data-page-key': '', hidden: true }, keyNum, keyLabel) : null;
+  const head = h('header', { class: 'page-head' },
+    h('div', { class: 'ph-title' },
       crumbs && crumbs.length ? h('nav', { class: 'crumbs', 'aria-label': 'Breadcrumb' },
         crumbs.flatMap((c, i) => [i ? h('span', { 'aria-hidden': 'true' }, '/') : null, c.href ? h('a', { href: c.href }, c.label) : h('span', null, c.label)])) : null,
-      h('h1', { tabindex: '-1', id: 'page-title' }, title),
+      // The tab names the page; a page whose h1 alone would not say where it is (Tasks) names its place too.
+      h('h1', { tabindex: '-1', id: 'page-title', 'data-tab-title': tabTitle || null }, title),
       lede ? h('p', { class: 'lede' }, lede) : null),
+    keyNode,
     actions ? h('div', { class: 'actions' }, actions) : null);
+  head.pageKey = keyNode && { node: keyNode, num: keyNum, label: keyLabel };
+  if (key && key !== 'pending') setPageKey(head, key);
+  return head;
+}
+
+// What waits on the reader (kittrial-5bb.525 slice b, r2): a task whose next step is theirs.
+// - The assignee's step, for the assignee.
+// - An owner step, for an owner or coordinator of the task's project, and only the steps that ask
+//   someone to act: review, integrate, close an integrated task, or accept a requirement. An epic,
+//   a record, a decision or a dependency-blocked row also carries an owner step, but it only says
+//   what the row is, so it waits on no one.
+// A delivered task is in its assignee's `assigned` list but waits on its owner; an owner's own
+// delivered task is in both of the owner's lists. Each is counted once, for whoever acts.
+const OWNER_ACTS = new Set(['awaiting-review', 'legacy-review-ready', 'approved', 'awaiting-integration', 'integrated']);
+export function waitsOnReader(ctx, t, approvesIn) {
+  const step = t && t.next_action;
+  if (!step || t.status === 'closed' || isDescriptive(t)) return false;
+  if (step.who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
+  // approvesIn is asked about the ROW (kittrial-5bb.525 r3, FIXP): My work answers from the server's own
+  // to_review list for review and integration steps, which carries the party rule.
+  if (step.who !== 'owner' || !approvesIn(t)) return false;
+  return ownerStepAsks(t);
+}
+
+// A row of a descriptive type says what it is and waits on no one, whatever its next step says
+// (kittrial-5bb.525 r3, FIXA): work.py:19's CLAIMABLE_EXCLUDED_TYPES, and the two labels that count the
+// same way, DECISION_LABEL ('decision') and MERGE_SLOT_LABEL ('gt:slot'). Tasks and My work both use it.
+const DESCRIPTIVE_TYPES = new Set(['epic', 'decision', 'gate', 'job', 'event', 'merge-slot']);
+const DESCRIPTIVE_LABELS = new Set(['decision', 'gt:slot']);
+export function isDescriptive(t) {
+  return DESCRIPTIVE_TYPES.has(String((t && t.issue_type) || 'task'))
+    || (Array.isArray(t && t.labels) && t.labels.some((label) => DESCRIPTIVE_LABELS.has(label)));
+}
+
+// An owner step that asks someone to act (review, integrate, close an integrated task, accept a
+// requirement), as opposed to one that only says what the row is (an epic, a record, a decision, a
+// blocked or non-claimable row). My work and Tasks both take it from here (kittrial-5bb.525 c r2).
+export function ownerStepAsks(t) {
+  return OWNER_ACTS.has(t.review_state) || (t.requirement_record === true && t.requirement_state === 'awaiting-acceptance');
+}
+
+// Fills (or, with no key, hides) the key number of a header made by pageHead.
+export function setPageKey(head, key) {
+  const parts = head && head.pageKey;
+  if (!parts) return;
+  const { node } = parts;
+  const known = Boolean(key) && key.num !== null && key.num !== undefined && key.num !== '';
+  node.hidden = !known;
+  parts.num.textContent = known ? String(key.num) : '';
+  parts.label.textContent = known ? key.label : '';
+  if (known && key.source) node.setAttribute('data-key-source', key.source); else node.removeAttribute('data-key-source');
+}
+
+// "3 hours", "2 days": how long ago an ISO time was, for a key number. Null when unknown.
+export function durationSince(iso, now = Date.now()) {
+  const at = Date.parse(iso);
+  if (!iso || Number.isNaN(at)) return null;
+  const minutes = Math.max(0, Math.floor((now - at) / 60000));
+  const unit = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  if (minutes < 60) return unit(minutes, 'minute');
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return unit(hours, 'hour');
+  return unit(Math.floor(hours / 24), 'day');
+}
+
+// Empty, loading and error states (kittrial-5bb.525 slice e): a small round icon, a title that
+// says what would be here, one sentence on how it gets there, and the action when there is one.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const STATE_ICONS = {
+  empty: ['M4 13l2.5-7h11L20 13', 'M4 13v5h16v-5h-5a3 3 0 0 1-6 0z'],
+  error: ['M12 4l9 16H3z', 'M12 10v4', 'M12 17.5v.01'],
+};
+function stateIcon(kind) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.8');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  STATE_ICONS[kind].forEach((d) => {
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', d);
+    svg.appendChild(path);
+  });
+  return h('span', { class: 'state-icon' }, svg);
 }
 
 export function empty(title, body, action) {
-  return h('div', { class: 'empty' }, h('strong', null, title), body ? h('p', null, body) : null, action || null);
+  return h('div', { class: 'state', 'data-state': 'empty' }, stateIcon('empty'),
+    h('div', { class: 'state-text' }, h('strong', null, title), body ? h('p', null, body) : null),
+    action ? h('div', { class: 'state-act' }, action) : null);
 }
 
-export function loading(label = 'Loading…') {
-  return h('div', { class: 'loading', role: 'status' }, label);
+// Loading: a skeleton in the shape of what will come, never a blank. Its words are for screen
+// readers (role=status); the bars are decoration, and they stop shimmering under reduced motion.
+// It is not itself aria-busy (a busy live region may be held back by assistive technology): the
+// region being loaded carries aria-busy, set and cleared by the view that reads it.
+const SKELETON = [['60', '30'], ['80', '40'], ['40', '30']];
+export function loading(label = 'Loading…', rows = 3) {
+  return h('div', { class: 'loading', role: 'status', 'data-state': 'loading' },
+    h('span', { class: 'visually-hidden' }, label),
+    h('div', { class: 'skeleton', 'aria-hidden': 'true' },
+      Array.from({ length: rows }, (_, i) => h('div', { class: 'sk-row' }, h('span', { class: 'sk sk-dot' }),
+        h('span', { class: 'sk-lines' }, SKELETON[i % SKELETON.length].map((w) => h('span', { class: 'sk sk-w' + w })))))));
 }
 
 // Explains an API failure in the user's terms, with the server request id for support.
@@ -111,12 +219,29 @@ export function describe(error) {
   }
 }
 
+// A failed READ in the reader's words (kittrial-5bb.525 e r2). Nothing was being saved, so it never says a
+// change "may not have been saved" or "do not reload" (describe() says that, rightly, for writes). It names
+// what is true: the server did not answer, or could not be reached; nothing was changed; and the server's own
+// sentence when its body sent one (a body without one leaves only the code, or 'Request failed').
+export function describeRead(error) {
+  if (!error) return 'The page could not be read. Nothing was changed.';
+  if (error.status === 0) return 'The server could not be reached. Nothing was changed; check the connection, then try again.';
+  if (error.status >= 500 && error.status !== 501) {
+    const said = error.message && error.message !== error.code && error.message !== 'Request failed' ? String(error.message).trim() : '';
+    return `The server did not answer (${error.status}). Nothing was changed.` + (said ? ' The server said: ' + said : '');
+  }
+  return describe(error);
+}
+
+// An error: inline where the read failed, on the crit tone with its rule and icon; what failed,
+// the server's reason in the reader's words, the request id for support, and Try again.
 export function errorState(error, retry) {
-  return h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'alert' },
-    h('strong', null, error && error.status === 404 ? 'Not found' : error && error.status === 403 ? 'No access' : 'Could not load this page'),
-    h('p', null, describe(error)),
-    error && error.requestId ? h('p', { class: 'small mono' }, 'Request ' + error.requestId) : null,
-    retry ? h('button', { type: 'button', onclick: retry }, 'Try again') : null));
+  return h('div', { class: 'state error', role: 'alert', 'data-state': 'error' }, stateIcon('error'),
+    h('div', { class: 'state-text' },
+      h('strong', null, error && error.status === 404 ? 'Not found' : error && error.status === 403 ? 'No access' : 'Could not load this page'),
+      h('p', null, describeRead(error)),
+      error && error.requestId ? h('p', { class: 'state-req mono' }, 'Request ' + error.requestId) : null),
+    retry ? h('div', { class: 'state-act' }, h('button', { type: 'button', onclick: retry }, 'Try again')) : null);
 }
 
 // Runs a mutation with a busy button, a clear failure message and — when the outcome is

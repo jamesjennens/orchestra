@@ -845,7 +845,7 @@ class AgentProjectsPageTests(AgentHarness):
         self.assertTrue(blocked['disabled'])
         self.assertEqual("alex is not a member of Beta: add them under the project's Members first",
                          blocked['text'])
-        self.assertEqual(['#/p/%s/settings' % self.beta], blocked['links'])
+        self.assertEqual(['#/p/%s/people' % self.beta], blocked['links'])
         self.assertEqual([self.alpha], before['ownerGrantable'])
         # 2. The owner's own page knows nothing of Beta (it is not the owner's project).
         owner = seen['ownerBefore']
@@ -1437,9 +1437,18 @@ class AgentReadCostTests(AgentHarness):
 
     def test_owner_list_reads_each_project_once_per_request(self):
         self.backend.list_calls = []
-        listing = self.request('GET', '/v1/agents', token=self.alex)
+        expiry_calls = [0]
+        original_expiry_now = self.service._expiry_now
+        def counting_expiry_now():
+            expiry_calls[0] += 1
+            return original_expiry_now()
+        with mock.patch.object(self.service, '_expiry_now', side_effect=counting_expiry_now):
+            listing = self.request('GET', '/v1/agents', token=self.alex)
         self.assertEqual(200, listing.status, listing.data)
         self.assertEqual(10, listing.data['total'])
+        # kittrial-5bb.521: one request moment is threaded through internal expiry checks
+        # (1 in authenticate + 1 in agents_list = 2 calls, instead of 234).
+        self.assertLessEqual(expiry_calls[0], 2)
         # 10 agents x 5 projects would be 50 reads; the request performs 5.
         self.assertEqual(5, len(self.backend.list_calls))
         self.assertEqual(set(self.projects), {call[0] for call in self.backend.list_calls})
@@ -1453,13 +1462,90 @@ class AgentReadCostTests(AgentHarness):
         self.assertEqual(5, len(self.backend.list_calls))
         self.assertEqual(5, len(self.backend.own_calls))
 
+    def test_two_requests_either_side_of_expiry_see_different_answers(self):
+        # kittrial-5bb.521 condition 1, S9 & s2-me-paths: a request moment is valid for one request
+        # only and is never cached on the Service or across requests. Two requests on either side of
+        # a credential's expiry see different answers across all five read paths (full list,
+        # bounded page, single agent, /me, /me/next), including after a backward clock step.
+        # /me and /me/next are called with a second credential on the same agent that stays live,
+        # watching the expiring credential's working flag in the route's own agent view.
+        agent_id, secret, created = self.agent_secret(self.alex, projects=list(self.projects))
+        cred_id = created['credential']['id']
+        live_issued = self.request('POST', '/v1/agents/%s/credentials' % agent_id,
+                                   {'label': 'stays-live'}, token=self.alex)
+        self.assertEqual(201, live_issued.status, live_issued.data)
+        live_secret = live_issued.data['credential']['secret']
+        live_id = live_issued.data['credential']['id']
+        now = self.service._expiry_now()
+        with self.service.store.lock:
+            self.service.state['credentials'][cred_id]['expires_at'] = now + 30
+            self.service.store.save()
+
+        def cred_map(creds):
+            return {c['id']: c for c in creds}
+
+        for path in ('/v1/agents', '/v1/agents?limit=20'):
+            res = self.request('GET', path, token=self.alex)
+            self.assertEqual(200, res.status, (path, res.data))
+            item = next(a for a in res.data['items'] if a['id'] == agent_id)
+            by_id = cred_map(item['credentials'])
+            self.assertTrue(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
+        one_before = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex)
+        self.assertEqual(200, one_before.status, one_before.data)
+        self.assertTrue(cred_map(one_before.data['credentials'])[cred_id]['working'])
+        self.assertTrue(cred_map(one_before.data['credentials'])[live_id]['working'])
+        for path in ('/v1/agents/me', '/v1/agents/me/next'):
+            me_before = self.request('GET', path, token=live_secret)
+            self.assertEqual(200, me_before.status, (path, me_before.data))
+            by_id = cred_map(me_before.data['agent']['credentials'])
+            self.assertTrue(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
+
+        base_clock = time.time()
+        self.service.store.clock = lambda: base_clock + 60
+        # Advance the monotone floor past expiry, then step the raw wall clock backward:
+        # the monotone half keeps cred_id expired across all five read routes while live_id stays working.
+        self.assertGreaterEqual(self.service._expiry_now(), now + 60)
+        self.service.store.clock = lambda: base_clock - 3600
+        for path in ('/v1/agents', '/v1/agents?limit=20'):
+            res = self.request('GET', path, token=self.alex)
+            self.assertEqual(200, res.status, (path, res.data))
+            item = next(a for a in res.data['items'] if a['id'] == agent_id)
+            by_id = cred_map(item['credentials'])
+            self.assertFalse(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
+        one_after = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex)
+        self.assertEqual(200, one_after.status, one_after.data)
+        self.assertFalse(cred_map(one_after.data['credentials'])[cred_id]['working'])
+        self.assertTrue(cred_map(one_after.data['credentials'])[live_id]['working'])
+        for path in ('/v1/agents/me', '/v1/agents/me/next'):
+            me_after = self.request('GET', path, token=live_secret)
+            self.assertEqual(200, me_after.status, (path, me_after.data))
+            by_id = cred_map(me_after.data['agent']['credentials'])
+            self.assertFalse(by_id[cred_id]['working'], path)
+            self.assertFalse(by_id[cred_id]['revoked'], path)
+            self.assertTrue(by_id[live_id]['working'], path)
+        self.assertEqual(401, self.request('GET', '/v1/agents/me', token=secret).status)
+        self.assertEqual(401, self.request('GET', '/v1/agents/me/next', token=secret).status)
+
     def test_agent_next_reads_every_granted_project_once(self):
         agent_id, secret, _ = self.agent_secret(self.alex, projects=list(self.projects))
         self.assertTrue(agent_id)
         self.backend.list_calls = []
         self.backend.own_calls = []
-        nxt = self.request('GET', '/v1/agents/me/next', token=secret)
+        expiry_calls = [0]
+        original_expiry_now = self.service._expiry_now
+        def counting_expiry_now():
+            expiry_calls[0] += 1
+            return original_expiry_now()
+        with mock.patch.object(self.service, '_expiry_now', side_effect=counting_expiry_now):
+            nxt = self.request('GET', '/v1/agents/me/next', token=secret)
         self.assertEqual(200, nxt.status, nxt.data)
+        self.assertLessEqual(expiry_calls[0], 2)
         self.assertEqual(5, len(self.backend.list_calls))
         # One owner-filtered own-task read per project, naming this agent's actor.
         actor = nxt.data['agent']['actor']
@@ -2199,6 +2285,13 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('inferred', seen['ownerInferredSaveAsked'])
         self.assertIn('confirms', seen['ownerInferredSaveAsked'])
         self.assertEqual({'boxes': {}, 'ownerChoice': 1, 'save': False}, seen['adminInferred'])
+        # kittrial-5bb.561 (1): each row shows its owner account plus the agent id (from the
+        # loaded list; server facts via http_auth.py agent_view); the Mine/All filter
+        # (default Mine) stays hidden when one owner is loaded.
+        for _name, _line in seen['rowOwnerLines'].items():
+            self.assertIn('alex', _line, 'row %s names its owner account' % _name)
+        self.assertIn('agent_', seen['rowOwnerLines']['Kestrel'], 'row names the agent id')
+        self.assertEqual(seen['mineFilterHiddenForOneOwner'], 0)
         # 1. What the card says, and what "What it may do" shows.
         self.assertEqual((first['Kestrel']['scopes'], first['Kestrel']['source'], first['Kestrel']['differ']), ('read', 'set', None))
         self.assertEqual(first['Kestrel']['line'], 'May: read.')
@@ -2243,14 +2336,33 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual((seen['afterWiden']['scopes'], seen['afterWiden']['differ']), ('read tasks', '1'))
         self.assertIn('1 working credential allows something else than that.', seen['afterWiden']['line'])
         # 6. A superuser: what the agent does not have cannot be ticked, and is not sent when it is.
-        self.assertEqual({name: disabled for name, (_, disabled) in seen['admin']['boxes'].items()},
+        # kittrial-5bb.561 r2: Mine is the default (read from the DOM, not hard-coded): under
+        # Mine the other owner's row is hidden; All shows every row. The scope checks run
+        # on the All view, so they see the rows.
+        self.assertEqual(seen['mineFilterShownToSuperuser'], 1)
+        self.assertEqual(seen['pressedMineOnly'], 'true')
+        self.assertEqual(seen['pressedAllOnly'], 'true')
+        self.assertTrue(seen['kestrelHiddenUnderMine'])
+        self.assertTrue(seen['wrenHiddenUnderMine'])
+        self.assertEqual(seen['mineShownUnderMine'], [])
+        self.assertIn('on this page of', seen['mineCountLine'])
+        self.assertEqual(seen['mineDefaultChoice'], 'Mine')
+        self.assertTrue(seen['adminAfterAllShowsWren'])
+        self.assertTrue(any(name.startswith('agent_') for name in seen['adminShownUnderAll']))
+        admin_panel = seen['adminAfterAll']
+        self.assertIsNotNone(admin_panel)
+        self.assertEqual({name: disabled for name, (_, disabled) in admin_panel['boxes'].items()},
                          {'read': True, 'tasks': False, 'records': True, 'checkpoints': True, 'reviews': True, 'feedback': True,
                           'proposals': True})
         self.assertEqual(seen['afterNarrow']['scopes'], 'read')
-        self.assertEqual(seen['adminUnknown'], {'boxes': {}, 'ownerChoice': 1, 'save': False})
-        self.assertEqual(seen['adminInferredSetup'], {'needed': 1, 'issue': False})
-        self.assertEqual(seen['adminUnconfirmed'], ['Dove', 'Wren'])
+        self.assertEqual(seen['adminUnknownAfterAll'], {'boxes': {}, 'ownerChoice': 1, 'save': False})
+        self.assertEqual(seen['adminInferredSetupAfterAll'], {'needed': 1, 'issue': False})
+        self.assertEqual(seen['adminUnconfirmedAfterAll'], ['Dove', 'Wren'])
+        self.assertIn('audit view', seen['adminUnconfirmedNote'])
         self.assertFalse(seen['ownerFilter'])
+        # kittrial-5bb.561 r2 (filters are caller-level): the Mine/All choice is stable
+        # across pages, and Mine says which page it counts.
+        self.assertEqual(seen['mineFilterShownToSuperuser'], 1)
         # 7. Set up folder.
         self.assertEqual((seen['setupKestrel']['needed'], seen['setupKestrel']['issue']), (0, True))
         self.assertIn('It carries what the agent has now: read.', seen['setupKestrel']['asked'])

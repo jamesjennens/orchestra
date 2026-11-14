@@ -7,7 +7,7 @@ import csv
 import re
 
 from lifecycle import DIMENSIONS, ENABLED, LIVE
-from reserved_comments import _bd_scan, _parse_go_bool, write_targets
+from reserved_comments import _bd_scan, _parse_go_bool, expand_bd_attachments, write_targets
 
 NAMES = frozenset((*DIMENSIONS, 'lifecycle-scope', ENABLED, LIVE))
 ADVICE = 'Use the dedicated lifecycle action (lifecycle.py record); no native write was attempted.'
@@ -97,18 +97,14 @@ def guard(args, attachments, read):
             refuse('editing a lifecycle event through raw bd is not allowed')
         return
 
-    # Resolve transported description bytes before scanning, without consulting
-    # request-created paths. Other attachment flags are checked by the endpoint.
-    expanded = []
+    # Resolve transported description and note bytes before scanning, without
+    # consulting request-created paths. Other attachment flags are checked by the endpoint.
     for token in args:
-        if token.startswith('@attachment:'):
-            item = attachments.get(token.partition(':')[2])
+        if isinstance(token, str) and token.startswith('@attachment:'):
+            item = attachments.get(token.partition(':')[2]) if isinstance(attachments, dict) else None
             if not isinstance(item, dict) or not isinstance(item.get('text'), str):
                 refuse('an attachment is incomplete')
-            flag = item.get('flag')
-            expanded.extend([flag, item['text']])
-        else:
-            expanded.append(token)
+    expanded = expand_bd_attachments(args, attachments)
     flags, operands, unknown = _bd_scan(expanded, command)
     flags = [(_ALIASES.get(name, name), value) for name, value in flags]
     if unknown or any(value is None for _, value in flags):

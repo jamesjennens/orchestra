@@ -268,6 +268,16 @@ def is_decision_issue(row):
     return isinstance(row, dict) and (row.get('issue_type') == 'decision' or 'decision' in (row.get('labels') or []))
 
 
+def reads_as_decision(row):
+    """Whether a delegation READ may treat ``row`` as a decision issue (kittrial-5bb.469 item 4).
+
+    The decision predicate, or the reserved ``delegation`` label: only ``apply`` adds that label
+    (a raw label write is refused), so retyping a decision that carries a delegation does not
+    silently end it. It never creates authority: that still needs an owner's journaled record.
+    """
+    return is_decision_issue(row) or (isinstance(row, dict) and LABEL in (row.get('labels') or []))
+
+
 def reading(row, project, journal):
     """One interpretation of delegation comments: honoured records, unhonoured, newer.
 
@@ -351,8 +361,10 @@ def current(row, project, state, journal, operators=None, owners=None):
     # Even an older missing grant can turn a two-grant ambiguity into authority;
     # an older revoke must not disappear behind a later (legacy) narrowing.
     # No unhonoured delegation comment can be proved harmless from its own text.
-    if unhonoured and records:
-        return None, ('the delegation on decision %s has an unhonoured comment; '
+    # An unhonoured comment with no honoured record (a grant whose journal entry was lost) says so
+    # too, so the agent is told how to recover (kittrial-5bb.469 item 1).
+    if unhonoured:
+        return None, ('the delegation on decision %s has an unhonoured comment (no valid host journal entry); '
                       'record a new decision to delegate again' % row.get('id'))
     if not records:
         return None, 'no delegation is recorded on decision %s' % row.get('id')
@@ -395,7 +407,7 @@ def check_acceptance(row, *, project, state, journal, agent, kind, operators=Non
         raise DelegationRefusal(403, 'The named delegation decision does not exist in this project')
     if row.get('malformed'):
         raise DelegationRefusal(403, 'Decision %s cannot be read' % row.get('id'))
-    if not is_decision_issue(row):
+    if not reads_as_decision(row):
         raise DelegationRefusal(403, 'Issue %s is not a decision issue (type decision or labelled decision)'
                                 % row.get('id'))
     delegation, reason = current(row, project, state, journal, operators, owners)
@@ -427,7 +439,9 @@ def check_write(payload, row, *, project, journal):
     validate_request(payload, recorded=True)
     if not isinstance(row, dict):
         raise DelegationRefusal(404, 'Decision %s does not exist in this project' % payload['decision'])
-    if not is_decision_issue(row):
+    # A grant needs a decision issue; a narrow or revoke also reaches a retyped one that still carries
+    # the delegation label, so the owner can end what a retype hid (kittrial-5bb.469 item 4).
+    if not (is_decision_issue(row) if payload['action'] == 'grant' else reads_as_decision(row)):
         raise DelegationRefusal(422, 'Issue %s is not a decision issue; record the delegation on a decision'
                                 % payload['decision'])
     records, unhonoured, _newer = reading(row, project, journal)
@@ -490,12 +504,15 @@ def apply(payload, *, project, journal, run, recorded_by, via, account, at):
     check_write(payload, row, project=project, journal=journal)
     record = make_record(payload, project=project, recorded_by=recorded_by, via=via, account=account, at=at)
     open_journal(journal)
+    # The label goes on BEFORE the native comment (kittrial-5bb.469 item 5): a crash after the comment
+    # then leaves a labelled decision the listing finds. A label with no honoured record lists as
+    # "no delegation recorded" and grants nothing.
+    if LABEL not in (row.get('labels') or []):
+        run(['update', payload['decision'], '--add-label', LABEL, '--json'])
     comment = record_json.loads(run(['comments', 'add', payload['decision'], body(record), '--json']))
     if not isinstance(comment, dict) or not comment.get('id'):
         raise ValueError('The delegation record cannot be reconciled')
     publish(journal, record)
-    if LABEL not in (row.get('labels') or []):
-        run(['update', payload['decision'], '--add-label', LABEL, '--json'])
     return {'schema_version': 1, 'operation_id': payload['operation_id'], 'decision': payload['decision'],
             'record': record, 'comment_id': str(comment['id'])}
 
@@ -519,12 +536,29 @@ def coverage(state, project, items):
 
 
 def listing(rows, project, state, journal, operators=None, owners=None):
-    """Every delegation on the given decision rows, in force or not, with its reason."""
+    """Every delegation on the given decision rows, in force or not, with its reason.
+
+    A row with any delegation comment is listed, honoured or not, so a decision whose grant lost
+    its journal entry is visible with its reason (kittrial-5bb.469 item 1). ``status`` and, when
+    the type is not decision, ``issue_type`` show what a reader needs; a closed decision still in
+    force carries the line that closing does not end a delegation (item 3).
+    """
     out = []
     for row in rows:
-        if not isinstance(row, dict) or not is_decision_issue(row) or not history(row, project, journal):
+        if not isinstance(row, dict) or not reads_as_decision(row):
+            continue
+        records, unhonoured, _newer = reading(row, project, journal)
+        if not records and not unhonoured:
             continue
         delegation, reason = current(row, project, state, journal, operators, owners)
-        out.append({'decision': row.get('id'), 'title': row.get('title'),
-                    'in_force': delegation is not None, 'delegation': delegation, 'reason': reason})
+        notes = []
+        if delegation is not None and row.get('status') == 'closed':
+            notes.append('Decision %s is closed, but closing does not end a delegation: revoke it to end it'
+                         % row.get('id'))
+        if not is_decision_issue(row):
+            notes.append('Decision %s is now typed %s; it still reads as a delegation decision because it '
+                         'carries the delegation label' % (row.get('id'), row.get('issue_type')))
+        out.append({'decision': row.get('id'), 'title': row.get('title'), 'status': row.get('status'),
+                    'issue_type': row.get('issue_type'), 'in_force': delegation is not None,
+                    'delegation': delegation, 'reason': reason, 'notes': notes})
     return out

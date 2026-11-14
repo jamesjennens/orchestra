@@ -52,7 +52,15 @@ import actor_names
 import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
-from review_workflow import TEXT_LIMITS
+from review_workflow import TEXT_LIMITS, limited
+
+#: The approval_basis field value for each basis the approve route names (kittrial-5bb.515 B, with the
+#: worker-credential basis of kittrial-5bb.519). Both values are in review_workflow.APPROVAL_BASES.
+APPROVAL_BASIS_OF = {'agent': 'same-person-agent', 'worker-credential': 'same-person-worker-credential'}
+#: Where the approve route puts the basis it decided, for the backends to write as ``approval_basis``
+#: (kittrial-5bb.515 r2). A tuple key: a JSON request body only has string keys, so no caller can spell it, and
+#: ``approval_basis`` itself is not a field a caller may send (a body naming it is refused).
+SERVER_APPROVAL_BASIS = ('server', 'approval_basis')
 import claim_limit
 import handover_steps
 import project_setup
@@ -63,7 +71,7 @@ import rooms
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
-from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+from http_auth import (Principal, AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_NUDGE_CARRY, NUDGES_SCOPE,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
@@ -76,6 +84,7 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
                        validate_claim_limit, validate_password_min_length)
 from version import report as version_report
+import invites
 import program_links
 #: kittrial-5bb.449: a requirement key with `/` is kept, and said how it is cited (PROGRAM_DESIGN §3.1).
 QUALIFY_KEY_WARNING = ('The key %(key)s contains "/": cite it as req:%(project)s/%(key)s, even in this project, '
@@ -103,6 +112,8 @@ def service_identity():
     return dict(_SERVICE_IDENTITY)
 
 
+#: kittrial-5bb.581: the response header naming the installed build (service_identity()'s build_id).
+BUILD_HEADER = 'X-Orchestra-Build'
 MAX_BODY_BYTES = 262144
 #: kittrial-5bb.418: the body a design.<scope> reference propose or revise may send, its document inside it
 #: (1 MiB of Markdown, design_documents.DOCUMENT_MAX_BYTES, plus the JSON escaping). Only those two routes, and
@@ -626,6 +637,17 @@ def written_at(service):
     return server_time(service._now())
 
 
+def approval_basis_listed(help_payload):
+    """Whether a ``review`` help payload lists ``approval_basis`` among ``approve``'s optional fields.
+
+    The one gate for writing the field (kittrial-5bb.515): an endpoint whose help does not say so (a kit before
+    the readers' release) may refuse a record that carries it, so the service keeps the sentence for it.
+    """
+    fields = help_payload.get('optional_fields') if isinstance(help_payload, dict) else None
+    approve = fields.get('approve') if isinstance(fields, dict) else None
+    return isinstance(approve, list) and 'approval_basis' in approve
+
+
 class InProcessBackend:
     """Disposable canonical operations used for local validation.
 
@@ -656,6 +678,9 @@ class InProcessBackend:
     #: one folder per project under it. None (the default) keeps no log, exactly as it
     #: keeps no project directory today.
     wake_root = None
+    #: The installation switch for invite links (kittrial-5bb.578): OFF. This service-local backend has
+    #: no deployment configuration, so a test or a local trial sets it; nothing else does.
+    invites_enabled = False
 
     def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None):
         import actor_names
@@ -676,6 +701,9 @@ class InProcessBackend:
 
     def get_delivery_roots(self):
         return tuple(self.delivery_roots or ())
+
+    def get_invites_enabled(self):
+        return self.invites_enabled is True
 
     def get_delivery_serve_max_bytes(self):
         return int(self.delivery_serve_max_bytes)
@@ -1179,6 +1207,15 @@ class InProcessBackend:
         self._event(project_id, task['id'], 'checkpoint-added', principal, record['actor'])
         return {'checkpoint': record, 'task_version': task['version']}
 
+    def approval_basis_advertised(self, project_id=None):
+        """Whether this backend's review help lists ``approval_basis`` for ``approve`` (kittrial-5bb.515).
+
+        The same help payload the endpoint serves for ``review --help``: this backend is the service's own kit,
+        so it asks that kit's help rather than assuming.
+        """
+        import work
+        return approval_basis_listed(work.help_payload('review'))
+
     def _review_add(self, principal, project_id, payload):
         task = self._task(project_id, payload.get('task_id'))
         operation = payload.get('operation')
@@ -1227,12 +1264,49 @@ class InProcessBackend:
                 delivery_block = {'kind': 'remote', 'remote': '', 'branch': branch}
             else:
                 delivery_block = {'kind': 'bundle', 'path': '', 'sha256': digest}
+            actor = payload.get('actor') or principal.actor
+            operation_id = payload.get('operation_id')
+            if isinstance(operation_id, str) and operation_id:
+                for stored in contributions:
+                    if stored.get('operation_id') != operation_id:
+                        continue
+                    if (stored.get('kind') == 'contribution'
+                            and stored.get('actor') == actor
+                            and stored.get('commit') == commit
+                            and stored.get('base_commit') == base_commit
+                            and stored.get('repository') == repository
+                            and stored.get('delivery') == delivery_block
+                            and stored.get('bundle_sha256') == digest
+                            and stored.get('branch') == branch
+                            and stored.get('summary') == summary.strip()):
+                        still_open = self._requests(contributions, True)
+                        from review_state import OPEN_ITEMS_MAX, open_items_warnings
+                        every = [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
+                                 for r in still_open]
+                        answer = {'contribution': stored, 'comment_id': stored['id'], 'reconciled': True,
+                                  'task_version': task['version'],
+                                  'open_items': every[:OPEN_ITEMS_MAX], 'open_items_total': len(every)}
+                        if every:
+                            answer['warnings'] = open_items_warnings(
+                                every, task['id'], '/v1/projects/%s/tasks/%s' % (project_id, task['id']))
+                        return answer
+                    raise invalid('Operation ID already used with different payload or actor')
+            current = [r for r in contributions if r['kind'] == 'contribution']
+            if current and commit.lower() == current[-1]['commit'].lower():
+                review_id, answered = self._active_changes_requested_review(contributions, current[-1]['id'])
+                if review_id is not None:
+                    answered = answered and not self._requests(contributions, True)
+                    from review_workflow import same_commit_refusal_message
+                    raise conflict(same_commit_refusal_message(review_id, answered=answered),
+                                   {'review_id': review_id})
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
                       'repository': repository, 'delivery': delivery_block,
                       'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
-                      'actor': payload.get('actor') or principal.actor,
+                      'actor': actor,
                       'created_at': now_iso(self.service._now())}
+            if isinstance(operation_id, str) and operation_id:
+                record['operation_id'] = operation_id
             contributions.append(record)
             # Like the canonical projection, a new revision does not resolve requests
             # that need a respond record: they stay open until the contributor responds.
@@ -1263,6 +1337,20 @@ class InProcessBackend:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
+        if operation == 'approve':
+            # kittrial-5bb.516: an approve summary is checked as the canonical write checks it
+            # (review_workflow.validate's ``limited`` and execute's ``check_plain_text``), with the endpoint
+            # backend's own answer for a refusal, so this backend never stores what bd would refuse: no empty
+            # summary (a same-person approval would then carry no basis sentence) and no control characters.
+            from review_workflow import check_plain_text
+            if 'summary' not in payload:
+                # The endpoint backend's own field check (EndpointBackend, 'payload is missing fields').
+                raise invalid('Canonical review payload is missing fields: summary')
+            try:
+                limited(payload.get('summary'), 'summary')
+                check_plain_text({'summary': payload.get('summary')})
+            except ValueError as error:
+                raise invalid('Canonical command rejected the request', 'ValueError: %s' % error) from None
         summary = (payload.get('summary') or '')[:1200]
         operation_id = payload.get('operation_id')
         items, resolutions = [], []
@@ -1270,9 +1358,10 @@ class InProcessBackend:
             items = self._review_items(payload.get('items'), allow_severity=True)
             if isinstance(operation_id, str) and operation_id:
                 for stored in contributions:
-                    if stored.get('kind') != 'request-changes' or stored.get('operation_id') != operation_id:
+                    if stored.get('operation_id') != operation_id:
                         continue
-                    if stored.get('actor') == actor and stored.get('contribution_id') == current[-1]['id'] \
+                    if stored.get('kind') == 'request-changes' and stored.get('actor') == actor \
+                            and stored.get('contribution_id') == current[-1]['id'] \
                             and stored.get('summary') == summary and stored.get('items') == items:
                         return {'review': stored, 'task_version': task['version']}
                     raise invalid('Operation ID already used with different payload or actor')
@@ -1296,6 +1385,14 @@ class InProcessBackend:
                   'items': items,
                   'actor': actor,
                   'created_at': now_iso(self.service._now())}
+        if operation == 'approve' and payload.get(SERVER_APPROVAL_BASIS) is not None:
+            # kittrial-5bb.515: the server's own statement, from the route (never a caller's key); the canonical
+            # vocabulary.
+            from review_workflow import APPROVAL_BASES
+            if payload[SERVER_APPROVAL_BASIS] not in APPROVAL_BASES:
+                raise invalid('Canonical command rejected the request',
+                              'ValueError: Invalid approval basis; expected one of: ' + ', '.join(sorted(APPROVAL_BASES)))
+            record['approval_basis'] = payload[SERVER_APPROVAL_BASIS]
         if operation == 'request-changes':
             # Marks the request as following the canonical respond rule. Requests
             # recorded before the respond step existed carry no flag and keep the old
@@ -1421,6 +1518,39 @@ class InProcessBackend:
                 continue
             newest[author_key(record['actor'])] = record
         return sorted(newest.values(), key=lambda record: (record['after'], record['created_at']), reverse=True)
+
+    @staticmethod
+    def _active_changes_requested_review(records, latest_id):
+        """Return ``(review_id, answered)`` blocking a same-commit ``contribute``, or ``(None, False)``."""
+        after_latest = False
+        blocking = {}
+        for record in records:
+            kind = record.get('kind')
+            if kind == 'contribution':
+                after_latest = (record.get('id') == latest_id)
+                continue
+            if not after_latest or record.get('contribution_id') != latest_id:
+                continue
+            if kind == 'request-changes':
+                items = record.get('items') or (
+                    [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
+                for item in items:
+                    if item.get('severity') != 'note':
+                        blocking[(record['id'], item['id'])] = 'open'
+            elif kind == 'respond':
+                for res in record.get('resolutions') or []:
+                    key = (res['request'], res['item'])
+                    if key in blocking:
+                        blocking[key] = 'responded'
+            elif kind == 'approve':
+                blocking.clear()
+        open_ids = [req_id for (req_id, _), status in blocking.items() if status == 'open']
+        if open_ids:
+            return open_ids[-1], False
+        responded_ids = [req_id for (req_id, _), status in blocking.items() if status == 'responded']
+        if responded_ids:
+            return responded_ids[-1], True
+        return None, False
 
     @staticmethod
     def _requests(records, open_only=False):
@@ -1780,7 +1910,16 @@ class InProcessBackend:
         records_standing = self._standing_recommendations(task, records)
         standing = [self._recommendation_view(record) for record in records_standing]
         import review_recommendations as rec
+        approved = ([r for r in records if r['kind'] == 'approve'][-1:]
+                    if task.get('review_state') == 'approved' else [])
+        basis = approved[0].get('approval_basis') if approved else None
+        import review_workflow
         return {'state': task.get('review_state') or 'none', 'contribution': contribution,
+                # Additive (kittrial-5bb.515): why the server let the standing approval through, only when it
+                # carries the field (an approval written before it has none).
+                **({'approval_basis': {'basis': basis, 'text': review_workflow.APPROVAL_BASES.get(basis, basis),
+                                       'author': approved[0]['actor'], 'at': approved[0]['created_at']}}
+                   if isinstance(basis, str) and basis else {}),
                 # Additive (kittrial-5bb.115): advice to approve the current contribution.
                 'recommendation': standing[0] if standing else None,
                 # Each in full: the brief route leaves out the author's own person and shows the next.
@@ -2080,6 +2219,7 @@ class InProcessBackend:
         read treats a task that has no registered lane -- and an actor's lane therefore
         carries the same name and id.
         """
+        from datetime import datetime, timezone
         from lanes import read as lanes_read
         from sessions import read_registry
         rows = [dict(task, issue_type=task.get('issue_type') or 'task',
@@ -2114,6 +2254,7 @@ class InProcessBackend:
             except Exception:
                 pass
         return lanes_read(rows, actor, registry, list(args),
+                          now=datetime.fromtimestamp(self.service._now(), tz=timezone.utc),
                           operators=operators, journal=None, scope=scope,
                           project=project_id, authority_state=self.service.state,
                           extra_live_sessions=extra_live_sessions)
@@ -2135,11 +2276,26 @@ class InProcessBackend:
                     comment_pending=attention_field(item, 'assignee_comment_pending') is True)
                 rows.append(row)
             pointers = waiting.comment_pointers(self._project_rows(project_id), actor) if comments else None
-            return waiting.coordinator_view(
-                rows,
-                self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
-                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'),
-                pointers)
+            board = self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
+                                    '--limit', str(LANES_LIMIT_MAX)], actor, scope='all')
+            filtered = self.service.filter_coordinator_wait_lanes(project_id, board)
+            view = waiting.coordinator_view(rows, filtered, pointers)
+            nudge_by_actor = {
+                (row.get('actor') or row.get('lane')): row['nudge']
+                for row in (filtered.get('items') if isinstance(filtered, dict) else None) or []
+                if isinstance(row, dict) and isinstance(row.get('nudge'), dict)
+            }
+            if nudge_by_actor:
+                for row in view.get('triggers', {}).get('lane-quiet') or []:
+                    key = row.get('actor') or row.get('lane')
+                    if key in nudge_by_actor:
+                        row['nudge'] = dict(nudge_by_actor[key])
+                for row in view.get('items') or []:
+                    if row.get('trigger') == 'lane-quiet':
+                        key = row.get('actor') or row.get('lane')
+                        if key in nudge_by_actor:
+                            row['nudge'] = dict(nudge_by_actor[key])
+            return view
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -2614,7 +2770,8 @@ class EndpointBackend:
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(dict(operation='read', task=task_id))],
                          authority=authority_request(principal, project_id, CAP_READ,
-                                                     now=self.service._expiry_now()),
+                                                     now=self.service._expiry_now(),
+                                                     raw_now=self.service._raw_now()),
                          require_authority=True)
 
     def integration_check(self, principal, project_id, task_id, target=None):
@@ -2625,7 +2782,8 @@ class EndpointBackend:
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(body)],
                          authority=authority_request(principal, project_id, CAP_READ,
-                                                     now=self.service._expiry_now()),
+                                                     now=self.service._expiry_now(),
+                                                     raw_now=self.service._raw_now()),
                          require_authority=True)
 
     def lifecycle_replay_guard(self, principal, project_id, task_id, dimension):
@@ -2828,6 +2986,15 @@ class EndpointBackend:
             error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
                                       422: 'invalid'}.get(status, 'unavailable'),
                               (reply.get('stderr') or 'Lifecycle state cannot be read').strip())
+            error.nothing_done = True
+            raise error
+        if action == 'review' and isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                reply.get('review_status') == 409 and isinstance(reply.get('review_id'), str) and reply['review_id']:
+            from review_workflow import same_commit_refusal_message
+            error = conflict(
+                same_commit_refusal_message(reply['review_id'], answered=bool(reply.get('review_answered'))),
+                {'review_id': reply['review_id']},
+            )
             error.nothing_done = True
             raise error
         if action == 'task-file' and isinstance(reply, dict) and reply.get('returncode') == 2 and \
@@ -3210,8 +3377,12 @@ class EndpointBackend:
             # configuration (``self.authority_store``), not request data. The decision
             # time is the service's monotone expiry clock, so the canonical endpoint
             # re-check cannot revive an item expired by a backward step.
+            # The web-lifecycle writers also get the raw host clock: integration judges an
+            # agent key's raw deadline against it (kittrial-5bb.560 r2).
             authority = authority_request(principal, project_id, capability,
-                                          now=self.service._expiry_now())
+                                          now=self.service._expiry_now(),
+                                          raw_now=(self.service._raw_now() if route.startswith('lifecycle.')
+                                                   else None))
             if self.service.approval_by_another_party and (
                     route.startswith('references.') or route.startswith('capabilities.') or route.startswith('interfaces.')):
                 authority['approval_by_another_party'] = True
@@ -3283,6 +3454,8 @@ class EndpointBackend:
         'request-review': ('summary',),
         'withdraw': ('disposition',),
         'resolve-item': ('disposition',),
+        # kittrial-5bb.515: approval_basis is NOT here. The route alone decides it and hands it over under
+        # SERVER_APPROVAL_BASIS; a body naming it is refused (the dedicated 422, and the unknown-field check).
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -3503,6 +3676,9 @@ class EndpointBackend:
                 # keep their null, because their ABSENCE is an invalid field set.
                 if payload.get(field) is not None:
                     body[field] = payload.get(field)
+            if operation == 'approve' and payload.get(SERVER_APPROVAL_BASIS) is not None:
+                # kittrial-5bb.515: the route's own value, never a caller's key.
+                body['approval_basis'] = payload[SERVER_APPROVAL_BASIS]
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
             if not body['operation_id']:
@@ -3586,6 +3762,20 @@ class EndpointBackend:
         if not isinstance(payload, dict):
             raise uncertain('Canonical design read returned an unexpected shape')
         return payload
+
+    def approval_basis_advertised(self, project_id):
+        """Whether the endpoint's machine-readable ``review`` help lists ``approval_basis`` for ``approve``.
+
+        Read from the endpoint each time it is asked (a read, not a write; no cache, so an endpoint replaced
+        under a running service is believed at the next approval). An endpoint of a kit before the field lists
+        nothing, and so does one whose answer cannot be read: the service then writes the sentence as before.
+        """
+        try:
+            reply = self._endpoint('review', project_id, self.actor_namespace + '/read', ['--help'])
+            payload = self._checked(reply, 'review', reading=True)
+        except Exception:                     # noqa: BLE001 -- any failure to read the help: not advertised, the sentence
+            return False
+        return approval_basis_listed(payload)
 
     def switches(self, project_id):
         """kittrial-5bb.434: the installation switches that refuse a web write, through the read-only
@@ -3695,10 +3885,11 @@ class EndpointBackend:
         ``'own'`` instead. The endpoint honours only that narrowing, and its own routes keep
         computing their scope themselves.
         """
+        authority = (authority_request(principal, project_id, CAP_READ, now=self.service._expiry_now())
+                     if principal is not None else None)
         reply = self._endpoint('work', project_id, actor, ['lanes'] + list(args),
-                               authority=authority_request(principal, project_id, CAP_READ,
-                                                           now=self.service._expiry_now()),
-                               require_authority=True, extra={'lanes_scope': scope})
+                               authority=authority,
+                               require_authority=principal is not None, extra={'lanes_scope': scope})
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical lanes read returned an unexpected shape')
@@ -3991,7 +4182,7 @@ class EndpointBackend:
         from admin import ConfigurationUnreadable
         try:
             return fn(Path(self.root))
-        except ConfigurationUnreadable as exc:
+        except (ConfigurationUnreadable, OSError) as exc:
             print(
                 'configuration: the service could not read the deployment configuration: %s'
                 % ascii(str(exc)[:600]),
@@ -4009,6 +4200,16 @@ class EndpointBackend:
     def get_delivery_serve_max_bytes(self):
         from admin import delivery_serve_max_bytes
         return self._read_deployment_setting(delivery_serve_max_bytes)
+
+    def get_invites_enabled(self):
+        """kittrial-5bb.578: ``invites_enabled`` from this installation's deployment.private.json, read
+        on every invite request (absent or not true: off; unreadable: the usual 503)."""
+        from admin import invites_enabled
+        warnings = []
+        value = self._read_deployment_setting(lambda root: invites_enabled(root, warnings=warnings))
+        for line in warnings[:1]:
+            print('configuration: ' + ascii(line[:300]), file=sys.stderr, flush=True)
+        return value is True
 
     def task_delivery_record(self, project_id, task_id, contribution_id=None):
         reply = self._endpoint(
@@ -4352,6 +4553,10 @@ class EndpointBackend:
                            'pending_review_requests': pending_review_requests,
                            'declined_review_requests': declined_review_requests,
                            'withdrawal': withdrawal,
+                           # Additive (kittrial-5bb.515): why the server let the approval through, from the
+                           # record's own field and present only when it has one. An older endpoint, or an
+                           # approval written before the field, has none, and its summary is only a summary.
+                           **self._approval_basis_view(review.get('approval_basis')),
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
                            # The newest few carry their whole content (a kit before that
@@ -4404,6 +4609,15 @@ class EndpointBackend:
                 'changes_since_checkpoint': data.get('changes_since_checkpoint')
                 if isinstance(data.get('changes_since_checkpoint'), dict)
                 else self._no_checkpoint_section(task_id) if data.get('checkpoint') is None else None}
+
+    @staticmethod
+    def _approval_basis_view(raw):
+        """The page's ``approval_basis`` block from the canonical projection's, or nothing."""
+        if not isinstance(raw, dict) or not isinstance(raw.get('basis'), str) or not raw['basis']:
+            return {}
+        text = raw.get('text')
+        return {'approval_basis': {'basis': raw['basis'], 'text': text if isinstance(text, str) and text else raw['basis'],
+                                   'author': raw.get('author'), 'at': raw.get('timestamp')}}
 
     @staticmethod
     def _no_checkpoint_section(task):
@@ -6155,6 +6369,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self._send_hsts()
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        # kittrial-5bb.581: the installed build on every answer (what /healthz already says to anyone), so an
+        # open page can offer a reload when the installation was upgraded under it.
+        self.send_header(BUILD_HEADER, str(service_identity().get('build_id') or ''))
         if getattr(self, '_written_at', None):
             # Set only for the answer of a write that was carried out; _dispatch clears it for the next request.
             self.send_header(SERVER_TIME_HEADER, self._written_at)
@@ -6722,9 +6939,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             status = result.pop('status', status)
         return status, result
 
-    def require(self, ctx, capability):
+    def require(self, ctx, capability, *, moment=None):
         """Authorize one read/route capability against live authority."""
-        return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability)
+        return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability, moment=moment)
 
     def _project(self, ctx, capability=CAP_READ):
         return self.service.check_authority(ctx.principal, ctx.params['pid'], capability)
@@ -6977,7 +7194,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         'superuser).')
 
     #: An agent approving under the project's default ``by-agent`` setting (kittrial-5bb.438): it may approve
-    #: another agent of its person, never itself, its person or its person's worker credentials.
+    #: another agent of its person, and work under a worker credential only its person has held (a name no
+    #: other account has held, or ``ACCOUNT/label``: kittrial-5bb.519); never itself (its sub-labels included),
+    #: its person's bare account id or a name another account has held.
     SAME_AGENT = ('This contribution was delivered by this agent itself.',
                   'This task is assigned to this agent itself.')
     BY_AGENT_NEXT = (' On this project a coordinator agent may approve the work of another agent of the same person, '
@@ -6985,6 +7204,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                      'approvals: by agent), but never its own work (its own sub-workers count as its own work) or its '
                      'person\'s own work: somebody of another party who may approve here must approve it (another '
                      'coordinator or owner of this project, or a superuser).')
+    #: The cases approval_permission names (kittrial-5bb.518, with the worker-credential case of .519).
+    APPROVAL_CASES = ('another-agent', 'worker-credential', 'own-work', 'own-person', 'own-worker-credential',
+                      'independent')
     #: Added to the summary of an approval that only this setting let through, so the record says so.
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
@@ -7005,17 +7227,43 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _normalize_basis_text(text):
-        folded = unicodedata.normalize('NFKC', text).casefold()
-        stripped = ''.join(
+        """The form two texts are compared in for the basis sentence (kittrial-5bb.485).
+
+        NFKD, so a precomposed letter and a letter with a combining mark meet, and so do fullwidth letters;
+        case folded; then every format character (Cf), mark (M*), punctuation (P*), symbol (S*) and bracket
+        is dropped and ALL whitespace removed, so that 'same-person', 'same person' and 'sameperson' are one.
+        """
+        folded = unicodedata.normalize('NFKD', unicodedata.normalize('NFKD', text).casefold())
+        return ''.join(
             ch for ch in folded
             if unicodedata.category(ch) != 'Cf'
-            and not unicodedata.category(ch).startswith('P')
+            and unicodedata.category(ch)[0] not in 'MPS'
+            and not ch.isspace()
             and ch not in '[](){}<>'
         )
-        return ' '.join(stripped.split())
 
-    def _basis_sentence_in(self, summary):
-        """The fixed approval sentence a caller's text contains (either one), or None."""
+    def _refuse_overlong_summary(self, summary, recommending):
+        """Refuse a summary over the field limit with what the canonical write says, before any normalization.
+
+        The text is the one review_workflow.limited (the canonical check) gives; an approve is wrapped as the
+        canonical command's refusal is (``Canonical command rejected the request`` with the ValueError as
+        detail), a recommendation carries it as its message; both 422 ``invalid_payload``.
+        """
+        if not isinstance(summary, str) or len(summary) <= self.SUMMARY_MAX:
+            return
+        try:
+            limited(summary, 'summary')
+        except ValueError as error:
+            detail = 'ValueError: %s' % error
+            raise invalid(str(error) if recommending else 'Canonical command rejected the request', detail) from None
+
+    def _basis_sentence_in(self, summary, recommending=False):
+        """The fixed approval sentence a caller's text contains (either one), or None (kittrial-5bb.519).
+
+        A summary over the field limit is refused first, in the canonical write's words and before any
+        normalization (:meth:`_refuse_overlong_summary`, kittrial-5bb.516), on approve and on recommend.
+        """
+        self._refuse_overlong_summary(summary, recommending)
         if not isinstance(summary, str):
             return None
         text = self._normalize_basis_text(summary)
@@ -7025,24 +7273,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return sentence
         return None
 
-    def _contains_same_person_approval(self, summary):
-        return self._basis_sentence_in(summary) is not None
+    def _contains_same_person_approval(self, summary, recommending=False):
+        return self._basis_sentence_in(summary, recommending) is not None
 
-    def _another_agent_only(self, agent_id, names, parties, project):
-        """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
+    def _another_agent_only(self, agent_id, names, assignee, author, project):
+        """Whether the by-agent setting lets agent ``agent_id`` approve work of ``author`` and ``assignee`` (kittrial-5bb.438).
 
         True when nothing of its party is there at all, or only other personal agents of the same account or
-        worker credentials of that account that the approve route lets through (kittrial-5bb.519: the same two
-        functions :meth:`_agent_approval_refusal` calls, so the list and the route have one source); False as
-        soon as one is the agent itself or a sub-label of it, the bare account id, or a shared name.
+        worker credentials of that account that the approve route lets through; False as soon as one is the
+        agent itself or a sub-label of it, the bare account id, or a shared name. It is
+        :func:`http_authority.by_agent_approval`, the one decision :meth:`_agent_approval_refusal` asks too
+        (kittrial-5bb.560), so the list and the route have one source. The caller has already asked that the
+        setting is ``by-agent`` and the agent's grant is effective; the decision asks both again.
         """
-        for target in parties:
-            if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
-                continue
-            if not (self.service.other_agent_of_same_person(agent_id, target)
-                    or self.service.worker_credential_of_same_person(agent_id, target, project)):
-                return False
-        return True
+        _, decision = self.service.by_agent_approval(project, agent_id, author, assignee, names)
+        return decision.allowed
 
     def _credential_work_in(self, agent_id, names, parties, project):
         """Whether one of ``parties`` of the approver's party is a worker credential of its person (kittrial-5bb.519)."""
@@ -7051,7 +7296,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                    and self.service.worker_credential_of_same_person(agent_id, target, project)
                    for target in parties)
 
-    def _agent_approval_refusal(self, principal, names, assignee, author, project):
+    def _agent_approval_refusal(self, principal, names, assignee, author, project, setting=None):
         """``(refusal or None, setting)`` for an agent approver the party rule refused (kittrial-5bb.438).
 
         Only asked once :meth:`_own_party_refusal` has refused an AGENT, which holds an effective
@@ -7061,42 +7306,128 @@ class ApiHandler(BaseHTTPRequestHandler):
         the same person, or a worker credential of that person that the record shows is that person's alone
         (:meth:`Service.worker_credential_of_same_person`, kittrial-5bb.519); the agent itself and its sub-labels,
         its person's bare account id and a name shared with another account still refuse.
+
+        ``setting`` is the project's setting when the caller already holds it (a list of rows reads it once,
+        kittrial-5bb.518): under any mode but ``by-agent`` that refusal stands without another read. Otherwise,
+        and when the approve route passes none, the setting is read here, inside the mutation, every time.
+
+        The decision is :func:`http_authority.by_agent_approval` (kittrial-5bb.560); this maps its refusal
+        kind to the route's sentence. The setting and the decision are read under one hold of the store lock.
         """
-        setting = self.service.agent_approval(project)
-        if setting['mode'] != 'by-agent':
+        if setting is not None and setting.get('mode') != 'by-agent':
+            return self._own_party_refusal(names, assignee, author, project, True), setting
+        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        setting, decision = self.service.by_agent_approval(project, agent_id, author, assignee, names)
+        if decision.allowed:
+            return None, dict(setting, basis=decision.basis)
+        if decision.refusal in ('strict', 'no-grant'):
+            # ``no-grant`` cannot be met here today: the route only asks for an agent whose credential
+            # holds ``approve``, which only an effective grant gives (kittrial-5bb.560).
             return self._own_party_refusal(names, assignee, author, project, True), setting
         own, shared_name, held, _ = self.OWN_PARTY_AGENT
-        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
-        basis = None
-        for target, is_author in ((author, True), (assignee, False)):
-            if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
-                continue
-            if self.service.other_agent_of_same_person(agent_id, target):
-                basis = basis or 'agent'
-                continue
-            if self.service.worker_credential_of_same_person(agent_id, target, project):
-                basis = 'worker-credential'
-                continue
-            head = target.split('/', 1)[0]
-            if agent_id and head.casefold() == agent_id.casefold():
-                return (self.SAME_AGENT[0 if is_author else 1]
-                        + (self.SUB_WORKER_NEXT if '/' in target else self.SAME_AGENT_NEXT)
-                        + self.BY_AGENT_NEXT), setting
-            if not is_author:
-                return held + self.BY_AGENT_NEXT, setting
-            if len(self.service.actor_parties(target, project, True)) > 1:
-                return shared_name % target + self.SHARED_NAME_NEXT + self.BY_AGENT_NEXT, setting
-            if self._bare_account_id_of(agent_id, target):
-                return self.ACCOUNT_ID_AUTHOR + self.BY_AGENT_NEXT, setting
-            return own + self.BY_AGENT_NEXT, setting
-        return None, dict(setting, basis=basis)
+        target = decision.target
+        if decision.refusal == 'same-agent':
+            return (self.SAME_AGENT[0 if decision.role == 'author' else 1]
+                    + (self.SUB_WORKER_NEXT if decision.sub_worker else self.SAME_AGENT_NEXT)
+                    + self.BY_AGENT_NEXT), setting
+        if decision.refusal == 'held-assignee':
+            return held + self.BY_AGENT_NEXT, setting
+        if decision.refusal == 'shared-name':
+            return shared_name % target + self.SHARED_NAME_NEXT + self.BY_AGENT_NEXT, setting
+        if decision.refusal == 'account-id':
+            return self.ACCOUNT_ID_AUTHOR + self.BY_AGENT_NEXT, setting
+        return own + self.BY_AGENT_NEXT, setting
 
     def _bare_account_id_of(self, agent_id, name):
-        """Whether ``name`` is exactly the account id of the person who owns ``agent_id``."""
+        """Whether ``name`` is exactly the account id of the person who owns ``agent_id``.
+
+        Candidate 1112a: the label :meth:`_approval_permission` (kittrial-5bb.518) reads. The decision itself
+        moved to :func:`http_authority._bare_account_id_of` (kittrial-5bb.560); this reads that one function.
+        """
+        import http_authority
         with self.service.store.lock:
-            agents = self.service.state.get('agents')
-            mine = agents.get(agent_id) if isinstance(agents, dict) else None
-            return isinstance(mine, dict) and isinstance(mine.get('owner'), str) and name == mine['owner']
+            return http_authority._bare_account_id_of(self.service.state, agent_id, name)
+
+    @staticmethod
+    def _refuse_caller_approval_basis(payload):
+        """The first of two barriers (kittrial-5bb.515): the basis of an approval is the server's statement.
+
+        A body naming ``approval_basis`` gets this 422 on every operation. The second barrier holds without it:
+        ``approval_basis`` is not a field a caller may send, so the unknown-field check refuses it too, and the
+        backends only ever write the value the route put under :data:`SERVER_APPROVAL_BASIS`.
+        """
+        if 'approval_basis' in payload:
+            raise invalid('approval_basis is set by the server')
+
+    def _approval_permission(self, principal, pid, author, assignee, setting=None, can_approve=None):
+        """Whether ``principal`` may approve a delivery now, and why (kittrial-5bb.518). Informational: it grants nothing.
+
+        The answer is the approve route's own, because it asks the functions the route asks and decides
+        nothing itself: :meth:`_own_party_refusal`, then, for an agent it refused, :meth:`_agent_approval_refusal`
+        (the project's agent-approval setting), and the installation's ``approval_by_another_party`` through
+        the same independence check. ``setting`` and ``can_approve`` are given by a caller that answers many rows
+        and reads them once; absent, they are read here. The case is a label for the sentence and is derived
+        from who delivered, never used to decide.
+        """
+        by_agent = principal.via == 'credential'
+        if setting is None:
+            setting = self.service.agent_approval(pid)
+        if can_approve is None:
+            can_approve = CAP_APPROVE in self.service.capabilities_for(principal, pid)
+        names = [principal.actor or principal.user_id, principal.user_id]
+        refusal = None
+        if by_agent or self.service.approval_by_another_party:
+            refusal = self._own_party_refusal(names, assignee, author, pid, by_agent)
+            if refusal and by_agent:
+                refusal, setting = self._agent_approval_refusal(principal, names, assignee, author, pid, setting)
+        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        # The case is a LABEL, read with the service functions the route reads, in the route's order. It decides
+        # nothing: may_approve and the refusal above come from the route's functions alone.
+        cases = []
+        for target in (author, assignee):
+            if not isinstance(target, str) or not target or self._independent_all(names, [target], pid, True):
+                continue
+            if not by_agent:
+                cases.append('own-person')
+            elif self.service.other_agent_of_same_person(agent_id, target):
+                cases.append('another-agent')
+            elif self.service.worker_credential_of_same_person(agent_id, target, pid):
+                # Refused under by-person and damaged, where it is a name of the party like any other.
+                cases.append('worker-credential' if setting['mode'] == 'by-agent' else 'own-worker-credential')
+            elif agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
+                cases.append('own-work')
+            elif self._bare_account_id_of(agent_id, target):
+                cases.append('own-person')
+            else:
+                cases.append('own-worker-credential')
+        allowed = ('another-agent', 'worker-credential') if by_agent and setting['mode'] == 'by-agent' else ()
+        if refusal:
+            case = next((c for c in cases if c not in allowed), cases[0] if cases else 'own-person')
+        else:
+            case = cases[0] if cases else 'independent'
+        shown = {'mode': setting['mode'], 'set_by': setting.get('set_by'),
+                 'set_by_display_name': setting.get('set_by_display_name'), 'set_at': setting.get('set_at'),
+                 'damaged': setting.get('damaged') is True}
+        may = bool(can_approve) and not refusal
+        who = ('set by %s at %s' % (shown['set_by_display_name'] or shown['set_by'], shown['set_at'])
+               if shown['set_by'] else 'the default; nobody has set it')
+        if not can_approve:
+            reason = 'You do not hold the approval capability in this project, so you cannot approve this.'
+        elif refusal:
+            reason = refusal                  # the route's own 403 sentence, word for word
+        elif case == 'another-agent':
+            reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
+                      '(%s), so a coordinator agent may approve another agent of its own person.' % who)
+        elif case == 'worker-credential':
+            reason = ('You may approve this: the project\'s setting Approvals by coordinator agents is by-agent '
+                      '(%s), so a coordinator agent may approve a worker credential of its own person issued with '
+                      'a name no other account has held.' % who)
+        elif case == 'independent':
+            reason = 'You may approve this: it was delivered by another party.'
+        else:
+            reason = ('You may approve this: this installation does not ask for another party to approve work '
+                      'for people.')
+        return {'may_approve': may, 'case': case, 'reason': reason, 'setting': shown}
 
     def _own_party_refusal(self, names, assignee, author, project, agent=False):
         """The sentence for an approver whose party the work is, or None when it is not.
@@ -8233,7 +8564,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def sessions_delete(self, ctx):
         return 204, self.service.logout(ctx.principal, request_id=ctx.request_id)
 
-    def _credential_expiry_view(self, principal):
+    def _credential_expiry_view(self, principal, moment=None):
         """The caller's own credential expiry, or ``None`` when it has none to show.
 
         The same secret-free shape both ``GET /v1/sessions/current`` and
@@ -8245,7 +8576,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         credential_id = getattr(principal, 'credential_id', None)
         credential = self.service.state['credentials'].get(credential_id) if credential_id else None
         if credential and credential.get('agent_id'):
-            return self.service.agent_credential_expiry_view(credential)
+            return self.service.agent_credential_expiry_view(credential, moment=moment)
         return None
 
     @route('POST', r'/v1/accounts')
@@ -8347,6 +8678,131 @@ class ApiHandler(BaseHTTPRequestHandler):
                            reason='account=%s' % ctx.params['uid'])
         self.service.store.save()
         return 200, result
+
+    # -- invite links (kittrial-5bb.578; invites.py) --------------------------------------------------------
+    #
+    # Accounts, memberships, agents and credentials are all the web service's own state, so these routes are
+    # the same for both backends: neither is asked to do anything except say whether the switch is on
+    # (``get_invites_enabled``) and whether a project's record may be granted access (``_require_usable``).
+
+    def _invites_enabled(self):
+        read = getattr(self.backend, 'get_invites_enabled', None)
+        return read is not None and read() is True
+
+    def _invite_refused(self, ctx, action, error):
+        """One audit line for an anonymous invite route's refusal (never the token or the password).
+
+        A 429 is audited and saved once per address in the sign-in window; repeats are answered with
+        neither (review S2 of kittrial-5bb.578), so a flood cannot roll the audit over."""
+        if isinstance(error, HttpError) and error.status == 429 and \
+                invites.quiet_throttle(self.service, self._source(), self._source_is_shared()):
+            error.quiet_audit = True
+            return
+        if isinstance(error, HttpError):
+            self.service.audit(ctx.request_id, None, action, 'denied' if error.status in (401, 403, 404, 429)
+                               else 'rejected', reason=error.code)
+            self.service.store.save_soon('the audit entry of a refusal')
+
+    @route('GET', r'/v1/invites')
+    def invites_list(self, ctx):
+        """The caller's invites with their status (a superuser: everyone's), whether the switch is on, and
+        the projects the caller may invite people to. A person's session only."""
+        enabled = self._invites_enabled()
+        items = invites.list_for(self.service, ctx.principal)
+        # kittrial-5bb.581: the projects are listed while the switch is off too, so an owner sees the panel
+        # with the off sentence rather than nothing; ``may_invite`` says whether there is any.
+        projects = invites.invitable_projects(self.service, ctx.principal)
+        return 200, {'enabled': enabled, 'items': items, 'projects': projects, 'may_invite': bool(projects),
+                     'default_hours': invites.DEFAULT_HOURS, 'max_hours': invites.MAX_HOURS,
+                     'off_sentence': None if enabled else invites.INVITES_OFF,
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('POST', r'/v1/invites')
+    def invites_create(self, ctx):
+        """Make one invite link. The token is in this answer only; an exact retry answers 200 without it."""
+        payload = dict(ctx.payload or {})
+        # The committed event names the invite (never the username), so a create can be linked to its
+        # redeem (``invites.redeemed`` carries the same id) from the audit alone.
+        metadata = {}
+
+        def create():
+            invites.require_enabled(self._invites_enabled())
+            refuse_unknown_fields(payload, invites.CREATE_FIELDS, 'An invite')
+            public, stored = invites.create(self.service, ctx.principal, payload, usable=self._require_usable,
+                                            request_id=ctx.request_id)
+            metadata.update(reason='invite=%s' % public['invite']['id'], invite_id=public['invite']['id'])
+            return public, stored
+        return self._mutate(ctx, 'invites.create', None, create, status=201, capability=CAP_AGENTS,
+                            replay_status=200, audit_metadata=metadata)
+
+    @route('POST', r'/v1/invites/(?P<iid>' + ID + r')/revoke')
+    def invites_revoke(self, ctx):
+        """Withdraw a pending invite: its inviter or a superuser. Open while the switch is off."""
+        payload = ctx.payload if ctx.payload is not None else {}
+
+        def revoke():
+            refuse_unknown_fields(payload, (), 'Withdrawing an invite')
+            result = invites.revoke(self.service, ctx.principal, ctx.params['iid'], request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'invites.revoke', None, revoke, capability=CAP_AGENTS,
+                            reason='invite=%s' % ctx.params['iid'][:40])
+
+    @route('POST', r'/v1/invites/view', anonymous=True, csrf=False)
+    def invites_view(self, ctx):
+        """What the signed-out invite page shows. The token is sent in the body, never in a URL, so it
+        is not in an access log; a token that cannot be used gets the one answer, and the misses of an
+        address are counted as sign-in failures are."""
+        try:
+            invites.require_enabled(self._invites_enabled())
+            payload = ctx.payload or {}
+            refuse_unknown_fields(payload, invites.VIEW_FIELDS, 'An invite read')
+            shown = invites.public_view(self.service, payload.get('token'), source=self._source(),
+                                        shared_source=self._source_is_shared())
+        except Exception as error:
+            self._invite_refused(ctx, 'invites.view', error)
+            raise
+        return 200, dict(shown, generated_at=now_iso(self.service._now()))
+
+    @route('POST', r'/v1/invites/redeem', anonymous=True, csrf=False)
+    def invites_redeem(self, ctx):
+        """Claim the invite: set the password; the account, memberships and agent are made at once."""
+        try:
+            invites.require_enabled(self._invites_enabled())
+            payload = ctx.payload or {}
+            refuse_unknown_fields(payload, invites.REDEEM_FIELDS, 'An invite redemption')
+            result = invites.redeem(self.service, payload.get('token'), payload.get('password'),
+                                    source=self._source(), shared_source=self._source_is_shared(),
+                                    usable=self._require_usable, request_id=ctx.request_id)
+        except Exception as error:
+            self._invite_refused(ctx, 'invites.redeem', error)
+            raise
+        return 201, result
+
+    @route('POST', r'/v1/invites/accept')
+    def invites_accept(self, ctx):
+        """kittrial-5bb.581: accept an invite for an existing account, as that account's own session.
+
+        Not anonymous and CSRF-checked, as every web write is. The token is in the body only. The
+        secret of the pre-approved agent's credential is in this answer only; an exact retry answers
+        200 without it. A token for anyone else, or of the new-person kind, gets the unknown-token 404."""
+        payload = dict(ctx.payload or {})
+
+        def accept():
+            invites.require_enabled(self._invites_enabled())
+            refuse_unknown_fields(payload, invites.ACCEPT_FIELDS, 'Accepting an invite')
+            try:
+                return invites.accept(self.service, ctx.principal, payload.get('token'), source=self._source(),
+                                      shared_source=self._source_is_shared(), usable=self._require_usable,
+                                      request_id=ctx.request_id)
+            except HttpError as error:
+                # A 429 is audited once per address in the sign-in window, as on the anonymous routes
+                # (_invite_refused); _mutate audits every other refusal itself.
+                if error.status == 429 and invites.quiet_throttle(self.service, self._source(),
+                                                                  self._source_is_shared()):
+                    error.quiet_audit = True
+                raise
+        return self._mutate(ctx, 'invites.accept', None, accept, status=201, capability=CAP_AGENTS,
+                            replay_status=200)
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/disable')
     def account_disable(self, ctx):
@@ -9256,6 +9712,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         # caller may change it: the same live CAP_PROJECT_ADMIN check the PUT route makes.
         result['agent_approval'] = self.service.agent_approval(ctx.params['pid'])
         result['can_set_agent_approval'] = self._may_set_agent_approval(ctx)
+        result['auto_nudge'] = self.service.auto_nudge(ctx.params['pid'])
+        result['can_set_auto_nudge'] = self._may_set_agent_approval(ctx)
         return 200, result
 
     def _may_set_agent_approval(self, ctx):
@@ -9288,6 +9746,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'projects.agent_approval', ctx.params['pid'], update,
                             capability=CAP_PROJECT_ADMIN, audit_metadata={'agent_approval': value})
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/auto-nudge')
+    def project_auto_nudge(self, ctx):
+        """Set whether the project sends automatic ``resume`` nudges to idle lanes (kittrial-5bb.514).
+
+        An owner of the project or a superuser, by session: never a credential, so no agent turns
+        automatic nudging on. The write records who set it and when, and is audited.
+        """
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'auto_nudge'}:
+            raise invalid('Send exactly the field to change: auto_nudge')
+        value = payload['auto_nudge']
+        if type(value) is not bool:
+            raise invalid('auto_nudge must be true or false')
+
+        def update():
+            result = self.service.set_auto_nudge(ctx.principal, ctx.params['pid'], value)
+            return result, result
+        return self._mutate(ctx, 'projects.auto_nudge', ctx.params['pid'], update,
+                            capability=CAP_PROJECT_ADMIN, audit_metadata={'auto_nudge': value})
 
     @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/claiming')
     def project_claiming(self, ctx):
@@ -9811,9 +10289,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     # The agent's own API is registered before ``/v1/agents/{aid}`` so the literal
     # ``me`` path always wins. Every route here returns stable JSON; the browser
     # screens are the separate task kittrial-5bb.20 and are not built here.
+    #: The version of the AGENT.md text the set-up page writes (web/js/agentSetup.js; its first line says it too),
+    #: and what an agent with an older copy is told (kittrial-5bb.518). The server never touches the agent's file.
+    AGENT_MD_VERSION = 2
+    AGENT_MD_NOTE = ('If your .orchestra/AGENT.md has no version line or an older one, it predates current guidance. '
+                     'The server\'s reads are authoritative over it: the brief\'s approval_permission decides whether '
+                     'you may approve. Ask your owner to re-run set-up from My agents to refresh the file.')
+
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
-        agent = self.service.agent_for_credential(ctx.principal)
+        moment = self.service._expiry_now()
+        agent = self.service.agent_for_credential(ctx.principal, moment=moment)
         # The agent record only (kittrial-5bb.303): this route is a polled whoami, so it
         # makes NO work read. The counted limit/held/available view needs the bounded
         # current-work snapshot, so it stays on ``/v1/agents/me/next``, which already
@@ -9825,6 +10311,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'agent': agent,
                 'setup': self.service.agent_setup(agent, None),
                 'claim_limit': self._agent_claim_limit_record_view(agent),
+                'agent_md': {'version': self.AGENT_MD_VERSION, 'note': self.AGENT_MD_NOTE},
                 'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
                 'generated_at': now_iso(self.service._now())}
         # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
@@ -9832,7 +10319,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # extension read this route, and the read caps the stored expiry at 366 days from
         # issuance (item 4). No new disclosure: it is the caller's credential only, never
         # another credential's.
-        expiry = self._credential_expiry_view(ctx.principal)
+        expiry = self._credential_expiry_view(ctx.principal, moment=moment)
         if expiry is not None:
             body['credential_expiry'] = expiry
             body['expires_soon'] = bool(expiry.get('expires_soon'))
@@ -9946,22 +10433,23 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
         role_override = validate_agent_role(ctx.query['role']) if 'role' in ctx.query else None
-        agent = self.service.agent_for_credential(ctx.principal)
-        attention = self._agent_attention(ctx.principal, agent, role=role_override)
+        moment = self.service._expiry_now()
+        agent = self.service.agent_for_credential(ctx.principal, moment=moment)
+        attention = self._agent_attention(ctx.principal, agent, role=role_override, moment=moment)
         # kittrial-5bb.443: an unacknowledged hand-over note for this agent's person, where it coordinates, is its
         # first next action. It carries the note's identity and the routes, never its text, and counts nowhere.
         notes = [self._handover_action(project_id, pointer)
                  for project_id, pointer in self.service.handover_notes_to_acknowledge(ctx.principal.agent_id)]
         # kittrial-5bb.447: an unsettled note from another project's coordinator, to a project where this agent's
         # grant has effect, comes next: its pointer and routes, never its text.
-        waking = self._notes_waking(ctx.principal)
+        waking = self._notes_waking(ctx.principal, moment=moment)
         notes = notes + [self._note_action(note) for note in waking]
         if notes:
             attention = dict(attention, actions=notes + list(attention['actions']))
         # `repository` is where the project's owner says its code lives (kittrial-5bb.118):
         # a label, null when not recorded. Data for the agent, never an instruction.
         projects = [{'id': p['id'], 'name': p['name'], 'repository': p.get('repository')}
-                    for p in self.service.list_projects(ctx.principal)]
+                    for p in self.service.list_projects(ctx.principal, moment=moment)]
         next_action = attention['actions'][0] if attention['actions'] else None
         if next_action is None and not projects:
             next_action = {'kind': 'no-project', 'reason': self.NO_PROJECT_NEXT_ACTION}
@@ -10293,11 +10781,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         return view
 
     # -- coordinator notes (kittrial-5bb.447) ---------------------------------------------------------------------
-    def _notes_waking(self, principal):
+    def _notes_waking(self, principal, moment=None):
         """The unsettled notes to the projects where this agent's coordinator grant has effect (none for a person)."""
         if principal is None or principal.via != 'credential' or not principal.agent_id:
             return []
-        projects, _more = self.service.note_projects(principal)
+        projects, _more = self.service.note_projects(principal, moment=moment)
         return self.service.unsettled_notes_to(projects)
 
     @staticmethod
@@ -10565,31 +11053,33 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'agents.create', None, create, status=201,
                             capability=CAP_AGENTS, replay_status=200, replay_check=replay_check)
 
-    def _agent_items(self, principal, agents=None):
+    def _agent_items(self, principal, agents=None, moment=None):
+        moment = self.service._expiry_now() if moment is None else moment
         items = []
-        for agent in self.service.list_agents(principal) if agents is None else agents:
+        for agent in self.service.list_agents(principal, moment=moment) if agents is None else agents:
             # One read per project for all the agents listed, not one per agent.
-            attention = self._agent_attention(principal, agent, many=True)
+            attention = self._agent_attention(principal, agent, many=True, moment=moment)
             items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
                               resume_prompt=self._agent_resume_prompt(agent, attention)))
         return items
 
     @route('GET', r'/v1/agents')
     def agents_list(self, ctx):
-        self.require(ctx, CAP_AGENTS)
+        moment = self.service._expiry_now()
+        self.require(ctx, CAP_AGENTS, moment=moment)
         if any(key in ctx.query for key in ('limit', 'cursor', 'unconfirmed')):
             limit, state = self._page(ctx, ctx.query)
             unconfirmed = ctx.query.get('unconfirmed', 'false')
             if unconfirmed not in ('true', 'false'):
                 raise invalid('unconfirmed must be true or false')
             agents, total = self.service.agent_page(ctx.principal, state['o'], limit,
-                                                  unconfirmed=unconfirmed == 'true')
-            return 200, {'items': self._agent_items(ctx.principal, agents), 'total': total,
+                                                  unconfirmed=unconfirmed == 'true', moment=moment)
+            return 200, {'items': self._agent_items(ctx.principal, agents, moment=moment), 'total': total,
                          'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit,
                                                     key=self.service.cursor_key())
                          if state['o'] + limit < total else None,
                          'generated_at': now_iso(self.service._now())}
-        items = self._agent_items(ctx.principal)
+        items = self._agent_items(ctx.principal, moment=moment)
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
 
@@ -10605,9 +11095,10 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('GET', r'/v1/agents/(?P<aid>' + ID + r')')
     def agents_get(self, ctx):
-        self.require(ctx, CAP_AGENTS)
-        agent = self.service.get_agent(ctx.principal, ctx.params['aid'])
-        attention = self._agent_attention(ctx.principal, agent)
+        moment = self.service._expiry_now()
+        self.require(ctx, CAP_AGENTS, moment=moment)
+        agent = self.service.get_agent(ctx.principal, ctx.params['aid'], moment=moment)
+        attention = self._agent_attention(ctx.principal, agent, moment=moment)
         return 200, dict(agent, attention=self._agent_attention_view(agent, attention),
                          resume_prompt=self._agent_resume_prompt(agent, attention),
                          generated_at=now_iso(self.service._now()))
@@ -11074,7 +11565,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: At most this many reviewer actions are listed per read; the counts stay exact.
     AGENT_REVIEW_LIMIT = 20
 
-    def _agent_review_actions(self, principal, agent, project_id, rows, counts):
+    def _agent_review_actions(self, principal, agent, project_id, rows, counts, moment=None):
         """The review work one agent is shown in one project: the actions to list.
 
         Two kinds, both at the priority of claimable work and listed before it
@@ -11097,19 +11588,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         agent_id = agent.get('id')
         actor = agent.get('actor') or agent_id
-        may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id)
-        approves = self.service.agent_approves(agent_id, project_id)
+        may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id, moment=moment)
+        approves = self.service.agent_approves(agent_id, project_id, moment=moment)
         if not may_review and not approves:
             return []
         # kittrial-5bb.438: under the project's default agent-approval setting a granted agent may approve the
         # work of ANOTHER agent of its person, so that work is offered to it too (and only to it, for approval).
-        by_agent = approves and self.service.agent_approval(project_id)['mode'] == 'by-agent'
+        setting = self.service.agent_approval(project_id) if approves else None
+        by_agent = approves and setting['mode'] == 'by-agent'
+        # kittrial-5bb.518: the reason names the setting and the case, from the approve route's own answer.
+        asker = Principal(principal.user_id, principal.display_name, False, 'credential', actor,
+                          agent_id=agent_id) if approves else None
         actions = []
         for row in rows:
             if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
                 continue
             parties = [row.get('assignee'), row.get('contribution_author')]
-            same_person = by_agent and self._another_agent_only(agent_id, [actor], parties, project_id)
+            same_person = by_agent and self._another_agent_only(agent_id, [actor], row.get('assignee'),
+                                                                row.get('contribution_author'), project_id)
             if not same_person and not self._independent([actor], parties, project_id):
                 continue
             recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
@@ -11128,6 +11624,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'A contribution by another account awaits review. ')
                           + 'You hold the coordinator grant in this project: review it, then approve it or request '
                             'changes.')
+                permission = self._approval_permission(asker, project_id, row.get('contribution_author'),
+                                                       row.get('assignee'), setting, True)
+                reason += ' %s (agent_approval: %s; case: %s)' % (permission['reason'], permission['setting']['mode'],
+                                                                  permission['case'])
             elif recommended_by and owner_approves:
                 kind, count, who = 'review-recommended', 'review_recommended', 'owner'
                 reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
@@ -11193,7 +11693,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         action.update(extra)
         return action
 
-    def _agent_may_read(self, principal, project_id):
+    def _agent_may_read(self, principal, project_id, moment=None):
         """The task-route authority check for one project, reused by attention.
 
         ``Service.check_authority`` is the single boundary every task route uses and it
@@ -11205,7 +11705,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         is skipped rather than read.
         """
         try:
-            self.service.check_authority(principal, project_id, CAP_READ)
+            self.service.check_authority(principal, project_id, CAP_READ, moment=moment)
         except HttpError:
             return False
         return True
@@ -11381,7 +11881,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'guidance_version': item.get('guidance_version'),
                 'links': {'project': '/v1/projects/%s' % project_id}}
 
-    def _agent_attention(self, principal, agent, many=False, role=None):
+    def _agent_attention(self, principal, agent, many=False, role=None, moment=None):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
         Each granted project is re-authorized with the same live-authority check the
@@ -11427,8 +11927,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         truncated = False
         snapshot_truncated = own_tasks_truncated = actions_truncated = False
         claiming_modes = {}
+        moment = self.service._expiry_now() if moment is None else moment
         for project_id in agent.get('projects') or []:
-            if not self._agent_may_read(principal, project_id):
+            if not self._agent_may_read(principal, project_id, moment=moment):
                 continue
             # The per-project claiming setting (kittrial-5bb.352), read FRESH here (it
             # lives outside the tracker, so the tracker read cache would not see it) and
@@ -11607,7 +12108,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             # When the agent is configured (or queried) as a worker, omit other people's
             # deliveries awaiting review while keeping CAP_REVIEWS for its own deliveries.
             if effective_role != 'worker':
-                review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
+                review_actions += self._agent_review_actions(
+                    principal, agent, project_id, read['tasks'], counts, moment=moment)
         # Counts cover the read pages; incomplete-source counts are lower bounds.
         # Only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.
@@ -14314,9 +14816,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         required=bool(review.get('approval_requires_other_party') or self.service.approval_by_another_party)
         named=any(r.get('reviewer')==caller for r in review.get('pending_review_requests') or [])
         text=approval_wait(review.get('state'),tid,caller,assignee,author,required,named_reviewer=named)
+        # kittrial-5bb.518: the same answer the approve route would give this caller, for an awaiting delivery.
+        permission = (self._approval_permission(ctx.principal, pid, author, assignee)
+                      if review.get('state') == 'awaiting-review' and author else None)
+        review['approval_permission'] = permission
         if (required and review.get('state')=='awaiting-review' and author
                 and not self._independent_all([caller],[author,assignee],pid)):
-            text=APPROVAL_WAIT
+            # Waiting for somebody else, unless the approve route itself would let THIS caller through: only an
+            # agent can be (a coordinator agent under the project's by-agent setting, for another agent of its
+            # person). A person is never told otherwise than before, under either setting.
+            if not (ctx.principal.via == 'credential' and permission and permission['may_approve']):
+                text=APPROVAL_WAIT
         review['waiting_for_approval']=text
         actors = [brief['task'].get('assignee')]
         actors += [checkpoint.get('author', {}).get('text') if checkpoint and isinstance(checkpoint.get('author'), dict)
@@ -14593,6 +15103,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (kittrial-5bb.209), and is then judged by party below whatever the setting says.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
+        self._refuse_caller_approval_basis(payload)
         recommending = payload.get('operation') == 'recommend'
         # With the installation's setting on, an approval is judged by whose work it is, which
         # needs the same read a recommendation makes (kittrial-5bb.199). Off: no read, no rule.
@@ -14669,11 +15180,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if typed is not None:
                     raise invalid('The approval summary may not contain %r; the server adds that sentence itself'
                                   % typed)
+                setting_basis = (setting.get('basis') or 'agent') if setting is not None else None
+                advertised = getattr(self.backend, 'approval_basis_advertised', None)
+                if setting is not None and advertised is not None and advertised(pid):
+                    # kittrial-5bb.515: the endpoint's review help lists the field, so the basis is a field of
+                    # the record and the approver's summary stays the approver's own words. The value is the
+                    # one the route's basis names (kittrial-5bb.519: an agent, or a worker credential).
+                    payload[SERVER_APPROVAL_BASIS] = APPROVAL_BASIS_OF[setting_basis]
                 if setting is not None:
-                    basis = setting.get('basis') or 'agent'
-                    sentence = (self.WORKER_CREDENTIAL_APPROVAL if basis == 'worker-credential'
+                    sentence = (self.WORKER_CREDENTIAL_APPROVAL if setting_basis == 'worker-credential'
                                 else self.SAME_PERSON_APPROVAL)
-                    if isinstance(summary, str):
+                    if isinstance(summary, str) and SERVER_APPROVAL_BASIS not in payload:
                         joined = (summary.rstrip() + ' ' if summary.strip() else '') + sentence
                         over = len(joined) - self.SUMMARY_MAX
                         if over > 0:
@@ -14684,7 +15201,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         payload['summary'] = joined
                     same_person.update(same_person_coordinator=True, author=delivered.get('author'),
                                        assignee=(current.get('task') or {}).get('assignee'),
-                                       basis=basis,
+                                       basis=setting_basis,
                                        agent_approval=setting['mode'],
                                        agent_approval_set_by=setting.get('set_by') or 'default',
                                        agent_approval_set_at=setting.get('set_at'))
@@ -14696,7 +15213,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
                     raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
                                     else self.NOT_INDEPENDENT)
-                typed = self._basis_sentence_in(payload.get('summary'))
+                typed = self._basis_sentence_in(payload.get('summary'), True)
                 if typed is not None:
                     raise invalid('The recommendation summary may not contain %r; the server adds that sentence itself'
                                   % typed)
@@ -15276,8 +15793,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                      item['review_state'] in ACTIVE_REVIEW_STATES)]
         body = self._paged(ctx, items, limit, state, complete=bool(read.get('complete')),
                            generated_at=now_iso(self.service._now()))
-        body['items'] = self._task_views(body['items'], ctx.params['pid'])
+        rows = body['items']
+        views = self._task_views(rows, ctx.params['pid'])
+        self._add_approval_permissions(ctx.principal, ctx.params['pid'], rows, views)
+        body['items'] = views
         return 200, body
+
+    def _add_approval_permissions(self, principal, pid, rows, views, setting=None, can_approve=None):
+        """Put ``approval_permission`` on each awaiting-review row of ``views`` (kittrial-5bb.518).
+
+        ``rows`` are the queue rows the views were made from, in the same order. The project's setting and the
+        caller's capability are read ONCE for the request, not once per row, and only when a row awaits review.
+        """
+        for row, view in zip(rows, views):
+            if row.get('review_state') != 'awaiting-review' or not row.get('contribution_author'):
+                continue
+            if setting is None:
+                setting = self.service.agent_approval(pid)
+            if can_approve is None:
+                can_approve = CAP_APPROVE in self.service.capabilities_for(principal, pid)
+            view['approval_permission'] = self._approval_permission(
+                principal, pid, row.get('contribution_author'), row.get('assignee'), setting, can_approve)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/lanes')
     def project_lanes(self, ctx):
@@ -15430,10 +15966,42 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _carrier_gate(self, ctx):
         self.service.check_authority(ctx.principal, None, CAP_NUDGE_CARRY)
 
+    def _all_project_lanes(self, project_id):
+        """Read all pages of ``project_id``'s lanes board as the service (scope ``'all'``)."""
+        from lanes import DEFAULT_IDLE_MINUTES, LANES_LIMIT_MAX
+        items = []
+        offset = 0
+        first = None
+        for _page in range(50):
+            page = self.backend.lanes_read(
+                project_id, None,
+                ['--idle-minutes', str(DEFAULT_IDLE_MINUTES), '--limit', str(LANES_LIMIT_MAX),
+                 '--offset', str(offset)],
+                'service/lanes', 'all')
+            if first is None:
+                first = dict(page) if isinstance(page, dict) else {'items': []}
+            for row in (page.get('items') if isinstance(page, dict) else None) or []:
+                if isinstance(row, dict):
+                    items.append(row)
+            offset = page.get('next_offset') if isinstance(page, dict) else None
+            if type(offset) is not int:
+                break
+        if first is None:
+            return {'items': [], 'idle_threshold_minutes': DEFAULT_IDLE_MINUTES}
+        first['items'] = items
+        return first
+
+    def _evaluate_carrier_auto_nudges(self, ctx):
+        """Evaluate automatic nudges in the carrier path only, reading each project's lanes as the service."""
+        for project_id in self.service.carrier_auto_nudge_projects(ctx.principal):
+            board = self._all_project_lanes(project_id)
+            self.service.evaluate_auto_nudges(ctx.principal, project_id, board, request_id=ctx.request_id)
+
     @route('GET', r'/v1/me/nudges', carrier=True)
     def me_nudges(self, ctx):
         """The carrier's own open requests: id, project, lane, message key and message set (no reason, no note)."""
         self._carrier_gate(ctx)
+        self._evaluate_carrier_auto_nudges(ctx)
         return 200, dict(self.service.carrier_nudges(ctx.principal), generated_at=now_iso(self.service._now()))
 
     @route('POST', r'/v1/me/carrier', carrier=True)
@@ -15444,6 +16012,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_unknown_fields(payload, self.CARRIER_FIELDS, 'A carrier heartbeat')
         answer, wrote = self.service.carrier_heartbeat(ctx.principal, payload)
         if wrote:
+            self._evaluate_carrier_auto_nudges(ctx)
             self.service.store.save_soon()
         return 200, answer
 
@@ -15637,6 +16206,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             truncated = truncated or not read.get('complete')
             reads.append((project, capabilities, read))
         details = self._me_work_details(reads, actor)
+        settings = {}                      # each project's agent-approval setting, read at most once a request
         for project, capabilities, read in reads:
             items = [dict(item, **details[(project['id'], item.get('id'))])
                      if (project['id'], item.get('id')) in details else item
@@ -15677,6 +16247,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                             [actor, principal.user_id],
                             [item.get('assignee'), item.get('contribution_author')],
                             project['id']):
+                        if item['review_state'] == 'awaiting-review' and item.get('contribution_author'):
+                            # kittrial-5bb.518: what the approve route would answer this person, per row; the
+                            # project's setting and the capability are read once for the project, not per row.
+                            if project['id'] not in settings:
+                                settings[project['id']] = self.service.agent_approval(project['id'])
+                            row['approval_permission'] = self._approval_permission(
+                                principal, project['id'], item.get('contribution_author'), item.get('assignee'),
+                                settings[project['id']], True)
                         to_review.append(row)
         if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
             truncated = True
@@ -15693,7 +16271,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Each agent's prompt covers only the projects that agent is granted.
         prompts = [agent_prompts.build_prompt(
             agent, owner_name,
-            [p for p in classified if p['id'] in set(agent.get('projects') or [])],
+            self._agent_prompt_projects(agent, principal, classified, settings),
             generated_at, server)
             for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
@@ -15703,6 +16281,37 @@ class ApiHandler(BaseHTTPRequestHandler):
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}
+
+    def _agent_prompt_projects(self, agent, owner, classified, settings):
+        """The projects of one agent's prompt, its review rows carrying what THE AGENT may do (kittrial-5bb.518).
+
+        ``classified`` is the owner's own sort of each project's queue. An agent that holds the coordinator
+        grant in a project is judged as the approve route judges it (``_approval_permission``): a sibling agent's
+        delivery is a row it may approve under by-agent and one it may not under by-person. An agent with no
+        grant is judged by nothing here and its rows stay as they were. ``settings`` is the request's per-project
+        cache of the agent-approval setting.
+        """
+        mine = set(agent.get('projects') or [])
+        agent_id = agent.get('id')
+        out = []
+        for entry in classified:
+            if entry['id'] not in mine:
+                continue
+            rows = entry['classes'].get('review') or []
+            if not rows or not self.service.agent_approves(agent_id, entry['id']):
+                out.append(entry)
+                continue
+            if entry['id'] not in settings:
+                settings[entry['id']] = self.service.agent_approval(entry['id'])
+            agent_principal = Principal(owner.user_id, owner.display_name, False, 'credential',
+                                        agent.get('actor') or agent_id, agent_id=agent_id)
+            marked = [dict(row, approval_permission=self._approval_permission(
+                          agent_principal, entry['id'], row.get('contribution_author'), row.get('assignee'),
+                          settings[entry['id']], True))
+                      if row.get('review_state') == 'awaiting-review' and row.get('contribution_author') else row
+                      for row in rows]
+            out.append(dict(entry, classes=dict(entry['classes'], review=marked)))
+        return out
 
     def _me_work_details(self, reads, actor):
         """Fill the canonical queue's gaps for the rows that matter most, within a bound.

@@ -26,7 +26,18 @@ const sample = [
   { id: 'agent_made', name: 'Swift', display_name: 'Swift', owner: 'u1', created_by: 'u2', created_by_display_name: 'Sam', enabled: true, scopes: ['read'], scopes_source: 'stored', projects: [], working_directory: 'C:\\s', credentials: [cred('c8')] },
 ];
 const api = {
-  agents: async () => { await agentsGate; return { items: sample, total: sample.length, next_cursor: null }; },
+  // Paginated like the real GET /v1/agents (http_service.py agents_list): the page asks for
+  // limit/cursor, and a bare call gets the unpaged full list the duplicate check probes.
+  agents: async (params) => {
+    await agentsGate;
+    if (params && (params.limit !== undefined || params.cursor !== undefined || params.unconfirmed !== undefined)) {
+      const limit = Number(params.limit) || sample.length;
+      const start = params.cursor ? Number(params.cursor) : 0;
+      const items = sample.slice(start, start + limit);
+      return { items, total: sample.length, next_cursor: start + limit < sample.length ? String(start + limit) : null };
+    }
+    return { items: sample, total: sample.length, next_cursor: null };
+  },
   accounts: async () => { await accountsGate; return { items: [{ id: 'u1', username: 'olive' }, { id: 'u2', username: 'sam' }] }; },
   agentHistory: async () => ({ items: [] }),
   createAgent: async (body) => { created.push(body); return { agent: { id: 'agent_1', name: body.name, tool: body.tool || null, projects: [] }, credential: { id: 'cred_n', secret: 'orc_NEW_SECRET' } }; },
@@ -73,9 +84,35 @@ Object.assign(out, {
   dirHint: page.querySelector('#a-dir-hint').textContent,
   pageText: page.textContent,
 });
+// kittrial-5bb.561 r2: rows show owner id + agent id; Mine/All is caller-level (stable
+// across pages); the duplicate-name check probes every name that account uses.
+out.ownerLabelsShowOwnerPlusId = sample.every((a) => row(a.id).all((e) => e.attributes['data-agent-owner'] !== undefined).length === 1
+  && row(a.id).all((e) => e.attributes['data-agent-owner'] !== undefined)[0].attributes['data-agent-owner'] === a.owner
+  && row(a.id).textContent.includes(a.owner) && row(a.id).textContent.includes(a.id));
+out.mineFilterShownToSuperuser = early.all((e) => e.attributes['data-mine-filter'] !== undefined).length === 1;
+out.mineFilterHiddenWithOneOwner = agents.showMineFilter({ me: { id: 'u1', superuser: false } }, sample) === false
+  && agents.showMineFilter({ me: { id: 'u1', superuser: false } }, [...sample, { ...sample[0], owner: 'u2' }]) === true
+  && agents.showMineFilter({ me: { id: 'u1', superuser: true } }, sample) === true;
+out.duplicateWarnsWithOwnerAndConfirm = (() => {
+  const dup = agents.duplicateNamed(sample, 'kestrel');
+  return dup && dup.id === 'agent_one' && /already used by/.test(agents.duplicateWarning(dup)) && /u1/.test(agents.duplicateWarning(dup)) && /agent_one/.test(agents.duplicateWarning(dup)) && /Create/.test(agents.duplicateWarning(dup));
+})();
+out.noHintForFreshAgent = agents.disableNotDeleteHint(sample[0]) === null;
+out.hintForActedAgent = (() => {
+  const hint = agents.disableNotDeleteHint({ ...sample[0], last_seen_at: '2026-01-01T00:00:00Z' });
+  return hint !== null && /disable it instead/.test(hint.textContent);
+})();
 page.querySelector('#a-name').value = 'Kestrel';
 const form = page.all((e) => e.tagName === 'FORM' && e.querySelector('#a-name'))[0];
-await form.dispatch('submit');
+const pendingSubmit = form.dispatch('submit');
+for (let i = 0; i < 200 && document.body.all((e) => e.tagName === 'DIALOG').length === 0; i += 1) await new Promise((r) => setTimeout(r, 25));
+out.duplicateNameAsksFirst = /already used by/.test((document.body.all((e) => e.tagName === 'DIALOG')[0] || {}).textContent || '')
+  && /every agent name that account uses/.test((document.body.all((e) => e.tagName === 'DIALOG')[0] || {}).textContent || '');
+for (const d of document.body.all((e) => e.tagName === 'DIALOG')) {
+  const yes = d.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Create anyway')[0];
+  if (yes) await yes.dispatch('click');
+}
+await pendingSubmit;
 await new Promise((r) => setTimeout(r, 300));
 out.sentTool = created.length ? created[0].tool : null;
 const dialog = document.body.all((e) => e.tagName === 'DIALOG')[0];

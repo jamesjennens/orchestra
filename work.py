@@ -303,8 +303,9 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
             return 'you', ('This is your work now: %d outstanding review %s. Read %s and '
                            'respond to each item: the revision that supersedes this contribution '
                            'has already been delivered.%s' % (items, plural, back, named))
-        return 'you', ('This is your work now: %d outstanding review %s. Read %s, deliver '
-                       'a revision that supersedes this contribution and respond to each item.%s'
+        return 'you', ('This is your work now: %d outstanding review %s. Read %s and respond '
+                       'to each item; where an item needs a code change, deliver a new commit '
+                       'that supersedes this contribution; the same commit is refused.%s'
                        % (items, plural, back, named))
     if state in ('awaiting-review', 'legacy-review-ready'):
         return 'reviewer', "Nothing is for you to do: the next move is the reviewer's."
@@ -713,6 +714,10 @@ def help_payload(action='work'):
         ]
         import review_recommendations
         payload['limits'] = dict(review_workflow_limits(), **review_recommendations.help_limits())
+        # kittrial-5bb.515: the fields each operation accepts beyond its required set. A writer that wants to
+        # use one reads this first (the web service writes approval_basis only when it is listed for approve).
+        import review_workflow
+        payload['optional_fields'] = review_workflow.help_optional_fields()
         payload['rounds_limits'] = {
             'rounds / items per round': '20 / 50',
             'attestations / holds per round': '10 / 10',

@@ -190,7 +190,11 @@ fields in the body. Scope compare-and-set controls never enter the native payloa
 
 All values of `reviewed` and `integrated` require the current contribution's
 standing independent approval, with no unresolved review requests. The approver
-must be a different party from both author and current assignee, the source must
+must be a different party from both author and current assignee, or a coordinator
+agent that the project's `agent_approval: by-agent` setting lets through: the same
+decision as the approve route, asked again from the present state on every read and
+write (see "Integration follows the setting and the grant" under Coordinators below;
+kittrial-5bb.560). The source must
 equal the full approved commit, and the caller must hold the merge slot for this
 task. These requirements are checked again under the project and configured
 authority locks before the effect. Recording a fact writes evidence; it does not
@@ -405,7 +409,7 @@ sudo -u <SERVICE_USER> python3 http_service.py \
   --state <RUNTIME_ROOT>/http-state.json --root <RUNTIME_ROOT> \
   --bootstrap-user <ADMIN_USERNAME>
 # the operator types the password twice at the prompts; it is never echoed or logged
-# (the password must have at least 12 characters; --password-min-length N changes that
+# (the password must have at least 5 characters; --password-min-length N changes that
 #  minimum, 1 to 1024; see "Password rule")
 ```
 
@@ -844,7 +848,7 @@ commands of that text.
 ### Handing a project to a coordinator
 
 **The page and the route** (kittrial-5bb.442; docs/design/COORDINATOR_ONBOARDING_DESIGN.md §3): the page
-**Hand this project to a coordinator** (`#/p/NAME/handover`, linked from Members & settings and from Set up)
+**Hand this project to a coordinator** (`#/p/NAME/handover`, linked from the project's People, Agents and Settings pages and from Set up)
 reads `GET /v1/projects/{id}/handover[?person=USER&agent=AGENT]`. It answers the steps for one member, each
 with a state (`done`, `todo`, `waiting`, `failed`, `hidden`), a plain sentence, who does it, and the existing
 page or route that fixes it. It writes nothing, and the page changes nothing itself.
@@ -853,7 +857,7 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
 | --- | --- | --- |
 | Coordinator role | the member's role | an owner (Members) |
 | Their agent has this project (only after the role, so no agent is made first) | the agents that have the project | the member, under My agents |
-| Coordinator grant | the grant and, when it has no effect, why: agent switched off, account disabled, no longer a coordinator, granting owner no longer an owner | an owner (Members & settings) |
+| Coordinator grant | the grant and, when it has no effect, why: agent switched off, account disabled, no longer a coordinator, granting owner no longer an owner | an owner (the project's Agents page) |
 | Installation switches | `GET /v1/projects/{id}/switches`; an endpoint that cannot answer makes only this step say so | the operator, with the command shown |
 | Agent approvals | the project's `agent_approval` setting | an owner |
 | Set up after the grant | the agent has reached the server since the grant (`last_seen_at` later than `granted_at`) | the member, by opening the agent's set-up again |
@@ -2195,7 +2199,7 @@ a child task or a decision under `{task}` through the host's own `coordinate cre
   `web_lifecycle_mark_writes` is `unreadable`; the other two read a malformed value as off.
 - `command` is the operator's `admin.py ... on --actor OPERATOR`.
 - It changes nothing and returns no path, configured value or actor. A contributor or viewer gets 403;
-  a non-member gets 404. Members & settings shows it to a coordinator.
+  a non-member gets 404. The project's Settings page shows it to a coordinator.
 
 **Task create takes a priority too.** `POST /v1/projects/{id}/tasks` takes `title`,
 `description`, `priority` (an integer 0 to 4; bd's default 2 applies when it is absent) and the
@@ -2510,20 +2514,58 @@ credential approved anything; this is the one place where that is lifted.
     `403`, and a credential never may, so no agent sets the rule that judges it.
   - What is recorded: who set it and when, audited as `projects.agent_approval`.
   - Where it shows: `GET /v1/projects/{id}` answers `agent_approval` (`mode`, `set_by`,
-    `set_by_display_name`, `set_at`) and `can_set_agent_approval`, and Members & settings has
+    `set_by_display_name`, `set_at`) and `can_set_agent_approval`, and the project's Settings page has
     an "Approvals by coordinator agents" panel.
   - Damage: a damaged stored value reads as the strict `by-person` (with `damaged: true`), never
     as the default.
-  - Storage: it lives in this service's state and only the web route applies it. The host route
-    compares actor names, so over ssh an agent of the same person was never refused, and a
-    project set to `by-person` here is not strict over ssh.
+  - Storage: it lives in this service's state, and the web route and the web integration
+    (below) apply it. The host route compares actor names, so over ssh an agent of the same
+    person was never refused, and a project set to `by-person` here is not strict over ssh.
+- **Integration follows the setting and the grant (kittrial-5bb.560).** The approval row of
+  `GET .../integration-check`, the standing approval and the `reviewed`/`integrated`
+  affordances of `GET .../lifecycle`, and the `reviewed` and `integrated` writers ask the
+  approve route's decision again, from the present state, whenever the approver is of the
+  author's or the assignee's party.
+  - It is re-decided on every read and write, not taken from the record. An approval already
+    recorded stops integrating when the project is switched to `by-person` or its setting is
+    damaged, or when the agent's grant ends: the grant is deleted, the account loses its
+    role, or no credential of the agent is still live (revoked, expired on the decision clock
+    or on its own raw deadline, past the 366-day cap, or issued to another account than the
+    agent's). The row then reads `allowed: false` and the writers answer `409`, both with "The
+    approval must be from another party than the author and current assignee".
+  - The same holds the other way: switching back to `by-agent`, or giving the grant again,
+    lets an older approval integrate again. A worker-credential name that another account
+    is issued later becomes shared, and an approval recorded under it then refuses.
+  - The host (ssh) route is not changed: it still compares actor names.
+- **What an agent sees, and agents set up before this release (kittrial-5bb.518).**
+  - The brief (`GET .../tasks/{task}/brief`) answers `review.approval_permission` for a delivery awaiting
+    review: `may_approve`, a `case` (`another-agent`, `worker-credential`, `own-work`, `own-person`,
+    `own-worker-credential`, `independent`), a sentence (a refusal's is the approve route's own 403 text, word for word), and the setting (`mode`, `set_by`, `set_by_display_name`, `set_at`,
+    `damaged`). The queue rows, My work and `GET /v1/agents/me/next` carry the same. It is informational
+    and is worked out by the functions the approve route calls, so it never disagrees with the route and
+    grants nothing. `waiting_for_approval` says someone else must approve only when a coordinator agent
+    may not.
+  - `.orchestra/AGENT.md` is written once, at set-up, and the server never changes it. A file written
+    before this release has no first line "AGENT.md version 2 (kittrial-5bb.518)" and a rule 9 that does not
+    mention the setting. `GET /v1/agents/me` answers `agent_md` (`version`, `note`) so an agent can tell its
+    copy is old; the server's reads are authoritative over the file. To refresh it, the agent's owner
+    re-runs set-up from My agents, which writes the current file. Nothing is lost by not doing so: who may
+    approve is unchanged by this release.
 - **An approval only this setting let through says so.**
-  - The web service appends to its summary: "Approved by a coordinator agent of the same person
-    as the agent that delivered it (project setting agent_approval: by-agent)."
+  - The web service records the approval's `approval_basis` (`same-person-agent`, or
+    `same-person-worker-credential` for a worker credential of its person) as a field of
+    the `approve` record, and the approver's summary stays their own words (kittrial-5bb.515,
+    release B). It does so only when the endpoint's machine-readable `review` help lists
+    `approval_basis` under `optional_fields.approve`; for an endpoint that does not (a kit before
+    the readers' release), it appends to the summary instead: "Approved by a coordinator agent of
+    the same person as the agent that delivered it (project setting agent_approval: by-agent)."
+    The route answers `422` to a request body that names `approval_basis`. Release order and the
+    rollback boundary are in [OPERATIONS.md](OPERATIONS.md#the-approval-basis-field-release-order-and-rollback-kittrial-5bb515).
   - The audit event of the review write carries `same_person_coordinator: true`, the author,
     the assignee, the mode, and who set it (or `default`) and when.
-  - If the caller's summary leaves no room for that sentence within the 1200-character bound,
-    the route answers `422` and says how many characters to cut. Nothing is written.
+  - In the sentence form, if the caller's summary leaves no room for that sentence within the
+    1200-character bound, the route answers `422` and says how many characters to cut. Nothing is
+    written. The field form appends nothing, so the whole 1200 characters are the approver's.
   - The web route refuses a caller-written basis sentence on `approve` or `recommend` with `422`
     (after NFKC, casefold, Unicode format-character removal, whitespace collapse and
     punctuation/bracket stripping; lookalike letters remain), while the host route does not, so
@@ -2601,7 +2643,7 @@ exactly as it refuses the superuser's own session. `tests/test_grant_issuer.py` 
 answers; neither rule was widened.
 
 The
-project's settings page lists "Agents in this project" for an owner with a "Make
+project's Agents page (`#/p/NAME/agents`; on the settings page before kittrial-5bb.522 slice 2) lists "Agents in this project" for an owner with a "Make
 coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
 grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by
 another account "You hold the coordinator grant in this project: review it, then approve
@@ -2663,8 +2705,9 @@ role, a superuser, an agent's credential, as the members list does) and changes 
   through the web-service-only `host-coordination` action (below), with the states of
   `host_rules`.
 
-The settings page ("Members & settings") shows it as "Who coordinates" to every member,
-with no control on it, and reads it again after an owner changes a role or a grant there.
+The project's People and Agents pages show it as "Who coordinates" to every member (on
+"Members & settings" before kittrial-5bb.522 slice 2), with no control on it, and read it again
+after an owner changes a role (People) or a grant (Agents) there.
 A superuser of the server may also act as a coordinator in any project; the page says
 so.
 
@@ -2975,16 +3018,32 @@ revoked one that was wider then seeded the next renewal once nothing worked).
 - **Editing another account's agent** (kittrial-5bb.355): the project list offers only the
   projects that agent's OWNER may be granted; every other project the viewer can see is
   listed greyed with "OWNER is not a member of PROJECT: add them under the project's
-  Members first", linking to that project's Members & settings when the viewer may manage
+  Members first", linking to that project's People page when the viewer may manage
   it. The page learns this from `owner_grantable_projects` on the agent read: the owner's
   live memberships (everything when the owner is a superuser), intersected with the
   projects THAT reader can see, so the answer never reveals a project the reader cannot
   see. Only the agent's owner or a superuser can edit an agent, as before.
-- **A coordinator's AGENT.md** (kittrial-5bb.387): the agent read carries
+- **A coordinator's AGENT.md** (kittrial-5bb.387, kittrial-5bb.521): the agent read carries
   `coordinates: [{project, effective}]`, the agent's coordinator grants in projects its
-  owner is a member of and whether each has effect now. Only the agent's owner, or a
-  superuser, signed in as a person sees it; no other member and no credential (the agent's
-  own on `/v1/agents/me` included) does. The set-up wizard writes the coordinator's
+  owner is a member of and whether each has effect now, and `coordinate_grantable_projects`,
+  the sorted list of unarchived granted project IDs where the signed-in caller may newly
+  grant this agent coordination in the set-up wizard (`PUT /v1/projects/{project}/agents/{id}/coordinator`:
+  the agent is enabled, the agent's owner is a member of the project with `coordinator` or
+  `owner` role or as a superuser — the same owner-member rule as `coordinates` — the agent
+  does not already hold an effective grant there, and the caller holds `project.admin`).
+  Because both `coordinate_grantable_projects` and `coordinates` require the agent's owner
+  to be in the project's memberships, a superuser owner who is not a member of the project
+  grants on the project's Agents page only, and the set-up wizard still writes
+  the worker's files until the owner is added as a member of the project. Only the agent's
+  owner, or a superuser, signed in as a person can read `GET /v1/agents/{id}` and
+  `GET /v1/agents` (another person receives `404` on `GET /v1/agents/{id}` and sees only
+  their own agents on `GET /v1/agents`; a credential receives `403` on both), while
+  credential self-reads (`/v1/agents/me` and `/v1/agents/me/next`) receive
+  `coordinate_grantable_projects: []` and no `coordinates` field. In the set-up
+  wizard, when `coordinate_grantable_projects` is non-empty and the agent does not yet hold
+  an effective coordinator grant, the role screen offers `Coordinator of <project>` choices
+  and an explicit `Make coordinator of <project>` button that calls the existing `PUT` route
+  and re-reads `GET /v1/agents/{id}`. The set-up wizard writes the coordinator's
   `.orchestra/AGENT.md` for an agent with an effective grant (guidance first, never claim a
   worker task, then deliveries awaiting review, approved work awaiting integration,
   checkpoints addressed to it, quiet lanes and lanes whose set wake time came due, with
@@ -3768,6 +3827,22 @@ line separately and unconfined.
   carries `needs_respond` and stays open across revisions until a `respond` resolves
   it. Requests recorded in older disposable state, without that flag, keep the old
   rule (the next revision resolves them).
+  While the task's latest delivery has a blocking `request-changes` not yet settled by an
+  un-invalidated `approve`, a `withdraw`, or full requester item resolution (`resolve-item`), a
+  new `contribute` through `POST /v1/projects/{id}/tasks/{task}/reviews` that repeats the same
+  commit SHA (case-folded) is refused with HTTP `409` (`error.code: "conflict"`, structured
+  `error.detail: {"review_id": "<id>"}`; canonical exception `code:
+  "same-commit-changes-requested"`, CLI exit status `2` and endpoint keys `review_status: 409`,
+  `review_id`, `review_answered`) on both the endpoint and in-process backends (kittrial-5bb.556).
+  While any blocking item is open, `error.message` is `this commit was already reviewed and
+  changes were requested; answer the review with respond, or deliver a new commit (review <id>)`;
+  once every blocking item is answered with `respond` and awaits re-review, `error.message` is
+  `this commit was already reviewed and its requested changes were answered; wait for the
+  reviewer to review it again, or deliver a new commit (review <id>)`. An exact `operation_id`
+  retry of the original `contribute` (with a new or omitted `Idempotency-Key`) still reconciles
+  (`201`, `reconciled: true`) on both backends without duplicating the contribution; a repeat
+  with the same `Idempotency-Key` replays the stored first `201` answer (`reconciled: false` on
+  the endpoint backend, no `reconciled` key on the in-process backend) without duplicating it.
 - **Account lookup residual risk.** `GET /v1/accounts/lookup` answers exact usernames
   for a project administrator. With the in-process backend any account may create a
   project and so become one; with the endpoint backend only a superuser registers projects
@@ -4190,7 +4265,7 @@ agent set-up wizard is what uses it (kittrial-5bb.329).
 
 The installation's password minimum is a setting, `--password-min-length N` on the web
 service and `"password_min_length": N` in the private office JSON, a whole number from 1
-to 1024, default **12** (kittrial-5bb.501; it was 1). An installation that sets another value, 1
+to 1024, default **5** (kittrial-5bb.547; it was 1 in kittrial-5bb.363 and 12 in kittrial-5bb.501). An installation that sets another value, 1
 included, keeps it. A value outside the bounds, or
 one that is not a whole number, is refused at startup with one sentence and a non-zero
 exit before the state document is opened; nothing is clamped. The **1024 maximum stays**,
@@ -4209,7 +4284,7 @@ The account page states the server's rule from `GET /v1/sessions/current`:
 minimum remains in the browser code. The reset page is signed out, so there is no session
 answer to read: it states no number and shows the server's own 422 sentence, which names
 the configured range, when the password is sent. The host bootstrap prompt names the range
-(`New superuser password (12 to 1024 characters)`). The log-in limits are those of
+(`New superuser password (5 to 1024 characters)`). The log-in limits are those of
 `docs/HTTP_TRANSPORT_DESIGN.md` section 4: a pair count, a per-account and a per-source count
 with slow mode, and a password change shares them.
 
@@ -4301,6 +4376,156 @@ is shown once to the creating superuser; a retry returns secret-free metadata.
 The audit identifies creator and owner, and the owner's card says Created by NAME.
 The owning account can issue a new secret and revoke that first key if the creator
 having seen it matters. Legacy agents have no invented creator attribution.
+
+## Invite links
+
+kittrial-5bb.578. A person makes a single-use link that, when the invited person opens it and sets a
+password, creates their account, adds it to named projects as a **contributor** and, optionally,
+creates one **worker** agent owned by it with its first credential, issued exactly as New agent issues
+one. Everything is the web service's own state (`http_auth.Store`), so the same routes serve both
+backends; the code is `invites.py` and the routes in `http_service.py`.
+
+kittrial-5bb.581 adds a second kind: an invite for an account that **already exists**
+(`person: "existing"`), to add it to projects and, optionally, add an agent for it, whether or not it is
+already a member. See "Invites for an existing account" below. Everything said here about the switch,
+who may invite, the token and the one `404` holds for both kinds.
+
+**The switch.** `invites_enabled` in `deployment.private.json`, **off** unless it is `true`. It is read
+on every invite request, so turning it on or off needs no restart; a value that is not `true` or
+`false` reads as off with a warning in the service's log, and an unreadable file is the usual `503`.
+While it is off the create form is replaced by that sentence (an owner still sees the panel), and
+`POST /v1/invites`, `POST /v1/invites/view`, `POST /v1/invites/redeem` and `POST /v1/invites/accept` all
+answer `403` with the one sentence
+`Invite links are switched off on this installation. An operator turns them on with "invites_enabled": true in deployment.private.json.`
+Listing and withdrawing stay open, so an invite made while it was on can still be withdrawn. Switching
+off withdraws nothing: a pending link that has not expired works again once the switch is back on. If
+that is not wanted, withdraw the pending invites (the project's People page, or `POST /v1/invites/{id}/revoke`)
+before switching off. A withdrawal whose save fails still holds in memory and is written by the next
+save; a service stopped before that save brings the invite back, so withdraw it again. To turn it
+on, stop nothing: add `"invites_enabled": true` to the top-level object of
+`<runtime root>/deployment.private.json` (keep it a regular file, mode 600, owned by the service
+account) and save. The service-local (disposable) backend has no deployment file; there it is the
+backend attribute `invites_enabled`, which only a test or a local trial sets.
+
+**Who may invite.** A person signed in to the web page (a session, never an agent or worker credential,
+whatever grant the agent holds) who could add the member directly today, by the Members table's rule:
+a superuser, or an **owner** of **every** project the invite names (`project.admin`, as
+`Service.set_member` requires). A coordinator who is not an owner may not, so an invite never widens
+who can add people (coordinator's decision on kittrial-5bb.578). It is checked when the invite is made
+and again when it is redeemed. A project the inviter cannot see is `404`; one where they are not an
+owner is `403`; an archived project, or one the backend will not serve, is refused.
+
+| Route | Who | What |
+| --- | --- | --- |
+| `GET /v1/invites` | a person's session | `enabled`, the caller's invites (a superuser: everyone's) with `person`, `status` `pending`, `used` (`used_by`, `used_at`, `used_from`, and for an existing account `memberships`), `expired` or `revoked`, and `projects` the caller may invite to with `may_invite` (listed while the switch is off too) |
+| `POST /v1/invites` | as above, switch on | `{person?: "new", display_name, username, projects, expires_hours?, agent?: {name, project, claim_limit?, role?}}` or `{person: "existing", username, role?, projects, expires_hours?, agent?}`; `201` with `token`, `path` (`/#/invite/TOKEN`), `link` (with `--public-url`) and the warning that the link is a key, **once**; an exact retry under the same `Idempotency-Key` answers `200` without the token |
+| `POST /v1/invites/{id}/revoke` | its inviter or a superuser | withdraws a pending invite (anyone else: `404`) |
+| `POST /v1/invites/view` | anyone holding the token, switch on | `{token}`: who invites whom, the projects, the agent, the expiry and the password minimum |
+| `POST /v1/invites/redeem` | anyone holding the token of a **new-person** invite, switch on | `{token, password}`; `201` with the account, the projects and, with an agent, the agent, its credential's secret and the set-up payload of New agent, **once** |
+| `POST /v1/invites/accept` | the **named existing account's own session** (CSRF; `Idempotency-Key` optional), switch on | `{token}`; `201` with the account, each project's `role` and `role_before` and, with an agent, the agent, its credential's secret and the set-up payload, **once**; an exact retry answers `200` without the secret |
+
+The username is checked as an account's is (2-64 characters of letters, digits, `. _ @ -`), and must not
+belong to an account or to another pending invite. The expiry is 72 hours unless `expires_hours` says
+1 to 168 (7 days). The agent takes a name (the New agent rule, and the secret-file clash rule against
+the new account's other agents), a project that is one of the invite's, and a claim limit (default 1);
+it gets the default scopes and the `worker` role, or `reviewer` when asked (kittrial-5bb.581). Any other
+`role`, or any `coordinator`, `grant`, `grants` or `scopes` field, is refused with one sentence: there is
+no coordinator grant in an invite. A new person always joins as a contributor; `role` on a new-person
+invite is `422`.
+
+**The token.** `secrets.token_urlsafe(32)` (32 random bytes); the state keeps only its SHA-256, as the
+key of `invites`, with the record of who invited whom, when, and the expiry on both clocks (as a reset
+value's). It goes in the link after `#`, so it never reaches a server log or a `Referer`, and the page
+sends it in a request body. Unknown, expired, used and withdrawn tokens all get one answer,
+`404 invite_unusable` `This invite link cannot be used. Ask the person who sent it for a new one.`, and
+every miss counts against the address exactly as a failed sign-in does (`Service._check_throttle`; ten
+in five minutes from one address answers `429`, and the shared tunnel address is slowed, not locked).
+The expiry clock is read once for every token, found or not, so no answer is slower for one kind of
+token. The first `429` of an address in that window is audited; the rest are not audited or saved. The
+username check when an invite is made counts against the inviter's account-lookup limit (20 in ten
+minutes, as `GET /v1/accounts/lookup`) and is audited with a keyed digest of the name; a disabled
+account's name is not reported as taken there, and such an invite is refused at redemption.
+
+**Redeeming** sets the password under the installation's password rule, then, in one transaction under
+the state lock (`Service._widening`): creates the account, adds the memberships, creates the agent and
+its credential, and marks the invite used, with the address it was used from. A refusal or a failure at
+any step, a failed save included, takes all of it back; the state file is replaced atomically, so a
+service that dies mid-way leaves it as it was. A username that was taken since the invite was made is
+`409 username_taken` with nothing created; an inviter who has lost the role, or a project archived
+since, is `409 invite_stale`. Each use writes `invites.redeemed` into every named project's audit
+(`invite_id`, `invited_by`, `new_user`, `used_from`), which is the inviter's notice beside the invite's
+status on their list. If the redemption answer is lost the secret is gone with it; the person signs in
+and issues a new one from the agent's card. A restore of the HTTP state withdraws the pending invites in
+the backup, as it spends unused reset values.
+
+**On the page.** The project's People page shows "Invite someone or add an agent" to a person who may invite to at least
+one project (with the off sentence while the switch is off), and the list of their invites at any time. The link opens a signed-out
+page (`#/invite/TOKEN`) that shows the invite, asks for the password twice, and then offers the agent's
+credential file, `.orchestra/agent.json` and `.orchestra/AGENT.md` (and the service certificate, when it
+has one) once.
+
+### Invites for an existing account
+
+kittrial-5bb.581. An owner (or a superuser) picks an existing account by username. The username check is
+the account lookup's: an unknown or disabled account is `404 No active account with that username`,
+counted and audited as `GET /v1/accounts/lookup` is. The invite names a membership `role`: `viewer`,
+`contributor` (the default) or `coordinator`, or `owner` from a superuser only (as `Service.set_member`).
+It may also name the same one agent as a new-person invite (`worker` or `reviewer`). The state keeps the
+account's id (`user_id`), never a password. These are refused when the invite is made:
+- yourself: `422`, "To add an agent for yourself use New agent on My agents; an invite is for someone else.";
+- a `display_name`: `422`;
+- an account that already has the named role or higher in every project, with no agent asked: `409`.
+
+The agent's name and the account's agent limit are not judged when the invite is made. They are judged
+only when the named account accepts, and only that person hears the answer: said to the inviter, they
+would tell them about the account's agents, in projects the inviter may not see.
+
+**The view** of such a link (`POST /v1/invites/view`, anonymous) says what a new-person invite's says:
+the inviter, the username it is for, the projects, the role named, the agent and the expiry. It says
+nothing about the account itself, not its display name (`display_name` is `null`) and not whether it is
+already a member anywhere, because the holder of a link may not be that person. `password_min_length` is
+`null`.
+
+**Accepting.** Only `POST /v1/invites/accept` serves this kind. It is not anonymous, it is CSRF-checked
+and it goes through the operation journal like every web write. The anonymous `POST /v1/invites/redeem`
+answers a token of this kind with the unknown-token `404` before it reads the password, so no invite
+can ever set the password of an existing account. These all get the same `404 invite_unusable`, counted
+against the address as a miss:
+- a session of any other account (the inviter and a superuser included);
+- a token of the new-person kind;
+- an unknown, used, expired or withdrawn token.
+
+An agent or worker credential is `403` before the token is read. In one transaction under the state lock
+(`Service._widening`), accepting does three things:
+- **adds** each membership the account lacks, and **raises** one it holds below the named role. One at
+  or above it is **kept**: nothing is ever lowered, and an owner is never touched;
+- makes the agent under the account with its first credential, as New agent does (`created_by` is the
+  inviter);
+- marks the invite used, with `memberships` (`{project: {before, after}}`).
+
+The inviter's right is judged again from present state:
+- every project needs `_holds` and must still be served;
+- an `owner` role needs the inviter still a superuser.
+
+Either failing is `409 invite_stale`. An agent name that shares the account's secret file with one of its
+agents, or the account at its agent limit, is `409`, with nothing changed. Any refusal or failure, a
+failed save included, takes all of it back. Each use writes
+`invites.redeemed` into every named project's audit with `existing_user` (a new-person redeem says
+`new_user`), `role_before` and `role_after`. The secret reaches only the accepting person, in that one
+answer; the inviter's list shows the status and the memberships, never a secret.
+
+**On the page.** The panel "Invite someone or add an agent" is on the project's **People** page. The
+project overview and People show an action with that name to a person who may invite (an owner or a
+superuser; the server still decides). While the switch is off, that person sees the panel with the off
+sentence. The link opens the same `#/invite/TOKEN` page:
+- signed out, it asks the named person to sign in (the ordinary `POST /v1/sessions`) and then accepts;
+- signed in as that person, it offers Accept;
+- signed in as anyone else, it says the invite is for another account.
+
+After accepting, it says what was added or kept in each project and offers the agent's files once.
+
+**Upgrades.** Every API answer carries `X-Orchestra-Build`, the build id `/healthz` already shows. An open
+page that sees it change offers "Orchestra was upgraded. Reload."
 
 ## Files attached to a task over HTTP
 
@@ -4557,6 +4782,17 @@ ungranted agents or worker credentials, or for the host route.
 - **Narrowing and revoking.** `action: narrow` names a strict subset of the scope in force;
   `action: revoke` ends the delegation. Either takes effect on the next acceptance. A second
   grant on the same decision is refused; record a new decision instead.
+- **Closing is not revoking.** Closing the decision issue does not end the delegation, and
+  reopening it does not bring one back (a contributor can change an issue's status): only
+  `revoke` ends it. The list shows each decision's `status`, and a closed decision still in force
+  carries the line "closing does not end a delegation: revoke it to end it".
+- **What the list shows.** Every decision with a delegation comment, honoured or not: a grant that
+  lost its journal entry is listed as not in force ("has an unhonoured comment"), so the owner
+  records a new decision. A decision retyped away from `decision` still reads as one while it
+  carries the reserved `delegation` label (only the delegation operation adds it, and a raw label
+  write or removal is refused); the list notes the current type. The label never grants anything.
+- **Comment floods.** Very many comments on a decision issue slow the reads that check it. A read
+  that times out refuses, so the delegation fails closed until the comments are fewer.
 - **Checked live at every acceptance**, under the write's lock, never cached: the decision exists
   in this project and is a decision issue; its one honoured grant was recorded by someone who is
   **still** a person owner of the project (or whose exact actor name is still on the operator
