@@ -18,6 +18,7 @@ make of it.
 Skipped where the endpoint cannot run (it imports fcntl: Windows) or there is no real bd. The decision
 itself is tested everywhere by tests/test_by_agent_decision_560.py and tests/test_web_lifecycle_by_agent_560.py.
 """
+import json
 import secrets
 import sys
 import unittest
@@ -237,7 +238,13 @@ class AgentApprovalIntegration(grant_real.RealStackTests):
         self.worker('lane', 'lane-c')
         task, contribution = self.deliver('lane')
         self.assertEqual((201, ''), self.route(task, contribution))
-        self.assertIn(API.WORKER_CREDENTIAL_APPROVAL, self.comments(task)[-1][1])
+        # Current endpoints store the server's basis as a typed field (.515 B),
+        # preserving the approver's own summary instead of appending the legacy sentence.
+        text = self.comments(task)[-1][1]
+        self.assertTrue(text.startswith('Kind: contribution-review-v1\n'))
+        approval = json.loads(text.split('\n', 1)[1])
+        self.assertEqual('same-person-worker-credential', approval['approval_basis'])
+        self.assertEqual('Accepted', approval['summary'])
         self.integrates(task)
 
     def test_a_grant_that_ended_after_approving_refuses_at_integration(self):
