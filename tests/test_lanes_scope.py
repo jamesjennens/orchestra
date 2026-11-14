@@ -281,10 +281,11 @@ class ParityTests(ScopeCase):
     def test_the_routes_rows_are_the_canonical_reads_rows_for_the_scope_it_chose(self):
         # Both reads must see the same instant, including every computed seconds field.
         now = datetime.now(timezone.utc)
-        clock = patch('lanes.datetime', wraps=datetime)
-        mocked_clock = clock.start()
+        # The backend supplies an explicit instant from service._now(), so patch
+        # that shared clock rather than lanes.read's unused datetime fallback.
+        clock = patch.object(self.service, '_now', return_value=now.timestamp())
+        clock.start()
         self.addCleanup(clock.stop)
-        mocked_clock.now.return_value = now
         every = self.lanes(self.tokens['olive']).data
         self.assertEqual('all', every['scope'])
         # the route adds only display fields to the canonical rows: display_name
