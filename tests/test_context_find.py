@@ -111,6 +111,12 @@ class SearchTests(unittest.TestCase):
         result = search([data], args=['--kind', 'task'])
         self.assertEqual(0, result['total'])
         self.assertEqual('partial', result['stale'])
+
+    def test_duplicate_native_ids_do_not_choose_the_first_task_body(self):
+        result = search([row(), row(text='A different source body')], args=['--kind', 'task'])
+        self.assertEqual(0, result['total'])
+        self.assertEqual('partial', result['stale'])
+        self.assertIsNone(result['cursor'])
     def test_long_comment_chunks_are_one_hit_and_hash_full_body(self):
         body = 'Prefix\n' + 'long data ' * 1100 + ' orthogonal report tail'
         chunks = [comment(body[:5000], body_offset=0, body_total_chars=len(body)),
@@ -327,6 +333,18 @@ class TypedReaderTests(unittest.TestCase):
         self.assertEqual('partial', result['stale'])
         self.assertTrue(result['total_is_lower_bound'])
 
+    def test_duplicate_native_rows_do_not_expose_an_old_checkpoint(self):
+        import test_briefing as fixture
+        data = self.checkpoint_rows()
+        later = copy.deepcopy(data[0])
+        payload = fixture.checkpoint([later], previous='checkpoint-current',
+                                     summary='A different current source')
+        fixture.append_checkpoint([later], 'checkpoint-new', payload)
+        result = search(data + [later], args=['--kind', 'checkpoint'])
+        self.assertEqual(0, result['total'])
+        self.assertEqual('partial', result['stale'])
+        self.assertIsNone(result['cursor'])
+
     def test_deep_large_or_duplicate_checkpoint_json_is_unknown_without_old_fallback(self):
         for source in ('[' * 300 + '0' + ']' * 300,
                        '{"summary":"orthogonal","summary":"different"}',
@@ -414,6 +432,26 @@ from test_reference_records import ReferenceCase, OPERATOR
 
 
 class ReferenceReaderTests(ReferenceCase):
+    def test_duplicate_native_rows_do_not_promote_an_earlier_reference(self):
+        self.propose(statement='orthogonal')
+        self.accept(1, self.sha(1))
+        later = copy.deepcopy(self.native.rows[0])
+        later['comments'].append(comment('Kind: reference-entry-v3\n{bad', 'damaged-new'))
+        result = search(self.native.rows + [later], args=['--kind', 'ref'],
+                        operators=[OPERATOR], project_path=self.project)
+        self.assertEqual(0, result['total'])
+        self.assertEqual('partial', result['stale'])
+        self.assertIsNone(result['cursor'])
+
+    def test_hidden_duplicate_id_cannot_quarantine_a_visible_task(self):
+        self.propose(statement='orthogonal hidden reference')
+        visible = row(self.native.rows[0]['id'])
+        before = search([visible], kinds=['task'])
+        after = search([visible] + self.native.rows, kinds=['task'])
+        for field in ('total', 'items', 'coverage', 'cursor', 'stale'):
+            self.assertEqual(before[field], after[field], field)
+        self.assertEqual(before['watermark']['generation'], after['watermark']['generation'])
+
     def test_reference_uses_selected_revision_not_raw_record_prose(self):
         self.propose(statement='orthogonal draft evidence')
         result = search(self.native.rows, args=['--kind', 'ref'], operators=[OPERATOR], project_path=self.project)

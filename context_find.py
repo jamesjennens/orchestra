@@ -445,6 +445,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
     budget = _Budget(coverage, clock, deadline)
     words = capabilities.words(options['phrase'])
     documents, identities, related, row_index, known_ids = [], set(), {}, {}, set()
+    ambiguous_ids = set()
     first = _instant(options.get('since'))
     last = _instant(options.get('until'), end=True)
     until_date = bool(options.get('until') and re.fullmatch(r'\d{4}-\d{2}-\d{2}', options['until']))
@@ -563,6 +564,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                 budget.check()
                 coverage['skipped_malformed'] += 1
                 continue
+            if original['id'] in known_ids:
+                ambiguous_ids.add(original['id'])
             known_ids.add(original['id'])
             if record_kind is not None and record_kind not in selected:
                 continue
@@ -583,7 +586,6 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
             row['comments'] = _comments(original, coverage, budget, allowed, record_kind)
             row['_find_comments_complete'] = row['comments'].complete
             if row['id'] in row_index:
-                coverage['skipped_malformed'] += 1
                 continue
             row_index[row['id']] = row
             prepared.append(row)
@@ -593,7 +595,14 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
             if len(matches) != 1:
                 raise ValueError('Task is not available unambiguously in this project')
             options = dict(options, task=matches[0])
-        prepared = _Checked(sorted(prepared, key=lambda row: row['id']), budget)
+        # A duplicated permitted identity cannot select the earlier body or
+        # ledger. Inaccessible kinds were excluded before identity collection.
+        visible_ambiguous = ambiguous_ids.intersection(row_index)
+        coverage['skipped_malformed'] += len(visible_ambiguous)
+        for task in visible_ambiguous:
+            row_index.pop(task)
+        prepared = _Checked(sorted((row for row in prepared if row['id'] not in ambiguous_ids),
+                                   key=lambda row: row['id']), budget)
 
         for kind, module in (('ref', 'reference_records'), ('cap', 'capability_records')):
             if kind not in selected:
