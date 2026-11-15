@@ -249,3 +249,5 @@ If those three are not wanted, rooms are not worth their cost.
 5. **The running summary:** versioned summary messages, pinned, and the summary-rate rule (R6), used by the scribe.
 
 Later and optional: open questions as records, when docs/OPEN_ITEMS_DECISIONS_DESIGN.md is built; "added since baseline" when kittrial-5bb.228 B2 is out; an outward notification hook where an installation can reach one.
+
+**Interview rooms for guests** (a link, no account) are designed in docs/INTERVIEW_LINKS_DESIGN.md (kittrial-5bb.591). They live in their own `.interviews/` folder, not in `.rooms/`.
