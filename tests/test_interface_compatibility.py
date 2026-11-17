@@ -108,6 +108,48 @@ class CompatibilityTests(unittest.TestCase):
         new=copy.deepcopy(old);new['paths']['/items']['post']['requestBody']['required']=True
         self.check(old,new,'breaking',media_type='application/vnd.oai.openapi+json')
 
+    def test_openapi_removed_response_checks_old_reachability(self):
+        media = 'application/vnd.oai.openapi+json'
+        for old_response, expected in (({'type': 'string'}, 'breaking'),
+                                       ({'type': 'string', 'const': 7}, 'unknown')):
+            with self.subTest(expected=expected):
+                old = api(old_response)
+                operation = old['paths']['/items'].pop('post')
+                del operation['requestBody']
+                old['paths']['/items']['get'] = operation
+                operation['responses']['404'] = api()['paths']['/items']['post']['responses']['200']
+                new = copy.deepcopy(old)
+                del new['paths']['/items']['get']['responses']['200']
+                self.check(old, new, expected, media_type=media)
+
+    def test_object_sampling_caps_copies_and_charges_before_allocating(self):
+        names = [f'field{i}' for i in range(80)]
+        document = schema(required=names, additionalProperties=False,
+                          properties={name: {'type': 'boolean'} for name in names})
+        for limit in (c.STEP_MAX, 400):
+            with self.subTest(limit=limit):
+                budget = c.Budget()
+                budget.left = limit
+                copied = []
+
+                class CountingDict(dict):
+                    def __init__(self, base, **changed):
+                        copied.append((len(base), limit - budget.left))
+                        super().__init__(base, **changed)
+
+                with patch.object(c, 'dict', CountingDict, create=True):
+                    if limit == 400:
+                        with self.assertRaisesRegex(c.Unsupported, 'comparison-budget'):
+                            c.samples(document, budget)
+                        self.assertLessEqual(sum(size for size, _ in copied), limit)
+                    else:
+                        witnesses = c.samples(document, budget)
+                        self.assertEqual(64, len(witnesses))
+                        self.assertEqual(63, len(copied))
+                entries = 0
+                for size, charged_before_copy in copied:
+                    entries += size
+                    self.assertGreaterEqual(charged_before_copy, entries)
     def test_openapi_unknown_context_prevents_an_additive_claim(self):
         old=api()
         for change in ({'security':[]},{'components':{}},{'openapi':'3.0.3'}):

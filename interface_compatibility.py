@@ -13,10 +13,12 @@ import record_json
 from export_requirements import _unique
 from requirements import canonical_bytes
 
-VERSION = 'interface-subset-1'
+# Earlier evidence can claim additive for a removed OpenAPI response code.
+VERSION = 'interface-subset-2'
 DIALECT = 'https://json-schema.org/draft/2020-12/schema'
 BYTE_MAX, DEPTH_MAX, NODE_MAX, OP_MAX, STEP_MAX = 1048576, 32, 10000, 1000, 10000
 TYPES = ('object', 'array', 'string', 'number', 'integer', 'boolean', 'null')
+OBJECT_SAMPLE_MAX = 64
 ANNOTATIONS = {'$schema', 'title', 'description', '$comment'}
 FACETS = {'object': {'properties', 'required', 'additionalProperties'},
           'array': {'items', 'minItems', 'maxItems'}, 'string': {'minLength', 'maxLength'},
@@ -182,15 +184,21 @@ def samples(s, budget):
     for key in s.get('required', []):
         found = [v for v in samples(props[key], budget) if accepts(props[key], v, budget)]
         if not found: return []
+        budget.tick()
         base[key] = found[0]
     values = [base]
     for key, child in props.items():
-        for v in samples(child, budget)[:4]: values.append(dict(base, **{key: v}))
+        for v in samples(child, budget)[:4]:
+            budget.tick(len(base) + 1)
+            values.append(dict(base, **{key: v}))
+            if len(values) == OBJECT_SAMPLE_MAX:
+                return values
     if s.get('additionalProperties', True):
         key = '__extra'
         while key in props: key += '_'
+        budget.tick(len(base) + 1)
         values.append(dict(base, **{key: None}))
-    return values[:64]
+    return values
 
 
 def compare_schema(old, new, direction, budget, evidence=None):
@@ -295,6 +303,15 @@ def compare_openapi(old, new, budget, evidence):
         elif oreq is None or nreq is None: outcomes.append('unknown')
         else:
             outcomes.append('breaking' if nrequired and not orequired else compare_schema(oreq, nreq, 'request', budget, evidence))
+        removed = ores.keys() - nres.keys()
+        if removed:
+            reachable = oreq is None or not orequired or schema_witness(oreq, budget)
+            for status in sorted(removed):
+                budget.tick()
+                observed = reachable and schema_witness(ores[status], budget)
+                outcomes.append('breaking' if observed else 'unknown')
+                if observed and len(evidence) < 7:
+                    evidence.append(('removed response %s %s %s' % (status, identity[1], identity[0]))[:160])
         for status, schema in nres.items():
             if status in ores: outcomes.append(compare_schema(ores[status], schema, 'response', budget, evidence))
             else:

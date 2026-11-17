@@ -61,6 +61,37 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual('additive',self.block()['state'])
         self.assertEqual(['request','response'],self.block()['checked_directions'])
 
+    def test_removed_openapi_success_response_leaves_register_breaking(self):
+        media = 'application/vnd.oai.openapi+json'
+        previous = self.new
+        accepted = []
+        for revision, statuses in ((5, ('200', '404')), (7, ('404',))):
+            responses = {status: {'description': status,
+                                  'content': {'application/json': {'schema': {'type': 'string'}}}}
+                         for status in statuses}
+            document = {'openapi': '3.1.0', 'info': {'title': 'Items', 'version': '1'},
+                        'paths': {'/items': {'get': {'responses': responses}}}}
+            pointer = dict(self.schema(document, f'OpenAPI revision {revision}'), media_type=media)
+            self.flow.apply(fixture.payload(operation='revise', operation_id=f'api-{revision}',
+                revision=revision, expected_sha256=previous['sha256'], schema=pointer,
+                compatibility={'rule': 'additive-within-major', 'change': 'additive'}))
+            self.flow.accept(operation=f'accept-api-{revision}')
+            previous = self.flow.entry()['record']
+            accepted.append(previous)
+        old, new = accepted
+        payload = dict(self.payload, operation_id='check-removed-response',
+                       old_revision=old['revision'], old_record_sha256=old['sha256'],
+                       new_revision=new['revision'], new_record_sha256=new['sha256'])
+        with patch.object(checks.classifier, 'VERSION', 'interface-subset-1'), \
+                patch.object(checks.classifier, 'compare_openapi', return_value='additive'):
+            self.assertEqual('additive', self.write(payload)['record']['result']['classification'])
+            self.assertEqual('additive', self.block()['state'])
+        self.assertEqual('compatibility-unverified', self.block()['state'])
+        result = self.write(dict(payload, operation_id='check-removed-response-r3'))['record']
+        self.assertEqual('breaking', result['result']['classification'])
+        self.assertEqual('breaking-without-version', self.block()['state'])
+        self.assertEqual(1, self.block()['trusted_results'])
+
     def test_unauthorized_or_demoted_verifier_report_untrusted(self):
         before=copy.deepcopy(self.flow.native.rows)
         with self.assertRaisesRegex(ValueError,'configured interface verifier'):self.write(actor='outsider')
