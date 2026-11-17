@@ -421,7 +421,7 @@ class SettingTests(SamePerson):
 
 
 class AgentApprovalPanelTests(unittest.TestCase):
-    """Members & settings: the panel follows the server's word and renders text only."""
+    """Settings (Members & settings before kittrial-5bb.522 slice 2): the panel follows the server's word and renders text only."""
 
     def test_the_panel_follows_the_server_and_renders_text(self):
         import json

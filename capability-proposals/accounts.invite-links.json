@@ -2,7 +2,7 @@
   "schema_version": 1,
   "operation_id": "capnew-5bb578-accounts-invite-links-0001",
   "key": "accounts.invite-links",
-  "name": "Invite links: a single-use link that makes an account, its memberships and one pre-approved worker agent",
+  "name": "Invite links: a single-use link that makes an account or adds memberships to one, with one pre-approved agent",
   "aliases": [
     "invite link",
     "invite someone",
@@ -12,9 +12,13 @@
     "pre-approved agent",
     "POST /v1/invites",
     "POST /v1/invites/redeem",
-    "#/invite/"
+    "#/invite/",
+    "invite an existing account",
+    "add an agent for someone",
+    "Invite someone or add an agent",
+    "POST /v1/invites/accept"
   ],
-  "summary": "A person's session (never an agent or worker credential) that is a superuser or an owner (project.admin, the Members table's rule) of every named project makes an invite, checked at create and again at redeem; a coordinator who is not an owner may not. Routes: GET/POST /v1/invites, POST /v1/invites/{id}/revoke (inviter or superuser). The token is secrets.token_urlsafe(32); state['invites'] keeps only its SHA-256, the projects, the optional worker agent (no coordinator grant, no scopes) and an expiry of 72 hours by default, at most 7 days. The signed-out page (#/invite/TOKEN) reads POST /v1/invites/view and redeems with POST /v1/invites/redeem: in one Service._widening under the state lock it creates the account, the contributor memberships, the agent and its credential (as create_agent issues it) and marks the invite used with the address; any failure takes all of it back. Unknown, expired, used and revoked tokens get one 404 answer and count as failed sign-ins do. Each use writes invites.redeemed into each named project's audit. Off unless invites_enabled.",
+  "summary": "A person's session (never an agent or worker credential) that is a superuser or an owner of every named project makes an invite, checked at create and again at use. It names a new person, or an existing account (person: existing, kittrial-5bb.581). state['invites'] keeps only the token's SHA-256 (secrets.token_urlsafe(32)), the projects, the role, an optional worker or reviewer agent (no coordinator grant, no scopes) and an expiry of 72 hours by default, at most 7 days. A new person redeems on the signed-out page (#/invite/TOKEN) with POST /v1/invites/redeem and a password. An existing account accepts only with its own session at POST /v1/invites/accept (CSRF): missing memberships are added with the named role (owner only from a superuser), and none is lowered. Either way one Service._widening under the state lock makes the memberships, the agent and its credential, and marks the invite used; any failure takes all of it back. Unknown, expired, used and revoked tokens, the wrong kind and the wrong person get one 404, counted as failed sign-ins. Each use writes invites.redeemed into each project's audit. Off unless invites_enabled.",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#invite-links"
@@ -31,10 +35,15 @@
     "http_service.py::ApiHandler.invites_create",
     "http_service.py::ApiHandler.invites_revoke",
     "http_service.py::ApiHandler.invites_view",
-    "http_service.py::ApiHandler.invites_redeem"
+    "http_service.py::ApiHandler.invites_redeem",
+    "invites.py::accept",
+    "invites.py::kind_of",
+    "http_service.py::ApiHandler.invites_accept"
   ],
   "tests": [
-    "tests/test_invites.py"
+    "tests/test_invites.py",
+    "tests/test_invites_581.py",
+    "tests/test_web_invites_581.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [

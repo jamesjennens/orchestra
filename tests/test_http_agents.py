@@ -845,7 +845,7 @@ class AgentProjectsPageTests(AgentHarness):
         self.assertTrue(blocked['disabled'])
         self.assertEqual("alex is not a member of Beta: add them under the project's Members first",
                          blocked['text'])
-        self.assertEqual(['#/p/%s/settings' % self.beta], blocked['links'])
+        self.assertEqual(['#/p/%s/people' % self.beta], blocked['links'])
         self.assertEqual([self.alpha], before['ownerGrantable'])
         # 2. The owner's own page knows nothing of Beta (it is not the owner's project).
         owner = seen['ownerBefore']

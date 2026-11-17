@@ -288,6 +288,8 @@ await test('m1_q_crosses_only_without_an_id_shaped_word', async () => {
     same(q(id), '/p/beta', 'an id: ' + id);
   }
   same(q('set-up'), '/p/beta', 'a hyphenated word has an id\'s shape and may stay behind');
+  // The dot is pinned (approval of slice 1 r3): a dotted word has an id's shape too, and stays behind.
+  for (const dotted of ['kit.guide', '5bb.522', 'v1.2', 'node.js']) same(q(dotted), '/p/beta', 'a dotted word: ' + dotted);
   // r3: an id next to any other character is still an id (the whole value is tested, no split, no trim).
   const ids = ['task_18913a1f7280', 'alpha-1', 'kittrial-5bb.522', 'room_7f3a', 'REQ-7'];
   const shapes = [(x) => '`' + x + '`', (x) => '#' + x, (x) => '<' + x + '>', (x) => 'id=' + x, (x) => x + '/', (x) => x + '..', (x) => x + '...',
@@ -505,6 +507,22 @@ await test('n1_a_session_lost_in_another_tab_forgets_the_project_and_nothing_is_
   same(second.storage.getItem(KEY('a')), null, 'not written by the page that got the 401');
 });
 
+// Note 1 (approval of slice 1 r3): section by section, a session that ended in another tab writes nothing back.
+// Records, Set up, How work is found, Handover and Notes answer a 401 instead of throwing, so they keep the
+// person's own key; that was accepted as it is (re-check of r2, n1) and is not asserted here.
+await test('n1_every_throwing_section_writes_nothing_back_after_a_lost_session', async () => {
+  for (const section of ['', 'reviews', 'releases', 'rooms', 'lanes', 'people', 'agents', 'settings', 'requirements', 'feedback']) {
+    dead = false;
+    const { root, storage } = await boot('#/p/beta');
+    same(storage.getItem(KEY('a')), 'beta', 'remembered first: ' + section);
+    dead = true;
+    location.hash = '/p/alpha' + (section ? '/' + section : '');
+    await settle(20);
+    same([storage.getItem(KEY('a')), !!root.querySelector('#project-switch')], [null, false], 'after the 401 on ' + (section || 'tasks'));
+  }
+  dead = false;
+});
+
 await test('n2_the_next_person_does_not_land_on_the_last_ones_url_after_a_lost_session', async () => {
   const { ctx } = await boot('#/p/alpha/reviews?review=changes-requested');
   ctx.sessionLost();
@@ -553,7 +571,7 @@ const newToasts = (before) => toasts().slice(before);
 
 // ---- r3 m1b: a search that stays behind is said so ------------------------------------------------------------
 await test('m1b_a_search_left_behind_is_said_once_and_alone_or_with_a_fallback_sentence', async () => {
-  const LEFT = 'The search was not carried over, because it names something in Alpha.';
+  const LEFT = 'The search was not carried over, because it looks like an id, and ids belong to one project.';
   let before = toasts().length;
   const { root } = await boot('#/p/alpha?q=alpha-1');
   await chooseProject(root, 'beta');
@@ -568,7 +586,7 @@ await test('m1b_with_a_fallback_the_two_sentences_share_one_toast', async () => 
   const before = toasts().length;
   const { root } = await boot('#/p/alpha/setup?q=alpha-1&status=closed');
   await chooseProject(root, 'beta');
-  same([route(), newToasts(before)], ['/p/beta?status=closed', ['Beta has no Set up page, so it opened on Tasks. The search was not carried over, because it names something in Alpha.']], 'both');
+  same([route(), newToasts(before)], ['/p/beta?status=closed', ['Beta has no Set up page, so it opened on Tasks. The search was not carried over, because it looks like an id, and ids belong to one project.']], 'both');
 });
 
 await test('m1b_no_search_no_line', async () => {
@@ -604,7 +622,10 @@ await test('s1b_an_archived_projects_page_does_not_become_the_remembered_project
   same(storage.getItem(KEY('a')), 'alpha', 'remembered');
   location.hash = '/p/eta';
   await settle(30);
-  same(root.querySelector('h1') && root.querySelector('h1').textContent, 'Eta', 'the archived page itself opened');
+  // Since kittrial-5bb.525 slice (b) the Tasks page's h1 is "Tasks" and its crumbs name the project.
+  const crumbs = root.all((e) => e.tagName === 'NAV' && e.attributes['aria-label'] === 'Breadcrumb')[0];
+  same([root.querySelector('h1') && root.querySelector('h1').textContent, Boolean(crumbs) && crumbs.textContent.includes('Eta')],
+    ['Tasks', true], 'the archived page itself opened');
   same(storage.getItem(KEY('a')), 'alpha', 'still alpha');
 });
 

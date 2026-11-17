@@ -1,5 +1,5 @@
 import { h, time, copyButton, confirmDialog } from '../dom.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag } from '../ui.js';
+import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag, waitsOnReader } from '../ui.js';
 import { agentCard, attentionOf } from './agents.js';
 import { myContributionsPanel } from './proposals.js';
 
@@ -34,6 +34,45 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
     }))));
 }
 
+// What waits on the reader is ui.js's waitsOnReader (kittrial-5bb.525 slice b r2; shared with Tasks since (c) r2).
+
+// Who may take an owner step on a row (kittrial-5bb.525 r3, FIXP: the party rule). A review or integration
+// step counts only when the server listed THAT row in this reader's to_review: the server applies the party
+// rule there (an author or assignee of the reader's own party is left out), and a project role does not.
+// Other owner steps (closing an integrated task, accepting a requirement) are not in to_review; for them an
+// owner or coordinator of the project, as the project list says, is the one who acts.
+const REVIEW_STEPS = new Set(['awaiting-review', 'legacy-review-ready', 'approved', 'awaiting-integration']);
+function approverIn(ctx, data) {
+  const listed = new Set(data.to_review.map((t) => t.project_id + '/' + t.id));
+  const role = (pid) => ['owner', 'coordinator', 'superuser'].includes(((ctx.projects || []).find((p) => p.id === pid) || {}).role);
+  return (t) => (REVIEW_STEPS.has(t.review_state) ? listed.has(t.project_id + '/' + t.id) : role(t.project_id));
+}
+
+// The header's key: the distinct tasks (project and id) that wait on the reader, across the lists
+// this page shows. When the read is incomplete (a project unreadable, or more work than one read
+// covers) the count is not the whole, so the page shows no number (the banner says why).
+function workKey(ctx, data, incomplete, revisions, assigned) {
+  if (incomplete) return null;
+  const n = revisions.concat(data.to_review, assigned)
+    .reduce((ids, t) => (waitsOnReader(ctx, t, approverIn(ctx, data)) ? ids.add(t.project_id + '/' + t.id) : ids), new Set()).size;
+  return { num: n, label: n === 1 ? 'waits on you' : 'wait on you', source: 'my-work:distinct-next-step-is-yours' };
+}
+
+// The next action: the oldest review or other owner step that waits on you, then the oldest
+// revision request, then the oldest of your own tasks to deliver. None when nothing waits.
+function workNext(ctx, data, revisions, assigned) {
+  const yours = (rows) => rows.filter((t) => waitsOnReader(ctx, t, approverIn(ctx, data)));
+  const since = (t) => Date.parse(t.waiting_since || t.updated_at || '') || Infinity;
+  const oldest = (rows) => rows.slice().sort((a, b) => since(a) - since(b))[0];
+  const reviews = yours(data.to_review), revise = yours(revisions), deliver = yours(assigned);
+  const [rows, label] = reviews.length ? [reviews, 'Open the oldest review']
+    : revise.length ? [revise, 'Open the oldest revision request']
+      : deliver.length ? [deliver, 'Open your oldest task'] : [[], null];
+  if (!label) return null;
+  const t = oldest(rows);
+  return h('a', { class: 'btn primary', href: ctx.href(`/p/${t.project_id}/t/${t.id}`), 'data-next-action': t.id }, label);
+}
+
 export async function home(ctx) {
   if (!ctx.projects.length) return welcome(ctx);
   const [data, contributions] = await Promise.all([ctx.api.myWork(), myContributionsPanel(ctx)]);
@@ -58,7 +97,8 @@ export async function home(ctx) {
     h('div', { class: 'panel-body agent-grid' }, needed.map((a) => h('div', { class: 'stack', 'data-agent': a.id || a.agent_id || a.name },
       agentCard(ctx, a, { compact: false }))))) : null;
   return h('div', { class: 'stack' },
-    pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.` }),
+    pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.`,
+      key: workKey(ctx, data, incomplete, revisions, assigned), actions: workNext(ctx, data, revisions, assigned) }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,
     agentPromptPanel(ctx, data),
     contributions,

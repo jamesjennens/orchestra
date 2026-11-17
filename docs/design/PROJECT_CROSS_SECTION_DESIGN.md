@@ -160,7 +160,8 @@ Agents in Alpha                        [ Add agent ]  [ ] include my agents not 
 - **The Project tab** is `/p/{remembered}`. A rail click on "Project" with nothing remembered shows the project picker, which is today's `/projects` cards.
 - **Members & settings is split in two:**
   - **People** (`/p/{pid}/people`) and **Agents** (`/p/{pid}/agents`) take the members panel (project.js:832-882) and the "Agents in this project" panel (project.js:888-934) as they are.
-  - **Settings** keeps claiming, agent approval, credentials, audit, guidance, coordination, delegations, and the links to the hand-over walkthrough and notes (project.js:990-1000).
+  - **Settings** keeps claiming, agent approval, credentials, audit, guidance, delegations, and the links to the hand-over walkthrough and notes (project.js:990-1000).
+  - **Who coordinates** moved to People and Agents as built in slice 2, where roles and grants are changed (its line: "owners change roles on People and grants on Agents").
   - **Old links:** the old `/p/{pid}/settings` route stays and opens Settings, so old links work.
 - **"Add person":** today's username lookup (GET /v1/accounts/lookup, project.js:878) plus role, then PUT member. A superuser may also pick from the People list. Everyone else adds by exact username, as today, because they cannot list accounts.
 - **"Add agent":** for the viewer's own agents, PATCH /v1/agents/{aid} `projects` (agents.js:401). Another person's agent joins a project only through its owner, as today (`_agent_projects`, http_auth.py:3314). The section says so: "Ask cora to add Egret to this project from Agents."
@@ -252,8 +253,9 @@ the project itself; the always-Tasks landing is .504's, above) and §1.9 for Tas
     `REQ-7`, `kittrial-5bb.522`. A search for an id names one record of one project, so it stays behind. Plain
     words cross. Any hyphenated or dotted word (`set-up`, `e.g.`, `v1.2`) has the shape too and stops crossing;
     that is accepted.
-  - **A search that stays behind is said so:** the toast adds "The search was not carried over, because it names
-    something in A." (A is the project left), alone or after a fallback sentence.
+  - **A search that stays behind is said so:** the toast adds "The search was not carried over, because it looks
+    like an id, and ids belong to one project." (the coordinator's wording, approval of slice 1 r3), alone or after a
+    fallback sentence.
   - **Records' `state`** is not carried: no page writes it, and only keys a page writes are carried.
   - **A key that names a record of A** (`?proposal=<key>` on Reviews, project.js:638) or a mode of one page is
     dropped, because B has no such record.

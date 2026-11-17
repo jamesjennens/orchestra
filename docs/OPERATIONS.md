@@ -3425,7 +3425,7 @@ secret or a payload).
 - **What reads it:**
   - a project's "Recent activity (audit)" panel (`GET /v1/projects/{id}/audit`), which also
     lists its granted agents' events (kittrial-5bb.365);
-  - an agent's History (on Agents, and on the project's Members & settings).
+  - an agent's History (on Agents, and on the project's Agents page).
 - **When events have gone:** the History says older history is no longer kept, rather than
   show a partial list as whole.
 - **Keeping more:** copy the state file's `audit` list before it rolls over; the kit does not

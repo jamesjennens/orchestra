@@ -67,7 +67,7 @@ out.creationTargets=sent.filter((x)=>x.path==='/v1/agents').map((x)=>x.body.owne
 for(const dialog of document.body.all((e)=>e.tagName==='DIALOG')){dialog.close();dialog.remove();}
 const ownerAfter=await agents.list(own);await settle();
 out.creatorDisclosure=ownerAfter.textContent.includes('Created by ')&&ownerAfter.textContent.includes('saw the first secret');
-const settings=await project.settings(root,{pid});await settle();
+const settings=await project.projectAgents(root,{pid});await settle();
 const panel=settings.all((e)=>e.attributes['data-panel']==='project-agents')[0];
 out.projectExpiry=panel.textContent.includes('Expires ');
 const pc=panel.all((e)=>e.attributes['data-extend']===cid)[0];

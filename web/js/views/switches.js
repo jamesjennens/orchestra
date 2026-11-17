@@ -1,4 +1,4 @@
-// The installation switches that refuse a web write (kittrial-5bb.434), on Members & settings: each switch's
+// The installation switches that refuse a web write (kittrial-5bb.434), on the project's Settings: each switch's
 // name, state, what it unlocks and the operator command that turns it on. Read only, for a reader the server
 // says may coordinate (`project.can_coordinate`); the page decides nothing itself. Every string is text.
 import { h } from '../dom.js';

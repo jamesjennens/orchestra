@@ -1,5 +1,5 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId } from '../ui.js';
+import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId, ownerStepAsks, isDescriptive } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { proposeSection } from './proposals.js';
 export { proposeSection } from './proposals.js';
@@ -33,11 +33,77 @@ export const RELEASE_NO_EFFECT = {
   'account-role': ' — its account is no longer an owner here',
   'issuer-role': ' — the person who gave it is no longer an owner here',
 };
+// kittrial-5bb.581: the way to the invite panel, in the page head of the overview and of People, for a person who may
+// invite to this project (its owner, or a superuser) while it is not archived. The server still decides.
+export function inviteAction(ctx, project) {
+  const superuser = Boolean(ctx.me && ctx.me.superuser);
+  if (!project || project.archived || !(isOwner(project) || superuser)) return null;
+  return h('a', { class: 'btn', href: ctx.href(`/p/${project.id}/people?invite=1`), 'data-action': 'invite' }, 'Invite someone or add an agent');
+}
+
+// The page head's actions, or null when there is none (pageHead draws no empty actions box).
+function headActions(...actions) {
+  const shown = actions.filter(Boolean);
+  return shown.length ? shown : null;
+}
+
 export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['coordinator', 'Coordinator'], ['owner', 'Owner']];
 
 async function load(ctx, pid) {
   const project = await ctx.api.project(pid);
   return project;
+}
+
+// A Tasks row waits on the reader when the server's next step is theirs (kittrial-5bb.525 c r2): the
+// same rule as My work's (ui.js waitsOnReader and ownerStepAsks), with the approver check for this one
+// project. An owner step counts only when it asks someone to act; one that only says what the row is
+// (an epic, a record, a decision, a blocked or non-claimable row) waits on no one.
+// A 'coordinator' step is the reader's only for an unassigned task under assigned claiming, where an
+// owner or coordinator assigns; a held integration is released on the coordination host, never here.
+export function waitsOnYou(ctx, project, t) {
+  const who = t.next_action && t.next_action.who;
+  if (!who || t.status === 'closed') return false;
+  // an epic, a decision, a gate, a job, an event, a merge slot: never the reader's step (r3, FIXA)
+  if (isDescriptive(t)) return false;
+  if (who === 'coordinator') return t.review_state !== 'held' && !t.assignee && canApprove(project);
+  if (who === 'owner' && !ownerStepAsks(t)) return false;
+  if (who === 'owner') return canApprove(project);
+  if (who === 'assignee') return Boolean(ctx.me) && t.assignee === ctx.me.id;
+  return false;
+}
+
+// Who acts next on a row, from its next step and the reader: one answer for the row's bar, its
+// hidden "Waits on you:" and the name in the Who acts next cell, so the three cannot disagree.
+// - "You" when the step is the reader's;
+// - the assignee's name for the assignee's step; "Anyone" for a claim;
+// - "An owner or coordinator" for an owner step that asks someone to act, and for assigning work
+//   under assigned claiming; "A coordinator, on the coordination host" for a held integration;
+// - "An operator" for a row that needs operator attention;
+// - "No one" for an owner step that only says what the row is (an epic, a record, a decision, a
+//   blocked or non-claimable row): its own words follow, and nobody is waited on.
+export function whoActsNext(ctx, project, t) {
+  const step = t.next_action;
+  const mine = waitsOnYou(ctx, project, t);
+  let name;
+  if (isDescriptive(t)) name = 'No one';       // whatever its next step says (r3, FIXA)
+  else if (!step) name = null;
+  else if (mine) name = 'You';
+  else if (step.who === 'assignee') name = t.assignee_name || t.assignee || 'The assignee';
+  else if (step.who === 'anyone') name = 'Anyone';
+  else if (step.who === 'coordinator') name = t.review_state === 'held' ? 'A coordinator, on the coordination host' : 'An owner or coordinator';
+  else if (ownerStepAsks(t)) name = 'An owner or coordinator';
+  else if (t.review_state === 'error') name = 'An operator';
+  else name = 'No one';
+  return { mine, name, text: step ? step.text : null };
+}
+
+// What the Tasks key counts, in the words of the filter it was read with.
+// "items", not "tasks": the server's total counts requirement records too, which this list hides
+// by default (kittrial-5bb.525 r2; a server total of tasks alone is a follow-up).
+function tasksKeyLabel(state, n) {
+  const item = n === 1 ? 'item' : 'items';   // "1 open item", "2 open items" (r3)
+  if (state.q || state.review) return 'matching ' + item;
+  return state.status === 'active' ? 'open ' + item : state.status === 'closed' ? 'closed ' + item : item + ' in all';
 }
 
 function crumbs(ctx, project, extra) {
@@ -487,7 +553,10 @@ export async function overview(ctx, { pid }) {
       pageHead({ crumbs: crumbs(ctx, project), title: project.name }),
       archivedBanner(project),
       unusableBanner(project),
-      h('p', null, h('a', { href: ctx.href(`/p/${pid}/settings`) }, 'Members, credentials and archive')));
+      // kittrial-5bb.522 slice 2 r2 (Should 1): members are on People since the split; credentials and
+      // archiving stay on Settings.
+      h('p', null, h('a', { href: ctx.href(`/p/${pid}/people`), 'data-link': 'unusable-members' }, 'Members'),
+        ' · ', h('a', { href: ctx.href(`/p/${pid}/settings`), 'data-link': 'unusable-settings' }, 'Credentials and archive')));
   }
   // kittrial-5bb.522 slice 1 (.502 §1.9): the filters are the URL's query, read here and written back on each
   // change, so a filtered list is shareable, reload-safe and survives a project switch.
@@ -506,6 +575,10 @@ export async function overview(ctx, { pid }) {
     ctx.setQuery(params, view);
   };
   const tableHost = h('div', { class: 'panel' });
+  // The page is the project's Tasks list: the h1 says so, the crumb names the project.
+  const head = pageHead({ crumbs: crumbs(ctx, project, 'Tasks'), title: 'Tasks', tabTitle: 'Tasks · ' + project.name, lede: project.description || null, key: 'pending',
+    actions: headActions(canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null,
+      inviteAction(ctx, project)) });
 
   const search = h('input', { type: 'search', id: 'task-search', placeholder: 'Search title, description or ID', 'aria-label': 'Search tasks', value: state.q });
   // A requirement record or BRD section is a visible row the server never calls claimable
@@ -528,16 +601,29 @@ export async function overview(ctx, { pid }) {
   let debounce;
   search.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(() => { state.q = search.value.trim(); state.cursor = null; state.stack = []; writeQuery(); draw(); }, 250); });
 
+  // Each read is numbered; only the newest one's answer is shown (kittrial-5bb.525 r2). An older answer
+  // that lands last would otherwise put one filter's rows and count under another filter's words.
+  let reads = 0;
   async function draw() {
+    const asked = ++reads;
     tableHost.setAttribute('aria-busy', 'true');
     let page;
     try {
       page = await ctx.api.tasks(pid, { limit: PAGE, cursor: state.cursor, status: state.status, q: state.q, review_state: state.review });
     } catch (error) {
+      if (asked !== reads) return;
+      tableHost.removeAttribute('aria-busy');
+      // A failed read has no count: the previous filter's number must not stay over the error.
+      setPageKey(head, null);
       tableHost.replaceChildren(errorState(error, draw));
       return;
-    } finally { tableHost.removeAttribute('aria-busy'); }
+    }
+    if (asked !== reads) return;
+    tableHost.removeAttribute('aria-busy');
     const allRows = page.items;
+    // The header's key (kittrial-5bb.525 slice b): the server's total for the list as filtered
+    // (page.total), never the rows on this page. No total, no number.
+    setPageKey(head, typeof page.total === 'number' ? { num: page.total, label: tasksKeyLabel(state, page.total), source: 'page.total' } : null);
     // Requirement records are marked by the server and, unless the filter asks for them,
     // left out of the task view (kittrial-5bb.277). The count is kept so the page can say
     // that rows were left out instead of reading as if the tracker held no work at all.
@@ -576,8 +662,10 @@ export async function overview(ctx, { pid }) {
           h('th', { scope: 'col', class: 'task-state-column' }, 'State'),
           h('th', { scope: 'col', class: 'task-next-column' }, 'Who acts next'),
           h('th', { scope: 'col', class: 'hide-narrow num task-updated-column' }, 'Updated'))),
-        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link task-row', 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
+        h('tbody', null, rows.map((t) => { const acts = whoActsNext(ctx, project, t); return h('tr', { class: 'row-link task-row' + (acts.mine ? ' mine' : ''), 'data-waits-on-you': acts.mine ? 'true' : null, 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
           h('td', { class: 'task-title-cell' },
+            // The bar on a row that waits on the reader is visual; a screen reader hears it here.
+            acts.mine ? h('span', { class: 'visually-hidden' }, 'Waits on you: ') : null,
             // A requirement record is marked plainly and points at the Requirements page,
             // never offered as ordinary work (kittrial-5bb.277).
             t.requirement_record ? h('span', { class: 'chip', title: 'A requirement record, not claimable work' }, 'Requirement') : null,
@@ -593,12 +681,13 @@ export async function overview(ctx, { pid }) {
           // carries an assignee with no name yet, and otherwise 'anyone'.
           // Stays textContent: untrusted text stays text.
           h('td', { class: 'task-state-column' }, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
-          h('td', { class: 'who-acts-cell task-next-column', 'data-who-acts': t.assignee_name || (t.assignee ? t.assignee : 'anyone') },
-            h('span', { class: 'who-acts' + (t.assignee ? '' : ' none') },
-              (t.assignee_name || (t.assignee ? t.assignee : 'anyone')),
+          // Who acts next: the name from whoActsNext (the same answer as the bar), then the step's own words.
+          h('td', { class: 'who-acts-cell task-next-column', 'data-who-acts': acts.name || 'unknown' },
+            h('span', { class: 'who-acts' + (acts.mine ? ' you' : '') + (acts.name === 'No one' ? ' none' : '') },
+              acts.mine ? h('b', null, acts.name) : (acts.name || '—'),
               ' · ',
-              (t.next_action ? t.next_action.text : '—'))),
-          h('td', { class: 'hide-narrow muted num task-updated-column' }, t.updated_at ? time(t.updated_at) : '')))))) :
+              (acts.text || '—'))),
+          h('td', { class: 'hide-narrow muted num task-updated-column' }, t.updated_at ? time(t.updated_at) : '')); })))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
       ...(partial ? [partial] : []),
       h('div', { class: 'pager' },
@@ -631,8 +720,7 @@ export async function overview(ctx, { pid }) {
     host);
 
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project), title: project.name, lede: project.description || null,
-      actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null }),
+    head,
     archivedBanner(project),
     unusableBanner(project),
     setupLine,
@@ -903,24 +991,23 @@ export function autoNudgePanel(ctx, project) {
   return host;
 }
 
-export async function settings(ctx, { pid }) {
-  const project = await load(ctx, pid);
+// The members panel (moved unchanged from Members & settings to People, kittrial-5bb.522 slice 2).
+// `coordination` is the Who-coordinates panel on the same page, read again after a role change.
+// `head` is People's page header (kittrial-5bb.525 slice b, on .522's People page): the members read sets its
+// key, the project's member count.
+function membersPanel(ctx, project, coordination, head) {
+  const pid = project.id;
   const owner = isOwner(project);
   // Its own selector: the role options belong to the members list, never to another
   // panel's control (the claiming setting has data-panel="claiming" instead).
   const membersHost = h('div', { class: 'panel', 'data-panel': 'members' });
-  const agentsHost = h('div');
-  const credsHost = h('div');
-  const auditHost = h('div');
-  // Who coordinates (kittrial-5bb.198), read again after an owner changes a role or a grant here.
-  const coordination = coordinationPanel(ctx, project);
-  // Delegated decision rights (kittrial-5bb.407): read by every member; recorded only by a person owner.
-  const delegated = delegationsPanel(ctx, project, { owner: project.role === 'owner' });
 
   async function drawMembers() {
     let data;
-    try { data = await ctx.api.members(pid); } catch (error) { membersHost.replaceChildren(errorState(error, drawMembers)); return; }
+    try { data = await ctx.api.members(pid); } catch (error) { setPageKey(head, null); membersHost.replaceChildren(errorState(error, drawMembers)); return; }
     const rows = data.items.slice().sort((a, b) => a.display_name.localeCompare(b.display_name));
+    const members = typeof data.total === 'number' ? data.total : data.next_cursor ? null : rows.length;
+    setPageKey(head, members === null ? null : { num: members, label: members === 1 ? 'member' : 'members', source: typeof data.total === 'number' ? 'members.total' : 'members.items' });
     membersHost.replaceChildren(
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Members ', h('span', { class: 'nav-count' }, rows.length)), h('span', { class: 'small muted hide-narrow' }, 'Viewers read · contributors claim and deliver · coordinators also approve · owners also manage')),
       h('div', { class: 'table-wrap' }, h('table', null,
@@ -969,6 +1056,16 @@ export async function settings(ctx, { pid }) {
     });
     return form;
   }
+
+  drawMembers();
+  return membersHost;
+}
+
+// The agents that work in this project (moved unchanged to the Agents section, kittrial-5bb.522 slice 2).
+function projectAgentsPanel(ctx, project, coordination) {
+  const pid = project.id;
+  const owner = isOwner(project);
+  const agentsHost = h('div');
 
   // The agents that work in this project, and which of them coordinate it (kittrial-5bb.209). An owner
   // gives and removes the grant here; the server says why when a grant cannot be given.
@@ -1020,6 +1117,71 @@ export async function settings(ctx, { pid }) {
         })))) : h('div', { class: 'panel-body' }, empty('No agents here yet', 'A member grants their own agent this project on the Agents page.'))));
   }
 
+  drawAgents();
+  return agentsHost;
+}
+
+// The hand-over walkthrough's link, on People and Agents as on Settings (PROJECT_CROSS_SECTION_DESIGN.md §3.6;
+// kittrial-5bb.522 slice 2 r2, note 3): the walkthrough's steps are fixed on these two pages.
+function handoverLink(ctx, pid) {
+  return h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator'));
+}
+
+export async function people(ctx, { pid }) {
+  const project = await load(ctx, pid);
+  const owner = isOwner(project);
+  const coordination = coordinationPanel(ctx, project);
+  // The header (kittrial-5bb.525 slice b): the key is the project's member count, from the members read (its
+  // total, or the rows when the read says there is no further page); the next action, for an owner, takes the
+  // reader to the "Add by username" form below.
+  const head = pageHead({ crumbs: crumbs(ctx, project, 'People'), title: 'People', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.',
+    key: 'pending', actions: headActions(owner && !project.archived ? h('button', { type: 'button', class: 'primary', 'data-next-action': 'add-member', onclick: () => {
+      const input = document.getElementById('m-username');
+      if (!input) return;
+      input.scrollIntoView({ block: 'center' });
+      input.focus({ preventScroll: true });
+    } }, 'Add a member') : null, inviteAction(ctx, project)) });
+  return h('div', { class: 'stack' },
+    head,
+    archivedBanner(project),
+    unusableBanner(project),
+    handoverLink(ctx, pid),
+    membersPanel(ctx, project, coordination, head),
+    // kittrial-5bb.578: invite links, moved with the members from Members & settings to People.
+    invitePanel(ctx, project),
+    coordination.node);
+}
+
+export async function projectAgents(ctx, { pid }) {
+  const project = await load(ctx, pid);
+  const owner = isOwner(project);
+  const coordination = coordinationPanel(ctx, project);
+  return h('div', { class: 'stack' },
+    pageHead({ crumbs: crumbs(ctx, project, 'Agents'), title: 'Agents', lede: owner ? 'Which agents work here and which of them coordinate.' : null }),
+    archivedBanner(project),
+    unusableBanner(project),
+    handoverLink(ctx, pid),
+    owner ? projectAgentsPanel(ctx, project, coordination)
+      : h('p', { 'data-note': 'agents-owner-only' }, 'Only this project’s owners see its agents here. Your own agents are under ', h('a', { href: ctx.href('/agents') }, 'My agents'), '.'),
+    coordination.node);
+}
+
+// The Settings lede, true for each role (kittrial-5bb.522 slice 2 r2, Should 3): a coordinator who is not an
+// owner can save how work is handed out (the claiming PUT needs coordinate), and nothing else on the page.
+export function settingsLede(project, owner) {
+  if (owner) return 'How work is claimed and approved, credentials, activity and archiving.';
+  if (project.can_coordinate) return 'You can change how work is handed out; only project owners can change the rest.';
+  return 'Only project owners can change these.';
+}
+
+export async function settings(ctx, { pid }) {
+  const project = await load(ctx, pid);
+  const owner = isOwner(project);
+  const credsHost = h('div');
+  const auditHost = h('div');
+  // Delegated decision rights (kittrial-5bb.407): read by every member; recorded only by a person owner.
+  const delegated = delegationsPanel(ctx, project, { owner: project.role === 'owner' });
+
   async function drawCreds() {
     if (!owner) { credsHost.replaceChildren(); return; }
     let data;
@@ -1059,7 +1221,7 @@ export async function settings(ctx, { pid }) {
         empty('No administrative activity yet', null)));
   }
 
-  drawMembers(); drawAgents(); drawCreds(); drawAudit();
+  drawCreds(); drawAudit();
 
   const danger = owner && !project.archived ? h('section', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Archive project')),
@@ -1072,18 +1234,15 @@ export async function settings(ctx, { pid }) {
       } }, 'Archive project')))) : null;
 
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
+    pageHead({ crumbs: crumbs(ctx, project, 'Settings'), title: 'Settings', lede: settingsLede(project, owner) }),
     archivedBanner(project),
     unusableBanner(project),
     // kittrial-5bb.442: the hand-over walkthrough, checked live (each member reads their own).
     // kittrial-5bb.447: notes between the coordinators of linked projects, in the same line (no new panel).
     h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator'),
       ' · ', h('a', { href: ctx.href(`/p/${pid}/notes`), 'data-link': 'notes' }, 'Notes between coordinators')),
-    membersHost,
-    // kittrial-5bb.578: invite links, shown only while the installation's switch is on (or to list your own).
-    invitePanel(ctx, project),
-    claimingPanel(ctx, project), agentApprovalPanel(ctx, project), autoNudgePanel(ctx, project), coordination.node,
+    claimingPanel(ctx, project), agentApprovalPanel(ctx, project), autoNudgePanel(ctx, project),
     // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
     switchesPanel(ctx, project),
-    delegated.node, agentsHost, credsHost, auditHost, danger);
+    delegated.node, credsHost, auditHost, danger);
 }

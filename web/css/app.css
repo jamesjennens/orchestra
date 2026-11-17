@@ -74,8 +74,9 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { height: 100%; }
+/* the working surface is white, the rail warm paper (WEB_FRESH_LOOK.md §1; fresh.css:70, :94); kittrial-5bb.525 r2 */
 body {
-  margin: 0; background: var(--ground); color: var(--ink);
+  margin: 0; background: var(--surface); color: var(--ink);
   font: var(--t-md)/1.5 var(--font); -webkit-font-smoothing: antialiased;
 }
 a { color: var(--accent); text-decoration: none; }
@@ -102,20 +103,22 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 @media (min-width: 761px) {
   .shell {
     background: linear-gradient(90deg,
-      var(--surface) 0 calc(var(--rail) - 1px),
+      var(--ground) 0 calc(var(--rail) - 1px),
       var(--line) calc(var(--rail) - 1px) var(--rail),
       transparent var(--rail));
   }
 }
 .rail {
-  background: var(--surface); border-right: 1px solid var(--line);
+  background: var(--ground); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 14px; padding: 16px 12px;
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
 }
-.brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px; font-weight: 650; font-size: var(--t-lg); color: var(--ink); }
-.brand-mark { width: 22px; height: 22px; flex: none; }
+/* the mark and the wordmark (kittrial-5bb.525 slice d): the tile, then "Orchestra" in the display serif */
+.brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px; color: var(--ink); }
+.brand > span { font-family: var(--font-display); font-weight: 600; font-size: var(--t-xl); letter-spacing: -.01em; line-height: 1; }
+.brand-mark { width: 24px; height: 24px; flex: none; }
 .rail-section { display: flex; flex-direction: column; gap: 2px; }
-.rail-label { font-size: var(--t-2xs); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 0 8px 4px; }
+.rail-label { font-size: var(--t-xs); font-weight: 600; color: var(--muted); padding: 0 8px 4px; }  /* sentence case, not 11px caps (525 c) */
 .nav-link {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 6px 8px; border-radius: var(--radius); color: var(--ink-2);
@@ -133,9 +136,29 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   font-size: 11px; font-weight: 700; background: var(--accent-soft); color: var(--accent);
 }
 .main { min-width: 0; padding: 20px 28px 48px; display: flex; flex-direction: column; gap: var(--s-4); }
-.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+/* ---------- page header (kittrial-5bb.525 slice b): what this is | its one number | next action ---------- */
+.page-head {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--s-2) var(--s-8); align-items: end;
+  padding-bottom: var(--s-6); border-bottom: 1px solid var(--line);
+}
+.page-head .ph-title { min-width: 0; display: flex; flex-direction: column; gap: var(--s-1); }
 .page-head h1, .auth-card h1 { overflow-wrap: anywhere; }
-.page-head .lede { margin-top: 4px; color: var(--muted); }
+.page-head .lede { margin-top: var(--s-1); color: var(--ink-2); }
+.page-key { display: flex; flex-direction: column; align-items: flex-end; text-align: right; }
+.page-key .key-num {
+  font-family: var(--font-display); font-size: var(--t-4xl); font-weight: 600; line-height: 1;
+  font-variant-numeric: tabular-nums lining-nums; color: var(--ink); white-space: nowrap;
+}
+.page-key .key-label { font-size: var(--t-sm); color: var(--muted); margin-top: var(--s-2); white-space: nowrap; }
+.page-head > .actions { justify-content: flex-end; grid-column: -2 / -1; }  /* flush right with or without a key */
+@media (min-width: 761px) { .page-head h1 { font-size: var(--t-3xl); } }
+@media (max-width: 760px) {
+  .page-head { grid-template-columns: minmax(0, 1fr); gap: var(--s-3); padding-bottom: var(--s-4); }
+  .page-key { flex-direction: row; align-items: baseline; gap: var(--s-2); text-align: left; }
+  .page-key .key-num { font-size: var(--t-3xl); }
+  .page-key .key-label { margin-top: 0; white-space: normal; }
+  .page-head > .actions { justify-content: flex-start; }
+}
 .crumbs { font-size: var(--t-sm); color: var(--muted); display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .crumbs a { color: var(--muted); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -147,6 +170,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 }
 .banner.info { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
 .banner.crit { background: var(--crit-soft); border-color: color-mix(in srgb, var(--crit) 35%, transparent); }
+.upgrade-banner { position: sticky; top: 0; z-index: 30; margin: 8px; }
 
 .content { min-width: 0; display: flex; flex-direction: column; }
 .main-top { display: none; padding: 12px 16px 0; }
@@ -212,11 +236,16 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 .panel-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: var(--t-sm); }
+/* tables that read at a glance (kittrial-5bb.525 slice c): heads in 12px sentence case, rows with room */
 th {
-  text-align: left; font-weight: 600; font-size: var(--t-xs); letter-spacing: .06em; text-transform: uppercase;
-  color: var(--muted); padding: 7px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--surface);
+  text-align: left; font-weight: 600; font-size: var(--t-xs);
+  color: var(--muted); padding: var(--s-2) var(--s-3); border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--surface);
 }
-td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td { padding: var(--s-3); border-bottom: 1px solid var(--line); vertical-align: top; }
+/* a row that waits on the reader carries a 3px accent bar ("where you are"), never a state colour */
+tbody tr.mine > td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+/* a button in a cell keeps its label on one line (Remove broke into two at 375px) */
+td > button, td > .btn { white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr.row-link { cursor: pointer; }
 tbody tr.row-link:hover td { background: var(--surface-2); }
@@ -230,14 +259,19 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
      cell of a fixed-width table column */
   display: inline-flex; align-items: center; gap: 5px; white-space: normal; max-width: 100%; overflow-wrap: anywhere;
   font-size: var(--t-xs); font-weight: 600; line-height: 18px; padding: 1px 8px; border-radius: 8px;
-  background: var(--idle-soft); color: var(--ink-2);
+  background: var(--idle-soft); color: var(--idle);
 }
-.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--idle); flex: none; }
-.chip.ok { background: var(--ok-soft); } .chip.ok::before { background: var(--ok); }
-.chip.warn { background: var(--warn-soft); } .chip.warn::before { background: var(--warn); }
-.chip.crit { background: var(--crit-soft); } .chip.crit::before { background: var(--crit); }
-.chip.accent { background: var(--accent-soft); } .chip.accent::before { background: var(--accent); }
-.chip.info { background: var(--info-soft); } .chip.info::before { background: var(--info); }
+/* the tone dot is the chip's own text colour: a state reads in its colour, its dot and its word */
+.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+.chip.ok { background: var(--ok-soft); color: var(--ok); }
+.chip.warn { background: var(--warn-soft); color: var(--warn); }
+.chip.crit { background: var(--crit-soft); color: var(--crit); }
+.chip.info { background: var(--info-soft); color: var(--info); }
+/* not a state: "where you are" (the wizard's step) */
+.chip.accent { background: var(--accent-soft); color: var(--ink); }
+.chip.accent::before { background: var(--accent); }
+/* not a state either: a word in a chip shape (a role, a priority, a final record) */
+.chip.plain { color: var(--ink-2); }
 .chip.plain::before { display: none; }
 .role { font-size: var(--t-xs); font-weight: 600; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 6px; line-height: 18px; }
 
@@ -271,6 +305,7 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
 .timeline.timeline-plain li::before { display: none; }
 .dot { width: 11px; height: 11px; border-radius: 50%; margin: 5px 0 0 3px; background: var(--idle); box-shadow: 0 0 0 3px var(--surface); }
 .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.crit { background: var(--crit); } .dot.accent { background: var(--accent); }
+.dot.info { background: var(--info); }
 .event-head { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .event-body { margin-top: 4px; color: var(--ink-2); font-size: var(--t-sm); }
 .request-list { margin: 6px 0 0; padding-left: 18px; font-size: var(--t-sm); display: flex; flex-direction: column; gap: 6px; }
@@ -284,9 +319,51 @@ form.respond { border-top: 1px solid var(--line); padding-top: 12px; margin-top:
 .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 
 /* ---------- empty/loading/error ---------- */
-.empty { padding: 32px 16px; text-align: center; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 8px; border: 1px dashed var(--line-strong); border-radius: var(--radius); }
+.empty { padding: var(--s-6) var(--s-4); text-align: center; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: var(--s-2); border: 1px dashed var(--line-strong); border-radius: var(--radius-lg); background: var(--ground); }
 .empty strong { color: var(--ink); font-size: var(--t-lg); }
-.loading { padding: 32px; color: var(--muted); font-size: var(--t-sm); }
+
+/* ---------- empty, loading and error states (kittrial-5bb.525 slice e) ---------- */
+/* a round icon, what would be here, how it gets there, and the action; empty is a dashed well */
+.state {
+  display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; gap: var(--s-1) var(--s-4); align-items: center;
+  padding: var(--s-4) var(--s-5); border-radius: var(--radius-lg); background: var(--ground); border: 1px dashed var(--line-strong);
+  color: var(--muted); text-align: left;
+}
+.panel > .state { margin: var(--s-3); }
+.state-icon {
+  width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--surface); border: 1px solid var(--line); color: var(--muted);
+}
+.state-icon svg { width: 18px; height: 18px; }
+.state-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.state-text strong { color: var(--ink); font-weight: 650; }
+.state-text p { margin: 0; font-size: var(--t-sm); color: var(--muted); }
+/* an error is the crit tone, with its rule: what failed, why, the request id and Try again */
+.state.error { background: var(--crit-soft); border: 1px solid color-mix(in srgb, var(--crit) 35%, transparent); border-left: 4px solid var(--crit); }
+.state.error .state-icon { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 35%, transparent); }
+.state.error .state-text p { color: var(--ink-2); }
+.state-req { font-family: var(--mono); font-size: var(--t-xs); }
+/* on the crit well a control's --field-line edge is under 3:1 (2.99 light); Try again takes the well's own rule */
+.state.error button, .state.error .btn { border-color: var(--crit); }
+/* loading: a skeleton in the shape of what comes, never a blank */
+.loading { padding: var(--s-2) 0; color: var(--muted); font-size: var(--t-sm); }
+.skeleton { display: flex; flex-direction: column; gap: var(--s-3); }
+.sk-row { display: grid; grid-template-columns: 12px minmax(0, 1fr); gap: var(--s-3); align-items: start; }
+.sk-lines { display: flex; flex-direction: column; gap: var(--s-2); }
+.sk {
+  display: block; height: 10px; border-radius: 5px;
+  background: linear-gradient(90deg, var(--surface-2) 0%, var(--line) 50%, var(--surface-2) 100%); background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+.sk-dot { width: 12px; height: 12px; border-radius: 50%; }
+.sk-w30 { width: 30%; } .sk-w40 { width: 40%; } .sk-w60 { width: 60%; } .sk-w80 { width: 80%; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+/* the shimmer stops for a reader who asked for less motion (this rule names it; the global one may change) */
+@media (prefers-reduced-motion: reduce) { .sk { animation: none; } }
+@media (max-width: 760px) {
+  .state { grid-template-columns: 36px minmax(0, 1fr); padding: var(--s-4); }
+  .state-act { grid-column: 2; justify-self: start; margin-top: var(--s-1); }
+}
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; color: var(--ink); }
 a.card:hover { border-color: var(--accent); text-decoration: none; }
@@ -296,10 +373,43 @@ a.card:hover { border-color: var(--accent); text-decoration: none; }
 .step { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px; display: flex; flex-direction: column; gap: 8px; }
 
 /* ---------- auth ---------- */
-.auth { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
-.auth-card { width: 100%; max-width: 380px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 28px; display: flex; flex-direction: column; gap: 18px; }
-.auth-card .brand { padding: 0; }
-.auth-foot { font-size: var(--t-xs); color: var(--muted); }
+/* sign-in (kittrial-5bb.525 slice d): the brand side on paper, the form on the working surface */
+.auth { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(380px, 1fr); }  /* the frame fills the window */
+.auth-side {
+  background: var(--ground); border-right: 1px solid var(--line); padding: var(--s-12);
+  display: flex; flex-direction: column; justify-content: space-between; gap: var(--s-8); overflow: hidden;
+}
+.auth-side .brand { padding: 0; }
+.auth-side .brand-mark { width: 32px; height: 32px; }
+.auth-side .brand > span { font-size: var(--t-2xl); }
+.auth-pitch { display: flex; flex-direction: column; gap: var(--s-4); max-width: 30ch; }
+.auth-pitch p { color: var(--ink-2); font-size: var(--t-lg); }
+.auth-pitch .auth-headline { font-family: var(--font-display); font-size: var(--t-4xl); font-weight: 600; line-height: 1.15; letter-spacing: -.015em; color: var(--ink); }
+.auth-score { width: min(420px, 100%); align-self: flex-end; }
+.auth-score rect { fill: var(--line-strong); }
+.auth-score rect.lead { fill: var(--accent); }
+.auth-fine { font-size: var(--t-sm); color: var(--muted); }
+.auth-main { display: grid; place-items: center; padding: var(--s-12) var(--s-6); background: var(--surface); }
+.auth-card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: var(--s-5); }
+.auth-card h1 { font-size: var(--t-3xl); }
+.auth-card-brand { display: none; padding: 0; }
+.auth-card .field input { min-height: 42px; font-size: var(--t-lg); }
+.auth-card button.primary { min-height: 44px; font-size: var(--t-md); }
+/* A field with a link on its label's line; the link stays after the input in tab order. */
+.field.with-aside { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--s-2); row-gap: var(--s-1); align-items: baseline; }
+.field.with-aside > label { grid-row: 1; grid-column: 1; }
+.field.with-aside > .field-aside { grid-row: 1; grid-column: 2; font-size: var(--t-sm); }
+.field.with-aside > :not(label):not(.field-aside) { grid-column: 1 / -1; }
+.auth-foot { font-size: var(--t-sm); color: var(--muted); border-top: 1px solid var(--line); padding-top: var(--s-4); }
+@media (max-width: 760px) {
+  .auth { grid-template-columns: minmax(0, 1fr); }
+  .auth-side { display: none; }
+  .auth-main { place-items: start center; padding: var(--s-8) var(--s-5); }
+  .auth-card h1 { font-size: var(--t-2xl); }
+  .auth-card-brand { display: flex; }
+  .auth-card-brand .brand-mark { width: 30px; height: 30px; }
+  .auth-card-brand > span { font-size: var(--t-xl); }
+}
 
 /* ---------- dialog & toast ---------- */
 dialog { border: 1px solid var(--line); border-radius: 10px; padding: 0; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); width: min(520px, calc(100vw - 32px)); }
@@ -417,7 +527,11 @@ h1[tabindex="-1"]:focus-visible { outline-offset: 4px; }
 .who-acts.agent { background: var(--surface-2); }
 /* in a table cell the who-acts line is plain wrappable text, not a box */
 td .who-acts { display: inline; border: 0; border-radius: 0; padding: 0; line-height: 1.6; }
-td .who-acts::before { content: "→ "; }
+td .who-acts::before { content: none; }
+/* "You" in the accent when the row's step is the reader's (WEB_FRESH_LOOK §6; kittrial-5bb.525 c r2); in a cell
+   it is the word, not the pill .who-acts.you is elsewhere */
+td .who-acts.you { background: none; border-color: transparent; color: var(--ink-2); }
+td .who-acts.you b { color: var(--accent); font-weight: 650; }
 
 /* ---------- on-page navigation for long pages ---------- */
 .on-page { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: var(--t-sm); padding: 0 2px; }
@@ -454,7 +568,7 @@ details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(-
 .empty-line { font-size: var(--t-sm); color: var(--muted); padding: 6px 0; }
 
 /* ---------- counts in section heads ---------- */
-.count { font-size: var(--t-xs); font-weight: 600; color: var(--muted); background: var(--surface-2); border-radius: 10px;
+.count { font-size: var(--t-xs); font-weight: 650; color: var(--ink-2); background: var(--surface-2); border-radius: 10px;
   padding: 0 7px; line-height: 18px; font-variant-numeric: tabular-nums; }
 
 /* ---------- task list: one row, the facts a reader scans ---------- */
@@ -509,4 +623,7 @@ th.task-updated-column, td.task-updated-column { text-align: right; }
   .task-list-project td.task-title-cell, .task-list-project td.task-state-column,
   .task-list-project td.task-next-column { grid-column: 1 / -1; }
   .task-list-project td.task-state-column { display: grid; grid-template-columns: none; justify-items: start; }
+  /* the "waits on you" bar moves from the first cell to the stacked row */
+  table.stack-narrow tr.mine, .task-list-work tr.mine { box-shadow: inset 3px 0 0 var(--accent); }
+  table.stack-narrow tr.mine > td:first-child, .task-list-work tr.mine > td:first-child { box-shadow: none; }
 }

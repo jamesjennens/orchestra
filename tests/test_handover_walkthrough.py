@@ -363,8 +363,8 @@ console.log(JSON.stringify(out));"""
                                              (KIT / 'web/js/views/handover.js').as_uri(), json.dumps({'steps': steps}))
         self.assertEqual(done.returncode, 0, done.stderr)
         out = {o['id']: o for o in json.loads(done.stdout.strip().splitlines()[-1])}
-        self.assertEqual(out['role']['links'], ['#/p/pp/settings'])
-        self.assertEqual(out['grant']['links'], [])                 # done: nothing to open
+        self.assertEqual(out['role']['links'], ['#/p/pp/people'])
+        self.assertEqual(out['grant']['links'], [])                 # done: nothing to open (its fix page is the Agents section)
         self.assertEqual(out['agent']['links'], [])                 # hidden: nothing to open
         self.assertEqual((out['switches']['codes'], out['switches']['buttons']), (1, 1))   # a command and its copy
         self.assertEqual(out['role']['scripts'], 0)

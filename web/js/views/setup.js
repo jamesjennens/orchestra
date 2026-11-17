@@ -14,7 +14,7 @@ export const STATE_LABELS = {
 
 // Where a step is done in the web interface, by step id. The operator steps have none.
 export function stepRoute(id, pid) {
-  return { members: `/p/${pid}/settings`, 'first-task': `/p/${pid}/new`, agent: '/agents' }[id] || null;
+  return { members: `/p/${pid}/people`, 'first-task': `/p/${pid}/new`, agent: '/agents' }[id] || null;
 }
 
 export function summary(data) {

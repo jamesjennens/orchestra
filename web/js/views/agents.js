@@ -2,7 +2,7 @@
 // owner opens this page they see which agent has something to do and which folder to
 // open in VS Code to resume it. Agents themselves read work over the REST API.
 import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
-import { pageHead, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
+import { pageHead, setPageKey, empty, field, setFieldError, formValues, act, errorState, describe, loading } from '../ui.js';
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
@@ -15,7 +15,7 @@ export const ATTENTION = {
   // could not be read is never headed "Could take more work".
   error: ['Could not read its work', 'crit'],
   unknown: ['Work read incomplete', 'warn'],
-  idle: ['Could take more work', 'accent'],
+  idle: ['Could take more work', ''],
   working: ['Working', ''],
   waiting: ['Waiting for review', 'ok'],
   blocked: ['Blocked', 'crit'],
@@ -249,7 +249,9 @@ export async function list(ctx) {
   // The page's structure is there at once, in its final order; the agents and the accounts fill in
   // their own places (kittrial-5bb.456 item 1), so nothing below them is pushed down later.
   const host = h('div', { class: 'stack', 'data-agents-host': '', 'aria-busy': 'true' },
-    h('div', { class: 'panel', 'data-agents-loading': '', role: 'status', style: 'min-height: 6rem' }, h('div', { class: 'panel-body muted' }, 'Loading your agents…')));
+    // The skeleton in the agents' own place (kittrial-5bb.525 slice e): it says so to a screen
+    // reader, and the cards replace it where it stands (kittrial-5bb.456 item 1).
+    h('div', { class: 'panel', 'data-agents-loading': '' }, h('div', { class: 'panel-body' }, loading('Loading your agents…'))));
   let unconfirmedOnly = false;
   let cursor = null;
   let mineOnly = true;
@@ -290,6 +292,16 @@ export async function list(ctx) {
     }
     return ownersOf(loaded.items).length > 1;
   }
+  // The header (kittrial-5bb.525 slice b): the key is the server's total of the agents this list
+  // reads (data.total), filled when the read returns; the next action takes the reader to the
+  // "Add an agent" form further down this page.
+  const head = pageHead({ title: 'My agents', lede: 'One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.',
+    key: 'pending', actions: h('button', { type: 'button', class: 'primary', 'data-next-action': 'add-agent', onclick: () => {
+      const input = document.getElementById('a-name');
+      if (!input) return;
+      input.scrollIntoView({ block: 'center' });
+      input.focus({ preventScroll: true });
+    } }, 'Add an agent') });
   const filter = h('div', { class: 'stack' },
     ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
       h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
@@ -300,13 +312,17 @@ export async function list(ctx) {
     } }), 'Show agents with inferred or unknown scopes') : null);
   async function load() {
     let data;
-    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
+    // The agents' region is busy while it is read, every time (kittrial-5bb.525 e r2), and not after a failure.
+    host.setAttribute('aria-busy', 'true');
+    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { setPageKey(head, null); host.replaceChildren(errorState(error, load)); return; } finally { host.removeAttribute('aria-busy'); }
     const items = data.items;
     loaded.items = items;
     loaded.total = data.total || items.length;
     // The filter is caller-level: keep every owner the caller may see, across pages, so the
     // Mine/All choice never appears on one page and vanishes on the next (kittrial-5bb.561 r2).
     for (const owner of ownersOf(items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
+    setPageKey(head, typeof data.total === 'number' ? { num: data.total,
+      label: unconfirmedOnly ? 'with inferred or unknown scopes' : data.total === 1 ? 'agent' : 'agents', source: 'agents.total' } : null);
     host.removeAttribute('aria-busy');
     const showFilter = mineShown();
     const shown = visibleItems();
@@ -486,7 +502,7 @@ export async function list(ctx) {
           h('input', { type: 'checkbox', disabled: true, 'aria-label': `${p.name} (not available to ${ownerName})` }),
           h('span', null, `${ownerName} is not a member of ${p.name}: `,
             ctx.me && (ctx.me.superuser || p.role === 'owner')
-              ? h('a', { href: ctx.href(`/p/${p.id}/settings`) }, "add them under the project's Members first")
+              ? h('a', { href: ctx.href(`/p/${p.id}/people`) }, "add them under the project's Members first")
               : "add them under the project's Members first")))),
       h('div', null, h('button', { type: 'submit' }, 'Save projects')));
     form.addEventListener('submit', async (event) => {
@@ -623,7 +639,7 @@ export async function list(ctx) {
   });
 
   const page = h('div', { class: 'stack' },
-    pageHead({ title: 'My agents', lede: 'One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.' }),
+    head,
     filter, host,
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add an agent')), h('div', { class: 'panel-body' }, form)));
   if (ownerField) {
@@ -1003,7 +1019,7 @@ function secretNotice(justCreated) {
     h('p', { class: 'small', 'data-secret-save': 'true' }, 'Save this secret now, in the file named below. Never paste it into a chat.'),
     h('p', { class: 'small muted', 'data-secret-once': 'true' }, 'It is shown once and this page does not keep it.'),
     justCreated ? h('p', { class: 'small muted', 'data-secret-later': 'true' },
-      'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Members & settings page first.') : null);
+      'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Agents page first.') : null);
 }
 
 function secretLinesBlock(payload, secretValue, os, noproxy = false) {
@@ -1195,14 +1211,14 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     role: () => setupText.coordinating(payload) ? [
       h('p', { class: 'small', 'data-role-coordinator': 'true' },
         `${payload.name} holds the coordinator grant for ${payload.coordinates.map(projectLabel).join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
-      more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Members & settings page, and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
+      more(h('p', { class: 'small muted' }, 'The grant is given here or on the project’s Agents page, and removed on the project’s Agents page. Without a grant that has effect, this screen offers worker and reviewer (and coordinator when you may grant it), and AGENT.md is the worker’s.')),
     ] : (() => {
       const grantable = payload.coordinateGrantableProjects || [];
       syncGrantRow();
       return [
         h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
         grantable.length === 0 ? h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
-          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.") : null,
+          "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Agents page first, then open this set-up again. The agent's owner must also be a member of that project, or this set-up still writes the worker's files.") : null,
         h('div', { class: 'copy-row', 'data-role-choice': 'true' },
           choice('setup-role', 'worker', 'Works on tasks', !state.coordinatorProject && state.role === 'worker', () => selectRole('worker')),
           choice('setup-role', 'reviewer', 'Reviews deliveries', !state.coordinatorProject && state.role === 'reviewer', () => selectRole('reviewer')),
@@ -1409,7 +1425,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       if (!(payload.coordinateGrantableProjects || []).includes(pid)) {
         state.coordinatorProject = null;
         render();
-        wizard.showError(new Error(`This set-up cannot tell whether ${payload.name} holds a coordinator grant for ${projectLabel(pid)}. Check the project's Members & settings page.`));
+        wizard.showError(new Error(`This set-up cannot tell whether ${payload.name} holds a coordinator grant for ${projectLabel(pid)}. Check the project's Agents page.`));
       } else {
         syncGrantRow();
         wizard.showError(new Error(`${payload.name} does not hold an active coordinator grant for ${projectLabel(pid)}.`));

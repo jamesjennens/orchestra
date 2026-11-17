@@ -29,7 +29,7 @@
 
 ## 3. The walkthrough
 
-**Where it lives:** one page per project, "Hand this project to a coordinator", linked from Members & settings and from the project's Set-up page (`project_setup.steps`, project_setup.py:128).
+**Where it lives:** one page per project, "Hand this project to a coordinator", linked from the project's People, Agents and Settings pages (Members & settings before kittrial-5bb.522 slice 2) and from the project's Set-up page (`project_setup.steps`, project_setup.py:128).
 
 **One list, two sides:** the owner and the new coordinator see the same ordered list of steps. Each step is checked live from state the server already holds, every time the page is read, and is marked done, to do, waiting on someone, or failed. A failed step says in one plain sentence who fixes it and how. The page never fixes anything by itself; each fix is the existing route behind the step's button.
 

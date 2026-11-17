@@ -350,7 +350,7 @@ class WhoMayInviteTests(InviteCase):
         for agent in ({'name': 'Boss', 'project': 'north', 'role': 'coordinator'},
                       {'name': 'Boss', 'project': 'north', 'coordinator': True},
                       {'name': 'Boss', 'project': 'north', 'grants': ['coordinator']},
-                      {'name': 'Boss', 'project': 'north', 'role': 'reviewer'},
+                      {'name': 'Boss', 'project': 'north', 'role': 'admin'},   # kittrial-5bb.581: reviewer is allowed
                       {'name': 'Boss', 'project': 'north', 'scopes': ['tasks', 'records']}):
             with self.subTest(agent=agent):
                 answer = self.invite(expect=403, agent=agent)
@@ -642,7 +642,9 @@ class SwitchTests(InviteCase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(len(self.service.state['invites']), 1)
         listed = self.call('GET', '/v1/invites', token=self.cora)[1]
-        self.assertEqual((listed['enabled'], listed['projects'], listed['off_sentence']), (False, [], invites.INVITES_OFF))
+        # kittrial-5bb.581: the projects stay listed while off, so an owner sees the panel with the off sentence.
+        self.assertEqual((listed['enabled'], [p['id'] for p in listed['projects']], listed['may_invite'], listed['off_sentence']),
+                         (False, ['north', 'south'], True, invites.INVITES_OFF))
         # Withdrawing still works while it is off.
         iid = listed['items'][0]['id']
         self.assertEqual(self.call('POST', '/v1/invites/%s/revoke' % iid, {}, self.cora)[0], 200)
