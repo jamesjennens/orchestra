@@ -645,7 +645,7 @@ def help_payload(action='work'):
                             'newer_activity_marker', 'newer_activity_fields',
                             'wait_newer_activity_marker',
                             'newer_activity_by_others', 'newer_activity_own',
-                            'newer_activity_coverage', 'unresolved_directions',
+                            'newer_activity_coverage', 'unresolved_directions', 'wake_summary',
                             'recommended', 'recommended_by', 'contribution_author'],
             'lanes': 'work lanes is the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md): ONE '
                      'export plus the session registry, one row per lane keyed by the session\'s '
@@ -1007,6 +1007,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'wait_newer_activity_marker':None,
                           'newer_activity_by_others':None,'newer_activity_own':None,
                           'newer_activity_coverage':None,'unresolved_directions':None,
+                          'wake_summary':None,
                           'waiting_for_approval':None,
                           'approval_requires_other_party':bool(independent_approval),
                           # A malformed row shows no validated review state, so whose move it

@@ -35,7 +35,9 @@ from test_briefing import checkpoint as checkpoint_payload
 COORD = 'coordinator/session'
 FIELDS = ('newer_activity', 'newer_activity_marker', 'newer_activity_fields', 'newer_activity_by_others',
           'newer_activity_own', 'newer_activity_coverage', 'unresolved_directions',
-          'wait_newer_activity_marker')
+          'wait_newer_activity_marker',
+          # kittrial-5bb.588 T4: the one sentence every reader prints.
+          'wake_summary')
 
 
 def queue_row(data):
