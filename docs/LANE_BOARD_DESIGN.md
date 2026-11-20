@@ -43,14 +43,15 @@ Kind: lane-state-v1
 | `schema_version` | int | `1` |
 | `task` | string | the task the checkpoint was written on; refused when it names another |
 | `checkpoint` | string | the comment id of the checkpoint written with this record; refused when it names a checkpoint that is not the task's newest at write time |
-| `state` | string | one of `working`, `waiting-on-coordinator`, `waiting-on-review`, `waiting-on-user`, `idle` |
-| `waiting_on` | string | a **role** (`coordinator`, `reviewer`, `user`) or an **actor id**. Required when `state` starts with `waiting-`; refused otherwise |
+| `state` | string | one of `working`, `waiting-on-coordinator`, `waiting-on-review`, `waiting-on-user`, `waiting-on-own-job`, `idle` (and the fault flag `needs-investigation`, section 6) |
+| `waiting_on` | string | a **role** (`coordinator`, `reviewer`, `user`) or an **actor id**. Required when `state` is `waiting-on-coordinator`, `waiting-on-review` or `waiting-on-user`; refused with every other state, `waiting-on-own-job` included |
+| `job` | string | `waiting-on-own-job` only (kittrial-5bb.588), and required there: one printable line, at most 120 characters, naming the worker's OWN job (a test run, a replay, a build). Untrusted text, shown escaped. Refused with any other state. With no `expect_by` the board treats the wait as overdue 4 hours after the state began, through the existing `expect_by_passed` flag and `lane-quiet` trigger; it is never a `checkpoint-to-coordinator` question and is not inferred from prose |
 | `expect_by` | time | ISO-8601 with an offset. Optional. **Any parseable value is accepted**, a past one included; an unparseable one is refused |
 
 Rules, all enforced at write, all refusing rather than coercing:
 
 - `state` outside the five values is refused, naming the accepted set.
-- `waiting_on` present without a waiting state, or absent with one, is refused.
+- `waiting_on` present without one of the three `waiting-on-*` states that name somebody, or absent with one, is refused.
 - `expect_by` is refused only when it cannot be parsed. A past `expect_by` is accepted and flagged on
   read (`expect_by_passed`), because a lane may legitimately write down that a deadline has passed.
   There is no "must be in the future at write time" rule.
@@ -137,7 +138,8 @@ is the whole point — the helper it replaces is O(tasks) comment reads.
   (age of the checkpoint that the record names); the age of the lane's newest write anywhere; and
   three flags:
   - `waiting_too_long` — `state` is `waiting-on-coordinator`, `waiting-on-review` or
-    `waiting-on-user` and the checkpoint age exceeds the threshold;
+    `waiting-on-user` and the checkpoint age exceeds the threshold (a `waiting-on-own-job` wait ages
+    by its effective `expect_by` instead: `expect_by`, or the state's start plus 4 hours);
   - `expect_by_passed` — a declared `expect_by` is in the past;
   - `your_move_idle` — the row's `whose_move` is the HOLDER (the row is `changes-requested`, or a
     claimed task with nothing delivered) and the holder has written nothing on it for longer than

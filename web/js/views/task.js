@@ -141,7 +141,8 @@ export async function detail(ctx, { pid, tid }) {
     h('div', { class: 'panel-body' },
       // Slice 2: the description moves to the "What is wanted" panel above; the
       // checkpoint keeps its own panel (summary, next step, carried items).
-      cp ? [h('h3', { class: 'small' }, 'Where it stands'), h('p', { class: 'prose' }, cp.summary), cp.next_action ? h('p', null, h('strong', null, 'Next step: '), cp.next_action) : null] : null,
+      cp ? [h('h3', { class: 'small' }, 'Where it stands'), h('p', { class: 'prose' }, cp.summary), cp.next_action ? h('p', null, h('strong', null, 'Next step: '), cp.next_action) : null,
+        localFactNote(cp.local_fact)] : null,
       cp ? changesSinceCheckpoint(brief.changes_since_checkpoint) : null,
       cp && openItems.length ? [h('h3', { class: 'small' }, 'Unresolved items ', h('span', { class: 'nav-count' }, String(openTotal))),
         h('ul', { class: 'open-items' }, openItems.map((o) => h('li', null, h('span', { class: 'chip plain' }, o.kind), ' ', o.text,
@@ -423,6 +424,17 @@ export function changesSinceCheckpoint(section) {
       ? h('p', { class: 'small muted' }, section.note) : null);
 }
 
+// kittrial-5bb.588: the worker's own statement of what it saw locally. Untrusted text: clipped and escaped,
+// placed as a text node only, and shown beside the checkpoint, never as a state of the task.
+export function localFactNote(fact) {
+  if (!fact || typeof fact !== 'object') return null;
+  const safe = (value, limit) => String(value == null ? '' : value).slice(0, limit)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'));
+  const text = `Observed locally: ${safe(fact.what, 160)} (${safe(fact.kind, 24)}) at ${safe(fact.at, 40)}`;
+  return h('p', { class: 'small muted', 'data-local-fact': 'true' }, text,
+    typeof fact.detail === 'string' && fact.detail ? h('span', { class: 'small' }, ' ', safe(fact.detail, 300)) : null);
+}
+
 export function checkpointForm(ctx, pid, tid, initialBrief) {
   let context = initialBrief;
   let contextReadFailed = false;
@@ -450,8 +462,15 @@ export function checkpointForm(ctx, pid, tid, initialBrief) {
     } }, 'Add unresolved item'),
     field({ id: 'cp-lane', label: 'Lane state', type: 'select', options: [
       ['', 'Leave lane state unchanged'], ['working', 'Working'], ['waiting-on-coordinator', 'Waiting on coordinator'],
-      ['waiting-on-review', 'Waiting on review'], ['waiting-on-user', 'Waiting on user'], ['idle', 'Idle']] }),
+      ['waiting-on-review', 'Waiting on review'], ['waiting-on-user', 'Waiting on user'],
+      ['waiting-on-own-job', 'Waiting on my own job'], ['idle', 'Idle']] }),
+    field({ id: 'cp-job', label: 'Own job', hint: 'For Waiting on my own job only (required there): one line, at most 120 characters, saying what you are waiting for, such as the full test run. It is not a question for the coordinator; with no expected-by time it counts as overdue after 4 hours.' }),
     field({ id: 'cp-waiting', label: 'Waiting on', hint: 'For a waiting state, name coordinator, reviewer, user, or an exact actor ID.' }),
+    field({ id: 'cp-fact-kind', label: 'Observed locally', type: 'select', options: [['', 'Nothing to add'], ['job-finished', 'My job finished'], ['job-failed', 'My job failed'], ['job-partial', 'My job partly finished'], ['time-reached', 'A time was reached'], ['file-seen', 'A file appeared']],
+      hint: 'Optional: what you saw on your own machine, saved with the lane state chosen above (any state). It is only your statement; it changes no review state.' }),
+    field({ id: 'cp-fact-what', label: 'What you saw', hint: 'One line, at most 160 characters.' }),
+    field({ id: 'cp-fact-at', label: 'Seen at', hint: 'Time with seconds and timezone, for example 2026-11-05T17:30:00Z.' }),
+    field({ id: 'cp-fact-detail', label: 'Detail', hint: 'Optional, at most 300 characters.' }),
     field({ id: 'cp-expect', label: 'Expected by', hint: 'Optional time with timezone, for example 2026-10-14T12:00:00Z.' }),
     field({ id: 'cp-not-before', label: 'Not before', hint: 'Optional wake time with timezone and seconds, for example 2026-11-05T17:30:00Z. Only the holder sets it: strictly in the future, at most 14 days ahead. The wait wakes at this time; a later checkpoint without it clears it.' }),
     h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'primary' }, 'Save checkpoint'),
@@ -498,8 +517,18 @@ export function checkpointForm(ctx, pid, tid, initialBrief) {
     if (v['cp-lane']) {
       body.lane_state = { schema_version: 1, task: tid, state: v['cp-lane'] };
       if (v['cp-waiting']) body.lane_state.waiting_on = v['cp-waiting'];
+      if (v['cp-job']) body.lane_state.job = v['cp-job'];
       if (v['cp-expect']) body.lane_state.expect_by = v['cp-expect'];
       if (v['cp-not-before']) body.lane_state.not_before = v['cp-not-before'];
+    }
+    if (v['cp-fact-kind']) {
+      // The fact rides in the lane-state record (any state), never in the checkpoint object.
+      if (!body.lane_state) {
+        status.replaceChildren('Choose a lane state above to record what you observed; it is saved with the lane state. Your text is kept.');
+        status.hidden = false; return;
+      }
+      body.lane_state.local_fact = { kind: v['cp-fact-kind'], what: v['cp-fact-what'], at: v['cp-fact-at'] };
+      if (v['cp-fact-detail']) body.lane_state.local_fact.detail = v['cp-fact-detail'];
     }
     status.hidden = true;
     try {

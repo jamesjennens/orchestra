@@ -22,6 +22,8 @@ act; ``next_actor`` is that same decision's caller-neutral role.
 import argparse
 from datetime import datetime, timezone
 
+from lane_state import OWN_JOB_DEFAULT_EXPECT, OWN_JOB_STATE, WAITING_ON_STATES
+
 DEFAULT_IDLE_MINUTES = 15
 IDLE_MINUTES_MIN, IDLE_MINUTES_MAX = 1, 10080          # one minute .. seven days
 LANES_LIMIT_MIN, LANES_LIMIT_MAX = 1, 100
@@ -273,6 +275,20 @@ def inferred_wait(checkpoint_payload):
     return None
 
 
+def local_fact(payload):
+    """The newest lane-state record's ``local_fact`` (kittrial-5bb.588) as the board shows it: the worker's own
+    statement of what it saw locally, clipped to its limits. A fact is NOT a state: it moves no flag or move."""
+    from lane_state import LOCAL_FACT_DETAIL_LIMIT, LOCAL_FACT_WHAT_LIMIT
+    fact = payload.get('local_fact') if isinstance(payload, dict) else None
+    if not isinstance(fact, dict):
+        return None
+    shown = {'kind': str(fact.get('kind'))[:24], 'what': str(fact.get('what'))[:LOCAL_FACT_WHAT_LIMIT],
+             'at': str(fact.get('at'))[:40]}
+    if isinstance(fact.get('detail'), str):
+        shown['detail'] = fact['detail'][:LOCAL_FACT_DETAIL_LIMIT]
+    return shown
+
+
 def holder_last_write(row, actor):
     """The timestamp text of the holder's newest comment on the task, or the task's own write time."""
     stamps = [comment.get('created_at') for comment in row.get('comments') or []
@@ -342,7 +358,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     found = declared_state(row, task)
     checkpoint = newest_checkpoint(row)
     declared = found is not None
-    wait_state = waiting_on = expect_by = None
+    wait_state = waiting_on = expect_by = job = None
     not_before = not_before_due = None
     checkpoint_id = None
     since = None
@@ -353,6 +369,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         wait_state = payload.get('state')
         waiting_on = payload.get('waiting_on')
         expect_by = payload.get('expect_by')
+        job = payload.get('job') if wait_state == OWN_JOB_STATE else None
         # A wake time is the HOLDER's own (kittrial-5bb.509): the writer refuses anybody
         # else's, and the reader takes it only from the lane's own record, so a record by
         # anybody else declares a state but never a timer for this lane. A value that does
@@ -372,10 +389,19 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
             if guessed is not None:
                 wait_state, waiting_on = guessed
     age = seconds_since(since, now)
-    expect_moment = moment(expect_by) if isinstance(expect_by, str) else None
+    expect_effective = expect_by
+    if wait_state == OWN_JOB_STATE and declared and not expect_by:
+        # kittrial-5bb.588: a wait on the lane's OWN job with no expect_by is overdue this long
+        # after the state began, so the existing expect_by_passed / lane-quiet path fires; nothing new.
+        began = moment(since) if isinstance(since, str) else None
+        if began is not None:
+            expect_effective = (began + OWN_JOB_DEFAULT_EXPECT).isoformat().replace('+00:00', 'Z')
+    expect_moment = moment(expect_effective) if isinstance(expect_effective, str) else None
     idle_seconds = holder_idle_seconds(row, actor, now)
     flags = []
-    if wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user') \
+    # The own-job wait ages by its (effective) expect_by, not by the idle threshold: a long
+    # test run is not "quiet" after fifteen minutes.
+    if wait_state in WAITING_ON_STATES \
             and age is not None and age > threshold:
         flags.append('waiting_too_long')
     if expect_moment is not None and expect_moment < now:
@@ -393,6 +419,9 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         'state': wait_state,
         'waiting_on': waiting_on,
         'expect_by': expect_by,
+        'job': job,
+        'local_fact': local_fact(payload if declared else None),
+        'expect_by_effective': expect_effective if wait_state == OWN_JOB_STATE else None,
         'not_before': not_before,
         'not_before_due': not_before_due,
         'timer_due': False,

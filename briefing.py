@@ -1944,8 +1944,12 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from task_assignment import notices as assignment_notices
     notice_block=assignment_notices(issue,project,actor)
     notice_records=assignment_notices(issue,project,None,limit=20)
+    from lane_state import newest as newest_lane_state
+    declared_lane=newest_lane_state(issue.get('comments'),task)
+    fact=declared_lane[1].get('local_fact') if declared_lane is not None and isinstance(declared_lane[1].get('local_fact'),dict) else None
     result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(owner_raw or 'unassigned',96),**({'owner_name':clip(owner_name,96),'assigned_to':clip(assigned_to,200)} if owner_name and owner_name!=owner_raw else {}),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
+                **({'local_fact':fact} if fact else {}),
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
             # kittrial-5bb.354: only with a checkpoint, so a task without one keeps the
@@ -2972,6 +2976,9 @@ def help_limits(action):
             'lane_state.not_before':'ISO-8601 with seconds and an offset, strictly future, <= 14 days ahead '
                                     '(the holder only; a later record without it clears it)',
             'lane_state.reason':'<= 300 characters (needs-investigation only)',
+            'lane_state.job':'<= 120 characters, one line (waiting-on-own-job only, required there)',
+            'lane_state.local_fact.what':'<= 160 characters, one line',
+            'lane_state.local_fact.detail':'<= 300 characters (optional)',
             'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)})
     return limits
 
@@ -3047,9 +3054,18 @@ def help_notes(action):
             'id, reason, evidence).',
             'An optional sibling key lane_state (kittrial-5bb.263) writes one Kind: lane-state-v1 record beside '
             'this checkpoint in the same act. Its fields are schema_version (1), task, state (one of working, '
-            'waiting-on-coordinator, waiting-on-review, waiting-on-user, idle, needs-investigation), waiting_on (a role coordinator/'
-            'reviewer/user or an actor id; required with a waiting state and refused without one) and expect_by '
-            '(optional ISO-8601 with an offset; a past value is accepted). Do not send checkpoint: the writer '
+            'waiting-on-coordinator, waiting-on-review, waiting-on-user, waiting-on-own-job, idle, needs-investigation), '
+            'waiting_on (a role coordinator/reviewer/user or an actor id; required with waiting-on-coordinator, '
+            'waiting-on-review and waiting-on-user and refused with every other state) and expect_by '
+            '(optional ISO-8601 with an offset; a past value is accepted). State waiting-on-own-job '
+            '(kittrial-5bb.588) is for waiting on YOUR OWN job (a test run, a replay, a build): it requires job '
+            '(one line, <= 120 characters, shown escaped), refuses waiting_on, allows expect_by and not_before, '
+            'is not a question for the coordinator, and with no expect_by counts as overdue 4 hours after the '
+            'state began; every other state refuses job. Any state may also carry local_fact (kittrial-5bb.588; '
+            '{kind, what, at, detail}: kind one of job-finished, job-failed, job-partial, time-reached, file-seen; '
+            'what one line <= 160 characters; at ISO-8601 with seconds and an offset; detail optional <= 300 '
+            'characters; no other keys), your own statement of what you saw locally: it rides in this lane_state '
+            'record, never in the checkpoint, and changes no review or lifecycle fact. Do not send checkpoint: the writer '
             'sets it to the comment id this checkpoint just published, which is what makes the record name the '
             'task\'s newest checkpoint at write time. It is NOT a checkpoint field: the checkpoint object '
             'above is unchanged and its field set stays closed, and lane_state is popped out before the checkpoint '

@@ -108,7 +108,7 @@ LANE_NUDGE = (
     'POST /v1/projects/PROJECT/nudges (lane, message resume or restart, reason stalled-at-prompt, '
     'api-error, lost-wake, no-answer or other, optional audit-only note of at most 200 characters, '
     'and an Idempotency-Key); never nudge your own lane or a lane of your own account. Never nudge a '
-    'lane whose declared state is waiting-on-coordinator, waiting-on-review or waiting-on-user unless '
+    'lane whose declared state is waiting-on-coordinator, waiting-on-review, waiting-on-user or waiting-on-own-job unless '
     'its wait has already been answered or you know its wait has died, and then only with '
     'acknowledge_declared_wait: true. An automatic nudge is allowed only when a lane has your_move_idle '
     'on a task whose declared state is not waiting-on-*, no nudge is pending or claimed, and no nudge '

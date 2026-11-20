@@ -35,16 +35,26 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
+from field_limits import check_text
+
 import record_json
 from requirements import canonical_bytes
 from reserved_comments import LANE_STATE_PREFIX as PREFIX, _reserved_prefix_view
 
 SCHEMA_VERSION = 1
-#: The declared states. The four ``waiting-*`` values are the waiting states: a
-#: ``waiting_on`` is required with one and refused with any other.
-STATES = ('working', 'waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user', 'idle',
-          'needs-investigation')
+#: The declared states. The four ``waiting-*`` values are the waiting states
+#: (:data:`WAITING_STATES`). Three of them wait on someone else (:data:`WAITING_ON_STATES`):
+#: ``waiting_on`` is required with those and refused with any other state.
+#: ``waiting-on-own-job`` (kittrial-5bb.588) waits on the worker's OWN job (a test run, a
+#: build): it requires ``job`` instead, refuses ``waiting_on``, and is never a question for
+#: the coordinator.
+OWN_JOB_STATE = 'waiting-on-own-job'
+STATES = ('working', 'waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user', OWN_JOB_STATE,
+          'idle', 'needs-investigation')
+#: Every state that is a wait (nudges, lane aging and the board count all four).
 WAITING_STATES = tuple(state for state in STATES if state.startswith('waiting-'))
+#: The waits that name somebody else: these, and only these, need ``waiting_on``.
+WAITING_ON_STATES = tuple(state for state in WAITING_STATES if state != OWN_JOB_STATE)
 #: The roles ``waiting_on`` may name instead of an actor id. The flag keys off the role;
 #: an actor id is shown beside it and is never converted into a role by guessing.
 ROLES = ('coordinator', 'reviewer', 'user')
@@ -60,15 +70,32 @@ ACTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 #: (fault_clear.py). The reason is untrusted text: bounded here, escaped when shown.
 FAULT_STATE = 'needs-investigation'
 REASON_LIMIT = 300
+#: ``job`` (kittrial-5bb.588): one printable line naming the worker's own job, untrusted
+#: text like ``reason``: bounded here, escaped when shown.
+JOB_LIMIT = 120
+#: With no ``expect_by`` a ``waiting-on-own-job`` is overdue this long after the state began.
+OWN_JOB_DEFAULT_EXPECT = timedelta(hours=4)
 TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
+
+#: ``local_fact`` (kittrial-5bb.588): what the worker saw LOCALLY (its job finished, a time reached, a file
+#: appeared). It rides in the lane-state record, never in the checkpoint object, so an older kit that does not know
+#: it refuses only this record (the board shows no declared state) and the checkpoint chain stays readable. It is
+#: only the worker's statement: it changes no review state and no lifecycle fact. Allowed with ANY state. Closed object.
+LOCAL_FACT_KINDS = ('job-finished', 'job-failed', 'job-partial', 'time-reached', 'file-seen')
+LOCAL_FACT_KEYS = ('kind', 'what', 'at', 'detail')
+LOCAL_FACT_WHAT_LIMIT = 160
+LOCAL_FACT_DETAIL_LIMIT = 300
+LOCAL_FACT_AT = re.compile(
+    r'\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:[Zz]|[+-]\d{2}:?\d{2})\Z')
 
 REQUIRED_FIELDS = ('schema_version', 'task', 'state')
 #: ``checkpoint`` is NOT sent in the request: the writer sets it to the comment id it
 #: publishes, which is the only way the record can be guaranteed to name the task's
 #: newest checkpoint at write time. ``waiting_on`` and ``expect_by`` are optional by
-#: rule. ``reason`` and ``about_task`` belong to ``needs-investigation`` only. The written
-#: record's field set is exactly these nine.
-OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by', 'not_before', 'reason', 'about_task')
+#: rule. ``reason`` and ``about_task`` belong to ``needs-investigation`` only, ``job`` to
+#: ``waiting-on-own-job`` only, ``local_fact`` allows any state. The written record's field set is exactly
+#: these eleven (``job`` and ``local_fact`` are absent from older records; schema_version stays 1).
+OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by', 'not_before', 'reason', 'about_task', 'job', 'local_fact')
 FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
 #: A ``not_before`` may be set at most this far ahead (kittrial-5bb.509): a wake time is
@@ -124,6 +151,77 @@ def display_reason(value):
     text = str(value if value is not None else '')[:REASON_LIMIT]
     shown = ''.join(ch if ch.isprintable() else ch.encode('unicode_escape').decode('ascii') for ch in text)
     return shown[:REASON_LIMIT]
+
+
+def display_job(value):
+    """A job line made safe to show: clipped, every non-printable character written as an escape."""
+    text = str(value if value is not None else '')[:JOB_LIMIT]
+    shown = ''.join(ch if ch.isprintable() else ch.encode('unicode_escape').decode('ascii') for ch in text)
+    return shown[:JOB_LIMIT]
+
+
+def _job_problems(value):
+    if not isinstance(value, str) or not value.strip():
+        return ['Invalid lane state: job must be one line of text naming your own job']
+    if len(value) > JOB_LIMIT:
+        return ['Invalid lane state: job is longer than %d characters' % JOB_LIMIT]
+    if not value.isprintable():
+        return ['Invalid lane state: job must be one line without newlines, control or direction characters']
+    return []
+
+
+def local_fact_problems(value):
+    """Every problem with a ``local_fact`` object, as lane-state sentences."""
+    if not isinstance(value, dict):
+        return ['Invalid lane state: local_fact must be an object with kind, what and at (and optionally detail)']
+    found = []
+    unknown = sorted(str(key)[:40] for key in set(value) - set(LOCAL_FACT_KEYS))
+    missing = [key for key in ('kind', 'what', 'at') if key not in value]
+    if unknown:
+        found.append('Invalid lane state: local_fact unknown fields: ' + ', '.join(unknown[:10]))
+    if missing:
+        found.append('Invalid lane state: local_fact missing fields: ' + ', '.join(missing))
+    if 'kind' in value:
+        try:
+            known = value['kind'] in LOCAL_FACT_KINDS
+        except TypeError:
+            known = False
+        if not known:
+            found.append('Invalid lane state: local_fact.kind must be one of ' + ', '.join(LOCAL_FACT_KINDS))
+    for key, limit in (('what', LOCAL_FACT_WHAT_LIMIT), ('detail', LOCAL_FACT_DETAIL_LIMIT)):
+        if key not in value:
+            continue
+        try:
+            check_text(value[key], 'local_fact.' + key, limit, nul=False)
+            if key == 'what' and not value[key].isprintable():
+                raise ValueError('local_fact.what must be one line without newlines or control characters')
+        except ValueError as error:
+            found.append(str(error))
+    if 'at' in value:
+        moment = value['at']
+        if not isinstance(moment, str) or not LOCAL_FACT_AT.fullmatch(moment.strip()):
+            found.append('Invalid lane state: local_fact.at must be ISO-8601 with seconds and an offset, such as '
+                         '2026-11-05T17:30:00Z')
+        else:
+            try:
+                parse_moment(moment.strip(), 'local_fact.at')
+            except ValueError:
+                found.append('Invalid lane state: local_fact.at is not a real time')
+    return found
+
+
+def display_local_fact(value):
+    """The one line a surface shows for a stored local_fact: ``Observed locally: <what> (<kind>) at <at>``.
+
+    Untrusted text: clipped to its limit and every non-printable character written as an escape."""
+    if not isinstance(value, dict):
+        return None
+
+    def safe(item, limit):
+        shown = str(item if item is not None else '')[:limit]
+        return ''.join(ch if ch.isprintable() else ch.encode('unicode_escape').decode('ascii') for ch in shown)
+    return 'Observed locally: %s (%s) at %s' % (safe(value.get('what'), LOCAL_FACT_WHAT_LIMIT),
+                                                 safe(value.get('kind'), 24), safe(value.get('at'), 40))
 
 
 def _reason_problems(value):
@@ -187,7 +285,20 @@ def problems(payload, task, checkpoint=None, now=None):
         found.append('Invalid lane state: checkpoint is missing; the writer sets it to the checkpoint it '
                      'publishes')
     waiting_on = payload.get('waiting_on')
-    if isinstance(state, str) and state.startswith('waiting-'):
+    if state == OWN_JOB_STATE:
+        if waiting_on is not None:
+            found.append('Invalid lane state: waiting_on is refused when state is %r; you wait on your own '
+                         'job, so name it in job' % state)
+        if 'job' not in payload:
+            found.append('Invalid lane state: job is required when state is %r' % state)
+        else:
+            found.extend(_job_problems(payload['job']))
+    elif 'job' in payload:
+        found.append('Invalid lane state: job is refused when state is %r; it belongs to %r'
+                     % (state, OWN_JOB_STATE))
+    if state == OWN_JOB_STATE:
+        pass
+    elif isinstance(state, str) and state in WAITING_ON_STATES:
         if waiting_on is None:
             found.append('Invalid lane state: waiting_on is required when state is %r' % state)
         else:
@@ -213,6 +324,8 @@ def problems(payload, task, checkpoint=None, now=None):
             if name in payload:
                 found.append('Invalid lane state: %s is refused when state is %r; it belongs to %r'
                              % (name, state, FAULT_STATE))
+    if 'local_fact' in payload:
+        found.extend(local_fact_problems(payload['local_fact']))
     if 'expect_by' in payload:
         try:
             parse_moment(payload['expect_by'])
