@@ -55,7 +55,10 @@ history for that exact commit first. A task of yours with changes requested is y
 (respond to each item; where an item needs a code change, deliver a new commit that
 supersedes this contribution; the same commit is refused): "nothing changed" never
 applies to it. Otherwise, if nothing new is actionable, leave it unchanged and stop
-rather than inventing work. Stop without acting only when every task of yours is with the
+rather than inventing work. A result you observed yourself (a job of yours finished,
+failed or stopped part-way) IS new: checkpoint it now, with a `local_fact` in your
+`lane_state`; you do not need a server event first. When a wait wakes you, print each
+item's `wake_summary`; never compose your own "no new activity". Stop without acting only when every task of yours is with the
 reviewer or the coordinator.
 
 When you need a decision or information, ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you. Never open a local interactive prompt or wait on terminal input; always record waits in a checkpoint with lane_state (waiting_on, expect_by), keep waiting-on-* on any idle-stop checkpoint: an idle stop ends this session's wait, not the declared wait, and your waker (tools/wake/wake.sh on its timer) keeps polling.

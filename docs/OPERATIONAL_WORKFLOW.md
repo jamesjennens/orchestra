@@ -446,6 +446,14 @@ The handoff's payload and its recovery are in [resume and contribution reviews](
 ("Replacement worker: explicit handoff"); what the web claim route answers is in
 [HTTP deployment](HTTP_DEPLOYMENT.md) ("Claiming a task").
 
+
+## When a worker does not wake for your comment (kittrial-5bb.588)
+
+Check these, in this order:
+
+1. **Are you and the worker the same actor?** A parent actor and its sub-labels (`alice/session` and `alice/session/sub0`) count as ONE actor (`briefing.same_activity_actor`). A comment written under the worker's own actor prefix is the worker's own activity, and by design it never wakes that worker or counts as new for it. The fix is separate actors for the coordinator and each worker, not a code change.
+2. **Read the worker's row** (`work --owner ACTOR`, or the task's `brief`). `newer_activity_by_others` and `wake_summary` say what the worker is told. Since kittrial-5bb.588 they are measured from the worker's OWN newest checkpoint, so a checkpoint you record on the task no longer hides your earlier comment.
+3. **Read its lane state on the board** (`work lanes`). A lane in `waiting-on-own-job` is running its own job (`job` says what). It is not waiting for you, and it is not nudged before its `expect_by` (4 hours after the state began when it gave none). After that, the usual `lane-quiet` and `timer-due` triggers tell you.
 ## Integrate through one project-wide merge slot
 
 Save each desired operation to `merge.json` and invoke:
