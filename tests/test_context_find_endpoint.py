@@ -50,6 +50,30 @@ class EndpointFindTests(unittest.TestCase):
         self.assertLessEqual(len(answer['stdout'].encode()), 16384)
         self.assertEqual([], self.case.tracker.writes)
 
+    def test_default_find_reads_decisions_without_web_authority_state(self):
+        self.rows.append(row('pp-3', issue_type='decision'))
+        path = self.case.root / 'http-state.json'
+        for contents in (None, b'{"schema_version": 999}', b'\xff'):
+            with self.subTest(contents=contents):
+                if contents is not None:
+                    path.write_bytes(contents)
+                body = json.loads(self.execute()['stdout'])
+                self.assertEqual({'task:pp-1', 'task:pp-2', 'task:pp-3'},
+                                 {item['pointer'] for item in body['items']})
+                decision = next(item for item in body['items'] if item['kind'] == 'decision')
+                self.assertEqual('not-attested', decision['state'])
+                self.assertEqual('current', body['stale'])
+
+    def test_web_authority_state_is_read_twice_for_multiple_decisions(self):
+        from http_authority import read_state, SCHEMA_VERSION
+        self.rows = [row('pp-%d' % n, issue_type='decision') for n in range(6)]
+        path = self.case.root / 'http-state.json'
+        path.write_text(json.dumps({'schema_version': SCHEMA_VERSION}))
+        with mock.patch('http_authority.read_state', wraps=read_state) as read:
+            body = json.loads(self.execute()['stdout'])
+        self.assertEqual(6, body['total'])
+        self.assertEqual([mock.call(path), mock.call(path)], read.call_args_list)
+
     def test_configured_help_is_json_without_a_native_read(self):
         answer = self.execute(self.request(['--help']))
         self.assertEqual(0, answer['returncode'])

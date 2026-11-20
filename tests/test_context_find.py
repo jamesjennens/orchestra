@@ -252,6 +252,40 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(200, len(result['items'][0]['excerpt']['text']))
         self.assertGreater(result['items'][0]['excerpt']['omitted_chars'], 0)
 
+    def test_long_comment_display_only_escapes_a_bounded_window(self):
+        text = '\x1b' * 45000 + ' orthogonal field observations'
+        comments = [comment(text, 'long'), comment('orthogonal methods', 'short')]
+        with mock.patch.object(find, '_flat', wraps=find._flat) as flat:
+            result = search([row(comments=comments)], args=['--kind', 'comment'])
+        self.assertEqual(2, result['total'])
+        self.assertTrue(all(len(call.args[0] or '') <= 1200 for call in flat.call_args_list))
+        hit = next(item for item in result['items'] if item['comment'] == 'long')
+        self.assertIn('orthogonal field observations', hit['excerpt']['text'])
+        self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), hit['sha256'])
+
+    def test_cutoff_keeps_matches_in_prepared_documents(self):
+        import capabilities
+        expired = False
+        def clock():
+            return 3 if expired else 0
+        def document(*args):
+            nonlocal expired
+            result = build(*args)
+            expired = args[2][0].strip() == 'orthogonal two'
+            return result
+        build = capabilities.bm25_document
+        rows = [row('sample-1', 'orthogonal one'), row('sample-2', 'orthogonal two'),
+                row('sample-3', 'orthogonal three')]
+        with mock.patch.object(capabilities, 'bm25_document', side_effect=document):
+            result = search(rows, clock=clock)
+        self.assertEqual('partial', result['stale'])
+        self.assertIn('computation-time', result['coverage']['cutoffs'])
+        self.assertTrue(result['total_is_lower_bound'])
+        self.assertEqual(2, result['coverage']['documents'])
+        self.assertEqual(2, result['total'])
+        self.assertIsNone(result['cursor'])
+        self.assertEqual({'sample-1', 'sample-2'}, {item['task'] for item in result['items']})
+
     def test_time_budget_stops_nonmatching_corpus(self):
         ticks = iter([0, 0.5, 0.8, 1.2, 2.1] + [3] * 200)
         result = search([row('sample-%d' % n, text='nonmatching') for n in range(20)], clock=lambda: next(ticks))

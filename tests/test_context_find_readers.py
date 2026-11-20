@@ -1,8 +1,10 @@
 """Every corpus kind uses its real reader and an escaped data envelope."""
 import hashlib
+import copy
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import test_context_find as fixture
 import context_find as find
@@ -119,7 +121,7 @@ class ReaderEnvelopeTests(unittest.TestCase):
             self.assert_data('decision', self.visible_and_denied('decision', [decision],
                              decision_reader=served_decision), updated=decision['updated_at'])
 
-    def test_capability_supersession_uses_the_current_own_reader_state(self):
+    def retired_capability(self):
         import test_capability_records as caps
         cap = self.own_case(caps.RetireTests)
         cap.native.actor = caps.OPERATOR
@@ -129,6 +131,11 @@ class ReaderEnvelopeTests(unittest.TestCase):
             caps.cr.apply_native(payload, caps.OPERATOR, cap.native, cap.project,
                                  operator=True, operators=[caps.OPERATOR])
         cap.retire('a.old', 'a.new', 1)
+        return cap
+
+    def test_capability_supersession_uses_the_current_own_reader_state(self):
+        import test_capability_records as caps
+        cap = self.retired_capability()
         live = fixture.search(cap.native.rows, args=['--kind', 'cap'],
                               operators=[caps.OPERATOR], project_path=cap.project)
         selected = {item['pointer']: item for item in live['items']}
@@ -143,6 +150,47 @@ class ReaderEnvelopeTests(unittest.TestCase):
         self.assertTrue(inert['total_is_lower_bound'])
         self.assertTrue(all('replaces' not in item and 'superseded_by' not in item
                             for item in selected.values()))
+
+    def test_incomplete_capability_cannot_fall_back_to_accepted_prefix(self):
+        import test_capability_records as caps
+        cap = self.retired_capability()
+        old = cap.native.row(cap.read('get', 'a.old')['native_id'])
+        comments = old['comments']
+        self.assertEqual(4, len(comments))
+        contradictory = [dict(comment, text=comment['text'] + ' ') for comment in comments[2:]]
+        rows = [dict(old, comments=comments + contradictory)]
+        for source, cap_size in ((rows, find.MAX_COMMENTS), ([old], 2)):
+            with self.subTest(cap_size=cap_size), mock.patch.object(find, 'MAX_COMMENTS', cap_size):
+                answer = fixture.search(source, args=['--kind', 'cap'],
+                                        operators=[caps.OPERATOR], project_path=cap.project)
+                self.assertEqual('partial', answer['stale'])
+                self.assertEqual([], answer['items'])
+
+    def test_incomplete_requirement_cannot_fall_back_to_accepted_prefix(self):
+        import requirement_http
+        import test_requirement_records as requirements
+        req = self.own_case(requirements.RequirementRecordTests)
+        req.apply(req.draft())
+        req.apply(req.accept(description='orthogonal accepted guidance'), operator=True)
+        accepted = len(req.native.row('req-1')['comments'])
+        req.apply(req.accept(operation_id='op-updated', revision=3,
+                             description='orthogonal updated guidance'), operator=True)
+        clean = copy.deepcopy([req.native.row('req-1')])
+        def served_requirements(rows, check):
+            return requirement_http.read_snapshot(req.project, fixture.PROJECT, ['list'], rows,
+                                                  req.native, ['alice'], check_budget=check)
+        def find_requirements(rows):
+            return fixture.search(rows, args=['--kind', 'requirement'],
+                                  project_path=req.project, requirement_reader=served_requirements)
+        self.assertEqual({3}, {item['revision'] for item in find_requirements(clean)['items']})
+        comments = clean[0]['comments']
+        contradictory = [dict(comment, text=comment['text'] + ' ') for comment in comments[accepted:]]
+        damaged = [dict(clean[0], comments=comments + contradictory)]
+        for source, cap_size in ((damaged, find.MAX_COMMENTS), (clean, accepted)):
+            with self.subTest(cap_size=cap_size), mock.patch.object(find, 'MAX_COMMENTS', cap_size):
+                answer = find_requirements(source)
+                self.assertEqual('partial', answer['stale'])
+                self.assertEqual([], answer['items'])
 
 
 if __name__ == '__main__':
