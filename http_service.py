@@ -2024,7 +2024,7 @@ class InProcessBackend:
             'newer_activity', 'newer_activity_marker', 'newer_activity_fields',
             'wait_newer_activity_marker',
             'newer_activity_by_others', 'newer_activity_own',
-            'newer_activity_coverage', 'unresolved_directions')}
+            'newer_activity_coverage', 'unresolved_directions', 'wake_summary')}
         events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
         anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
                    and e.get('actor') == checkpoint.get('actor')
@@ -2094,12 +2094,15 @@ class InProcessBackend:
         contribution_id=(review['contribution'] or {}).get('id')
         # The one rule from work.py, not a copy (kittrial-5bb.264 item 4).
         from work import is_redelivery
-        from briefing import MARKER_DIGEST, fields_digest
+        from briefing import MARKER_DIGEST, WAKE_NO_CHECKPOINT, fields_digest
         redelivered=is_redelivery(contribution_id, open_requests)
         # This disposable model keeps no per-entry checkpoint digests, so its coverage
         # is unknown and the stable marker is honestly null (kittrial-5bb.351); the
         # counts are the same summary its brief route already answers with.
-        activity=self._agent_activity_summary(task,last) if last and not unreadable else None
+        # kittrial-5bb.588 T1: newer activity is measured from the assignee's OWN newest
+        # checkpoint; the position fields (open items, checkpoint_at) stay the newest record's.
+        base=self._own_baseline_checkpoint(task,saved,last) if last and not unreadable else None
+        activity=self._agent_activity_summary(task,base) if base else None
         return {'assignee_comment_pending':self._assignee_comment_pending(task) if not unreadable else False,
                 'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
                 'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
@@ -2107,7 +2110,7 @@ class InProcessBackend:
                                                             for item in (last.get('open_items') or []) if isinstance(item,dict)) if last else 0,
                 'redelivered':redelivered,
                 'checkpoint_at':at,
-                'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None,
+                'newer_activity':self._other_agent_activity(task,base) if base else None,
                 'newer_activity_marker':None,
                 # The current title/description/acceptance digest (kittrial-5bb.367 F2b):
                 # this model carries the fields even though it records no per-entry digests.
@@ -2120,7 +2123,10 @@ class InProcessBackend:
                 'newer_activity_by_others':(activity or {}).get('other_count'),
                 'newer_activity_own':(activity or {}).get('own_count'),
                 'newer_activity_coverage':(activity or {}).get('coverage'),
-                'unresolved_directions':None}
+                'unresolved_directions':None,
+                # kittrial-5bb.588 T4: the same one sentence the canonical rows carry.
+                'wake_summary':(self._agent_wake_summary(task,base,activity) if base else
+                                WAKE_NO_CHECKPOINT if not unreadable else None)}
 
     def _assignee_comment_pending(self, task):
         from briefing import pending_other_comments, same_activity_actor, comment_author_allowed
@@ -2181,6 +2187,33 @@ class InProcessBackend:
         at=checkpoint.get('created_at')
         return bool(at and any(r.get('created_at','')>at and not same_activity_actor(r.get('actor'),task.get('assignee'))
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
+
+    @staticmethod
+    def _own_baseline_checkpoint(task, saved, last):
+        """The assignee's own newest checkpoint, else the newest (kittrial-5bb.588 T1)."""
+        from briefing import same_activity_actor
+        owner = task.get('assignee')
+        if not owner:
+            return last
+        own = [entry for entry in saved if isinstance(entry, dict)
+               and same_activity_actor(entry.get('actor'), owner)]
+        return own[-1] if own else last
+
+    def _agent_wake_summary(self, task, checkpoint, activity):
+        """The canonical one sentence (briefing.wake_summary_text) for this backend's events."""
+        from briefing import same_activity_actor, wake_summary_text
+        events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
+        anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                   and e.get('actor') == checkpoint.get('actor')
+                   and e.get('time', '') >= checkpoint.get('created_at', '')]
+        remaining = events[anchors[-1] + 1:] if anchors else []
+        others = [e for e in remaining if not same_activity_actor(e.get('actor'), task.get('assignee'))]
+        later = [e for e in others if e.get('action') == 'checkpoint-added']
+        newest = others[-1] if others else None
+        return wake_summary_text(checkpoint.get('created_at'), (activity or {}).get('other_count'),
+                                 (newest.get('actor'), newest.get('time')) if newest else None,
+                                 (later[-1].get('actor'), later[-1].get('time')) if later else None,
+                                 (activity or {}).get('coverage'))
 
     def _agent_activity_summary(self, task, checkpoint):
         """Bounded event references for the disposable backend, without digest claims.
@@ -2596,7 +2629,8 @@ def own_queue_tasks(queue, actor=None):
                       'newer_activity_by_others':fields.get('newer_activity_by_others'),
                       'newer_activity_own':fields.get('newer_activity_own'),
                       'newer_activity_coverage':fields.get('newer_activity_coverage'),
-                      'unresolved_directions':fields.get('unresolved_directions')})
+                      'unresolved_directions':fields.get('unresolved_directions'),
+                      'wake_summary':fields.get('wake_summary')})
         if row.get('lifecycle_reasons'):
             tasks[-1]['lifecycle_reasons'] = dict(row['lifecycle_reasons'])
     return {'tasks':tasks,'complete':bool(queue.get('complete'))}
@@ -5054,7 +5088,10 @@ class EndpointBackend:
                 'newer_activity_coverage': row.get('newer_activity_coverage')
                 if isinstance(row.get('newer_activity_coverage'), str) else None,
                 'unresolved_directions': row.get('unresolved_directions')
-                if type(row.get('unresolved_directions')) is int and row.get('unresolved_directions') >= 0 else None}
+                if type(row.get('unresolved_directions')) is int and row.get('unresolved_directions') >= 0 else None,
+                # kittrial-5bb.588 T4: the one sentence a wake prints.
+                'wake_summary': row.get('wake_summary')
+                if isinstance(row.get('wake_summary'), str) else None}
 
     def agent_tasks(self, project_id, actor=None, queue=None):
         """The tasks one actor holds, from the canonical ``work --owner ACTOR`` view.
@@ -5109,7 +5146,8 @@ class EndpointBackend:
                              'newer_activity_by_others': attention.get('newer_activity_by_others'),
                              'newer_activity_own': attention.get('newer_activity_own'),
                              'newer_activity_coverage': attention.get('newer_activity_coverage'),
-                             'unresolved_directions': attention.get('unresolved_directions')})
+                             'unresolved_directions': attention.get('unresolved_directions'),
+                             'wake_summary': attention.get('wake_summary')})
                 if item.get('lifecycle_reasons'):
                     rows[-1]['lifecycle_reasons'] = dict(item['lifecycle_reasons'])
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
@@ -10565,6 +10603,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                            newer_activity_own=attention_field(task, 'newer_activity_own'),
                            newer_activity_coverage=attention_field(task, 'newer_activity_coverage'),
                            unresolved_directions=attention_field(task, 'unresolved_directions'),
+                           wake_summary=attention_field(task, 'wake_summary'),
                            # The holder's wake time rides the row (kittrial-5bb.509) so the
                            # wait's worker_view reads the same timer the CLI read does.
                            lane_not_before=attention_field(task, 'lane_not_before'))
@@ -12013,6 +12052,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'newer_activity_coverage': task.get('newer_activity_coverage')
                            if blocked or in_progress or comment_pending else None,
                            'unresolved_directions': task.get('unresolved_directions')
+                           if blocked or in_progress or comment_pending else None,
+                           'wake_summary': task.get('wake_summary')
                            if blocked or in_progress or comment_pending else None}
                 # Whose move it is, in the same words as the canonical `work --mine` row
                 # (kittrial-5bb.249): one helper, so the two answers cannot disagree about the
