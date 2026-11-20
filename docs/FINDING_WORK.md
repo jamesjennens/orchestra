@@ -171,7 +171,8 @@ the setting to be changed.
 It claims **exactly one** task that nobody holds, registers its plan on the task, and
 works on that one until it is delivered. Declare the lane's wait state in the checkpoint
 payload's sibling `lane_state` key (`state`; `waiting_on`, a role or an actor id, required
-with a waiting state and refused otherwise; and an optional `expect_by`, ISO-8601 with an
+with waiting-on-coordinator, waiting-on-review or waiting-on-user and refused otherwise; `job`, required with
+waiting-on-own-job (your own run or build) and refused otherwise; and an optional `expect_by`, ISO-8601 with an
 offset) at claim, at every checkpoint and whenever a wait begins, so `work lanes` shows
 the board and flags a wait that has run too long.
 

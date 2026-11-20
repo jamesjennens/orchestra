@@ -48,7 +48,7 @@ export function laneRowsRow(row) {
     for (const entry of lane.held || []) {
       held.push(h('tr', { 'data-lane': holder, 'data-task': entry.task },
         h('td', null, holder), h('td', null, `${entry.task} ${entry.title || ''}`.trim()),
-        h('td', null, entry.state || ''), h('td', null, entry.waiting_on_name || entry.waiting_on || ''),
+        h('td', null, entry.state || ''), h('td', null, entry.job ? `own job: ${String(entry.job).slice(0, 120)}` : (entry.waiting_on_name || entry.waiting_on || '')),
         h('td', null, entry.expect_by || ''), h('td', null, flags(entry))));
     }
   }

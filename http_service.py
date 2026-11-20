@@ -1985,6 +1985,7 @@ class InProcessBackend:
                      for item in last.get('open_items') or []]
             checkpoint = {'id': last['id'], 'at': last['created_at'], 'author': last['actor'],
                           'summary': last['summary'], 'next_action': last.get('next_action'),
+                          **({'local_fact': last['lane_state']['local_fact']} if isinstance((last.get('lane_state') or {}).get('local_fact'), dict) else {}),
                           'open_items': items,
                           'pointer_items': pointers.item_pointers(items,'source'),
                           'resolved': [dict(item) for item in last.get('resolved') or []],
@@ -4482,6 +4483,7 @@ class EndpointBackend:
             checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
+                          **({'local_fact': point['local_fact']} if isinstance(point.get('local_fact'), dict) else {}),
                           'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
                           'intent': (data.get('intent') or {}).get('text'),
                           'acceptance': (data.get('acceptance') or {}).get('text'),

@@ -168,7 +168,8 @@ or bundle destination. Keep delivery, review, integration, deployment and live
 verification separate. Before interruption or handoff, publish a fresh structured
 checkpoint and use the saved actor to resume. Declare your lane's wait state in that
 same checkpoint payload's sibling `lane_state` key (`state`; `waiting_on`, a role or an
-actor id, required with a waiting state; and an optional `expect_by`, ISO-8601 with an
+actor id, required with waiting-on-coordinator, waiting-on-review or waiting-on-user; `job`, one line, required with
+waiting-on-own-job (your own run or build, never a question for the coordinator); and an optional `expect_by`, ISO-8601 with an
 offset, where a past value is accepted and flagged; and an optional `not_before`, a full
 ISO-8601 time with seconds and an offset, strictly in the future, that only the holder
 sets and that the blocking wait wakes you at - a later record without it clears it; set
