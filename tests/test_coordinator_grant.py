@@ -797,8 +797,9 @@ class CoordinationReadTests(Grants):
                 self.assertEqual(sorted((p['user_id'], p['role']) for p in answer.data['people']), people)
                 self.assertEqual([(a['name'], a['owner_display_name']) for a in answer.data['agents']], [('Heron', 'cora')])
                 self.assertEqual(answer.data['agents'][0]['granted_by_display_name'], 'olive')
-                # The agent's id, its actor and its credentials are not part of this read.
-                self.assertEqual(set(answer.data['agents'][0]), {'name', 'owner_display_name', 'granted_by_display_name', 'granted_at'})
+                # kittrial-5bb.583: the agent's id is part of this read; its actor and its credentials are not.
+                self.assertEqual(set(answer.data['agents'][0]), {'id', 'name', 'owner_display_name', 'granted_by_display_name', 'granted_at'})
+                self.assertEqual(answer.data['agents'][0]['id'], self.agent_id)
                 self.assertEqual(set(answer.data), {'project', 'people', 'agents', 'web_rules', 'host_rules', 'host_operators', 'generated_at'})
         # An agent's credential reads it as it reads the members list: both are CAP_READ.
         self.assertEqual((200, 200), (self.read(self.agent).status,
@@ -937,6 +938,12 @@ class PageTests(Grants):
         self.assertFalse(any(text.startswith('carl') for text in before['people']), before)
         self.assertEqual(len(granted['agents']), 1)
         self.assertTrue(granted['agents'][0].startswith('Heron, agent of cora · granted by olive'), granted)
+        self.assertIn(self.agent_id, granted['agents'][0])
+        self.assertEqual(granted['buttons'], 0)
+        self.assertEqual(granted['copyButtons'], [self.agent_id])
+        self.assertEqual(before['copyButtons'], [])
+        for row in seen['before']:
+            self.assertIn(row['agent'], row['copyButtons'])
         self.assertEqual(before['rules'], [['approval_by_another_party', 'false']])
         self.assertIn('no host project behind it', before['host'])
         # The host's operator list (kittrial-5bb.198), from the host-coordination read given below.

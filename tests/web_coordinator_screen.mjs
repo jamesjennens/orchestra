@@ -35,7 +35,8 @@ async function settle() {
 const panel = (page) => page.all((e) => e.tagName === 'SECTION' && e.attributes['data-panel'] === 'project-agents')[0];
 const rows = (page) => panel(page).all((e) => e.tagName === 'TR' && e.attributes['data-agent']).map((tr) => ({
   agent: tr.attributes['data-agent'], coordinator: tr.attributes['data-coordinator'], text: tr.textContent,
-  buttons: tr.all((e) => e.tagName === 'BUTTON').map((b) => b.textContent),
+  buttons: tr.all((e) => e.tagName === 'BUTTON' && !e.attributes['data-copy-id']).map((b) => b.textContent),
+  copyButtons: tr.all((e) => e.tagName === 'BUTTON' && e.attributes['data-copy-id']).map((b) => b.attributes['data-copy-id']),
 }));
 // Who coordinates (kittrial-5bb.198): the read-only panel every member sees.
 const coordination = (page) => {
@@ -48,7 +49,8 @@ const coordination = (page) => {
     host: (node.all((e) => e.attributes && e.attributes['data-rules'] === 'host')[0] || { textContent: '' }).textContent,
     operators: (node.all((e) => e.attributes && e.attributes['data-operators'])[0] || { attributes: {}, textContent: '' }).attributes['data-operators']
       + ': ' + (node.all((e) => e.attributes && e.attributes['data-operators'])[0] || { textContent: '' }).textContent,
-    buttons: node.all((e) => e.tagName === 'BUTTON' || e.tagName === 'SELECT' || e.tagName === 'INPUT').length,
+    buttons: node.all((e) => (e.tagName === 'BUTTON' && !e.attributes['data-copy-id']) || e.tagName === 'SELECT' || e.tagName === 'INPUT').length,
+    copyButtons: node.all((e) => e.tagName === 'BUTTON' && e.attributes['data-copy-id']).map((b) => b.attributes['data-copy-id']),
   };
 };
 const press = async (page, agent, label) => {

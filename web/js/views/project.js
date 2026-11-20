@@ -1,5 +1,5 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
-import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId, ownerStepAsks, isDescriptive } from '../ui.js';
+import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId, ownerStepAsks, isDescriptive, idBadge, matchesEntityFilter, extractAgentIds } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { proposeSection } from './proposals.js';
 export { proposeSection } from './proposals.js';
@@ -454,7 +454,7 @@ export function lanesPanel(ctx, project) {
       h('div', { class: 'event-head' },
         // Display only (kittrial-5bb.416): the server's display_name text, never decided here.
         h('strong', { title: isAccountId(lane.lane) ? lane.lane : null }, lane.display_name || (isAccountId(lane.lane) ? 'Someone' : lane.lane)), ' ',
-        isAccountId(lane.lane) ? null : h('span', { class: 'mono small muted' }, lane.lane),
+        isAccountId(lane.lane) ? null : idBadge(lane.lane, { what: 'Agent ID' }),
         ' ',
         lane.idle ? h('span', { class: 'chip', 'data-idle': 'true', title: 'This lane holds nothing' }, 'Free')
           : h('span', { class: 'chip plain' }, held.length === 1 ? '1 task held' : held.length + ' tasks held'),
@@ -505,13 +505,32 @@ export function lanesPanel(ctx, project) {
     } finally { panel.removeAttribute('aria-busy'); }
     const lanes = data.items || [];
     const counts = data.flags || {};
+    const listHost = h('div', { class: 'stack', 'data-lanes-list': 'true' });
+    const renderLanes = () => {
+      const shown = lanes.filter((lane) => matchesEntityFilter(state.q, {
+        names: [lane.display_name],
+        ids: [lane.lane, lane.actor],
+      }));
+      listHost.replaceChildren(...(shown.length ? shown.map((lane) => laneBlock(ctx, project, lane, data))
+        : [empty(lanes.length ? 'No matching lanes' : 'No lanes to show',
+          lanes.length ? 'No lane on this page matches that filter.' : 'No session holds work in this project right now.')]));
+    };
+    const filterInput = lanes.length ? h('input', {
+      type: 'search',
+      value: state.q || '',
+      placeholder: 'Filter lanes by name or ID',
+      'aria-label': 'Filter lanes',
+      'data-filter': 'lanes',
+    }) : null;
+    if (filterInput) filterInput.addEventListener('input', () => { state.q = filterInput.value; renderLanes(); });
+    renderLanes();
     panel.replaceChildren(head(), threshold(),
+      filterInput ? h('div', { class: 'filters' }, filterInput) : null,
       h('p', { class: 'small muted', role: 'note' },
         'Reading with ', String(data.idle_minutes), ' idle minutes: ',
         LANE_FLAGS.map(([key, label]) => `${counts[key] || 0} ${label.toLowerCase()}`).join(' · '),
         '. ', scopeSentence(data)),
-      lanes.length ? h('div', { class: 'stack' }, lanes.map((lane) => laneBlock(ctx, project, lane, data)))
-        : empty('No lanes to show', 'No session holds work in this project right now.'),
+      listHost,
       pager(data));
   }
   draw();
@@ -1066,6 +1085,7 @@ function projectAgentsPanel(ctx, project, coordination) {
   const pid = project.id;
   const owner = isOwner(project);
   const agentsHost = h('div');
+  let filterText = '';
 
   // The agents that work in this project, and which of them coordinate it (kittrial-5bb.209). An owner
   // gives and removes the grant here; the server says why when a grant cannot be given.
@@ -1074,47 +1094,69 @@ function projectAgentsPanel(ctx, project, coordination) {
     let data;
     try { data = await ctx.api.projectAgents(pid); } catch (error) { agentsHost.replaceChildren(errorState(error, drawAgents)); return; }
     const rows = (data.items || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+    const tbody = h('tbody');
+    const rowOf = (a) => {
+      const grant = a.coordinator;
+      const release = a.release;
+      const change = async (e, call, done) => {
+        try { await act(e.currentTarget, call, { success: done }); } catch { /* the refusal is shown */ }
+        drawAgents(); coordination.draw();
+      };
+      return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none',
+        'data-release': release ? String(release.effective) : 'none' },
+        h('td', null, a.name,
+          a.id ? h('div', { class: 'sub' }, idBadge(a.id, { what: 'Agent ID' })) : null,
+          a.enabled ? null : h('div', { class: 'sub' }, 'Disabled'),
+          historyPanel(() => ctx.api.projectAgentHistory(pid, a.id))),
+        h('td', { 'data-account-cell': a.owner || '' }, a.owner_display_name || a.owner,
+          a.owner ? h('div', { class: 'sub' }, idBadge(a.owner, { what: 'Account ID' })) : null),
+        h('td', null, !grant ? h('span', { class: 'muted' }, 'No') :
+          [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
+            h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
+              grant.effective ? null : (NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']))]),
+        h('td', null, !release ? h('span', { class: 'muted' }, 'No') :
+          [h('span', { class: 'chip ' + (release.effective ? 'ok' : 'plain') }, release.effective ? 'May release' : 'Granted, no effect'),
+            h('div', { class: 'sub' }, 'by ', release.granted_by_display_name || release.granted_by, ' ', time(release.granted_at),
+              release.effective ? null : (RELEASE_NO_EFFECT[release.no_effect_because] || RELEASE_NO_EFFECT['account-role']))]),
+        h('td', null, (a.credentials || []).map((c) => h('div', { class: 'stack', 'data-credential': c.id },
+          h('code', { class: 'small' }, c.id), expiryLine(c),
+          !project.archived && a.enabled && c.working ? extensionButton(a, c,
+            () => ctx.api.extendProjectAgentCredential(pid, a.id, c.id), drawAgents) : null))),
+        h('td', null, project.archived ? null : h('div', { class: 'stack' },
+          grant ?
+            h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
+              onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :
+            h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' coordinate this project',
+              onclick: (e) => change(e, () => ctx.api.grantCoordinator(pid, a.id), `${a.name} coordinates this project`) }, 'Make coordinator'),
+          release ?
+            h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the release grant from ' + a.name,
+              onclick: (e) => change(e, () => ctx.api.revokeRelease(pid, a.id), `${a.name} may no longer record releases`) }, 'Remove release grant') :
+            h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' record releases in this project',
+              onclick: (e) => change(e, () => ctx.api.grantRelease(pid, a.id), `${a.name} may record releases`) }, 'Allow releases'))));
+    };
+    const renderRows = () => {
+      const shown = rows.filter((a) => matchesEntityFilter(filterText, {
+        names: [a.name, a.owner_display_name],
+        ids: [a.id, a.owner],
+      }));
+      tbody.replaceChildren(...(shown.length ? shown.map(rowOf) : [h('tr', null, h('td', { colspan: '6', class: 'small muted' }, 'No agents match this filter.'))]));
+    };
+    const filterInput = rows.length ? h('input', {
+      type: 'search',
+      value: filterText,
+      placeholder: 'Filter by agent or account name or ID',
+      'aria-label': 'Filter project agents',
+      'data-filter': 'project-agents',
+    }) : null;
+    if (filterInput) filterInput.addEventListener('input', () => { filterText = filterInput.value; renderRows(); });
+    if (rows.length) renderRows();
     agentsHost.replaceChildren(h('section', { class: 'panel', 'data-panel': 'project-agents' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Agents in this project ', h('span', { class: 'nav-count' }, rows.length)),
         h('span', { class: 'small muted hide-narrow' }, 'A coordinating agent may approve other accounts’ work here; never its own account’s. A release grant only lets it record release facts')),
+      filterInput ? h('div', { class: 'panel-body' }, h('div', { class: 'filters' }, filterInput)) : null,
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, 'Release'), h('th', { scope: 'col' }, 'Agent credentials'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
-        h('tbody', null, rows.map((a) => {
-          const grant = a.coordinator;
-          const release = a.release;
-          const change = async (e, call, done) => {
-            try { await act(e.currentTarget, call, { success: done }); } catch { /* the refusal is shown */ }
-            drawAgents(); coordination.draw();
-          };
-          return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none',
-            'data-release': release ? String(release.effective) : 'none' },
-            h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled'),
-              historyPanel(() => ctx.api.projectAgentHistory(pid, a.id))),
-            h('td', null, a.owner_display_name || a.owner),
-            h('td', null, !grant ? h('span', { class: 'muted' }, 'No') :
-              [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
-                h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
-                  grant.effective ? null : (NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']))]),
-            h('td', null, !release ? h('span', { class: 'muted' }, 'No') :
-              [h('span', { class: 'chip ' + (release.effective ? 'ok' : 'plain') }, release.effective ? 'May release' : 'Granted, no effect'),
-                h('div', { class: 'sub' }, 'by ', release.granted_by_display_name || release.granted_by, ' ', time(release.granted_at),
-                  release.effective ? null : (RELEASE_NO_EFFECT[release.no_effect_because] || RELEASE_NO_EFFECT['account-role']))]),
-            h('td', null, (a.credentials || []).map((c) => h('div', { class: 'stack', 'data-credential': c.id },
-              h('code', { class: 'small' }, c.id), expiryLine(c),
-              !project.archived && a.enabled && c.working ? extensionButton(a, c,
-                () => ctx.api.extendProjectAgentCredential(pid, a.id, c.id), drawAgents) : null))),
-            h('td', null, project.archived ? null : h('div', { class: 'stack' },
-              grant ?
-                h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
-                  onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :
-                h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' coordinate this project',
-                  onclick: (e) => change(e, () => ctx.api.grantCoordinator(pid, a.id), `${a.name} coordinates this project`) }, 'Make coordinator'),
-              release ?
-                h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the release grant from ' + a.name,
-                  onclick: (e) => change(e, () => ctx.api.revokeRelease(pid, a.id), `${a.name} may no longer record releases`) }, 'Remove release grant') :
-                h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' record releases in this project',
-                  onclick: (e) => change(e, () => ctx.api.grantRelease(pid, a.id), `${a.name} may record releases`) }, 'Allow releases'))));
-        })))) : h('div', { class: 'panel-body' }, empty('No agents here yet', 'A member grants their own agent this project on the Agents page.'))));
+        tbody)) : h('div', { class: 'panel-body' }, empty('No agents here yet', 'A member grants their own agent this project on the Agents page.'))));
   }
 
   drawAgents();
@@ -1209,15 +1251,54 @@ export async function settings(ctx, { pid }) {
         empty('No worker credentials', 'Agents and scripts use a credential instead of a password. Issue one per worker.')));
   }
 
+  let auditFilter = '';
   async function drawAudit() {
     if (!owner) { auditHost.replaceChildren(); return; }
     let data;
     try { data = await ctx.api.audit(pid, { limit: 20 }); } catch (error) { auditHost.replaceChildren(errorState(error, drawAudit)); return; }
-    auditHost.replaceChildren(h('section', { class: 'panel' },
+    const items = data.items || [];
+    const tbody = h('tbody');
+    const idsOf = (a) => {
+      const fromRow = a.agent && typeof a.agent.id === 'string' && a.agent.id ? [a.agent.id] : [];
+      const fromDetail = extractAgentIds(a.detail).filter((id) => !fromRow.includes(id));
+      return { fromRow, fromDetail, all: [...fromRow, ...fromDetail] };
+    };
+    const rowOf = (a) => {
+      const { fromRow, fromDetail } = idsOf(a);
+      return h('tr', { 'data-audit-action': a.action || '' },
+        h('td', { class: 'muted' }, time(a.time)),
+        h('td', { title: a.user_id || null }, actorWords(a.user_name, a.user_id, 'someone')),
+        h('td', { class: 'mono small' },
+          a.action, a.outcome && a.outcome !== 'committed' ? ' · ' + a.outcome : '',
+          fromRow.map((id) => h('div', { class: 'sub' }, a.agent && a.agent.name ? [a.agent.name, ' '] : null, idBadge(id, { what: 'Agent ID' }))),
+          fromDetail.map((id) => h('div', { class: 'sub' }, idBadge(id, { what: 'Agent ID' })))),
+        h('td', { class: 'hide-narrow' }, a.detail || ''));
+    };
+    const renderRows = () => {
+      const shown = items.filter((a) => {
+        const { all } = idsOf(a);
+        return matchesEntityFilter(auditFilter, {
+          names: [a.action, a.detail, a.user_name, a.agent && a.agent.name],
+          ids: [...all, a.user_id],
+        });
+      });
+      tbody.replaceChildren(...(shown.length ? shown.map(rowOf) : [h('tr', null, h('td', { colspan: '4', class: 'small muted' }, 'No audit rows match this filter.'))]));
+    };
+    const filterInput = items.length ? h('input', {
+      type: 'search',
+      value: auditFilter,
+      placeholder: 'Filter audit by action, detail, or agent ID',
+      'aria-label': 'Filter audit',
+      'data-filter': 'audit',
+    }) : null;
+    if (filterInput) filterInput.addEventListener('input', () => { auditFilter = filterInput.value; renderRows(); });
+    if (items.length) renderRows();
+    auditHost.replaceChildren(h('section', { class: 'panel', 'data-panel': 'audit' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Recent activity (audit)')),
-      data.items.length ? h('div', { class: 'table-wrap' }, h('table', null,
+      filterInput ? h('div', { class: 'panel-body' }, h('div', { class: 'filters' }, filterInput)) : null,
+      items.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'When'), h('th', { scope: 'col' }, 'Who'), h('th', { scope: 'col' }, 'Action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Detail'))),
-        h('tbody', null, data.items.map((a) => h('tr', null, h('td', { class: 'muted' }, time(a.time)), h('td', { title: a.user_id || null }, actorWords(a.user_name, a.user_id, 'someone')), h('td', { class: 'mono small' }, a.action, a.outcome && a.outcome !== 'committed' ? ' · ' + a.outcome : ''), h('td', { class: 'hide-narrow' }, a.detail || '')))))) :
+        tbody)) :
         empty('No administrative activity yet', null)));
   }
 

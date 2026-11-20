@@ -3865,7 +3865,7 @@ class Service:
                 if grant is None or not self._may_coordinate(project_id, agent) \
                         or not grant_issuer_holds(self.state, project_id, grant):
                     continue
-                agents.append({'name': agent['name'], 'owner_display_name': self._owner_name(agent['owner']),
+                agents.append({'id': agent['id'], 'name': agent['name'], 'owner_display_name': self._owner_name(agent['owner']),
                                'granted_by_display_name': self._owner_name(grant['granted_by']),
                                'granted_at': grant.get('granted_at')})
             return {'people': people, 'agents': agents}

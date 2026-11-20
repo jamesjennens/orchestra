@@ -7,7 +7,7 @@
 // (the server address, the project, the names of the reader's own agents) and says which are
 // left to replace. No prompt contains a secret: the page never has one.
 import { h, copyButton } from '../dom.js';
-import { pageHead } from '../ui.js';
+import { pageHead, idBadge } from '../ui.js';
 import { markdown } from '../md.js';
 import * as setupText from '../agentSetup.js';
 
@@ -81,6 +81,7 @@ export async function page(ctx, { pid }) {
     const forAgents = mine.length ? mine.map((agent) => {
       const name = agent.display_name || agent.name;
       return h('div', { class: 'stack', 'data-agent': agent.id },
+        agent.id ? h('div', { class: 'copy-row' }, h('strong', null, name), idBadge(agent.id, { what: 'Agent ID' })) : null,
         h('section', { class: 'setup-block', 'data-prompt': 'resume', 'aria-label': 'Resume prompt for ' + name },
           h('div', { class: 'copy-row' }, h('h3', { class: 'small' }, 'Resume ' + name + ' once, by hand'),
             copyButton('Copy', setupText.resumePrompt(name), { ariaLabel: 'Copy the resume prompt for ' + name, what: 'Prompt' })),

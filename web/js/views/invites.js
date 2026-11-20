@@ -8,7 +8,7 @@
 // Every string from the server is put in as text.
 import { h, time, confirmDialog, secretDialog, brandMark } from '../dom.js';
 import { field, setFieldError, formValues, act, describe, focusFirstEmpty,
-         passwordHint, passwordTooShort, PASSWORD_MISMATCH } from '../ui.js';
+         passwordHint, passwordTooShort, PASSWORD_MISMATCH, idBadge, matchesEntityFilter } from '../ui.js';
 import { inviteSetupBlock } from './agents.js';
 
 export const STATUS_WORDS = Object.freeze({ pending: 'Pending', used: 'Used', expired: 'Expired', revoked: 'Withdrawn' });
@@ -148,37 +148,63 @@ export function invitePanel(ctx, project) {
     return node;
   }
 
+  let filterText = '';
+
   function person(item) {
+    const agentBadge = item.agent_id ? h('div', { class: 'sub' }, idBadge(item.agent_id, { what: 'Agent ID' })) : null;
     if (item.person === 'existing') {
       return h('td', null, h('div', { class: 'title' }, '@' + item.username + ' (existing account)'),
-        h('div', { class: 'sub' }, item.role ? 'as ' + item.role : '', item.agent ? `${item.role ? ' · ' : ''}agent ${item.agent.name} in ${item.agent.project}` : ''));
+        h('div', { class: 'sub' }, item.role ? 'as ' + item.role : '', item.agent ? `${item.role ? ' · ' : ''}agent ${item.agent.name} in ${item.agent.project}` : ''),
+        agentBadge);
     }
     return h('td', null, h('div', { class: 'title' }, item.display_name), h('div', { class: 'sub' }, '@' + item.username,
-      item.agent ? ` · agent ${item.agent.name} in ${item.agent.project}` : ''));
+      item.agent ? ` · agent ${item.agent.name} in ${item.agent.project}` : ''),
+      agentBadge);
   }
 
   function list(items) {
     if (!items.length) return [];
-    return [h('div', { class: 'table-wrap' }, h('table', null,
-      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Person'), h('th', { scope: 'col' }, 'Projects'),
-        h('th', { scope: 'col' }, 'Status'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Detail'),
-        h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
-      h('tbody', null, items.map((item) => h('tr', { 'data-invite': item.id, 'data-status': item.status, 'data-person': item.person || 'new' },
-        person(item),
-        h('td', null, (item.projects || []).map((p) => p.name).join(', '),
-          item.person === 'existing' && item.status === 'used' ? membershipLines(item).map((line) => h('div', { class: 'sub', 'data-membership': 'true' }, line)) : null),
-        h('td', null, h('span', { class: 'chip ' + (item.status === 'pending' ? 'info' : 'plain') }, STATUS_WORDS[item.status] || String(item.status))),
-        h('td', { class: 'hide-narrow small' },
-          'Made by ', item.invited_by_name, ' ', time(item.created_at),
-          item.status === 'used' ? [' · used ', time(item.used_at), ' by ', item.used_by_name || item.used_by, ' from ', item.used_from || 'an unknown address'] :
-            item.status === 'revoked' ? [' · withdrawn ', time(item.revoked_at), ' by ', item.revoked_by_name || item.revoked_by] :
-              [' · expires ', time(item.expires_at)]),
-        h('td', null, item.status === 'pending' ? h('button', { type: 'button', class: 'danger', onclick: async (e) => {
-          const who = item.person === 'existing' ? '@' + item.username : item.display_name;
-          if (!(await confirmDialog({ title: `Withdraw the invite for ${who}?`, body: 'The link stops working at once.', confirmLabel: 'Withdraw', danger: true }))) return;
-          try { await act(e.currentTarget, () => ctx.api.revokeInvite(item.id), { success: 'Invite withdrawn' }); } catch { /* shown */ }
-          draw();
-        } }, 'Withdraw') : ''))))))];
+    const tbody = h('tbody');
+    const rowOf = (item) => h('tr', { 'data-invite': item.id, 'data-status': item.status, 'data-person': item.person || 'new', 'data-agent-id': item.agent_id || null },
+      person(item),
+      h('td', null, (item.projects || []).map((p) => p.name).join(', '),
+        item.person === 'existing' && item.status === 'used' ? membershipLines(item).map((line) => h('div', { class: 'sub', 'data-membership': 'true' }, line)) : null),
+      h('td', null, h('span', { class: 'chip ' + (item.status === 'pending' ? 'info' : 'plain') }, STATUS_WORDS[item.status] || String(item.status))),
+      h('td', { class: 'hide-narrow small' },
+        'Made by ', item.invited_by_name, ' ', time(item.created_at),
+        item.status === 'used' ? [' · used ', time(item.used_at), ' by ', item.used_by_name || item.used_by, ' from ', item.used_from || 'an unknown address'] :
+          item.status === 'revoked' ? [' · withdrawn ', time(item.revoked_at), ' by ', item.revoked_by_name || item.revoked_by] :
+            [' · expires ', time(item.expires_at)]),
+      h('td', null, item.status === 'pending' ? h('button', { type: 'button', class: 'danger', onclick: async (e) => {
+        const who = item.person === 'existing' ? '@' + item.username : item.display_name;
+        if (!(await confirmDialog({ title: `Withdraw the invite for ${who}?`, body: 'The link stops working at once.', confirmLabel: 'Withdraw', danger: true }))) return;
+        try { await act(e.currentTarget, () => ctx.api.revokeInvite(item.id), { success: 'Invite withdrawn' }); } catch { /* shown */ }
+        draw();
+      } }, 'Withdraw') : ''));
+    const renderRows = () => {
+      const shown = items.filter((item) => matchesEntityFilter(filterText, {
+        names: [item.display_name, item.username, item.agent && item.agent.name],
+        ids: [item.agent_id],
+      }));
+      tbody.replaceChildren(...(shown.length ? shown.map(rowOf) : [h('tr', null, h('td', { colspan: '5', class: 'small muted' }, 'No invites match this filter.'))]));
+    };
+    const filterInput = h('input', {
+      type: 'search',
+      value: filterText,
+      placeholder: 'Filter invites by name, username, or agent ID',
+      'aria-label': 'Filter invites',
+      'data-filter': 'invites',
+    });
+    filterInput.addEventListener('input', () => { filterText = filterInput.value; renderRows(); });
+    renderRows();
+    return [
+      h('div', { class: 'panel-body' }, h('div', { class: 'filters' }, filterInput)),
+      h('div', { class: 'table-wrap' }, h('table', null,
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Person'), h('th', { scope: 'col' }, 'Projects'),
+          h('th', { scope: 'col' }, 'Status'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Detail'),
+          h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
+        tbody)),
+    ];
   }
 
   function focusPanel() {

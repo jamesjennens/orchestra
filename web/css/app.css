@@ -627,3 +627,9 @@ th.task-updated-column, td.task-updated-column { text-align: right; }
   table.stack-narrow tr.mine, .task-list-work tr.mine { box-shadow: inset 3px 0 0 var(--accent); }
   table.stack-narrow tr.mine > td:first-child, .task-list-work tr.mine > td:first-child { box-shadow: none; }
 }
+
+/* Copyable agent / account ids (kittrial-5bb.583): monospace text stays in textContent
+   and wraps cleanly on narrow screens without hiding (findable by Ctrl+F). */
+.id-chip { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; max-width: 100%; }
+.id-code { font-family: var(--mono); font-size: var(--t-xs); color: var(--muted); overflow-wrap: anywhere; word-break: break-all; }
+.id-chip button { min-height: 22px; padding: 0 6px; font-size: var(--t-xs); }

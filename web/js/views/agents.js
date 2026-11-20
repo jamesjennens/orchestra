@@ -2,7 +2,7 @@
 // owner opens this page they see which agent has something to do and which folder to
 // open in VS Code to resume it. Agents themselves read work over the REST API.
 import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
-import { pageHead, setPageKey, empty, field, setFieldError, formValues, act, errorState, describe, loading } from '../ui.js';
+import { pageHead, setPageKey, empty, field, setFieldError, formValues, act, errorState, describe, loading, idBadge, matchesEntityFilter } from '../ui.js';
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
@@ -92,9 +92,17 @@ function ownerLine(agent) {
   // carries owner/owner_display_name, so the shared card never prints 'unknown owner · no id'
   // from a real My work payload; the fallback stays for payloads that lack them
   // (the demo mock agentView uses owner_id/owner_name only).
+  // kittrial-5bb.583: show both owner account id and agent id as monospace copyable text.
   const name = agent.owner_display_name || agent.owner_name || ownerId(agent) || 'unknown owner';
-  const id = ownerId(agent);
-  return id && id !== name ? `${name} (${id}) · ${agent.id || 'no id'}` : `${name} · ${agent.id || 'no id'}`;
+  const oid = ownerId(agent);
+  const parts = [name];
+  if (oid && oid !== name) {
+    parts.push(' (', idBadge(oid, { what: 'Account ID' }), ')');
+  } else if (oid) {
+    parts.splice(0, 1, idBadge(oid, { what: 'Account ID' }));
+  }
+  parts.push(' · ', agent.id ? idBadge(agent.id, { what: 'Agent ID' }) : 'no id');
+  return parts;
 }
 
 function hasActed(raw) {
@@ -255,6 +263,8 @@ export async function list(ctx) {
   let unconfirmedOnly = false;
   let cursor = null;
   let mineOnly = true;
+  let searchText = '';
+  let lastData = null;
   const previous = [];
   const pendingReleases = new Map();
   const loaded = { items: [], total: 0, owners: [], probed: false };
@@ -271,9 +281,15 @@ export async function list(ctx) {
     // Mine is a caller-level view, not a page-level one (kittrial-5bb.561 r2): an audit view
     // (superuser + inferred/unknown-scopes box ticked) shows every loaded row, and Mine
     // itself is stable across pages (decided from all owners the caller may see, not the page).
-    if (unconfirmedOnly && ctx.me && ctx.me.superuser) return loaded.items;
-    return mineOnly && mineShown() && ctx.me
-      ? loaded.items.filter((a) => ownerId(a) === ctx.me.id) : loaded.items;
+    const base = (unconfirmedOnly && ctx.me && ctx.me.superuser)
+      ? loaded.items
+      : (mineOnly && mineShown() && ctx.me
+        ? loaded.items.filter((a) => ownerId(a) === ctx.me.id) : loaded.items);
+    if (!searchText.trim()) return base;
+    return base.filter((a) => matchesEntityFilter(searchText, {
+      names: [a.display_name, a.name, a.owner_display_name, a.owner_name],
+      ids: [a.id, ownerId(a)],
+    }));
   }
   function mineShown() {
     if (!ctx.me || !loaded.items.length) return false;
@@ -302,7 +318,18 @@ export async function list(ctx) {
       input.scrollIntoView({ block: 'center' });
       input.focus({ preventScroll: true });
     } }, 'Add an agent') });
+  const searchInput = h('input', {
+    type: 'search',
+    placeholder: 'Filter agents by name, account, or ID',
+    'aria-label': 'Filter agents',
+    'data-filter': 'agents',
+  });
+  searchInput.addEventListener('input', () => {
+    searchText = searchInput.value;
+    if (lastData) renderLoaded(lastData);
+  });
   const filter = h('div', { class: 'stack' },
+    h('div', { class: 'filters' }, searchInput),
     ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
       h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
       unconfirmedOnly = event.target.checked;
@@ -310,20 +337,7 @@ export async function list(ctx) {
       previous.length = 0;
       load();
     } }), 'Show agents with inferred or unknown scopes') : null);
-  async function load() {
-    let data;
-    // The agents' region is busy while it is read, every time (kittrial-5bb.525 e r2), and not after a failure.
-    host.setAttribute('aria-busy', 'true');
-    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { setPageKey(head, null); host.replaceChildren(errorState(error, load)); return; } finally { host.removeAttribute('aria-busy'); }
-    const items = data.items;
-    loaded.items = items;
-    loaded.total = data.total || items.length;
-    // The filter is caller-level: keep every owner the caller may see, across pages, so the
-    // Mine/All choice never appears on one page and vanishes on the next (kittrial-5bb.561 r2).
-    for (const owner of ownersOf(items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
-    setPageKey(head, typeof data.total === 'number' ? { num: data.total,
-      label: unconfirmedOnly ? 'with inferred or unknown scopes' : data.total === 1 ? 'agent' : 'agents', source: 'agents.total' } : null);
-    host.removeAttribute('aria-busy');
+  function renderLoaded(data) {
     const showFilter = mineShown();
     const shown = visibleItems();
     const scopeNote = (ctx.me && ctx.me.superuser && unconfirmedOnly)
@@ -334,11 +348,30 @@ export async function list(ctx) {
         h('div', { class: 'stack' }, ...agentCardMore(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
           ownedBy(ctx, a) ? disableAndReleaseBlock(a) : null,
           manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))))) :
-      h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
+      h('div', { class: 'panel' }, searchText.trim()
+        ? empty('No matching agents', 'No loaded agent matches this filter.')
+        : empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
       h('span', { class: 'small muted' }, mineOnly && showFilter && !(ctx.me && ctx.me.superuser && unconfirmedOnly) ? `${shown.length} shown on this page of ${data.total} agents` : `${shown.length} shown of ${data.total} agents`),
       previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
       data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
+  }
+  async function load() {
+    let data;
+    // The agents' region is busy while it is read, every time (kittrial-5bb.525 e r2), and not after a failure.
+    host.setAttribute('aria-busy', 'true');
+    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { setPageKey(head, null); host.replaceChildren(errorState(error, load)); return; } finally { host.removeAttribute('aria-busy'); }
+    const items = data.items;
+    lastData = data;
+    loaded.items = items;
+    loaded.total = data.total || items.length;
+    // The filter is caller-level: keep every owner the caller may see, across pages, so the
+    // Mine/All choice never appears on one page and vanishes on the next (kittrial-5bb.561 r2).
+    for (const owner of ownersOf(items)) if (!loaded.owners.includes(owner)) loaded.owners.push(owner);
+    setPageKey(head, typeof data.total === 'number' ? { num: data.total,
+      label: unconfirmedOnly ? 'with inferred or unknown scopes' : data.total === 1 ? 'agent' : 'agents', source: 'agents.total' } : null);
+    host.removeAttribute('aria-busy');
+    renderLoaded(data);
   }
   // Disabling an agent and optionally releasing its held, undelivered claims (kittrial-5bb.510).
   // Owner-only: the disable completes first; the dry run shows what it would release, and the
@@ -798,7 +831,8 @@ export async function inviteSetupBlock(ctx, created, secret) {
     } catch (error) { saveStatus.textContent = 'Could not save the files: ' + ((error && error.message) || 'unknown error'); saveStatus.hidden = false; }
   } }, 'Save .orchestra files to the agent folder…') : null;
   return h('section', { class: 'stack', 'data-invite-setup': 'true' },
-    h('h2', { class: 'small' }, `Your agent ${payload.name}`),
+    h('div', { class: 'copy-row' }, h('h2', { class: 'small' }, `Your agent ${payload.name}`),
+      payload.agentId ? idBadge(payload.agentId, { what: 'Agent ID' }) : null),
     secretNotice(false),
     secretLinesBlock(payload, secret, os),
     h('div', { class: 'copy-row' },
@@ -823,6 +857,7 @@ export const CURL_ERROR_LINES = Object.freeze({
   35: 'curl exit 35: the TLS handshake failed (wrong address or a proxy speaking plain HTTP to the https port).',
   26: 'curl exit 26: cannot read the config file — the file name is wrong or Notepad added .txt.',
   401: 'HTTP 401: the secret or the header line is wrong.',
+  'connect-to': 'Different address (NAT, forward or proxy): if an agent machine reaches the server only through another address, the set-up test fails because the commands use the server’s public_url; a connect-to line in the .curlrc file fixes it.',
 });
 
 // ": read, tasks" for a list of scopes, or "" when the server sent none (an older service).
@@ -1148,7 +1183,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 
   dialog.append(
     h('div', { class: 'dialog-body' },
-      h('div', { class: 'copy-row' }, progress), title, idleWarningBanner,
+      h('div', { class: 'copy-row' }, progress, payload.agentId ? idBadge(payload.agentId, { what: 'Agent ID' }) : null), title, idleWarningBanner,
       // kittrial-5bb.360: an address that may not go into a command is never used in one.
       payload.serverRefused ? h('p', { class: 'small error-text', role: 'alert', 'data-server-refused': 'true' },
         'This server’s address cannot be used in a command, so the commands show <ORCHESTRA_SERVER_URL>: ask whoever runs the server to correct its public_url.') : null,
@@ -1346,9 +1381,12 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       } finally { button.disabled = false; }
     } }, 'Save to agent folder…');
     return h('div', { class: 'stack' },
-      h('div', { class: 'copy-row', 'data-folder-beside': 'true' }, button,
+      h('div', { class: 'copy-row', 'data-folder-beside': 'true' },
+        folder ? h('span', { class: 'small muted', 'data-step-label': 'copy-folder' }, '1. Copy the folder path') : null,
         folder ? h('code', { class: 'path', 'data-folder-path': folder }, folder) : h('span', { class: 'small muted' }, 'the agent’s folder'),
-        folder ? copyButton('Copy', folder, { ariaLabel: 'Copy the agent folder path', what: 'Folder path' }) : null),
+        folder ? copyButton('Copy', folder, { ariaLabel: 'Copy the agent folder path', what: 'Folder path' }) : null,
+        folder ? h('span', { class: 'small muted', 'data-step-label': 'save-folder' }, '2.') : null,
+        button),
       saveStatus);
   }
 
@@ -1648,6 +1686,7 @@ export async function setupWizardPage(ctx) {
             h('p', { class: 'small' }, 'Which agent do you want to set up?'),
             h('ul', { class: 'open-items' }, items.map((a) => h('li', { class: 'copy-row', 'data-choose-agent': a.id },
               h('strong', null, a.display_name || a.name),
+              a.id ? idBadge(a.id, { what: 'Agent ID' }) : null,
               h('button', {
                 type: 'button',
                 class: 'primary',
@@ -1671,7 +1710,8 @@ export async function setupWizardPage(ctx) {
     pageHead({ title: `Set up ${agent.display_name || agent.name}`, lede: 'Step-by-step agent setup wizard.' }),
     h('div', { class: 'panel' },
       h('div', { class: 'panel-body' },
-        h('p', { class: 'small' }, 'The step-by-step setup wizard is open for ', h('strong', null, agent.display_name || agent.name), '.'),
+        h('p', { class: 'small' }, 'The step-by-step setup wizard is open for ', h('strong', null, agent.display_name || agent.name), '.',
+          agent.id ? [' ', idBadge(agent.id, { what: 'Agent ID' })] : null),
         h('div', { class: 'copy-row' },
           h('button', { type: 'button', class: 'primary', onclick: (e) => reopenSetup(ctx, agent.id, e.currentTarget) }, 'Reopen setup wizard'),
           h('a', { class: 'btn', href: ctx.href('/agents') }, 'Back to My agents')))));

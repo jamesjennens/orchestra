@@ -1,5 +1,5 @@
 import { h, time } from '../dom.js';
-import { errorState } from '../ui.js';
+import { errorState, idBadge } from '../ui.js';
 
 // Who coordinates a project (kittrial-5bb.198): the members whose role coordinates, the agents whose grant has
 // effect and the rules that bind them. For every member, and read only: an owner changes roles and grants on the
@@ -43,8 +43,10 @@ export function coordinationPanel(ctx, project) {
             p.display_name, ' · ', ROLE[p.role] || p.role, p.disabled ? ' · account disabled, so does not coordinate now' : '')))
             : h('p', { class: 'muted' }, 'No member coordinates this project.')),
         h('div', null, h('h3', { class: 'small' }, 'Agents'),
-          agents.length ? h('ul', null, agents.map((a) => h('li', { 'data-agent-name': a.name },
-            a.name, ', agent of ', a.owner_display_name, h('span', { class: 'muted' }, ' · granted by ', a.granted_by_display_name, ' ', time(a.granted_at)))))
+          agents.length ? h('ul', null, agents.map((a) => h('li', { 'data-agent-name': a.name, 'data-agent-id': a.id || null },
+            a.name, ', agent of ', a.owner_display_name,
+            h('span', { class: 'muted' }, ' · granted by ', a.granted_by_display_name, ' ', time(a.granted_at)),
+            a.id ? [' · ', idBadge(a.id, { what: 'Agent ID' })] : null)))
             : h('p', { class: 'muted' }, 'No agent coordinates this project.')),
         h('div', null, h('h3', { class: 'small' }, 'Operators of the server'),
           operators.state === 'available'

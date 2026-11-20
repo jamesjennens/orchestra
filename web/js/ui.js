@@ -1,5 +1,5 @@
 // Shared UI pieces: state chips, lifecycle strip, page scaffolding and error states.
-import { h, toast } from './dom.js';
+import { h, toast, copyButton } from './dom.js';
 
 // An account id (usr_...) is never shown as text; agent and session ids stay visible so
 // an actor can still be told apart. The caller passes the fallback word: 'Someone' where
@@ -338,4 +338,55 @@ export function passwordTooShort(me, value) {
 
 export function avatarName(name) {
   return name || 'Unassigned';
+}
+
+// Copyable monospace id badge (kittrial-5bb.583): text-only DOM (h()), never hidden on narrow
+// screens so Ctrl+F always finds the full id, and its Copy button copies only the exact id string.
+export function idBadge(id, { what = 'ID', ariaLabel } = {}) {
+  const value = typeof id === 'string' ? id.trim() : '';
+  if (!value) return null;
+  const btn = copyButton('Copy', value, { ariaLabel: ariaLabel || ('Copy ' + what + ' ' + value), what });
+  btn.setAttribute('data-copy-id', value);
+  return h('span', { class: 'id-chip', 'data-id-chip': value },
+    h('code', { class: 'id-code', 'data-copyable-id': value }, value),
+    btn);
+}
+
+// Client-side search matcher for agents and people (kittrial-5bb.583):
+// - matches full id, id without agent_/usr_ prefix, or >= 4 hex-character prefix of the hex part;
+// - a shorter query (< 4 hex chars) matches names and full ids only, never hex prefixes;
+// - an explicit id-shaped query (agent_<hex>/usr_<hex>) matches ids only, and id-lookalike tokens
+//   inside a name are stripped before name matching so a lookalike name cannot make a second row match.
+export function matchesEntityFilter(query, { names = [], ids = [] } = {}) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return true;
+  const isHexPrefix = /^[0-9a-f]{4,}$/.test(q);
+  const explicitId = /^(?:agent|usr)_[0-9a-f]{4,}$/.test(q);
+  for (const raw of ids) {
+    if (typeof raw !== 'string') continue;
+    const id = raw.trim().toLowerCase();
+    if (!id) continue;
+    if (id === q) return true;
+    const bare = id.replace(/^(?:agent|usr)_/, '');
+    if (bare !== id) {
+      if (q === bare) return true;
+      if (isHexPrefix && bare.startsWith(q)) return true;
+      if (explicitId && id.startsWith(q)) return true;
+    }
+  }
+  if (explicitId) return false;
+  for (const raw of names) {
+    if (typeof raw !== 'string') continue;
+    const cleaned = raw.trim().toLowerCase().replace(/\b(?:agent|usr)_[0-9a-f]{4,}\b/g, '');
+    if (cleaned.includes(q)) return true;
+  }
+  return false;
+}
+
+// Extracts unique agent_<hex> ids from a text string (kittrial-5bb.583, audit rows):
+// parses only what is already shown in the row's own text without any extra lookup.
+export function extractAgentIds(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const matches = text.match(/\bagent_[0-9a-f]{4,}\b/gi) || [];
+  return [...new Set(matches)];
 }
