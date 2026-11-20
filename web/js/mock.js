@@ -21,7 +21,7 @@ export function seed() {
     usr_priya: { id: 'usr_priya', username: 'priya', display_name: 'Priya Raman', superuser: false, disabled: false, created_at: at(700) },
     usr_tomasz: { id: 'usr_tomasz', username: 'tomasz', display_name: 'Tomasz Nowak', superuser: false, disabled: false, created_at: at(650) },
     usr_kestrel: { id: 'usr_kestrel', username: 'kestrel', display_name: 'Kestrel (agent)', superuser: false, disabled: false, created_at: at(400),
-      agent_of: 'usr_tomasz', tool: 'GitHub Copilot in VS Code', working_directory: 'C:\\Users\\tomasz\\agents\\portal-kestrel', last_seen_at: at(3) },
+      agent_of: 'usr_tomasz', tool: 'GitHub Copilot in VS Code', working_directory: 'C:\\Users\\tomasz\\agents\\portal-kestrel', machine: 'tomasz-laptop', notes: 'Wake with the Teams ping; sleeps after lunch.', last_seen_at: at(3) },
     usr_wren: { id: 'usr_wren', username: 'wren', display_name: 'Wren (agent)', superuser: false, disabled: false, created_at: at(380),
       agent_of: 'usr_priya', tool: 'GitHub Copilot in VS Code', working_directory: 'D:\\work\\agents\\invoice-wren', last_seen_at: at(5) },
     usr_lena: { id: 'usr_lena', username: 'lena', display_name: 'Lena Fischer', superuser: false, disabled: false, created_at: at(300) },
@@ -506,6 +506,7 @@ export function createMock(options = {}) {
     // The folder path can reveal local usernames: only the owner and superusers see it.
     const ownerView = Boolean(viewer && (viewer.id === a.agent_of || viewer.superuser));
     return { id: a.id, display_name: a.display_name, owner_id: a.agent_of, owner_name: name(a.agent_of), tool: a.tool, working_directory: ownerView ? a.working_directory : undefined,
+      machine: ownerView ? a.machine || null : undefined, notes: ownerView ? a.notes || null : undefined,
       last_seen_at: a.last_seen_at || null, projects: projectsOf, items: items.sort((x, y) => (x.kind === 'feedback' ? -1 : y.kind === 'feedback' ? 1 : 0)), attention, claimable, disabled: a.disabled || db.users[a.agent_of].disabled };
   };
   const agentsOf = (uid) => Object.values(db.users).filter((u) => u.agent_of === uid);
@@ -543,6 +544,8 @@ export function createMock(options = {}) {
     const a = db.users[p.aid];
     if (!a || !a.agent_of || (a.agent_of !== db.session && !me().superuser)) return err(404, 'not_found', 'Agent not found');
     for (const k of ['working_directory', 'tool']) if (b[k] !== undefined) a[k] = String(b[k]).slice(0, 300) || null;
+    if (b.machine !== undefined) a.machine = String(b.machine).slice(0, 120) || null;
+    if (b.notes !== undefined) a.notes = String(b.notes).slice(0, 1000) || null;
     return ok(agentView(a, me()));
   });
 

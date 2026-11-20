@@ -171,12 +171,17 @@ function resumeBlock(agent, folder, compact) {
 const createdByNote = (raw) => (raw.created_by && raw.created_by !== raw.owner ? h('p', { class: 'small muted', 'data-created-by': raw.created_by },
   'Created by ', raw.created_by_display_name || raw.created_by, '. That superuser saw the first secret. Issue a new secret if this matters to you.') : null);
 const projectsLine = (agent) => h('div', { class: 'small muted' }, 'Projects: ', agent.projects.map((p) => `${p.name} (${p.role})`).join(', ') || 'none');
+// Owner-only: the server sends machine and notes to the owner (http_auth.py agent_view).
+// They are plain text, so they render as text nodes, never as markup.
+const machineNotesLine = (raw) => h('div', { class: 'small muted', 'data-machine-notes': raw.id || '' },
+  'Machine: ', raw.machine || h('span', null, 'Not recorded'), ' · Notes: ', raw.notes || h('span', null, 'Not recorded'));
 
 // What the My agents page keeps behind "Details" for each agent (kittrial-5bb.456 item 1): the parts of
 // the full card that the one-line row leaves out.
 export function agentCardMore(ctx, raw) {
   const agent = normalize(ctx, raw);
-  return [resumeBlock(agent, agent.working_directory, false), createdByNote(raw), scopesLine(raw), projectsLine(agent)];
+  return [resumeBlock(agent, agent.working_directory, false), createdByNote(raw), scopesLine(raw), projectsLine(agent),
+    ownedBy(ctx, raw) ? machineNotesLine(raw) : null];
 }
 
 export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
@@ -464,18 +469,43 @@ export async function list(ctx) {
     return details;
   }
 
+  // Folder, and for the owner also machine and notes. Only fields the person changed are sent.
+  // A refusal for machine or notes sits under its own field; anything else toasts as before.
   function editFolder(agent) {
+    const owner = ownedBy(ctx, agent);
     const details = h('details', { class: 'deliver' });
-    const form = h('form', { class: 'form', novalidate: true },
-      field({ id: 'wd-' + agent.id, label: 'Folder on your computer', value: agent.working_directory || '', hint: 'Only you and administrators can see this.' }),
-      h('div', null, h('button', { type: 'submit' }, 'Save folder')));
+    const fields = [field({ id: 'wd-' + agent.id, label: 'Folder on your computer', value: agent.working_directory || '', hint: 'Only you and administrators can see this.' })];
+    if (owner) {
+      fields.push(field({ id: 'mc-' + agent.id, label: 'Machine', value: agent.machine || '', hint: 'Which computer it runs on.' }),
+        field({ id: 'nt-' + agent.id, label: 'Notes', type: 'textarea', value: agent.notes || '', hint: 'Where it runs and how to wake it' }));
+    }
+    const form = h('form', { class: 'form', novalidate: true }, ...fields, h('div', null, h('button', { type: 'submit' }, 'Save')));
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const value = formValues(form)['wd-' + agent.id].trim();
-      const saved = await act(form.querySelector('button'), () => ctx.api.updateAgent(agent.id, { working_directory: value }), { success: 'Folder saved' }).catch(() => null);
+      const values = formValues(form);
+      const body = {};
+      const folder = values['wd-' + agent.id].trim();
+      if (folder !== (agent.working_directory || '')) body.working_directory = folder;
+      if (owner) {
+        const machine = values['mc-' + agent.id].trim();
+        const notes = values['nt-' + agent.id].trim();
+        if (machine !== (agent.machine || '')) body.machine = machine;
+        if (notes !== (agent.notes || '')) body.notes = notes;
+      }
+      if (!Object.keys(body).length) return;
+      const saved = await act(form.querySelector('button'), () => ctx.api.updateAgent(agent.id, body), {
+        success: 'Saved',
+        onError: (error) => {
+          const msg = String(error && error.message || '');
+          const id = /^machine/.test(msg) ? 'mc-' : /^notes/.test(msg) ? 'nt-' : null;
+          if (!id) return false;
+          setFieldError(form, id + agent.id, msg);
+          return true;
+        },
+      }).catch(() => null);
       if (saved) load();
     });
-    details.append(h('summary', null, 'Change folder'), form);
+    details.append(h('summary', null, owner ? 'Change folder, machine and notes' : 'Change folder'), form);
     return details;
   }
   // Grant or withdraw projects. An agent with none gets only a "no projects yet" note

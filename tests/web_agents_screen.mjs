@@ -242,6 +242,42 @@ out.odd = [
   {}, { scopes: null, scopes_source: 'unknown' }, { scopes: ['read'], credentials: 'x' }, { scopes: ['read'], credentials: [null, 5, { scopes: 'x', working: true }, { working: true }] },
   { scopes_source: 'unknown', credentials: [{ scopes: ['read'], revoked: false }, { scopes: 7, revoked: false }] }, { scopes: 'read', scopes_differ: 5, credentials: {} },
 ].map((raw) => { try { const line = view.scopesLine(raw); return [view.otherCredentials(raw).length, line ? line.attributes['data-scopes'] : null]; } catch (error) { return 'threw: ' + error.message; } });
+// 9. kittrial-5bb.511: machine and notes show to the owner only; the folder form sends only what
+// changed; markup stays text; a refusal from the server sits under its own field.
+{
+  let page = await open(who.alex);
+  const kid = block(page, 'Kestrel').attributes['data-agent'];
+  const formOf = (p) => block(p, 'Kestrel').all((e) => e.tagName === 'FORM' && e.all((x) => x.attributes.id === 'mc-' + kid).length > 0)[0];
+  const fieldOf = (p, id) => formOf(p).all((e) => e.attributes.id === id)[0];
+  out.machineNotesText = block(page, 'Kestrel').all((e) => e.attributes['data-machine-notes'] !== undefined).map((e) => e.textContent)[0] || null;
+  let before = sent.length;
+  await formOf(page).dispatch('submit');
+  await settle();
+  out.unchangedSent = sent.length - before;
+  fieldOf(page, 'mc-' + kid).value = 'tomasz-desk';
+  before = sent.length;
+  await formOf(page).dispatch('submit');
+  await settle();
+  out.machineOnlySent = sent.slice(before).map((s) => s[3]);
+  page = await open(who.alex);
+  fieldOf(page, 'nt-' + kid).value = '<b>wake</b> <img src=x onerror=alert(1)>';
+  await formOf(page).dispatch('submit');
+  await settle();
+  page = await open(who.alex);
+  const shown = block(page, 'Kestrel');
+  out.markupText = shown.all((e) => e.attributes['data-machine-notes'] !== undefined).map((e) => e.textContent)[0] || null;
+  out.markupElements = shown.all((e) => e.tagName === 'IMG' || e.tagName === 'B').length;
+  fieldOf(page, 'nt-' + kid).value = 'x'.repeat(1001);
+  await formOf(page).dispatch('submit');
+  await settle();
+  out.tooLongError = (formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {}).textContent || null;
+  const admin = await open(who.admin);
+  await admin.all((e) => e.attributes['data-mine-choice'] === 'All')[0].dispatch('click');
+  await settle();
+  const adminKestrel = block(admin, 'Kestrel');
+  out.adminMachineNotes = adminKestrel ? [adminKestrel.textContent.includes('tomasz-desk'), adminKestrel.textContent.includes('<b>wake</b>')] : null;
+  out.adminMachineFields = adminKestrel ? adminKestrel.all((e) => e.attributes.id && /^(mc|nt)-/.test(e.attributes.id)).length : null;
+}
 out.sent = sent;
 // ASCII only: the page's text has typographic quotes, and a Windows pipe is not UTF-8.
 console.log(JSON.stringify(out).replace(/[^\x00-\x7f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')));

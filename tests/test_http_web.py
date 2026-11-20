@@ -1817,7 +1817,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         # What the agent may do is on its card, and "What it may do" on the Agents page is the one place
         # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
         self.assertIn('    compact || lean ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
-        self.assertIn('scopesLine(raw), projectsLine(agent)]', self.function_body(code, 'agentCardMore'))
+        self.assertIn('scopesLine(raw), projectsLine(agent),\n    ownedBy(ctx, raw) ? machineNotesLine(raw) : null]', self.function_body(code, 'agentCardMore'))
         self.assertNotIn('before this was fixed', code)
         self.assertIn('agent.scopes === null', reissue)
         self.assertIn("issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, "

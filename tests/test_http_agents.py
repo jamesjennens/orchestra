@@ -2268,6 +2268,8 @@ class AgentsPageTests(RenewalScopeTests):
             for credential in self.working(nothing[name]):
                 self.revoke(nothing[name], credential['id'])
             self.made_before(nothing[name])
+        seeded = self.request('PATCH', '/v1/agents/%s' % kestrel, {'machine': 'tomasz-laptop', 'notes': 'Wake with the Teams ping.'}, token=self.alex)
+        self.assertEqual(200, seeded.status, seeded.data)
         web = ROOT / 'web' / 'js'
         done = run_node_module(self, node, 'await import(process.argv[1])',
                                (ROOT / 'tests' / 'web_agents_screen.mjs').as_uri(),
@@ -2277,6 +2279,15 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(0, done.returncode, done.stderr[-3000:])
         seen = json.loads(done.stdout.strip().splitlines()[-1])
         first = seen['first']
+        # kittrial-5bb.511: machine and notes are the owner's; the folder form sends only changes.
+        self.assertIn('Machine: tomasz-laptop', seen['machineNotesText'])
+        self.assertEqual(0, seen['unchangedSent'])
+        self.assertEqual([{'machine': 'tomasz-desk'}], seen['machineOnlySent'])
+        self.assertIn('<b>wake</b> <img src=x onerror=alert(1)>', seen['markupText'])
+        self.assertEqual(0, seen['markupElements'], 'notes are text, never markup')
+        self.assertIn('at most 1000', seen['tooLongError'])
+        self.assertEqual([False, False], seen['adminMachineNotes'])
+        self.assertEqual(0, seen['adminMachineFields'])
         self.assertIn('inferred', seen['ownerInferredAsked'])
         self.assertIn('not confirmed', seen['ownerInferredAsked'])
         self.assertIn('stored scopes: read', seen['ownerInferredAsked'])
@@ -2375,12 +2386,18 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(seen['odd'], [[0, None], [0, 'unknown'], [0, 'read'], [2, 'read'], [2, 'unknown'], [0, 'unknown']])
         # What the page sent, in order: a list only from "What it may do".
         credentials = '/v1/agents/AGENT/credentials'
-        self.assertEqual(seen['sent'], [
+        self.assertEqual(seen['sent'][:5], [
             ['alex', 'POST', credentials + '/CRED/revoke', {}],
             ['alex', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read']}],
             ['alex', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read', 'tasks']}],
             ['admin', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read']}],
             ['alex', 'POST', credentials, {'label': 'web: new secret'}]])
+        # kittrial-5bb.511: the folder form sent only what changed: the machine alone, then the notes
+        # (markup, then the over-long value the server refused). Nothing was sent for an unchanged form.
+        self.assertEqual(seen['sent'][5:], [
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'machine': 'tomasz-desk'}],
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'notes': '<b>wake</b> <img src=x onerror=alert(1)>'}],
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'notes': 'x' * 1001}]])
         self.assertEqual(self.stored(kestrel), (['read'], 'set'))
         self.assertEqual(self.stored(nothing['Dove']), (None, None))
 
