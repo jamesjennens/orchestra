@@ -262,6 +262,15 @@ blocking instead of returning it twice. Without `--since` the client uses the fi
 it remembers in its small local state file; `--fresh` ignores it and asks for the whole
 baseline again.
 
+Three local-only options wake the wait from this machine, checked between polls with no extra
+server request; the first of them, the server's answer or `--timeout` to fire wins. A local
+wake prints the normal wait JSON with the caller's own fingerprint, `timed_out: false`, exit 0,
+and a top-level `local_wake: {kind, what, at}`:
+
+- `--recheck-in DURATION` (`30s`, `30m`, `2h`, `1d`; more than zero, at most 14 days): `kind` is `time-reached`.
+- `--until-file PATH` (at most 1024 characters; only `os.path.exists` is called): `kind` is `file-seen`, `what` the escaped path.
+- `--until-exit PID`: `kind` is `process-exited`; the process is only checked (`kill(pid, 0)` on POSIX, `OpenProcess` plus a zero-wait on Windows), never signalled.
+
 A waiting agent should not invent its next wait. With `--idle-since TIME` (an ISO-8601
 instant with an offset: when the caller's current idle spell began) and a bounded
 `--timeout`, the result of every timeout with the fingerprint unchanged carries:
