@@ -1022,19 +1022,32 @@ function secretNotice(justCreated) {
       'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Agents page first.') : null);
 }
 
-function secretLinesBlock(payload, secretValue, os, noproxy = false) {
+function secretLinesBlock(payload, secretValue, os, { noproxy = false, bridge = true } = {}) {
   const meta = PAYLOAD_META.get(payload) || {};
   const address = meta.bridgeServer || payload.server;
   const fingerprint = (meta.certificate && meta.certificate.sha256) || null;
-  const lines = setupText.credentialFileLines(address, fingerprint, secretValue, { noproxy });
-  const file = setupText.osSecretFile(payload.secretFile, os);
   const posix = setupText.osKind(os) === 'posix';
+  const includeCert = Boolean(meta.certificate) && !bridge;
+  const homeDir = includeCert ? setupText.userHomeFromWorkingDirectory(payload.workingDirectory, { windows: !posix }) : null;
+  const lines = setupText.credentialFileLines(address, fingerprint, secretValue, {
+    noproxy,
+    certFile: includeCert ? payload.certificateFile : null,
+    hasCertificate: includeCert,
+    windows: !posix,
+    homeDir,
+  });
+  const file = setupText.osSecretFile(payload.secretFile, os);
   return h('div', { class: 'stack', 'data-secret-lines': 'true' },
     h('p', { class: 'small' }, `Open ${osWords(os).editor}, paste these lines, and save them as the file below${posix ? '' : ' (Save as type: All files)'}. They are shown only now.`),
     h('div', { class: 'copy-row' }, h('pre', { class: 'json secret', 'data-secret-file-text': 'true' }, lines),
       copyButton('Copy', lines, { ariaLabel: 'Copy the credential file text with the secret', what: 'Credential file text' })),
     commandLine(file, 'file name'),
-    more(h('p', { class: 'small muted' }, 'The first lines tell Orchestra Bridge which server to use (and which certificate to expect); the last line is the secret. Keep the file name exactly, with no .txt at the end. Never put the secret in the agent’s folder, a commit or a command line.')));
+    more(h('p', { class: 'small muted' }, includeCert
+      ? (posix
+        ? 'The first lines name this server and its certificate path for curl; the last line is the secret. Keep the file name exactly, with no .txt at the end. Never put the secret in the agent’s folder, a commit or a command line.'
+        : 'The first lines name this server, its certificate path for curl, and ssl-no-revoke; the last line is the secret. Keep the file name exactly, with no .txt at the end. Never put the secret in the agent’s folder, a commit or a command line.')
+        + (homeDir ? '' : ' Replace <your-name> with your user folder name, or continue to the next screen to write the real path.')
+      : 'The first lines tell Orchestra Bridge which server to use (and which certificate to expect); the last line is the secret. Keep the file name exactly, with no .txt at the end. Never put the secret in the agent’s folder, a commit or a command line.')));
 }
 
 // The "Save your secret" screen without a secret in hand: one line saying why, and the issue
@@ -1245,8 +1258,24 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     secret: () => [
       state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,
       state.secretValue
-        ? secretLinesBlock(payload, state.secretValue, state.os, state.noproxy)
+        ? secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge })
         : issueBlock(ctx, agent, payload, wizard),
+      hasCertificate && state.secretValue
+        ? h('label', { class: 'small', 'data-curl-cert-toggle': 'true' },
+            h('input', {
+              type: 'checkbox',
+              'data-include-cert': 'true',
+              checked: !state.bridge,
+              onchange: (event) => {
+                state.bridge = !event.target.checked;
+                if (state.bridge) state.runs = 'bridge';
+                else if (state.runs === 'bridge') state.runs = 'none';
+                persist();
+                render();
+              },
+            }),
+            ' Include certificate path (for curl / no-Bridge agents)')
+        : null,
       state.issued ? more(h('p', { class: 'small', 'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ') },
         'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.')) : null,
       state.issued ? olderCredentials(ctx, state.issued.agent, state.issued.credential && state.issued.credential.id) : null,

@@ -77,20 +77,59 @@ export function headerLine(secretValue = SECRET_PLACEHOLDER) {
   return `header = "Authorization: Bearer ${secretValue}"`;
 }
 
+// Extract the user's home/profile directory from an agent's recorded working directory so
+// credential files for curl / non-Bridge agents carry the real cacert path without asking the
+// person to replace <your-name> by hand (kittrial-5bb.524). Rejects control characters, quotes,
+// dot segments, and invalid Windows filename characters so nothing can inject a curl config line.
+export function userHomeFromWorkingDirectory(workingDirectory, { windows = false } = {}) {
+  if (typeof workingDirectory !== 'string') return null;
+  const trimmed = workingDirectory.trim();
+  if (!trimmed || /[\x00-\x1f\x7f"]/.test(trimmed)) return null;
+  if (windows) {
+    const match = /^([A-Za-z]:)[\\/](Users)[\\/]([^\\/]+)(?:[\\/]|$)/i.exec(trimmed);
+    if (!match) return null;
+    const user = match[3];
+    if (user === '.' || user === '..' || /[<>|?*]/.test(user)) return null;
+    return `${match[1]}/${match[2]}/${user}`;
+  }
+  const match = /^(\/(?:home|Users)\/([^/]+))(?:\/|$)/.exec(trimmed);
+  if (!match) return null;
+  const user = match[2];
+  if (user === '.' || user === '..') return null;
+  return match[1];
+}
+
 // The curl option lines for the service's own certificate. curl does NOT expand %USERPROFILE% or
 // ~ inside a config file: a literal placeholder answers rc 2 (file does not exist), and a
 // Windows path with backslashes also answers rc 2. The rewrite command writes these lines with
-// the real expanded path; the Notepad body below shows a full path the person types themselves
-// (kittrial-5bb.275 rev2). ssl-no-revoke is kept as a safe option for Windows curl.exe; once
-// cacert names the real file it was NOT needed on curl.exe 8.21 (Schannel) with a certificate
-// that has no revocation point -- it is not claimed as required.
-export function certificateCurlLines(certFile, { windows = false } = {}) {
+// the real expanded path; when `homeDir` is supplied (from the agent's working directory or a
+// shell expansion), that path is used directly with exact quoting; otherwise <your-name> is shown
+// (kittrial-5bb.275 rev2, kittrial-5bb.524). ssl-no-revoke is Windows-only.
+export function certificateCurlLines(certFile, { windows = false, homeDir = null } = {}) {
   if (!certFile) return [];
   const name = certFile.name;
+  const safeHome = typeof homeDir === 'string' && homeDir.trim() && !/[\x00-\x1f\x7f"]/.test(homeDir)
+    ? homeDir.trim() : null;
   if (windows) {
-    return [`cacert = "C:/Users/<your-name>/${name}"`, 'ssl-no-revoke'];
+    const base = safeHome ? safeHome.replace(/\\/g, '/').replace(/\/+$/, '') : 'C:/Users/<your-name>';
+    return [`cacert = "${base}/${name}"`, 'ssl-no-revoke'];
   }
-  return [`cacert = /home/<your-name>/${name}`];
+  const base = safeHome ? safeHome.replace(/\/+$/, '') : '/home/<your-name>';
+  const path = `${base}/${name}`;
+  return [/\s/.test(base) ? `cacert = "${path}"` : `cacert = ${path}`];
+}
+
+// Managed (non-secret) lines of the credential file, in exact order: server/fingerprint comments,
+// optional noproxy, optional certificate curl options. Shared by both credentialFileCommand()
+// (set-up rewrite) and credentialFileLines() (secret screen) so set-up and rotation have one
+// single source of truth (kittrial-5bb.524).
+export function credentialManagedLines(comments, { certFile = null, hasCertificate = false, noproxy = false, server = null, windows = false, homeDir = null } = {}) {
+  const lines = comments.slice();
+  if (noproxy) lines.push(noproxyLine(server));
+  if (hasCertificate && certFile) {
+    lines.push(...certificateCurlLines(certFile, { windows, homeDir }));
+  }
+  return lines;
 }
 
 // What the credential file holds, in order: when the service presents its own certificate, the
@@ -161,32 +200,28 @@ function powershellLiteral(text) {
   return text.replace(/`/g, '``').replace(/\$/g, '`$').replace(/"/g, '`"');
 }
 
+const PS_USER_PROFILE_SENTINEL = '__ORCHESTRA_PS_USERPROFILE__';
+
 export function credentialFileCommand(file, comments, { certFile = null, hasCertificate = false, noproxy = false, server = null } = {}) {
-  // POSIX rewrite: managed lines as printf arguments. `cacert = $HOME/...` is written so the
-  // shell expands $HOME; curl does not expand ~ or $HOME inside a config file.
-  const posixManaged = comments.slice();
-  if (noproxy) posixManaged.push(noproxyLine(server));
-  if (hasCertificate && certFile) {
-    posixManaged.push(`cacert = $HOME/${certFile.name}`);
-  }
+  // POSIX rewrite: managed lines built by credentialManagedLines with $HOME so the shell
+  // expands $HOME; curl does not expand ~ or $HOME inside a config file.
+  const posixManaged = credentialManagedLines(comments, { certFile, hasCertificate, noproxy, server, windows: false, homeDir: '$HOME' });
   const quoted = posixManaged.map((line) => (line.startsWith('cacert =')
     ? `"${line.replace(/"/g, '\\"')}"`
     : shQuote(line))).join(' ');
-  // PowerShell rewrite: the cacert line is built on the person's machine so the path is real,
-  // with forward slashes inside the quotes. Built with double-quoted PowerShell strings and
-  // backtick escapes only -- a single-quoted fragment that opens with '/...' never terminates
-  // (kittrial-5bb.275 rev3). ssl-no-revoke is included as a safe option for Windows curl.exe
-  // (not claimed as required once cacert names the real file).
-  const psParts = comments.map((line) => psQuote(line) + ' + "`r`n"');
-  if (noproxy) psParts.push(psQuote(noproxyLine(server)) + ' + "`r`n"');
-  if (hasCertificate && certFile) {
-    // Emits: "cacert = `"" + ([Environment]::GetFolderPath('UserProfile') -replace '\\','/') + "/NAME.crt`"`r`n"
-    // The string must CLOSE after the escaped quote: `" is the quote character inside the
-    // string, then " ends it (kittrial-5bb.275 rev4, one character).
-    psParts.push('"cacert = `"" + ([Environment]::GetFolderPath(\'UserProfile\') -replace \'\\\\\',\'/\') + "/'
-      + certFile.name + '`"`r`n"');
-    psParts.push('"ssl-no-revoke`r`n"');
-  }
+  // PowerShell rewrite: managed lines built by the same credentialManagedLines helper, substituting
+  // PowerShell's live UserProfile expression (forward slashes inside double quotes, backtick
+  // escapes only -- a single-quoted fragment that opens with '/...' never terminates;
+  // kittrial-5bb.275 rev3/rev4, kittrial-5bb.524).
+  const winManaged = credentialManagedLines(comments, { certFile, hasCertificate, noproxy, server, windows: true, homeDir: PS_USER_PROFILE_SENTINEL });
+  const psParts = winManaged.map((line) => {
+    if (line.includes(PS_USER_PROFILE_SENTINEL)) {
+      const [before, after] = line.split(PS_USER_PROFILE_SENTINEL);
+      return `"${powershellLiteral(before)}" + ([Environment]::GetFolderPath('UserProfile') -replace '\\\\','/') + "${powershellLiteral(after)}\`r\`n"`;
+    }
+    if (line === 'ssl-no-revoke') return '"ssl-no-revoke`r`n"';
+    return psQuote(line) + ' + "`r`n"';
+  });
   const psPrefix = psParts.join(' + ');
   const powershell = '& { $p="' + file.powershell + '"; if (-not (Test-Path $p)) { Write-Output \'Save the header line first, then run this again.\'; return }; $c=[IO.File]::ReadAllText($p); '
     + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_MANAGED_PATTERN + ",''); "
@@ -285,14 +320,19 @@ export function testCommands(payload) {
   });
 }
 
-// The lines the person pastes into the credential file on the "Save your secret" screen: the
-// comment lines the extension reads (the server address and, when the service has its own
-// certificate, its fingerprint), then the header line. With the address already in the file,
-// Orchestra Bridge 0.14's Set up proposes the server and checks the fingerprint itself, so the
-// short path needs no rewrite command (kittrial-5bb.348). `secretValue` is the fresh secret, passed
-// in by the one screen that shows it; every other caller gets the placeholder.
-export function credentialFileLines(server, fingerprint, secretValue = SECRET_PLACEHOLDER, { noproxy = false } = {}) {
-  return [...credentialCommentLines(server, fingerprint), ...(noproxy ? [noproxyLine(server)] : []), headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
+// The lines the person pastes into the credential file on the "Save your secret" screen: built
+// by the same credentialManagedLines() helper as credentialFileCommand() (server/fingerprint
+// comments, optional noproxy, and for curl/non-Bridge agents with a custom certificate, cacert
+// and Windows-only ssl-no-revoke; kittrial-5bb.524), followed by the header line. With the
+// address already in the file, Orchestra Bridge 0.14's Set up proposes the server and checks the
+// fingerprint itself, so the short Bridge path needs no rewrite command (kittrial-5bb.348).
+// `secretValue` is the fresh secret, passed in by the one screen that shows it; every other
+// caller gets the placeholder.
+export function credentialFileLines(server, fingerprint, secretValue = SECRET_PLACEHOLDER,
+  { noproxy = false, certFile = null, hasCertificate = false, windows = false, homeDir = null } = {}) {
+  const comments = credentialCommentLines(server, fingerprint);
+  const managed = credentialManagedLines(comments, { certFile, hasCertificate, noproxy, server, windows, homeDir });
+  return [...managed, headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
 }
 
 // kittrial-5bb.550 Part 2: long text goes in a file, never inside one long command line, for every agent. The
