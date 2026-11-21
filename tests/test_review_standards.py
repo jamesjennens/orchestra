@@ -294,13 +294,25 @@ def _make_child_spawning_slow_git(work_dir, pid_log_path, slow_subcmd='unbundle'
     if os.name == 'nt':
         wrapper = Path(work_dir) / 'fake-git.cmd'
         wrapper.write_text(
-            '@echo off\r\n"%s" "%s" %%*\r\n' % (sys.executable, str(helper_py)),
+            '@echo off\r\n'
+            'echo %%* | findstr /C:"%s" >nul\r\n'
+            'if not errorlevel 1 (\r\n'
+            '  "%s" "%s" %%*\r\n'
+            '  exit /b %%ERRORLEVEL%%\r\n'
+            ')\r\n'
+            '"%s" %%*\r\n' % (slow_subcmd, sys.executable, str(helper_py), real_git),
             encoding='utf-8',
         )
     else:
         wrapper = Path(work_dir) / 'fake-git'
         wrapper.write_text(
-            '#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, str(helper_py)),
+            '#!/bin/sh\n'
+            'for a in "$@"; do\n'
+            '  if [ "$a" = "%s" ]; then\n'
+            '    exec "%s" "%s" "$@"\n'
+            '  fi\n'
+            'done\n'
+            'exec "%s" "$@"\n' % (slow_subcmd, sys.executable, str(helper_py), real_git),
             encoding='utf-8',
         )
         os.chmod(str(wrapper), 0o755)
@@ -4065,11 +4077,12 @@ class PortableReviewStandardsUnitTests(unittest.TestCase):
                         delivery_roots=[str(bpath.parent)],
                         needed_paths=['app.py'],
                         lock_dir=self.base,
-                        max_inspect_seconds=0.35,
+                        max_inspect_seconds=1.0,
                     )
-                    self.assertLess(time.monotonic() - t0, 2.5)
+                    self.assertLess(time.monotonic() - t0, 4.0)
                     self.assertTrue(to_obs['inspect_timed_out'])
                     self.assertFalse(to_obs['tree_available'])
+            self.assertTrue(pid_log.exists(), 'slow git unbundle never spawned a child helper')
             spawned = [int(x) for x in pid_log.read_text(encoding='utf-8').splitlines() if x.strip()]
             self.assertEqual(3, len(spawned), spawned)
             for cpid in spawned:
@@ -4587,6 +4600,193 @@ class PortableReviewStandardsUnitTests(unittest.TestCase):
                 standing_recommendations=[],
             )
             self.assertEqual(2, spy_scan2.call_count)
+
+    def test_portable_r7_waivers_fault_stat_paths_and_x07_to_x11_pins(self):
+        """Pin s2e-stat-paths (_lstat_or_none), n5e-waivers-fault (warn+block+brief), and n4e X07-X11."""
+        import errno as _errno
+        proj_dir = self.base / 'proj-r7'
+        proj_dir.mkdir(exist_ok=True)
+        hstore = rs.HostStandardsStore(proj_dir, 'proj-r7')
+        rs.put_register(
+            hstore,
+            {'expected_version': 0, 'reason': 'r7 pin register', 'rules': [_sample_rule('STD-7', severity='must')]},
+            actor='person:alice',
+            author_person='person:alice',
+            is_person_session=True,
+            is_coordinator_or_owner=True,
+        )
+        commit_r7 = 'a' * 40
+        root_str = str(proj_dir)
+
+        # X09: _safe_store_exception_reason OSError branch (exact path-free text)
+        self.assertEqual(
+            'waivers: permission denied',
+            rs._safe_store_exception_reason(
+                PermissionError(_errno.EACCES, 'Permission denied', '/abs/secret/host/path/waivers'),
+                'waivers',
+            ),
+        )
+
+        # POSIX permission pins (s2e _lstat_or_none 0o600, n5e waivers/, X07, X08, X10, X11)
+        if os.name == 'posix' and os.geteuid() != 0:
+            # 1) s2e _lstat_or_none on 0o600 directory -> StandardsDamagedError with relative label, no host path
+            std_root = hstore.root
+            commits_dir = std_root / 'commits'
+            commits_dir.mkdir(exist_ok=True)
+            (commits_dir / ('%s.json' % commit_r7)).write_text('{}', encoding='utf-8')
+            os.chmod(str(commits_dir), 0o600)
+            try:
+                with self.assertRaises(rs.StandardsDamagedError) as ctx_stat:
+                    rs._lstat_or_none(commits_dir / ('%s.json' % commit_r7))
+                self.assertEqual(
+                    'commits/%s.json cannot be stat-checked: permission denied' % commit_r7,
+                    str(ctx_stat.exception),
+                )
+                self.assertNotIn(root_str, str(ctx_stat.exception))
+            finally:
+                os.chmod(str(commits_dir), 0o755)
+
+            # 2) X10 + n5e-waivers-fault: waivers/ at 0o300
+            waivers_dir = std_root / 'waivers'
+            waivers_dir.mkdir(exist_ok=True)
+            os.chmod(str(waivers_dir), 0o300)
+            try:
+                # X10 exact message
+                with self.assertRaises(rs.StandardsDamagedError) as ctx_x10:
+                    rs._list_regular_names(waivers_dir, 'waivers')
+                self.assertEqual('cannot scan waivers: permission denied', str(ctx_x10.exception))
+                self.assertNotIn(root_str, str(ctx_x10.exception))
+
+                # n5e: warn-mode approve lands and records fault in would_have_refused
+                rs.set_gate_mode(hstore, 'warn', actor='person:alice', author_person='person:alice',
+                                 reason='warn for n5e', is_person_session=True, is_coordinator_or_owner=True)
+                so_warn = rs.evaluate_approval_signoff(
+                    hstore,
+                    task_id='task-n5e',
+                    issue={'id': 'task-n5e', 'issue_type': 'task', 'labels': [], 'comments': []},
+                    contribution={'comment_id': 'cid-n5e', 'commit': commit_r7, 'author': 'worker-bob'},
+                    operation_id='op-n5e-warn',
+                    actor='cora-op',
+                    extracted_fields={},
+                    valid_item_ids=set(),
+                    standing_recommendations=[],
+                )
+                self.assertTrue(
+                    any('unreadable_waivers: cannot scan waivers: permission denied' in w
+                        for w in so_warn['would_have_refused']),
+                    so_warn['would_have_refused'],
+                )
+                self.assertNotIn(root_str, json.dumps(so_warn))
+
+                # n5e: block-mode approve -> 503 retryable path-free
+                rs.set_gate_mode(hstore, 'block', actor='person:alice', author_person='person:alice',
+                                 reason='block for n5e', is_person_session=True, is_coordinator_or_owner=True)
+                with self.assertRaises(rs.StandardsRefusal) as ctx_blk:
+                    rs.evaluate_approval_signoff(
+                        hstore,
+                        task_id='task-n5e',
+                        issue={'id': 'task-n5e', 'issue_type': 'task', 'labels': [], 'comments': []},
+                        contribution={'comment_id': 'cid-n5e', 'commit': commit_r7, 'author': 'worker-bob'},
+                        operation_id='op-n5e-block',
+                        actor='cora-op',
+                        extracted_fields={},
+                        valid_item_ids=set(),
+                        standing_recommendations=[],
+                    )
+                self.assertEqual(503, ctx_blk.exception.status)
+                self.assertIn('cannot scan waivers: permission denied', str(ctx_blk.exception))
+                self.assertNotIn(root_str, str(ctx_blk.exception))
+
+                # n5e: brief_standards_block -> 503 retryable path-free
+                with self.assertRaises(rs.StandardsRefusal) as ctx_brief:
+                    rs.brief_standards_block(
+                        hstore,
+                        {'id': 'task-n5e', 'issue_type': 'task', 'labels': [], 'comments': []},
+                        {'contribution': {'comment_id': 'cid-n5e', 'commit': commit_r7, 'author': 'worker-bob'},
+                         'review_state': 'awaiting-review'},
+                    )
+                self.assertEqual(503, ctx_brief.exception.status)
+                self.assertIn('cannot scan waivers: permission denied', str(ctx_brief.exception))
+                self.assertNotIn(root_str, str(ctx_brief.exception))
+
+                # n5e: list_waivers_view -> 503 retryable path-free
+                with self.assertRaises(rs.StandardsRefusal) as ctx_lv:
+                    rs.list_waivers_view(hstore, 'task-n5e')
+                self.assertEqual(503, ctx_lv.exception.status)
+                self.assertNotIn(root_str, str(ctx_lv.exception))
+            finally:
+                os.chmod(str(waivers_dir), 0o755)
+
+            # 3) X11: read_notifications exact path-free message on unreadable notifications.jsonl
+            notif_path = std_root / 'notifications.jsonl'
+            notif_path.write_text('{"kind":"note"}\n', encoding='utf-8')
+            os.chmod(str(notif_path), 0o000)
+            try:
+                with self.assertRaises(rs.StandardsDamagedError) as ctx_x11:
+                    hstore.read_notifications()
+                self.assertEqual('notifications.jsonl cannot be read: permission denied', str(ctx_x11.exception))
+                self.assertNotIn(root_str, str(ctx_x11.exception))
+            finally:
+                os.chmod(str(notif_path), 0o644)
+
+            # 4) X07 + X08: reconcile_or_clean_staged keeps unreadable landed copies past 24h
+            so_dir = std_root / 'signoffs'
+            so_dir.mkdir(exist_ok=True)
+            old_mtime = time.time() - (26 * 3600)
+            # X07: two tasks reuse the same operation_id 'op-shared-x07'; task 1 has hashed staged name (contains '.')
+            cid1_x07, cid2_x07, shared_op = 'cid.one.x07', 'cid.two.x07', 'op-shared-x07'
+            hashed_name = rs._signoff_staged_filename(cid1_x07, shared_op)
+            self.assertIn('_sha256-', hashed_name)
+            p_x07 = so_dir / hashed_name
+            p_x07.write_text('{"status":"staged"}', encoding='utf-8')
+            os.utime(str(p_x07), (old_mtime, old_mtime))
+            os.chmod(str(p_x07), 0o000)
+            # X08: plain-named unreadable staged copy for a landed approval
+            cid_x08, op_x08 = 'cid-x08', 'op-x08'
+            plain_name = rs._signoff_staged_filename(cid_x08, op_x08)
+            self.assertNotIn('_sha256-', plain_name)
+            p_x08 = so_dir / plain_name
+            p_x08.write_text('{"status":"staged"}', encoding='utf-8')
+            os.utime(str(p_x08), (old_mtime, old_mtime))
+            os.chmod(str(p_x08), 0o000)
+
+            rows_x = [
+                {
+                    'id': 'task-x07-1',
+                    'comments': [
+                        {'id': 'app-x07-1', 'text': 'Kind: contribution-review-v1\n' + json.dumps({
+                            'schema_version': 1, 'operation': 'approve', 'operation_id': shared_op,
+                            'task': 'task-x07-1', 'contribution': cid1_x07, 'previous': None, 'summary': 'ok',
+                        })},
+                    ],
+                },
+                {
+                    'id': 'task-x07-2',
+                    'comments': [
+                        {'id': 'app-x07-2', 'text': 'Kind: contribution-review-v1\n' + json.dumps({
+                            'schema_version': 1, 'operation': 'approve', 'operation_id': shared_op,
+                            'task': 'task-x07-2', 'contribution': cid2_x07, 'previous': None, 'summary': 'ok',
+                        })},
+                    ],
+                },
+                {
+                    'id': 'task-x08',
+                    'comments': [
+                        {'id': 'app-x08', 'text': 'Kind: contribution-review-v1\n' + json.dumps({
+                            'schema_version': 1, 'operation': 'approve', 'operation_id': op_x08,
+                            'task': 'task-x08', 'contribution': cid_x08, 'previous': None, 'summary': 'ok',
+                        })},
+                    ],
+                },
+            ]
+            try:
+                hstore.reconcile_or_clean_staged(rows_x)
+                self.assertTrue(p_x07.exists(), 'X07: unreadable hashed landed copy must be kept across reused op_id')
+                self.assertTrue(p_x08.exists(), 'X08: unreadable plain landed copy must be kept past 24h')
+            finally:
+                for p in (p_x07, p_x08):
+                    if p.exists():
+                        os.chmod(str(p), 0o644)
 
 
 if __name__ == '__main__':

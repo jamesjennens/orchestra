@@ -557,6 +557,13 @@ def _lstat_or_none(path):
         return os.lstat(str(path))
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        # Never let a stat error carry the host path (s2d/s2e).
+        parts = Path(str(path)).parts
+        label = '/'.join(parts[parts.index('.standards') + 1:]) if '.standards' in parts else (parts[-1] if parts else '.standards')
+        raise StandardsDamagedError(
+            '%s cannot be stat-checked: %s' % (label or '.standards', _os_error_reason(exc))
+        ) from exc
 
 
 def _require_real_dir(path, label):
@@ -3488,7 +3495,15 @@ def list_waivers_view(store, task_id, current_contribution=None, now=None):
     cid = (current_contribution or {}).get('comment_id')
     commit = (current_contribution or {}).get('commit')
     items = []
-    for w in store.list_waivers(task_id=task_id):
+    try:
+        waivers_list = store.list_waivers(task_id=task_id)
+    except (StandardsDamagedError, OSError) as exc:
+        reason = _safe_store_exception_reason(exc, 'waivers')
+        raise StandardsRefusal(
+            'Standards waivers store is unreadable (%s); retry once the store is repaired.' % reason,
+            status=503,
+        ) from exc
+    for w in waivers_list:
         wcopy = dict(w)
         if cid and commit:
             st, detail = evaluate_waiver_status(w, cid, commit, today_str)
@@ -5590,7 +5605,19 @@ def evaluate_approval_signoff(
     today_str = utc_today_str(now)
     active_waivers_by_rule = {}
     expired_waivers = []
-    for w in store.list_waivers(task_id=task_id):
+    waivers_fault = None
+    try:
+        waivers_list = store.list_waivers(task_id=task_id)
+    except (StandardsDamagedError, OSError) as exc:
+        reason = _safe_store_exception_reason(exc, 'waivers')
+        if gate['mode'] == 'block':
+            raise StandardsRefusal(
+                'Standards waivers store is unreadable (%s); retry once the store is repaired.' % reason,
+                status=503,
+            ) from exc
+        waivers_fault = 'unreadable_waivers: %s' % reason
+        waivers_list = []
+    for w in waivers_list:
         wst, wdetail = evaluate_waiver_status(w, cid, commit, today_str)
         if wst == 'active':
             active_waivers_by_rule[w['rule_id']] = w
@@ -5707,6 +5734,9 @@ def evaluate_approval_signoff(
     tally_actor = recommended_by_actor or actor
 
     ts = utc_now_iso(now)
+    warn_would_have_refused = list(unresolved_must)
+    if waivers_fault is not None:
+        warn_would_have_refused.append(waivers_fault)
     staged_signoff = {
         'schema_version': SCHEMA_VERSION,
         'status': 'staged',
@@ -5725,7 +5755,7 @@ def evaluate_approval_signoff(
         'shared_version': reg.get('shared_version'),
         'gate_mode': gate['mode'],
         'gate_source': gate['source'],
-        'would_have_refused': unresolved_must if gate['mode'] == 'warn' else [],
+        'would_have_refused': warn_would_have_refused if gate['mode'] == 'warn' else [],
         'diff_status': diff_status,
         'diff_recorded_by': diff_recorded_by,
         'git_inspection_timed_out': bool(git_timed_out),
@@ -6483,9 +6513,17 @@ def brief_standards_block(
     if isinstance(contribution, dict) and (contribution.get('comment_id') or contribution.get('id')):
         cid = str(contribution.get('comment_id') or contribution.get('id'))
         today_str = utc_today_str(now)
+        try:
+            task_waivers = store.list_waivers(task_id=str(issue.get('id') or ''))
+        except (StandardsDamagedError, OSError) as exc:
+            reason = _safe_store_exception_reason(exc, 'waivers')
+            raise StandardsRefusal(
+                'Standards waivers store is unreadable (%s); retry once the store is repaired.' % reason,
+                status=503,
+            ) from exc
         active_waiver_ids = [
             w['rule_id']
-            for w in store.list_waivers(task_id=str(issue.get('id') or ''))
+            for w in task_waivers
             if evaluate_waiver_status(w, cid, commit, today_str)[0] == 'active'
         ]
         required_checks = []

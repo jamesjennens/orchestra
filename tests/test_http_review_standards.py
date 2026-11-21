@@ -2209,7 +2209,7 @@ class _HttpStandardsMixin:
         spawned_pids = []
         try:
             with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
-                 mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 0.35):
+                 mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 1.0):
                 r_warn = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
                     'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-warn-ok',
                     'previous': prev1, 'contribution': cid1,
@@ -2225,6 +2225,7 @@ class _HttpStandardsMixin:
                 ],
                 r_warn.data['sign_off']['would_have_refused'],
             )
+            self.assertTrue(pid_log.exists(), 'slow git unbundle never spawned a child helper')
             spawned_pids = [int(x) for x in pid_log.read_text(encoding='utf-8').splitlines() if x.strip()]
             self.assertGreaterEqual(len(spawned_pids), 1)
             for cpid in spawned_pids:
@@ -2250,7 +2251,7 @@ class _HttpStandardsMixin:
         spawned_pids2 = []
         try:
             with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
-                 mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 0.35):
+                 mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 1.0):
                 r_blk_missing = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
                     'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-blk-missing',
                     'previous': prev2, 'contribution': cid2, 'summary': 'Missing checks under timeout.',
@@ -2267,6 +2268,7 @@ class _HttpStandardsMixin:
                 }, token=oscar_tok, headers={'Idempotency-Key': 'idem-r6-blk-cite-retry'})
                 self.assertEqual(503, r_blk_cite.status, r_blk_cite.data)
                 self.assertIn(rs.refusal_git_inspection_timeout(commit2), r_blk_cite.data['error']['message'])
+            self.assertTrue(pid_log.exists(), 'slow git unbundle never spawned a child helper')
             spawned_pids2 = [int(x) for x in pid_log.read_text(encoding='utf-8').splitlines() if x.strip()]
             for cpid in spawned_pids2:
                 self.assertTrue(_wait_pid_dead(cpid, timeout=1.5))
@@ -2677,6 +2679,8 @@ const ctxWithReg = {
 };
 
 const taskDom = await taskView.detail(ctxWithReg, { pid: 'p1', tid: 't-1' });
+const earlierNode = taskDom.all((e) => e.attributes && e.attributes['data-earlier-signoff-op'] === 'op-prev-1')[0];
+const earlierChips = earlierNode ? earlierNode.all((e) => e.tagName === 'SPAN' && String(e.className || e.attributes.class || '').includes('chip')).map((c) => c.textContent) : [];
 const timeoutCard = taskView.signOffCard(ctxWithReg, 'p1', 't-1', {
   contribution_id: 'con_to',
   register_version: 1,
@@ -2731,13 +2735,15 @@ const ctxLint = {
 const stdDom = await stdView.page(ctxLint, { pid: 'p1' });
 const stdText = stdDom.textContent;
 
-console.log(JSON.stringify({ signOffCallsWithReg, signOffCallsNoReg, taskText, stdText }));
+console.log(JSON.stringify({ signOffCallsWithReg, signOffCallsNoReg, taskText, stdText, earlierChips }));
 """
         done = run_node_module(self, node, script, shim_uri, standards_uri, task_uri)
         self.assertEqual(0, done.returncode, done.stderr)
         out = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual(1, out['signOffCallsWithReg'])
         self.assertEqual(0, out['signOffCallsNoReg'])
+        # X12: assert the 'git inspection timed out' chip specifically on the earlier approval card.
+        self.assertIn('git inspection timed out', out['earlierChips'])
         for expected in (
             'Checked against standards register v1',
             'Approver: usr_olga',
@@ -2760,6 +2766,176 @@ console.log(JSON.stringify({ signOffCallsWithReg, signOffCallsNoReg, taskText, s
             self.assertIn(expected, out['taskText'])
         self.assertIn('Register defines 6 all_changes must rules (limit 5).', out['stdText'])
         self.assertNotIn('[object Object]', out['stdText'])
+
+
+class RealEndpointBdStandardsR7Tests(unittest.TestCase):
+    """Real endpoint.py subprocess + real bd pins for s2e-stat-paths (0o600), n5e-waivers-fault, and n6e-project-get."""
+
+    def test_checked_oserror_net_never_leaks_host_path(self):
+        secret_path = '/srv/secret/installation/projects/pp/.standards/gate.json'
+        reply = {
+            'returncode': 2,
+            'stdout': '',
+            'stderr': "PermissionError: [Errno 13] Permission denied: '%s'\n" % secret_path,
+        }
+        with self.assertRaises(http_service.HttpError) as ctx:
+            http_service.EndpointBackend._checked(reply, 'web-standards', reading=True)
+        self.assertEqual('filesystem error: permission denied', ctx.exception.detail)
+        self.assertNotIn(secret_path, str(ctx.exception.detail))
+        self.assertNotIn(secret_path, str(ctx.exception.message))
+
+    def test_real_endpoint_bd_0600_stat_paths_waivers_fault_and_project_get(self):
+        if os.name != 'posix' or os.geteuid() == 0:
+            self.skipTest('POSIX non-root chmod test')
+        import test_claim_held as held
+        import test_http_review_fixes as fixes
+        import test_bd_label_aliases as rb
+
+        class _RealStack(held.Members, fixes.Harness, rb.RealBdLabelAliasTests):
+            _stop_server = rb.RealBdLabelAliasTests._stop_server
+
+            def make_backend(self):
+                return http_service.EndpointBackend(
+                    sys.executable, str(Path(__file__).resolve().parents[1] / 'endpoint.py'), str(self.root), service=self.service
+                )
+
+            def runTest(self):
+                pass
+
+        try:
+            _RealStack.setUpClass()
+        except unittest.SkipTest as exc:
+            self.skipTest(str(exc))
+        inst = _RealStack()
+        try:
+            fixes.Harness.setUp(inst)
+            admin_tok = inst.admin_token()
+            reg = inst.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'}, token=admin_tok)
+            self.assertIn(reg.status, (200, 201, 409), reg.data)
+            inst.members('pp')
+            owner_tok = inst.tokens['alex']
+            contrib_tok = inst.tokens['casey']
+            self.assertEqual(200, inst.request('PUT', '/v1/projects/pp/members/%s' % inst.ids['drew'],
+                                               {'role': 'coordinator'}, token=owner_tok).status)
+            coord_tok = inst.tokens['drew']
+
+            # Publish a v1 register + create a task + contribute a delivery so all routes exercise .standards/.
+            pub = inst.request('PUT', '/v1/projects/pp/standards', {
+                'expected_version': 0,
+                'rules': [{
+                    'id': 'STD-1', 'owner': inst.ids['alex'], 'severity': 'must',
+                    'statement': 'Check bounds.', 'rationale': 'Safety.',
+                    'applicability': {'all_changes': True},
+                    'check': {'kind': 'judgement'},
+                }],
+                'reason': 'r7 real-stack register',
+            }, token=owner_tok)
+            self.assertIn(pub.status, (200, 201), pub.data)
+
+            created = inst.request('POST', '/v1/projects/pp/tasks', {'title': 'Real stack r7 task'}, token=owner_tok)
+            self.assertIn(created.status, (200, 201), created.data)
+            tid = created.data['id']
+            cl = inst.request('POST', '/v1/projects/pp/tasks/%s/claim' % tid, {}, token=contrib_tok)
+            self.assertEqual(200, cl.status, cl.data)
+            commit_sha = 'c' * 40
+            c_resp = inst.request('POST', '/v1/projects/pp/tasks/%s/reviews' % tid, {
+                'schema_version': 1, 'operation': 'contribute', 'operation_id': 'op-r7-contrib-1',
+                'previous': None, 'supersedes': None, 'repository': 'repo',
+                'base_commit': 'b' * 40, 'commit': commit_sha,
+                'delivery': {'kind': 'remote', 'remote': 'origin', 'branch': 'main'},
+                'summary': 'Deliver real-stack task.',
+            }, token=contrib_tok, headers={'Idempotency-Key': 'idem-r7-c1'})
+            self.assertEqual(201, c_resp.status, c_resp.data)
+            cid = c_resp.data['comment_id']
+
+            std_dir = inst.root / 'projects' / 'pp' / '.standards'
+            commits_dir = std_dir / 'commits'
+            signoffs_dir = std_dir / 'signoffs'
+            waivers_dir = std_dir / 'waivers'
+            commits_dir.mkdir(exist_ok=True)
+            signoffs_dir.mkdir(exist_ok=True)
+            waivers_dir.mkdir(exist_ok=True)
+            root_str = str(inst.root)
+
+            # 1) s2e-stat-paths + n6e-project-get: .standards/ at 0o600
+            os.chmod(str(std_dir), 0o600)
+            try:
+                r_proj = inst.request('GET', '/v1/projects/pp', token=contrib_tok)
+                self.assertEqual(200, r_proj.status, r_proj.data)
+                self.assertEqual('unavailable', r_proj.data['standards_gate']['mode'])
+                self.assertNotIn(root_str, json.dumps(r_proj.data))
+                for path in (
+                    '/v1/projects/pp/standards',
+                    '/v1/projects/pp/standards/versions',
+                    '/v1/projects/pp/standards/commits/%s' % commit_sha,
+                    '/v1/projects/pp/tasks/%s/waivers' % tid,
+                    '/v1/projects/pp/tasks/%s/sign-off' % tid,
+                    '/v1/projects/pp/tasks/%s/sign-off.md' % tid,
+                ):
+                    resp = inst.request('GET', path, token=contrib_tok)
+                    body_text = resp.body.decode('utf-8', errors='replace')
+                    self.assertNotIn(root_str, body_text, 'Host path leaked on %s: %s' % (path, body_text))
+            finally:
+                os.chmod(str(std_dir), 0o755)
+
+            # 2) s2e-stat-paths: .standards/commits/ at 0o600 and .standards/signoffs/ at 0o600
+            os.chmod(str(commits_dir), 0o600)
+            try:
+                r_cm = inst.request('GET', '/v1/projects/pp/standards/commits/%s' % commit_sha, token=contrib_tok)
+                self.assertNotIn(root_str, r_cm.body.decode('utf-8', errors='replace'))
+            finally:
+                os.chmod(str(commits_dir), 0o755)
+
+            os.chmod(str(signoffs_dir), 0o600)
+            try:
+                for p in ('/v1/projects/pp/tasks/%s/sign-off' % tid, '/v1/projects/pp/tasks/%s/sign-off.md' % tid):
+                    r_so = inst.request('GET', p, token=contrib_tok)
+                    self.assertNotIn(root_str, r_so.body.decode('utf-8', errors='replace'))
+            finally:
+                os.chmod(str(signoffs_dir), 0o755)
+
+            # 3) n5e-waivers-fault: waivers/ at 0o300 on real endpoint.py + bd
+            os.chmod(str(waivers_dir), 0o300)
+            try:
+                # Brief -> 503 retryable, path-free
+                r_brief = inst.request('GET', '/v1/projects/pp/tasks/%s/brief' % tid, token=contrib_tok)
+                self.assertEqual(503, r_brief.status, r_brief.data)
+                self.assertNotIn(root_str, json.dumps(r_brief.data))
+
+                # GET waivers -> 503 retryable, path-free
+                r_waiv = inst.request('GET', '/v1/projects/pp/tasks/%s/waivers' % tid, token=contrib_tok)
+                self.assertEqual(503, r_waiv.status, r_waiv.data)
+                self.assertNotIn(root_str, json.dumps(r_waiv.data))
+
+                # Warn-mode approve -> 201 and records unreadable_waivers fault in sign-off
+                r_app_warn = inst.request('POST', '/v1/projects/pp/tasks/%s/reviews' % tid, {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r7-app-warn',
+                    'previous': cid, 'contribution': cid, 'summary': 'Warn approve with unreadable waivers.',
+                }, token=coord_tok, headers={'Idempotency-Key': 'idem-r7-app-warn'})
+                self.assertEqual(201, r_app_warn.status, r_app_warn.data)
+                self.assertTrue(
+                    any('unreadable_waivers:' in w for w in r_app_warn.data['sign_off']['would_have_refused']),
+                    r_app_warn.data['sign_off']['would_have_refused'],
+                )
+                self.assertNotIn(root_str, json.dumps(r_app_warn.data))
+
+                # Block-mode approve -> 503 retryable, path-free
+                self.assertEqual(200, inst.request('PUT', '/v1/projects/pp/standards/gate', {
+                    'mode': 'block', 'reason': 'Block for n5e',
+                }, token=owner_tok).status)
+                r_app_blk = inst.request('POST', '/v1/projects/pp/tasks/%s/reviews' % tid, {
+                    'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r7-app-blk',
+                    'previous': r_app_warn.data['comment_id'], 'contribution': cid,
+                    'summary': 'Block approve with unreadable waivers.',
+                }, token=owner_tok, headers={'Idempotency-Key': 'idem-r7-app-blk'})
+                self.assertEqual(503, r_app_blk.status, r_app_blk.data)
+                self.assertNotIn(root_str, json.dumps(r_app_blk.data))
+            finally:
+                os.chmod(str(waivers_dir), 0o755)
+        finally:
+            inst.doCleanups()
+            _RealStack.tearDownClass()
+
 
 
 if __name__ == '__main__':

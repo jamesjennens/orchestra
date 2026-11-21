@@ -1257,9 +1257,17 @@ class InProcessBackend:
         import review_standards
         with self.service.store.lock:
             store = self._standards_store(project_id, writable=False)
-            if store.inspect_register_raw()[0] == 'none':
-                return None
-            return review_standards.get_gate_view(store)
+            try:
+                if store.inspect_register_raw()[0] == 'none':
+                    return None
+                return review_standards.get_gate_view(store)
+            except (review_standards.StandardsDamagedError, OSError) as exc:
+                return {
+                    'mode': 'unavailable',
+                    'source': 'unavailable',
+                    'status': 'unavailable',
+                    'error': review_standards._safe_store_exception_reason(exc, '.standards'),
+                }
 
     def standards_read(self, project_id, principal, version=None):
         import review_standards
@@ -2647,15 +2655,18 @@ class InProcessBackend:
             _, active_person, same_party_pair = review_standards._build_state_person_helpers(
                 self.service.state, project_id
             )
-            std_block = review_standards.brief_standards_block(
-                std_ro,
-                self._standards_issue_view(task),
-                review_block,
-                full=False,
-                active_person_checker=active_person,
-                same_party_pair=same_party_pair,
-                now=self.service._now(),
-            )
+            try:
+                std_block = review_standards.brief_standards_block(
+                    std_ro,
+                    self._standards_issue_view(task),
+                    review_block,
+                    full=False,
+                    active_person_checker=active_person,
+                    same_party_pair=same_party_pair,
+                    now=self.service._now(),
+                )
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
             if std_block is not None:
                 std_extra['standards'] = std_block
         return {**description, 'task': dict(task), 'checkpoint': checkpoint, 'review': review_block,
@@ -3857,6 +3868,7 @@ class EndpointBackend:
         if code:
             said = stderr.strip().split('\n')[-1] if stderr.strip() else None
             detail = said[:cls._detail_limit(action, said, reply.get('refused'))] if said else None
+            detail = cls._sanitize_os_error_detail(action, said, detail)
             if code == 2:
                 if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str):
                     std_status = reply.get('standards_status')
@@ -3980,6 +3992,32 @@ class EndpointBackend:
         said = (stderr or '').strip().split('\n')
         print('busy: the endpoint answered return code 75 for %s: %s'
               % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
+
+    _OS_ERROR_LINE_RE = re.compile(
+        r'^(?:[A-Za-z_]*OSError|PermissionError|FileNotFoundError|FileExistsError|'
+        r'IsADirectoryError|NotADirectoryError|BlockingIOError|ChildProcessError|'
+        r'BrokenPipeError|ConnectionError|TimeoutError|IOError):\s*(.*)$'
+    )
+
+    @classmethod
+    def _sanitize_os_error_detail(cls, action, said, detail):
+        """Never forward an OSError line (which may carry a host path) to HTTP clients; log it for the operator."""
+        if not isinstance(said, str) or not said:
+            return detail
+        if not cls._OS_ERROR_LINE_RE.match(said) and '[Errno ' not in said:
+            return detail
+        print('os-error: the endpoint answered with an OS error for %s: %s'
+              % (action or 'a request', ascii(said[:400])), file=sys.stderr, flush=True)
+        low = said.lower()
+        if 'permission denied' in low or 'permissionerror' in low or 'errno 13' in low or 'errno 1]' in low:
+            return 'filesystem error: permission denied'
+        if 'no such file' in low or 'filenotfounderror' in low or 'errno 2]' in low:
+            return 'filesystem error: file not found'
+        if 'is a directory' in low or 'isadirectoryerror' in low:
+            return 'filesystem error: is a directory'
+        if 'not a directory' in low or 'notadirectoryerror' in low:
+            return 'filesystem error: not a directory'
+        return 'filesystem error'
 
     def _settle_actor_rows(self, principal, project_id):
         """Judge an unmarked credential's name by the tracker once and keep the outcome.
@@ -5447,9 +5485,17 @@ class EndpointBackend:
         if not project.is_dir():
             return None
         store = review_standards.HostStandardsStore(project, project_id)
-        if store.inspect_register_raw()[0] == 'none':
-            return None
-        return review_standards.get_gate_view(store)
+        try:
+            if store.inspect_register_raw()[0] == 'none':
+                return None
+            return review_standards.get_gate_view(store)
+        except (review_standards.StandardsDamagedError, OSError) as exc:
+            return {
+                'mode': 'unavailable',
+                'source': 'unavailable',
+                'status': 'unavailable',
+                'error': review_standards._safe_store_exception_reason(exc, '.standards'),
+            }
 
     def standards_read(self, project_id, principal, version=None):
         body = {'operation': 'read'}
