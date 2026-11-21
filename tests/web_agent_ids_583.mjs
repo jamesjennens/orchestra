@@ -90,7 +90,7 @@ function hasHideNarrowAncestor(node) {
 
 function collectIdChips(root) {
   return root.all((e) => e.attributes && e.attributes['data-id-chip']).map((chip) => {
-    const code = chip.all((e) => e.tagName === 'CODE' && e.attributes['data-copyable-id'])[0];
+    const code = chip.all((e) => (e.tagName === 'CODE' && e.attributes['data-copyable-id']) || (e.tagName === 'SPAN' && /\bmono\b/.test(String(e.className || (e.attributes && e.attributes.class) || ''))))[0];
     const btn = chip.all((e) => e.tagName === 'BUTTON' && e.attributes['data-copy-id'])[0];
     return {
       id: chip.attributes['data-id-chip'],
@@ -227,6 +227,49 @@ out.lanes = {
     cleared: await runFilter(lanesFilter, '', laneRows),
   } : null,
 };
+
+// --- 4b. Account (usr_...) lanes stay free of usr_ text (kittrial-5bb.504 + .583 r2) ---
+const usrLaneCtx = {
+  ...ownerCtx,
+  api: createApi(async (method, path, headers, body) => {
+    if (path.startsWith(`/v1/projects/${pidA}/lanes`)) {
+      return {
+        status: 200,
+        data: {
+          scope: 'all',
+          scope_basis: 'project-role',
+          scope_role: 'owner',
+          can_nudge: false,
+          items: [
+            { lane: ownerId, actor: ownerId, display_name: 'Olive', idle: true, held: [], last_write_age_seconds: 12 },
+            { lane: 'usr_deadbeef00001111', actor: 'usr_deadbeef00001111', display_name: '', idle: true, held: [], last_write_age_seconds: 34 },
+            { lane: agentAId, actor: agentAId, display_name: 'Osprey', idle: true, held: [], last_write_age_seconds: 56 },
+          ],
+          total: 3,
+          next_offset: null,
+        },
+      };
+    }
+    const response = await fetch(base + path, { method, headers: { ...headers, Authorization: 'Bearer ' + ownerToken }, body });
+    const text = await response.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+    return { status: response.status, data };
+  }),
+};
+const usrLanesPage = await projectView.lanesPage(usrLaneCtx, { pid: pidA });
+await settle();
+const usrLaneBlocks = usrLanesPage.all((e) => e.tagName === 'DIV' && e.attributes['data-lane']).map((blk) => {
+  const strong = blk.all((e) => e.tagName === 'STRONG')[0];
+  return {
+    lane: blk.attributes['data-lane'],
+    text: blk.textContent,
+    strongText: strong ? strong.textContent : '',
+    strongTitle: strong ? (strong.attributes.title || null) : null,
+    chips: collectIdChips(blk),
+  };
+});
+out.usrLanes = { blocks: usrLaneBlocks };
 
 // --- 5. Invite list (/p/{pidA}/people invitePanel) + inviteSetupBlock ---
 const invPanel = invitesView.invitePanel(ownerCtx, { id: pidA, name: 'Alpha', archived: false });

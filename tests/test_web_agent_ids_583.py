@@ -200,7 +200,11 @@ class AgentIds583Tests(unittest.TestCase):
         self.assertTrue(any(aid in row for row in aus['fullId']), aus)
         self.assertTrue(any(aid in row for row in aus['noPrefix']), aus)
         self.assertTrue(any(aid in row for row in aus['hex4']), aus)
-        self.assertFalse(any(aid in row for row in aus['hex2']), aus)
+        # 2-char hex never matches by id (only if those 2 letters occur in non-id text such as 'created').
+        hex2 = aid.split('_', 1)[1][:2].lower()
+        for row in aus['hex2']:
+            non_id = re.sub(r'\b(?:agent|usr)_[0-9a-f]+\b', '', row.lower())
+            self.assertIn(hex2, non_id, '2-char hex %r should not match audit row %r by id' % (hex2, row))
 
     # (4) Agent/person name with <script>, quotes, or id-lookalike renders as text and does NOT make a second agent match.
     def test_04_xss_and_id_lookalike_names_render_as_text_and_do_not_match_other_agent(self):
@@ -323,6 +327,31 @@ class AgentIds583Tests(unittest.TestCase):
         # No real host names, installation addresses, or IP literals.
         for forbidden in ('officewin', 'goomba', 'koopa', '192.168.', '10.0.', '127.0.0.1', 'http://', 'https://'):
             self.assertNotIn(forbidden, text.lower())
+
+    # (10) Account (usr_...) lanes hide usr_ ids as text (kittrial-5bb.504 + .583 r2).
+    def test_10_usr_lane_renders_no_usr_text_anywhere_in_block(self):
+        seen = self._seen()
+        blocks = {b['lane']: b for b in seen['usrLanes']['blocks']}
+        oid = self.env.ids['olive']
+        self.assertIn(oid, blocks)
+        self.assertIn('usr_deadbeef00001111', blocks)
+        self.assertIn(self.owner_agent_id, blocks)
+        # Named usr_ lane: display_name shown, id only in title, zero usr_ text and zero id chips.
+        named = blocks[oid]
+        self.assertEqual('Olive', named['strongText'])
+        self.assertEqual(oid, named['strongTitle'])
+        self.assertNotIn('usr_', named['text'])
+        self.assertEqual([], named['chips'])
+        # Unnamed usr_ lane: 'Someone' fallback shown, id only in title, zero usr_ text and zero id chips.
+        unnamed = blocks['usr_deadbeef00001111']
+        self.assertEqual('Someone', unnamed['strongText'])
+        self.assertEqual('usr_deadbeef00001111', unnamed['strongTitle'])
+        self.assertNotIn('usr_', unnamed['text'])
+        self.assertEqual([], unnamed['chips'])
+        # Non-account agent_ lane alongside them still renders visible id + copy button.
+        agent_blk = blocks[self.owner_agent_id]
+        self.assertIn(self.owner_agent_id, agent_blk['text'])
+        self.assertEqual([self.owner_agent_id], [c['copyId'] for c in agent_blk['chips']])
 
 
 if __name__ == '__main__':

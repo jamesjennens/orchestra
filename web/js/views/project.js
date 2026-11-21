@@ -1,4 +1,4 @@
-import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
+import { h, time, confirmDialog, secretDialog, toast, shortSha, copyButton } from '../dom.js';
 import { pageHead, setPageKey, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId, ownerStepAsks, isDescriptive, idBadge, matchesEntityFilter, extractAgentIds } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { proposeSection } from './proposals.js';
@@ -449,12 +449,17 @@ export function lanesPanel(ctx, project) {
   function laneBlock(ctx, project, lane, data) {
     const held = lane.held || [];
     const raised = LANE_FLAGS.filter(([key]) => lane[key]);
+    const laneCopyBtn = isAccountId(lane.lane) ? null : copyButton('Copy', lane.lane, { ariaLabel: 'Copy Agent ID ' + lane.lane, what: 'Agent ID' });
+    if (laneCopyBtn) laneCopyBtn.setAttribute('data-copy-id', lane.lane);
     return h('div', { class: 'lane', 'data-lane': lane.lane, 'data-actor': lane.actor,
       'data-inferred': lane.inferred ? 'true' : null },
       h('div', { class: 'event-head' },
         // Display only (kittrial-5bb.416): the server's display_name text, never decided here.
+        // Account ids (usr_...) stay hidden as text (kittrial-5bb.504); non-account lanes show id + Copy button (kittrial-5bb.583).
         h('strong', { title: isAccountId(lane.lane) ? lane.lane : null }, lane.display_name || (isAccountId(lane.lane) ? 'Someone' : lane.lane)), ' ',
-        isAccountId(lane.lane) ? null : idBadge(lane.lane, { what: 'Agent ID' }),
+        isAccountId(lane.lane) ? null : h('span', { class: 'id-chip', 'data-id-chip': lane.lane },
+          isAccountId(lane.lane) ? null : h('span', { class: 'mono small muted' }, lane.lane),
+          laneCopyBtn),
         ' ',
         lane.idle ? h('span', { class: 'chip', 'data-idle': 'true', title: 'This lane holds nothing' }, 'Free')
           : h('span', { class: 'chip plain' }, held.length === 1 ? '1 task held' : held.length + ' tasks held'),
