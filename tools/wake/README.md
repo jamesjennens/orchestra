@@ -97,7 +97,7 @@ Examples of a wake command:
       WAKE_COMMAND='agent-cli --prompt "New work is ready; run your next turn."'
 
     Keep the prompt fixed. The woken agent reads the wait output itself and prints each
-    item's `wake_summary`, the one sentence the service builds (kittrial-5bb.588); a wake
+    item's `wake_summary`, the one sentence the service builds; a wake
     script never passes task text into the prompt.
 
     a scheduled task that starts the harness (Windows; cmd.exe syntax):

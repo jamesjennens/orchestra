@@ -443,7 +443,7 @@ export function agentJson(payload) {
 
 //: The first line of the AGENT.md this page writes (kittrial-5bb.518). Change the text of the file, change this number:
 //: tests/test_agent_md_version.py fails otherwise. GET /v1/agents/me answers the number the server knows (agent_md.version).
-export const AGENT_MD_VERSION_LINE = 'AGENT.md version 2 (kittrial-5bb.518)';
+export const AGENT_MD_VERSION_LINE = 'AGENT.md version 3 (kittrial-5bb.588)';
 
 // A no-Bridge worker needs a tool-tracked watch, not a detached shell daemon.
 export function workerWaitLoop(server, file) {

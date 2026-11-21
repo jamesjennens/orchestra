@@ -409,9 +409,13 @@ class EndpointFollowups(a.EndpointAttentionTests):
         self.native('reviewer')(['update',task,'--assignee','former-actor'])
         self.native('reviewer')(['update',task,'--assignee',actor])
         self.native(actor)(['comments','add',task,'Current own comment'])
-        self.assertFalse(next(x for x in self.next()['next_actions'] if x['task']==task)['newer_activity'])
+        # kittrial-5bb.588 T1: the baseline is the assignee's OWN newest checkpoint, so the former owner's later
+        # checkpoint is new activity by someone else; the assignee's own comment still never counts.
+        found=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertEqual((True,1),(found['newer_activity'],found['newer_activity_by_others']))
         self.native('former-actor')(['comments','add',task,'Former owner instruction'])
-        self.assertTrue(next(x for x in self.next()['next_actions'] if x['task']==task)['newer_activity'])
+        found=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertEqual((True,2),(found['newer_activity'],found['newer_activity_by_others']))
 
     def test_withdrawn_and_superseded_deliveries_keep_their_review_state(self):
         actor=self.next()['agent']['actor'];task=self.tasks[0]
@@ -589,10 +593,14 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
         for owner in ('former-owner', actor):
             self.native_ok('update', task, '--assignee', owner)
         self.native_ok('comments', 'add', task, 'current owner comment', '--author', actor)
-        self.assertFalse(self.action(task)['newer_activity'])
+        # kittrial-5bb.588 T1: measured from the assignee's own checkpoint, the former owner's later checkpoint is
+        # new activity by someone else; the current owner's own comment still never counts.
+        found = self.action(task)
+        self.assertEqual((True, 1), (found['newer_activity'], found['newer_activity_by_others']))
         time.sleep(1.1)  # Native comment timestamps have second precision.
         self.native_ok('comments', 'add', task, 'former owner instruction', '--author', 'former-owner')
-        self.assertTrue(self.action(task)['newer_activity'])
+        found = self.action(task)
+        self.assertEqual((True, 2), (found['newer_activity'], found['newer_activity_by_others']))
         other = self.agent('Other')
         held = self.new('other actor task'); self.own(held, other)
         self.assertNotIn(held, [row['task'] for row in self.next()['next_actions']])
