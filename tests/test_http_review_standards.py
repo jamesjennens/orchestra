@@ -26,7 +26,13 @@ import test_http_review_fixes
 from test_http_review_fixes import Harness
 from test_http_web import WEB, run_node_module
 from test_lane_nudge_carrier import fill
-from test_review_standards import _kill_pid_best_effort, _make_child_spawning_slow_git, _wait_pid_dead
+from test_review_standards import (
+    _kill_pid_best_effort,
+    _make_child_spawning_slow_git,
+    _make_wrapper_spawned_slow_git,
+    _run_git_with_unbundle_deadline,
+    _wait_pid_dead,
+)
 
 _ORIG_HASH_PASSWORD = http_auth.hash_password
 _ORIG_TMP_ROOT = test_http_review_fixes.TMP_ROOT
@@ -2205,10 +2211,15 @@ class _HttpStandardsMixin:
         #    MUST land 201 (NEVER 503!), record git_inspection_timed_out=True and would_have_refused,
         #    and kill all child processes!
         pid_log = self.tmp / 'http-r6-pids.txt'
-        fake_git = _make_child_spawning_slow_git(self.tmp, pid_log, slow_subcmd='unbundle')
+        fake_git = (
+            _make_wrapper_spawned_slow_git(self.tmp, pid_log, slow_subcmd='unbundle')
+            if os.name != 'nt'
+            else _make_child_spawning_slow_git(self.tmp, pid_log, slow_subcmd='unbundle')
+        )
         spawned_pids = []
         try:
             with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
+                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0)), \
                  mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 1.0):
                 r_warn = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
                     'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-warn-ok',
@@ -2248,9 +2259,16 @@ class _HttpStandardsMixin:
         tid2, cid2, prev2, commit2 = self.deliver_task_bundle(
             pid, alice_tok, {'svc.py': 'alpha = 2\nbeta = 3\n'}, title='R6 Block Timeout 2'
         )
+        pid_log_block = self.tmp / 'http-r6-block-pids.txt'
+        fake_git_block = (
+            _make_wrapper_spawned_slow_git(self.tmp, pid_log_block, slow_subcmd='unbundle')
+            if os.name != 'nt'
+            else _make_child_spawning_slow_git(self.tmp, pid_log_block, slow_subcmd='unbundle')
+        )
         spawned_pids2 = []
         try:
-            with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
+            with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git_block), \
+                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0)), \
                  mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 1.0):
                 r_blk_missing = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
                     'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-blk-missing',
@@ -2268,10 +2286,11 @@ class _HttpStandardsMixin:
                 }, token=oscar_tok, headers={'Idempotency-Key': 'idem-r6-blk-cite-retry'})
                 self.assertEqual(503, r_blk_cite.status, r_blk_cite.data)
                 self.assertIn(rs.refusal_git_inspection_timeout(commit2), r_blk_cite.data['error']['message'])
-            self.assertTrue(pid_log.exists(), 'slow git unbundle never spawned a child helper')
-            spawned_pids2 = [int(x) for x in pid_log.read_text(encoding='utf-8').splitlines() if x.strip()]
+            self.assertTrue(pid_log_block.exists(), 'slow git unbundle never spawned a child helper in block section')
+            spawned_pids2 = [int(x) for x in pid_log_block.read_text(encoding='utf-8').splitlines() if x.strip()]
+            self.assertGreaterEqual(len(spawned_pids2), 2)
             for cpid in spawned_pids2:
-                self.assertTrue(_wait_pid_dead(cpid, timeout=1.5))
+                self.assertTrue(_wait_pid_dead(cpid, timeout=1.5), 'Child PID %d survived HTTP block timeout!' % cpid)
         finally:
             for cpid in spawned_pids2:
                 _kill_pid_best_effort(cpid)
@@ -2319,6 +2338,63 @@ class _HttpStandardsMixin:
                 self.assertIn('cannot scan signoffs: permission denied', raw_reg2)
             finally:
                 os.chmod(str(so_dir), 0o755)
+
+    def test_r8_n5e_warn_mode_waivers_fault_lands_for_agent_approver_and_another_party(self):
+        """Pin n5e-agent-warn: in warn mode with waivers/ at 0o300, approve lands for both
+        a coordinator-granted agent approver and a person approver with approval_by_another_party on."""
+        if os.name != 'posix' or os.geteuid() == 0:
+            self.skipTest('POSIX non-root chmod test')
+        pid = self.pid
+        _, alice_tok = self.create_person('alice_r8', 'contributor', pid)
+        cora_id, cora_tok = self.create_person('cora_r8', 'coordinator', pid)
+        _, cora_agent_tok = self.create_agent(cora_tok, 'cora-r8-agent', [pid], coordinate_in=[pid])
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/standards' % pid, {
+            'expected_version': 0,
+            'reason': 'v1 for r8 n5e agent/another_party warn test',
+            'rules': [_rule('R8MUST-1', owner=cora_id, severity='must', applicability={'all_changes': True})],
+        }, token=self.owner_tok).status)
+        tid1, cid1, prev1, _ = self.deliver_task_bundle(pid, alice_tok, {'a.py': 'x = 1\n'}, title='R8 Agent Warn')
+        tid2, cid2, prev2, _ = self.deliver_task_bundle(pid, alice_tok, {'b.py': 'y = 2\n'}, title='R8 Another Party Warn')
+
+        orig_another_party = self.service.approval_by_another_party
+        waivers_dir = None
+        patcher = None
+        if self.is_endpoint_backend:
+            waivers_dir = self.canonical_root / 'projects' / pid / '.standards' / 'waivers'
+            waivers_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(waivers_dir), 0o300)
+        else:
+            patcher = mock.patch.object(
+                rs.DictStandardsStore,
+                'list_waivers',
+                side_effect=rs.StandardsDamagedError('cannot scan waivers: permission denied'),
+            )
+            patcher.start()
+        try:
+            # 1) Coordinator agent approver in warn mode under waivers fault -> lands 201 and records fault.
+            r_agent = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
+                'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r8-agent-warn',
+                'previous': prev1, 'contribution': cid1, 'summary': 'Coordinator agent warn-mode approve.',
+            }, token=cora_agent_tok, headers={'Idempotency-Key': 'idem-r8-agent-warn'})
+            self.assertEqual(201, r_agent.status, r_agent.data)
+            whr1 = r_agent.data['sign_off']['would_have_refused']
+            self.assertTrue(any('unreadable_waivers' in x for x in whr1), whr1)
+
+            # 2) Person approver with approval_by_another_party=True in warn mode under waivers fault -> lands 201.
+            self.service.approval_by_another_party = True
+            r_party = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
+                'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r8-party-warn',
+                'previous': prev2, 'contribution': cid2, 'summary': 'Another-party person warn-mode approve.',
+            }, token=cora_tok, headers={'Idempotency-Key': 'idem-r8-party-warn'})
+            self.assertEqual(201, r_party.status, r_party.data)
+            whr2 = r_party.data['sign_off']['would_have_refused']
+            self.assertTrue(any('unreadable_waivers' in x for x in whr2), whr2)
+        finally:
+            self.service.approval_by_another_party = orig_another_party
+            if patcher is not None:
+                patcher.stop()
+            if waivers_dir is not None:
+                os.chmod(str(waivers_dir), 0o755)
 
 
 class HttpStandardsInProcessSuite(_HttpStandardsMixin, Harness):
@@ -2772,17 +2848,39 @@ class RealEndpointBdStandardsR7Tests(unittest.TestCase):
     """Real endpoint.py subprocess + real bd pins for s2e-stat-paths (0o600), n5e-waivers-fault, and n6e-project-get."""
 
     def test_checked_oserror_net_never_leaks_host_path(self):
+        import io
+        from contextlib import redirect_stderr
         secret_path = '/srv/secret/installation/projects/pp/.standards/gate.json'
+        # 1) Real OSError marked with fault='os-error' is redacted and logged to operator stderr.
         reply = {
             'returncode': 2,
             'stdout': '',
             'stderr': "PermissionError: [Errno 13] Permission denied: '%s'\n" % secret_path,
+            'fault': 'os-error',
         }
-        with self.assertRaises(http_service.HttpError) as ctx:
+        buf_os = io.StringIO()
+        with redirect_stderr(buf_os), self.assertRaises(http_service.HttpError) as ctx:
             http_service.EndpointBackend._checked(reply, 'web-standards', reading=True)
         self.assertEqual('filesystem error: permission denied', ctx.exception.detail)
         self.assertNotIn(secret_path, str(ctx.exception.detail))
         self.assertNotIn(secret_path, str(ctx.exception.message))
+        self.assertIn('os-error:', buf_os.getvalue())
+
+        # 2) Member payload containing '[Errno 13]' WITHOUT fault='os-error' keeps its own text and logs nothing.
+        member_msg = "ValueError: Unknown rule '[Errno 13] x' in check record"
+        reply_member = {
+            'returncode': 2,
+            'stdout': '',
+            'stderr': member_msg + '\n',
+            'refused': 'coordinator-rule',
+            'standards_status': 422,
+        }
+        buf_mem = io.StringIO()
+        with redirect_stderr(buf_mem), self.assertRaises(http_service.HttpError) as ctx_mem:
+            http_service.EndpointBackend._checked(reply_member, 'review', reading=False)
+        self.assertEqual(422, ctx_mem.exception.status)
+        self.assertIn("[Errno 13] x", ctx_mem.exception.message)
+        self.assertEqual('', buf_mem.getvalue())
 
     def test_real_endpoint_bd_0600_stat_paths_waivers_fault_and_project_get(self):
         if os.name != 'posix' or os.geteuid() == 0:
@@ -2790,6 +2888,8 @@ class RealEndpointBdStandardsR7Tests(unittest.TestCase):
         import test_claim_held as held
         import test_http_review_fixes as fixes
         import test_bd_label_aliases as rb
+        if not rb.BD:
+            self.skipTest('bd is not installed on this host')
 
         class _RealStack(held.Members, fixes.Harness, rb.RealBdLabelAliasTests):
             _stop_server = rb.RealBdLabelAliasTests._stop_server

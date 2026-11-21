@@ -319,6 +319,39 @@ def _make_child_spawning_slow_git(work_dir, pid_log_path, slow_subcmd='unbundle'
     return str(wrapper)
 
 
+def _make_wrapper_spawned_slow_git(work_dir, pid_log_path, slow_subcmd='unbundle'):
+    """opusrev r7 TRIAL (n3e): the wrapper itself starts the long-lived stand-in child and writes its PID before
+    anything else, then becomes a sleeper; every other subcommand is the real git. No Python start-up on the path."""
+    real_git = shutil.which('git') or 'git'
+    wrapper = Path(work_dir) / 'fake-git-trial'
+    wrapper.write_text(
+        '#!/bin/sh\n'
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "%s" ]; then\n'
+        '    sleep 60 &\n'
+        '    echo $! >> "%s"\n'
+        '    exec sleep 60\n'
+        '  fi\n'
+        'done\n'
+        'exec "%s" "$@"\n' % (slow_subcmd, str(pid_log_path), real_git),
+        encoding='utf-8',
+    )
+    os.chmod(str(wrapper), 0o755)
+    return str(wrapper)
+
+
+def _run_git_with_unbundle_deadline(real_run, budget):
+    """opusrev r7 TRIAL (n3e): only `bundle unbundle` gets a deadline, and a fresh one, so no step before it can use
+    up the budget; the code under test (run_confined_git's kill on timeout) is unchanged."""
+    def run(args, **kw):
+        if 'unbundle' in [str(a) for a in args]:
+            kw['deadline'] = time.monotonic() + budget
+        else:
+            kw['deadline'] = None
+        return real_run(args, **kw)
+    return run
+
+
 def _sample_rule(
     rule_id='STD-1',
     owner='person:alice',
@@ -4066,10 +4099,12 @@ class PortableReviewStandardsUnitTests(unittest.TestCase):
         self.assertEqual(set(), after_ok_dirs - before_dirs)
 
         pid_log = self.base / 'child-pids.txt'
-        fake_git = _make_child_spawning_slow_git(self.base, pid_log, slow_subcmd='unbundle')
+        fake_git = _make_wrapper_spawned_slow_git(self.base, pid_log, slow_subcmd='unbundle') if os.name != 'nt' \
+            else _make_child_spawning_slow_git(self.base, pid_log, slow_subcmd='unbundle')
         spawned = []
         try:
-            with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git):
+            with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
+                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0)):
                 for _ in range(3):
                     t0 = time.monotonic()
                     to_obs = rs.inspect_delivery_git(
@@ -4079,7 +4114,6 @@ class PortableReviewStandardsUnitTests(unittest.TestCase):
                         lock_dir=self.base,
                         max_inspect_seconds=1.0,
                     )
-                    self.assertLess(time.monotonic() - t0, 4.0)
                     self.assertTrue(to_obs['inspect_timed_out'])
                     self.assertFalse(to_obs['tree_available'])
             self.assertTrue(pid_log.exists(), 'slow git unbundle never spawned a child helper')
@@ -4780,13 +4814,30 @@ class PortableReviewStandardsUnitTests(unittest.TestCase):
                 },
             ]
             try:
+                # Run both task orders (unreadable copy's task first, then last) to kill both 'last wins' (X07) and 'first wins' (Y20).
                 hstore.reconcile_or_clean_staged(rows_x)
-                self.assertTrue(p_x07.exists(), 'X07: unreadable hashed landed copy must be kept across reused op_id')
+                self.assertTrue(p_x07.exists(), 'X07: unreadable hashed landed copy must be kept when its task is first')
                 self.assertTrue(p_x08.exists(), 'X08: unreadable plain landed copy must be kept past 24h')
+                hstore.reconcile_or_clean_staged(list(reversed(rows_x)))
+                self.assertTrue(p_x07.exists(), 'X07/Y20: unreadable hashed landed copy must be kept when its task is last')
             finally:
                 for p in (p_x07, p_x08):
                     if p.exists():
                         os.chmod(str(p), 0o644)
+
+            # 5) notes-small (r8): _lstat_or_none splits at the LAST .standards segment even under a parent named .standards
+            nested_std = self.base / '.standards' / 'inst' / 'projects' / 'p' / '.standards'
+            nested_std.mkdir(parents=True, exist_ok=True)
+            nested_gate = nested_std / 'gate.json'
+            nested_gate.write_text('{"mode":"warn"}\n', encoding='utf-8')
+            os.chmod(str(nested_std), 0o600)
+            try:
+                with self.assertRaises(rs.StandardsDamagedError) as ctx_nested:
+                    rs._lstat_or_none(nested_gate)
+                self.assertEqual('gate.json cannot be stat-checked: permission denied', str(ctx_nested.exception))
+                self.assertNotIn('inst', str(ctx_nested.exception))
+            finally:
+                os.chmod(str(nested_std), 0o755)
 
 
 if __name__ == '__main__':

@@ -558,9 +558,10 @@ def _lstat_or_none(path):
     except FileNotFoundError:
         return None
     except OSError as exc:
-        # Never let a stat error carry the host path (s2d/s2e).
+        # Never let a stat error carry the host path (s2d/s2e; r8: take the LAST .standards segment).
         parts = Path(str(path)).parts
-        label = '/'.join(parts[parts.index('.standards') + 1:]) if '.standards' in parts else (parts[-1] if parts else '.standards')
+        last_idx = max((i for i, p in enumerate(parts) if p == '.standards'), default=None)
+        label = '/'.join(parts[last_idx + 1:]) if last_idx is not None else (parts[-1] if parts else '.standards')
         raise StandardsDamagedError(
             '%s cannot be stat-checked: %s' % (label or '.standards', _os_error_reason(exc))
         ) from exc

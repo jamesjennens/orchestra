@@ -2618,7 +2618,7 @@ class InProcessBackend:
                 item.update(checkpoint=None, coverage='unknown')
         return result
 
-    def task_brief(self, project_id, task_id):
+    def task_brief(self, project_id, task_id, *, include_standards=True):
         """Everything the task page shows, from one read of the in-process state."""
         task = self._task(project_id, task_id)
         from briefing import ContextPointers
@@ -2649,8 +2649,8 @@ class InProcessBackend:
                           'open_items_shown': len(items), 'open_items_total': len(items)}
         review_block = self._review_view(task)
         std_extra = {}
-        std_ro = self._standards_store(project_id, writable=False)
-        if std_ro.inspect_register_raw()[0] != 'none':
+        std_ro = self._standards_store(project_id, writable=False) if include_standards else None
+        if std_ro is not None and std_ro.inspect_register_raw()[0] != 'none':
             import review_standards
             _, active_person, same_party_pair = review_standards._build_state_person_helpers(
                 self.service.state, project_id
@@ -3868,7 +3868,9 @@ class EndpointBackend:
         if code:
             said = stderr.strip().split('\n')[-1] if stderr.strip() else None
             detail = said[:cls._detail_limit(action, said, reply.get('refused'))] if said else None
-            detail = cls._sanitize_os_error_detail(action, said, detail)
+            detail = cls._sanitize_os_error_detail(
+                action, said, detail, is_os_error=(reply.get('fault') == 'os-error')
+            )
             if code == 2:
                 if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str):
                     std_status = reply.get('standards_status')
@@ -3993,19 +3995,17 @@ class EndpointBackend:
         print('busy: the endpoint answered return code 75 for %s: %s'
               % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
 
-    _OS_ERROR_LINE_RE = re.compile(
-        r'^(?:[A-Za-z_]*OSError|PermissionError|FileNotFoundError|FileExistsError|'
-        r'IsADirectoryError|NotADirectoryError|BlockingIOError|ChildProcessError|'
-        r'BrokenPipeError|ConnectionError|TimeoutError|IOError):\s*(.*)$'
-    )
-
     @classmethod
-    def _sanitize_os_error_detail(cls, action, said, detail):
-        """Never forward an OSError line (which may carry a host path) to HTTP clients; log it for the operator."""
+    def _sanitize_os_error_detail(cls, action, said, detail, *, is_os_error=False):
+        """Never forward an OSError line (which may carry a host path) to HTTP clients; log it for the operator.
+
+        Decides strictly by the endpoint's explicit ``fault == 'os-error'`` mark so member
+        payloads (e.g. a rule id containing '[Errno 13]') keep their own text and never log.
+        """
+        if not is_os_error:
+            return detail
         if not isinstance(said, str) or not said:
-            return detail
-        if not cls._OS_ERROR_LINE_RE.match(said) and '[Errno ' not in said:
-            return detail
+            return 'filesystem error'
         print('os-error: the endpoint answered with an OS error for %s: %s'
               % (action or 'a request', ascii(said[:400])), file=sys.stderr, flush=True)
         low = said.lower()
@@ -5169,7 +5169,7 @@ class EndpointBackend:
             raise uncertain('The canonical task summary returned an unexpected shape')
         return payload
 
-    def task_brief(self, project_id, task_id):
+    def task_brief(self, project_id, task_id, *, include_standards=True):
         """Map the canonical ``brief --json`` read onto the task page's shape.
 
         Two canonical reads: ``bd show`` for the editable task row (title,
@@ -5177,8 +5177,10 @@ class EndpointBackend:
         lifecycle facts and dependencies. Nothing is inferred beyond what they say.
         """
         task = self.get_task(project_id, task_id)
-        data = self._run('brief', project_id, self.actor_namespace + '/read',
-                         [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS)])
+        brief_args = [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS)]
+        if not include_standards:
+            brief_args.append('--no-standards')
+        data = self._run('brief', project_id, self.actor_namespace + '/read', brief_args)
         if not isinstance(data, dict):
             raise uncertain('Canonical brief returned an unexpected shape')
         checkpoint = None
@@ -15977,8 +15979,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if recommending or judged:
             # A field this kit does not know is refused, not dropped, by the one rule for
             # every review operation below (kittrial-5bb.110): at most five plain names.
-            # One read serves the record-anchor check and the person rule below.
-            current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
+            # One read serves the record-anchor check and the person rule below; skip the
+            # standards block here so a warn-mode approve under a waivers fault is not
+            # refused 503 before reaching the gate (kittrial-5bb.570 r8).
+            current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'], include_standards=False)
             self._refuse_record_anchor(current.get('task'), write=True)
         else:
             self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)

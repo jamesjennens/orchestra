@@ -1558,7 +1558,7 @@ def compact_integration(value):
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
           independent_approval=False,owners=None,provenance_writes=True,identity_names=None,
           field_history=None,git_observation=None,standards_same_party_pair=None,
-          standards_active_person=None):
+          standards_active_person=None,include_standards=True):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -1809,7 +1809,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     notice_block=assignment_notices(issue,project,actor)
     notice_records=assignment_notices(issue,project,None,limit=20)
     std_block=None
-    if journal is not None:
+    if include_standards and journal is not None:
         from pathlib import Path as _StdPath
         import review_standards as _review_standards
         _jpath=_StdPath(journal)
@@ -2650,6 +2650,7 @@ def parse_args(action,args):
     if action=='brief':
         parser.add_argument('--items-offset',type=int,default=0);parser.add_argument('--items-limit',type=int,default=5)
         parser.add_argument('--full',action='store_true')
+        parser.add_argument('--no-standards',action='store_true')
     elif action=='history':
         parser.add_argument('--limit',type=int);parser.add_argument('--since');parser.add_argument('--cursor');parser.add_argument('--body-budget',type=int,default=4000)
         parser.add_argument('--recent',type=int);parser.add_argument('--last',type=int)
@@ -3121,7 +3122,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
                          identity_names=identity_names,field_history=field_history,
                          git_observation=git_observation,
                          standards_same_party_pair=standards_same_party_pair,
-                         standards_active_person=standards_active_person)
+                         standards_active_person=standards_active_person,
+                         include_standards=not a.no_standards)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

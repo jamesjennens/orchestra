@@ -2735,7 +2735,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             return stdout
         runner=NativeRunner(run, project=path, bounded=bounded)
         brief_git_obs=None
-        if action=='brief':
+        if action=='brief' and '--no-standards' not in args:
             import review_standards
             def _show_single_brief_prelock(tid):
                 out,_=native.split(native.run(native.argv(root,path,actor,['show',tid,'--json','--include-comments']),environment(root)))
@@ -2745,7 +2745,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             std_pair=None
             std_active=None
-            if action=='brief' and authority_config is not None:
+            if action=='brief' and '--no-standards' not in args and authority_config is not None:
                 import review_standards
                 if review_standards.HostStandardsStore(path,name).inspect_register_raw()[0]!='none':
                     from http_authority import read_state as _read_auth_state
@@ -4186,6 +4186,10 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        if isinstance(e,OSError):
+            # Mark OS errors explicitly so HTTP redacts host paths only on real OS errors
+            # and never on user payloads that happen to contain '[Errno ...]' (kittrial-5bb.570 r8).
+            answer['fault']='os-error'
         import raw_lifecycle
         if isinstance(e,raw_lifecycle.Refusal):
             answer['stderr']=f'ValueError: {e}\n'
