@@ -776,8 +776,18 @@ exit code. It reads the runtime but changes no records or service state.
 For recovery, stop the service, inspect the last backup status and sidecar,
 follow `docs/OPERATIONS.md` for `restore-new` into a **disposable** project,
 compare exports, and only then make an explicit operator decision on the live
-runtime. Keep the native directory, coordination sidecar and operation journal
-snapshot together. Do not test restore against a live installation.
+runtime. Because `office_service.py` stops both the web service and Dolt when
+stopped, `admin.py restore-new` automatically starts a temporary loopback Dolt
+on a stopped `office-foreground` runtime using the same spawn, parent-death
+(`PR_SET_PDEATHSIG`), credential-stripping, and shutdown rules as
+`office_service.py`, waits for `SELECT 1` (up to `dolt_startup_seconds` in
+`deployment.private.json`, default 30 s, valid 1–600), and stops the temporary
+Dolt before restoring HTTP state and on any failure or signal. It never
+bootstraps or sets database credentials (an auth refusal stops the child and
+refuses with `Nothing was changed.`), and it refuses without starting a second
+server if another process holds the database port. Keep the native directory,
+coordination sidecar and operation journal snapshot together. Do not test
+restore against a live installation.
 
 ## UAT verification record
 

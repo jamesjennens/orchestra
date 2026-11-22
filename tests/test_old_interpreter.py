@@ -56,7 +56,9 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'handover_steps.py',  # kittrial-5bb.442: library-only (no __main__ block); imported by http_service
            'host_reads.py', 'host_notes.py', 'http_auth.py', 'http_authority.py', 'interface_lock.py', 'interface_records.py',
            'invites.py',  # kittrial-5bb.578: library-only; imported by http_service
-           'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'lifecycle_audit.py', 'nudges.py', 'lifecycle_voids.py', 'native.py', 'nudge_messages.py', 'onboarding.py', 'open_items.py',
+           'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'lifecycle_audit.py', 'nudges.py', 'lifecycle_voids.py', 'native.py', 'nudge_messages.py',
+           'office_dolt.py',  # kittrial-5bb.520: library-only (no __main__ block); imported by office_service and admin
+           'onboarding.py', 'open_items.py',
            'program_links.py',  # kittrial-5bb.446: library-only (no __main__ block); imported by reference_records and http_service
            'decision_attest.py',  # kittrial-5bb.454 r2: library-only
            'program_decisions.py',  # kittrial-5bb.454: library-only (no __main__ block); imported by program_view's callers and trace_read
@@ -387,6 +389,43 @@ class SourceTests(unittest.TestCase):
         for newer in ('if (n := 1):\n    pass\n', 'def f(a, /):\n    pass\n'):
             with self.assertRaises(SyntaxError):
                 ast.parse(newer, feature_version=(3, 6))
+
+    def test_office_dolt_and_restore_dolt_helpers_stay_python_3_6_compatible(self):
+        """kittrial-5bb.520: shared Dolt helper code uses neither 3.7+ syntax nor 3.7+ subprocess/stdlib APIs."""
+        forbidden_subprocess_kw = {'capture_output', 'text', 'user', 'group', 'extra_groups',
+                                   'umask', 'pipesize', 'process_group'}
+        forbidden_attrs = {'monotonic_ns', 'nullcontext'}
+
+        def check_tree(tree, label):
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if node.func.attr in ('run', 'Popen'):
+                        used = {kw.arg for kw in node.keywords if kw.arg}
+                        bad = used & forbidden_subprocess_kw
+                        self.assertFalse(bad, '%s uses Python 3.7+ subprocess keywords: %s' % (label, sorted(bad)))
+                    self.assertNotIn(node.func.attr, forbidden_attrs,
+                                     '%s uses Python 3.7+ attribute %s' % (label, node.func.attr))
+
+        dolt_source = (ROOT / 'office_dolt.py').read_text(encoding='utf-8')
+        dolt_tree = ast.parse(dolt_source, feature_version=(3, 6))
+        self.assertFalse([node for node in dolt_tree.body
+                          if isinstance(node, ast.ImportFrom) and node.module == '__future__'])
+        check_tree(dolt_tree, 'office_dolt.py')
+
+        admin_tree = ast.parse((ROOT / 'admin.py').read_text(encoding='utf-8'), feature_version=(3, 6))
+        helper_names = {'_temporary_dolt_lock', '_check_existing_dolt', 'temporary_office_dolt'}
+        found = set()
+        for node in admin_tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names:
+                found.add(node.name)
+                check_tree(node, 'admin.py:%s' % node.name)
+        self.assertEqual(found, helper_names)
+
+        # Confirm the guard bites on 3.7+ subprocess arguments.
+        bad_tree = ast.parse("import subprocess\nsubprocess.run(['true'], capture_output=True, text=True)\n",
+                             feature_version=(3, 6))
+        with self.assertRaises(AssertionError):
+            check_tree(bad_tree, 'synthetic-3.7')
 
 
 if __name__ == '__main__':

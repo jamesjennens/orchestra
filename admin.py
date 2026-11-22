@@ -7009,6 +7009,153 @@ def http_restore_hold(root,args):
         finally:os.close(fd)
 
 
+def _temporary_dolt_lock(root):
+    """Acquire ``<root>/office-service.lock`` non-blocking when plain restore-new starts a temporary Dolt."""
+    try:
+        import fcntl
+    except ImportError:
+        raise ValueError(
+            'Starting a temporary Dolt for restore-new needs the runtime lock, and this host has no fcntl. '
+            'Nothing was changed.'
+        ) from None
+    fd=os.open(str(root/'office-service.lock'),os.O_CREAT|os.O_RDWR,0o600)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise ValueError(
+            'Refusing restore-new: the office service lock %s is held, yet Dolt did not answer SELECT 1. '
+            'Wait for the service to finish starting or stop it cleanly, then run restore-new again. '
+            'Nothing was changed.'%(root/'office-service.lock')
+        ) from None
+    return fd
+
+
+def _check_existing_dolt(root,cfg,env):
+    """Return True if Dolt answers SELECT 1, False if the port is free, or raise ValueError to refuse."""
+    import office_dolt
+    ready,detail=office_dolt.probe_database(root,cfg,env)
+    if ready:
+        return True
+    port=cfg['port']
+    if office_dolt.port_listening(port):
+        if office_dolt.is_auth_refusal(detail):
+            raise ValueError(
+                'Refusing restore-new: Dolt on 127.0.0.1:%s refused the root connection (%s). '
+                'Restore runs only against an initialized runtime and never sets or resets database credentials. '
+                'Nothing was changed.'%(port,office_dolt.bounded_diagnostic(detail=detail,max_chars=240))
+            )
+        raise ValueError(
+            'Refusing restore-new: 127.0.0.1:%s is already in use, but Dolt did not answer SELECT 1 (%s); '
+            'a second Dolt server was not started. Stop whatever holds port %s, then run restore-new again. '
+            'Nothing was changed.'%(port,office_dolt.bounded_diagnostic(detail=detail,max_chars=240),port)
+        )
+    return False
+
+
+@contextmanager
+def temporary_office_dolt(root,holds_office_lock=False):
+    """Run a temporary loopback Dolt for ``restore-new`` on a stopped ``office-foreground`` runtime (kittrial-5bb.520).
+
+    Reuses ``office_dolt`` so spawn, PDEATHSIG, shutdown, credential stripping, startup wait
+    configuration, and ``SELECT 1`` probing follow the same rules as ``office_service.py``.
+    Never bootstraps credentials; refuses a non-Dolt listener on the database port; always
+    stops the temporary Dolt and removes its temp log before returning.
+    """
+    if os.name!='posix' or not (root/'deployment.private.json').is_file():
+        yield
+        return
+    cfg=config(root)
+    if cfg.get('unit')!='office-foreground':
+        yield
+        return
+    if not (root/'server.json').is_file() or not os.access(str(root/'bin'/'dolt'),os.X_OK):
+        yield
+        return
+    import office_dolt
+    import tempfile
+    startup_seconds=office_dolt.dolt_startup_seconds(cfg)
+    env=environment(root)
+    if _check_existing_dolt(root,cfg,env):
+        yield
+        return
+    lock_fd=None
+    if not holds_office_lock:
+        lock_fd=_temporary_dolt_lock(root)
+    child=None
+    log_path=None
+    try:
+        if lock_fd is not None and _check_existing_dolt(root,cfg,env):
+            yield
+            return
+        fd,temp_log=tempfile.mkstemp(dir=str(root),prefix='.restore-dolt-',suffix='.log')
+        os.close(fd)
+        os.chmod(temp_log,0o600)
+        log_path=Path(temp_log)
+        db_env=office_dolt.db_server_env(env)
+        with signal_termination_guard():
+            child=office_dolt.spawn_process(office_dolt.dolt_command(root),root,log_path,db_env)
+            until=time.monotonic()+startup_seconds
+            ready=False
+            last_detail=''
+            auth_refusals=0
+            while time.monotonic()<until:
+                if child.poll() is not None:
+                    diag=office_dolt.bounded_diagnostic(log_path,last_detail)
+                    raise ValueError(
+                        'Refusing restore-new: temporary Dolt exited with status %d during startup (%s). '
+                        'Nothing was changed.'%(child.returncode,diag)
+                    )
+                remaining=until-time.monotonic()
+                probe_timeout=max(0.25,min(float(office_dolt.SQL_PROBE_TIMEOUT),remaining))
+                ok,detail=office_dolt.probe_database(root,cfg,env,timeout=probe_timeout)
+                if ok:
+                    ready=True
+                    break
+                last_detail=detail
+                if office_dolt.is_auth_refusal(detail):
+                    auth_refusals+=1
+                    if auth_refusals>=2:
+                        office_dolt.stop_process(child,time.monotonic()+office_dolt.DOLT_STOP_SECONDS)
+                        diag=office_dolt.bounded_diagnostic(log_path,detail)
+                        raise ValueError(
+                            'Refusing restore-new: temporary Dolt refused the root connection (%s). '
+                            'Restore runs only against an initialized runtime and never sets or resets '
+                            'database credentials. Nothing was changed.'%diag
+                        )
+                else:
+                    auth_refusals=0
+                remaining=until-time.monotonic()
+                if remaining>0:
+                    time.sleep(min(0.2,remaining))
+            if not ready:
+                office_dolt.stop_process(child,time.monotonic()+office_dolt.DOLT_STOP_SECONDS)
+                diag=office_dolt.bounded_diagnostic(log_path,last_detail)
+                if office_dolt.is_auth_refusal(last_detail):
+                    raise ValueError(
+                        'Refusing restore-new: temporary Dolt refused the root connection (%s). '
+                        'Restore runs only against an initialized runtime and never sets or resets '
+                        'database credentials. Nothing was changed.'%diag
+                    )
+                raise ValueError(
+                    'Refusing restore-new: temporary Dolt did not become ready within %d seconds (%s). '
+                    'Nothing was changed.'%(startup_seconds,diag)
+                )
+        yield
+    finally:
+        try:
+            if child is not None:
+                office_dolt.stop_process(child,time.monotonic()+office_dolt.DOLT_STOP_SECONDS)
+        finally:
+            if log_path is not None:
+                try:os.unlink(str(log_path))
+                except OSError:pass
+            if lock_fd is not None:
+                import fcntl
+                try:fcntl.flock(lock_fd,fcntl.LOCK_UN)
+                finally:os.close(lock_fd)
+
+
 def task_files_backup_path(root,name):
     """Where a project's task files are backed up: ``backups/<name>.task-files`` (kittrial-5bb.380)."""
     return root/'backups'/(name+'.task-files')
@@ -12609,62 +12756,66 @@ def _main():
             # kittrial-5bb.500 F1: the HTTP state pair is read and checked here too, so a missing or unusable
             # one refuses the restore before the destination exists, not after the native restore.
             if args.restore_http_state:prepare_http_state_restore(root,args.credentials)
-            # From here the destination starts to exist. Hold its restore lock to the end,
-            # so retire-project cannot pull it away mid-restore, and print the notice for
-            # every way the rest can stop (kittrial-5bb.85 review 01a10219): a failure, a
-            # stop or Ctrl-C in add-project, in the native restore, or in what follows it.
-            import fcntl
-            (root/'backups').mkdir(exist_ok=True)
-            restoring=restore_lock_path(root,args.destination).open('a')
-            fcntl.flock(restoring,fcntl.LOCK_EX)
-            # ``step`` is a one-word holder: ``finish_restore`` names the provisioning step
-            # inside itself, so a failure there prints the provisioning notice and not the
-            # re-point's (kittrial-5bb.202 review item 4, review F8).
-            step=['add-project']
-            try:
-                # SIGTERM is an exception for the whole of what follows, not only inside
-                # the native restore: a stop during add-project (or the re-point) used to
-                # end the process with no notice at all (review 01a1026a).
-                with signal_termination_guard():
-                    add_project(root,args.destination,requirements_default=False)
-                    # kittrial-5bb.500 F4: from here until finish_restore has succeeded the project is a
-                    # leftover if anything stops: backup_project refuses it (see RESTORE_INCOMPLETE_MARKER).
-                    write_restore_marker(root,args.destination,args.project)
-                    # The native restore runs through the Dolt SQL client (no bd ~10 s read
-                    # timeout), in its own process group, and adopts the restored project
-                    # identity; a destination without server metadata keeps `bd backup restore`.
-                    step[0]='native restore'
-                    print(native_restore(root,args.project,args.destination))
-                    step[0]='re-point and coordination'
-                    warning=finish_restore(root,args,snapshot,step)
-                    step[0]='restore marker'
-                    clear_restore_marker(root,args.destination)
-            except BaseException as error:
-                # add-project's own refusals (a populated or retired destination) are raised
-                # before it creates anything: they need no notice about a leftover project.
-                if not (step[0]=='add-project' and isinstance(error,ValueError)):
-                    destination_state=restore_destination_state(root,args.destination)
-                    # The provisioning notice says what the clone now holds, so read the slot
-                    # from the clone itself (read-only) instead of assuming the step's failure
-                    # means a missing slot (kittrial-5bb.202 rev-3 item 1, review F1). Its
-                    # "empty, working project" shape is included: a clone from an empty slotless
-                    # source reads that way, and it still needs the provisioning notice.
-                    slot=(project_merge_slot_state(root,args.destination)
-                          if step[0]==MERGE_SLOT_STEP and destination_state in ('partial','empty') else None)
-                    # The deployment-authority step did not run when this one failed, and the
-                    # provisioning notice must not leave that unsaid (kittrial-5bb.240 F1). The
-                    # comparison it makes is read-only; the re-grant is never run from here.
-                    authority=(restore_authority_not_run(root,args.project,args)
-                               if step[0]==MERGE_SLOT_STEP else None)
-                    print(restore_failure_notice(args.destination,error,destination_state,step=step[0],
-                                                 merge_slot=slot,
-                                                 journals_restored=getattr(args,'journal_restored',None),
-                                                 authority_note=authority),
-                          file=sys.stderr)
-                raise
-            finally:
-                restoring.close()
-            # Still under the office lock (F3): the state is written once the project has restored.
+            # kittrial-5bb.520: on a stopped foreground-office runtime (unit == 'office-foreground'),
+            # start a temporary Dolt for the database restore and stop it again before restoring HTTP state.
+            with temporary_office_dolt(root,holds_office_lock=bool(args.restore_http_state)):
+                # From here the destination starts to exist. Hold its restore lock to the end,
+                # so retire-project cannot pull it away mid-restore, and print the notice for
+                # every way the rest can stop (kittrial-5bb.85 review 01a10219): a failure, a
+                # stop or Ctrl-C in add-project, in the native restore, or in what follows it.
+                import fcntl
+                (root/'backups').mkdir(exist_ok=True)
+                restoring=restore_lock_path(root,args.destination).open('a')
+                fcntl.flock(restoring,fcntl.LOCK_EX)
+                # ``step`` is a one-word holder: ``finish_restore`` names the provisioning step
+                # inside itself, so a failure there prints the provisioning notice and not the
+                # re-point's (kittrial-5bb.202 review item 4, review F8).
+                step=['add-project']
+                try:
+                    # SIGTERM is an exception for the whole of what follows, not only inside
+                    # the native restore: a stop during add-project (or the re-point) used to
+                    # end the process with no notice at all (review 01a1026a).
+                    with signal_termination_guard():
+                        add_project(root,args.destination,requirements_default=False)
+                        # kittrial-5bb.500 F4: from here until finish_restore has succeeded the project is a
+                        # leftover if anything stops: backup_project refuses it (see RESTORE_INCOMPLETE_MARKER).
+                        write_restore_marker(root,args.destination,args.project)
+                        # The native restore runs through the Dolt SQL client (no bd ~10 s read
+                        # timeout), in its own process group, and adopts the restored project
+                        # identity; a destination without server metadata keeps `bd backup restore`.
+                        step[0]='native restore'
+                        print(native_restore(root,args.project,args.destination))
+                        step[0]='re-point and coordination'
+                        warning=finish_restore(root,args,snapshot,step)
+                        step[0]='restore marker'
+                        clear_restore_marker(root,args.destination)
+                except BaseException as error:
+                    # add-project's own refusals (a populated or retired destination) are raised
+                    # before it creates anything: they need no notice about a leftover project.
+                    if not (step[0]=='add-project' and isinstance(error,ValueError)):
+                        destination_state=restore_destination_state(root,args.destination)
+                        # The provisioning notice says what the clone now holds, so read the slot
+                        # from the clone itself (read-only) instead of assuming the step's failure
+                        # means a missing slot (kittrial-5bb.202 rev-3 item 1, review F1). Its
+                        # "empty, working project" shape is included: a clone from an empty slotless
+                        # source reads that way, and it still needs the provisioning notice.
+                        slot=(project_merge_slot_state(root,args.destination)
+                              if step[0]==MERGE_SLOT_STEP and destination_state in ('partial','empty') else None)
+                        # The deployment-authority step did not run when this one failed, and the
+                        # provisioning notice must not leave that unsaid (kittrial-5bb.240 F1). The
+                        # comparison it makes is read-only; the re-grant is never run from here.
+                        authority=(restore_authority_not_run(root,args.project,args)
+                                   if step[0]==MERGE_SLOT_STEP else None)
+                        print(restore_failure_notice(args.destination,error,destination_state,step=step[0],
+                                                     merge_slot=slot,
+                                                     journals_restored=getattr(args,'journal_restored',None),
+                                                     authority_note=authority),
+                              file=sys.stderr)
+                    raise
+                finally:
+                    restoring.close()
+            # Still under the office lock (F3): the state is written once the project has restored
+            # and any temporary Dolt has already been stopped.
             http_text=None
             if args.restore_http_state:
                 try:

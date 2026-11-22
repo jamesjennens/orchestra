@@ -684,6 +684,75 @@ class StateRestoreRealBdTests(RealRuntimeCase):
         self.assertNotIn('HTTP state pair', out)
         self.assertIn('Restored the HTTP state files from a backup set recorded DEGRADED', out)
 
+    def test_stopped_office_foreground_restore_new_starts_and_stops_real_dolt(self):
+        """kittrial-5bb.520: on a stopped office-foreground runtime, restore-new runs a real temporary Dolt and stops it."""
+        import office_dolt
+        self.a_backed_up_office('hsf')
+        cfg_path = self.root / 'deployment.private.json'
+        original_cfg = cfg_path.read_text(encoding='utf-8')
+        server_json = self.root / 'server.json'
+        server_doc = {
+            'log_level': 'warning',
+            'behavior': {'autocommit': True, 'auto_gc_behavior': {'enable': False}},
+            'listener': {'host': '127.0.0.1', 'port': self.port, 'socket': str(self.root / 'mysql.sock')},
+            'data_dir': str(self.root / 'data'),
+            'cfg_dir': str(self.root / 'data' / '.doltcfg'),
+            'metrics': {'port': -1},
+        }
+        server_json.write_text(json.dumps(server_doc), encoding='utf-8')
+        doc = json.loads(original_cfg)
+        doc['unit'] = 'office-foreground'
+        cfg_path.write_text(json.dumps(doc), encoding='utf-8')
+        self._stop_server()
+        self.__class__.server = None
+        for _ in range(50):
+            if not office_dolt.port_listening(self.port):
+                break
+            time.sleep(0.1)
+        self.assertFalse(office_dolt.port_listening(self.port))
+        try:
+            # Non-Dolt listener holding the DB port is refused without starting a second server.
+            holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            holder.bind(('127.0.0.1', self.port))
+            holder.listen(4)
+            try:
+                code, _, err = self.main('restore-new', 'hsf', 'hsfblocked',
+                                         '--restore-http-state', '--credentials', 'keep')
+                self.assertEqual(1, code)
+                self.assertIn('a second Dolt server was not started', err)
+                self.assertIn('Nothing was changed.', err)
+                self.assertFalse(self.exists('hsfblocked'))
+            finally:
+                holder.close()
+            # With port free and office stopped, restore-new starts temporary Dolt, restores, and stops Dolt.
+            code, out, err = self.main('restore-new', 'hsf', 'hsf2',
+                                       '--restore-http-state', '--credentials', 'keep')
+            self.assertEqual(0, code, err or out)
+            self.assertTrue(self.exists('hsf2'))
+            self.assertFalse(office_dolt.port_listening(self.port),
+                             'temporary real Dolt must be stopped after restore-new')
+            self.assertEqual([], list(self.root.glob('.restore-dolt-*.log')))
+        finally:
+            cfg_path.write_text(original_cfg, encoding='utf-8')
+            with contextlib.suppress(FileNotFoundError):
+                server_json.unlink()
+            server_env = dict(os.environ, HOME=str(self.root / 'home'),
+                              DOLT_ROOT_PATH=str(self.root / 'dolt-home'),
+                              XDG_CONFIG_HOME=str(self.root / 'config'))
+            self.__class__.server = subprocess.Popen(
+                [str(self.root / 'bin' / 'dolt'), 'sql-server', '-H', '127.0.0.1', '-P', str(self.port),
+                 '--data-dir', str(self.root / 'data')],
+                cwd=str(self.root), env=server_env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(self.READY_TRIES):
+                if office_dolt.database_ready(self.root, admin.config(self.root), admin.environment(self.root)):
+                    break
+                time.sleep(self.READY_PAUSE)
+            self.assertTrue(
+                office_dolt.database_ready(self.root, admin.config(self.root), admin.environment(self.root)),
+                'harness Dolt server did not restart after stopped-office test')
+
 # --------------------------------------------------------------------- F5 and the time, no tracker needed
 class StateFilesTests(unittest.TestCase):
     """The pair on disk: F5, and the backup time of verified.md item 1."""

@@ -14,10 +14,7 @@ if sys.version_info < (3, 10):
     sys.exit(2)
 import argparse
 import contextlib
-import csv
-import ctypes
 import fcntl
-import io
 import json
 import os
 import re
@@ -32,6 +29,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 import admin
+import office_dolt
 import record_json
 import regular_file
 from version import report
@@ -338,13 +336,7 @@ def start_warnings(settings):
     return lines
 
 
-def _after_fork():
-    """Ask Linux to kill a child when the supervisor is SIGKILLed."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
-        raise OSError(ctypes.get_errno(), 'PR_SET_PDEATHSIG failed')
-    if os.getppid() == 1:  # parent died between fork and prctl
-        os._exit(1)
+_after_fork = office_dolt.after_fork
 
 
 def log_directory(raw):
@@ -368,71 +360,32 @@ def log_directory(raw):
 
 
 def _spawn(command, root, log_path, env):
-    log_directory(log_path.parent)
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, 'ab', buffering=0) as stream:
-        return subprocess.Popen([str(part) for part in command], cwd=root, env=env,
-                                stdin=subprocess.DEVNULL, stdout=stream,
-                                stderr=subprocess.STDOUT, start_new_session=True,
-                                preexec_fn=_after_fork)
+    return office_dolt.spawn_process(command, root, log_path, env, ensure_dir=log_directory)
 
 
-def _stop(child, deadline):
-    if child is None or child.poll() is not None:
-        return False
-    try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        child.wait(timeout=max(0, deadline-time.monotonic()))
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        child.wait()
-        return True
-    return False
+_stop = office_dolt.stop_process
 
 
 def _sql_probe(root, query, password=None):
     """Bound each readiness query so shutdown cannot hang in the SQL client."""
     cfg = admin.config(root)
     env = admin.environment(root)
-    if password is not None:
-        env['DOLT_CLI_PASSWORD'] = password
-    return subprocess.run(
-        [str(root/'bin/dolt'), '--host', '127.0.0.1', '--port', str(cfg['port']),
-         '--no-tls', '--user', 'root', 'sql', '--result-format', 'csv'],
-        input=query, text=True, encoding='utf-8', capture_output=True,
-        check=True, timeout=5, env=env, cwd=root).stdout
+    done = office_dolt.sql_probe(root, query, cfg, env, password=password)
+    if done.returncode != 0:
+        raise subprocess.CalledProcessError(done.returncode, done.args, output=done.stdout, stderr=done.stderr)
+    return done.stdout
 
 
 def _database_ready(root):
     try:
-        _sql_probe(root, 'SELECT 1;')
-        return True
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+        return office_dolt.database_ready(root, admin.config(root), admin.environment(root))
+    except (OSError, ValueError):
         return False
 
 
 def _bootstrap_database(root):
     """Finish first-start authentication; retries work after a killed parent."""
-    if _database_ready(root):
-        return
-    users = _sql_probe(root, 'SELECT User,Host FROM mysql.user;', password='')
-    rows = list(csv.DictReader(io.StringIO(users)))
-    hosts = [row['Host'] for row in rows if row.get('User') == 'root']
-    if not hosts:
-        raise RuntimeError('Fresh Dolt server has no root account')
-    password = admin.config(root)['password']
-    changes = ["ALTER USER 'root'@'%s' IDENTIFIED BY '%s';" %
-               (host.replace("'", "''"), password) for host in hosts]
-    _sql_probe(root, '\n'.join(changes), password='')
-    if not _database_ready(root):
-        raise RuntimeError('Dolt root authentication did not become ready')
+    return office_dolt.bootstrap_database(root, admin.config(root), admin.environment(root))
 
 
 def _install_binaries(root, assets):
@@ -669,6 +622,7 @@ def run(root, logs, config, port, stop_seconds):
         raise ValueError('Use an unprivileged HTTP port and a 1-30 second stop deadline')
     if not (root/'server.json').is_file() or not (root/'deployment.private.json').is_file():
         raise ValueError('Prepare this runtime before starting it')
+    startup_seconds = office_dolt.dolt_startup_seconds(admin.config(root))
     settings = service_config(config)
     # Before anything is started (kittrial-5bb.168 item 1): an unusable certificate or key is one
     # sentence naming the file, not a child's traceback and "A supervised child exited". The
@@ -698,24 +652,23 @@ def run(root, logs, config, port, stop_seconds):
         forced = False
         try:
             env = admin.environment(root)
-            db_env = env.copy()
-            db_env.pop('DOLT_CLI_PASSWORD', None)
-            db_env.pop('BEADS_DOLT_PASSWORD', None)
+            db_env = office_dolt.db_server_env(env)
             db = _spawn([root/'bin/dolt', 'sql-server', '--config', root/'server.json'],
                         root, logs/'dolt.log', db_env)
-            until = time.monotonic()+30
+            until = time.monotonic() + startup_seconds
             ready = False
             while time.monotonic() < until and not stop:
                 if db.poll() is not None:
                     raise RuntimeError('Dolt exited during startup; inspect dolt.log')
                 try:
-                    _bootstrap_database(root)
-                    ready = True
-                    break
+                    if _bootstrap_database(root):
+                        ready = True
+                        break
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                    time.sleep(.2)
+                    pass
+                time.sleep(.2)
             if not stop and not ready:
-                raise RuntimeError('Dolt did not become ready within 30 seconds')
+                raise RuntimeError('Dolt did not become ready within %d seconds' % startup_seconds)
             release_script = Path(__file__).resolve()
             release_python = os.path.realpath(sys.executable)
             command = web_command(settings, root, port, release_python, release_script)
