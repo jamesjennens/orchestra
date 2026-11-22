@@ -196,7 +196,8 @@ class BoardTests(unittest.TestCase):
         self.assertNotIn('expect_by_passed', entry['flags'])
         self.assertNotIn('waiting_too_long', entry['flags'])
         before_rows = waiting.coordinator_view([], result)['triggers']['lane-quiet']
-        self.assertTrue(all('expect_by_passed' not in row['flags'] for row in before_rows), before_rows)
+        self.assertEqual([], before_rows)          # no lane-quiet at all before 4 h (r1 review m1)
+        self.assertEqual([], entry['flags'])
         # Passed: the EXISTING flag and the existing lane-quiet trigger fire.
         result = board([row], now=after)
         lane, entry = entry_of(result, 'own-1')
