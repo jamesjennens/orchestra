@@ -239,9 +239,6 @@ class HiddenFamiliesToday(unittest.TestCase):
                          RECORD_COMMENT_FAMILIES)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 import claim_limit  # noqa: E402
 import test_http_agents  # noqa: E402
@@ -281,3 +278,7 @@ class T1InProcessBackend(test_http_agents.AgentHarness):
         self.assertTrue(found['newer_activity'])
         self.assertGreaterEqual(found['newer_activity_by_others'], 1)
         self.assertNotIn('Nothing new', found['wake_summary'])
+
+
+if __name__ == '__main__':
+    unittest.main()

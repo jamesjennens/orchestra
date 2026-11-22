@@ -388,6 +388,13 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
             guessed = inferred_wait(checkpoint[0])
             if guessed is not None:
                 wait_state, waiting_on = guessed
+    if declared and wait_state == OWN_JOB_STATE:
+        # kittrial-5bb.588 r2 (S4): an own-job wait is dated from the start of its episode, so
+        # re-posting it slides neither the 4 h default nor the declared wait's "since".
+        from lane_state import own_job_episode_start
+        began_with = own_job_episode_start(row.get('comments') or [], task)
+        if began_with is not None:
+            since = began_with.get('created_at')
     age = seconds_since(since, now)
     expect_effective = expect_by
     if wait_state == OWN_JOB_STATE and declared and not expect_by:
@@ -406,7 +413,11 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         flags.append('waiting_too_long')
     if expect_moment is not None and expect_moment < now:
         flags.append('expect_by_passed')
-    if move == 'you' and idle_seconds is not None and idle_seconds > threshold:
+    # kittrial-5bb.588 r2 (m1): a declared own-job wait is not idle before its effective expect_by;
+    # after it, your_move_idle and expect_by_passed both fire, through the existing lane-quiet path.
+    own_job_quiet = (declared and wait_state == OWN_JOB_STATE
+                     and expect_moment is not None and expect_moment >= now)
+    if move == 'you' and idle_seconds is not None and idle_seconds > threshold and not own_job_quiet:
         flags.append('your_move_idle')
     return {
         'task': task,

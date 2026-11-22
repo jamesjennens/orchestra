@@ -124,38 +124,39 @@ class MustMainBlockIsLast(unittest.TestCase):
 
 
 class ShouldWakeSummaryNamesAFieldEdit(unittest.TestCase):
-    """S1: an edit of the title, description or acceptance moves the fingerprint; the sentence says so."""
+    """S1: an edit of the title, description or acceptance moves the fingerprint; the sentence says the task changed.
 
-    def test_a_title_edit_is_named(self):
+    The checkpoint records no per-field digest, so the sentence cannot say WHICH field; it says the task
+    itself changed, whenever the checkpoint is stale and no entry explains it."""
+
+    CHANGED = ('Nothing new by others since your checkpoint at %s; the task itself changed after it '
+               '(a field, its status, assignee, labels or dependencies).' % STAMP)
+
+    def test_a_title_edit_is_said(self):
         data = rows()
         save_cp(data, 'cp1')
         data[0]['title'] = 'A task with a longer title'
-        summary = queue_row(data)['wake_summary']
-        self.assertEqual('Nothing new by others since your checkpoint at %s; the task\'s title changed.' % STAMP,
-                         summary)
+        self.assertEqual(self.CHANGED, queue_row(data)['wake_summary'])
 
-    def test_two_fields_are_named_in_order(self):
-        data = rows()
-        save_cp(data, 'cp1')
-        data[0]['description'] = 'Intent, now with more words'
-        data[0]['acceptance_criteria'] = 'Acceptance, and more'
-        summary = queue_row(data)['wake_summary']
-        self.assertTrue(summary.endswith('; the task\'s description and acceptance criteria changed.'), summary)
-
-    def test_a_comment_and_a_field_edit_are_both_named(self):
-        data = rows()
-        save_cp(data, 'cp1')
-        data[0]['comments'].append(comment('c-coord', 'See the new title', later(300), author=COORD))
-        data[0]['title'] = 'A task with a longer title'
-        summary = queue_row(data)['wake_summary']
-        self.assertTrue(summary.startswith('1 new entry by others'), summary)
-        self.assertTrue(summary.endswith('; the task\'s title changed.'), summary)
+    def test_a_description_or_acceptance_edit_is_said(self):
+        for name in ('description', 'acceptance_criteria'):
+            with self.subTest(field=name):
+                data = rows()
+                save_cp(data, 'cp1')
+                data[0][name] = 'Edited'
+                self.assertEqual(self.CHANGED, queue_row(data)['wake_summary'])
 
     def test_brief_says_the_same(self):
         data = rows()
         save_cp(data, 'cp1')
         data[0]['title'] = 'A task with a longer title'
-        self.assertEqual(queue_row(data)['wake_summary'], b.brief(data, PROJECT, TASK)['activity']['wake_summary'])
+        self.assertEqual(self.CHANGED, b.brief(data, PROJECT, TASK)['activity']['wake_summary'])
+
+    def test_the_lanes_own_comment_is_not_a_task_change(self):
+        data = rows()
+        save_cp(data, 'cp1')
+        data[0]['comments'].append(comment('c-own', 'My note', later(60)))
+        self.assertEqual('Nothing new by others since your checkpoint at %s.' % STAMP, queue_row(data)['wake_summary'])
 
     def test_nothing_changed_still_says_nothing_new(self):
         data = rows()

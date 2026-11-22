@@ -1976,6 +1976,7 @@ class InProcessBackend:
         description = ({'description_pointers': pointers.item_pointers(
             [{'id': 'description', 'text': ' '.join(described)}], 'text')['description']} if described else {})
         checkpoints = self.state.get('checkpoints', {}).get(task_id) or []
+        baseline = self._own_baseline_checkpoint(task, checkpoints, checkpoints[-1]) if checkpoints else None
         checkpoint = None
         if checkpoints:
             last = checkpoints[-1]
@@ -2001,8 +2002,10 @@ class InProcessBackend:
                 'lifecycle': {}, 'depends_on': [],
                 # This backend keeps no activity cursor; its checkpoints need none.
                 'activity_cursor': None,
-                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None,
-                **self._activity_blocks(task, checkpoints[-1] if checkpoints else None)}
+                # kittrial-5bb.588 r2 (m4): newer, activity and changes_since_checkpoint are all
+                # measured from ONE baseline, the assignee's own newest checkpoint (as the agent rows).
+                'newer': self._agent_activity_summary(task, baseline) if baseline else None,
+                **self._activity_blocks(task, baseline)}
 
     def _activity_blocks(self, task, checkpoint):
         """The task read's ``activity`` and ``changes_since_checkpoint`` (kittrial-5bb.354).
