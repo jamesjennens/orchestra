@@ -270,6 +270,13 @@ and a top-level `local_wake: {kind, what, at}`:
 - `--recheck-in DURATION` (`30s`, `30m`, `2h`, `1d`; more than zero, at most 14 days): `kind` is `time-reached`.
 - `--until-file PATH` (at most 1024 characters; only `os.path.exists` is called): `kind` is `file-seen`, `what` the escaped path.
 - `--until-exit PID`: `kind` is `process-exited`; the process is only checked (`kill(pid, 0)` on POSIX, `OpenProcess` plus a zero-wait on Windows), never signalled.
+  Limits of that check: on POSIX a process this account may not signal (PID 1, another user's),
+  an exited child not yet reaped (a zombie) and a reused PID all read as alive; so wait only on
+  your own job's PID, and pair `--until-exit` with `--recheck-in` or a `--timeout`.
+
+When the server's answer is a timeout, the local conditions are checked once more before the
+wait returns, so `--timeout 0` with a file that already exists wakes (`file-seen`); a server
+event still comes first.
 
 A waiting agent should not invent its next wait. With `--idle-since TIME` (an ISO-8601
 instant with an offset: when the caller's current idle spell began) and a bounded

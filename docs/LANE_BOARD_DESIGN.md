@@ -45,12 +45,12 @@ Kind: lane-state-v1
 | `checkpoint` | string | the comment id of the checkpoint written with this record; refused when it names a checkpoint that is not the task's newest at write time |
 | `state` | string | one of `working`, `waiting-on-coordinator`, `waiting-on-review`, `waiting-on-user`, `waiting-on-own-job`, `idle` (and the fault flag `needs-investigation`, section 6) |
 | `waiting_on` | string | a **role** (`coordinator`, `reviewer`, `user`) or an **actor id**. Required when `state` is `waiting-on-coordinator`, `waiting-on-review` or `waiting-on-user`; refused with every other state, `waiting-on-own-job` included |
-| `job` | string | `waiting-on-own-job` only (kittrial-5bb.588), and required there: one printable line, at most 120 characters, naming the worker's OWN job (a test run, a replay, a build). Untrusted text, shown escaped. Refused with any other state. With no `expect_by` the board treats the wait as overdue 4 hours after the state began, through the existing `expect_by_passed` flag and `lane-quiet` trigger; it is never a `checkpoint-to-coordinator` question and is not inferred from prose |
+| `job` | string | `waiting-on-own-job` only (kittrial-5bb.588), and required there: one printable line, at most 120 characters, naming the worker's OWN job (a test run, a replay, a build). Untrusted text, shown escaped. Refused with any other state. With no `expect_by` the board treats the wait as overdue 4 hours after its episode began (the first of an unbroken run of own-job records by the holder: re-posting it does not restart the clock), through the existing `expect_by_passed` flag and `lane-quiet` trigger. Before its (effective) `expect_by` it raises no flag at all, `your_move_idle` included; it is never a `checkpoint-to-coordinator` question and is not inferred from prose |
 | `expect_by` | time | ISO-8601 with an offset. Optional. **Any parseable value is accepted**, a past one included; an unparseable one is refused |
 
 Rules, all enforced at write, all refusing rather than coercing:
 
-- `state` outside the five values is refused, naming the accepted set.
+- `state` outside the six values (and the fault flag `needs-investigation`) is refused, naming the accepted set.
 - `waiting_on` present without one of the three `waiting-on-*` states that name somebody, or absent with one, is refused.
 - `expect_by` is refused only when it cannot be parsed. A past `expect_by` is accepted and flagged on
   read (`expect_by_passed`), because a lane may legitimately write down that a deadline has passed.
