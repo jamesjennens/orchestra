@@ -79,9 +79,12 @@ class GateTests(cred.PinBase):
         super().setUp()
         self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)
 
+    def records(self, task):
+        return list(self.backend.state['contributions'].get(task, []))
+
     def test_each_text_is_refused_422_on_approve_and_on_recommend_and_nothing_is_written(self):
         task, cid = self.deliver(self.tokens['carl'])
-        before = len(self.events('reviews.add'))
+        before = self.records(task)
         for name, text in REFUSED.items():
             for who, token in (('agent', self.agent), ('person', self.tokens['olive'])):
                 with self.subTest(text=name, on='approve', by=who):
@@ -97,7 +100,8 @@ class GateTests(cred.PinBase):
                     'summary': text, 'items': []}, token=self.agent)
                 self.assertEqual(422, refused.status, refused.data)
                 self.assertIn('may not contain', refused.data['error']['message'])
-        self.assertEqual(before, len(self.events('reviews.add')))
+        self.assertEqual(before, self.records(task))           # no review record was stored
+        self.assertFalse([e for e in self.events('reviews.add') if e.get('same_person_coordinator')])
 
     def test_the_refusal_names_the_text_it_found(self):
         task, cid = self.deliver(self.tokens['carl'])
@@ -191,6 +195,29 @@ class HintTests(cred.ShapeSetup):
 
     def test_the_credential_helper_is_gone(self):
         self.assertFalse(hasattr(API, '_credential_work_in'))
+
+
+class RetryTests(cred.PinBase):
+    """Rule 6, documented: a retry after the basis changed (the task was reassigned meanwhile) changes nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)
+        self.lane_c, _ = self.worker_of('cora', 'lane-c')
+
+    def test_the_retry_under_the_same_key_is_answered_as_recorded_and_the_first_basis_stands(self):
+        task, cid = self.deliver(self.tokens['carl'])
+        self.backend._task(self.project, task)['assignee'] = 'lane-c'        # the assignee decides: a credential
+        body = {'operation': 'approve', 'contribution': cid, 'summary': 'accepted'}
+        first = self.request('POST', self.base(task) + '/reviews', body, token=self.agent, key='approve-540-retry')
+        self.assertEqual(201, first.status, first.data)
+        self.backend._task(self.project, task)['assignee'] = self.other_id    # now it would be another agent
+        again = self.request('POST', self.base(task) + '/reviews', body, token=self.agent, key='approve-540-retry')
+        self.assertEqual(first.status, again.status, again.data)
+        self.assertEqual(first.data, again.data)
+        self.assertEqual('accepted ' + CREDENTIAL_SENTENCE, self.approval_summary(task))
+        events = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')]
+        self.assertEqual(['worker-credential'], [e['basis'] for e in events])
 
 
 if __name__ == '__main__':
