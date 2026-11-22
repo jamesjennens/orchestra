@@ -40,7 +40,7 @@ const observe = (root) => ({
   text: root.textContent,
 });
 
-const BASIS = { basis: 'same-person-agent', text: 'Allowed by: coordinator agent of the same person as the delivering agent',
+const BASIS = { basis: 'same-person-agent', text: 'Allowed by: coordinator agent of the same person as the agent on this task',
   author: 'heron', at: '2026-01-02T00:00:00Z' };
 const withField = await page({ state: 'awaiting-integration', requests: [], contribution: contribution('Delivered the change'),
   approval_basis: BASIS }, []);
@@ -51,7 +51,7 @@ const oldForm = await page({ state: 'awaiting-integration', requests: [], contri
   [{ action: 'approve', actor: 'heron', time: '2026-01-02T00:00:00Z', detail: 'accepted ' + SENTENCE }]);
 await settle();
 const CREDENTIAL = { basis: 'same-person-worker-credential',
-  text: 'Allowed by: coordinator agent of the same person as the delivering worker credential (project setting '
+  text: 'Allowed by: coordinator agent of the same person as the worker credential on this task (project setting '
     + 'agent_approval: by-agent; the audit entry holds who set it and when)',
   author: 'heron', at: '2026-01-02T00:00:00Z' };
 const withCredential = await page({ state: 'awaiting-integration', requests: [],

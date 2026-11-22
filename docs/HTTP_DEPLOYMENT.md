@@ -2503,9 +2503,18 @@ credential approved anything; this is the one place where that is lifted.
     a name, or set the worker up from My agents."), and the agent itself, as when another worker
     uses a copy of its credential ("set it up as a new agent from My agents.").
   - The approval then ends with "Approved by a coordinator agent of the same person as the worker
-    credential that delivered it (project setting agent_approval: by-agent).", the web route
-    refuses a caller who writes either sentence (`422`), and the audit event of the write carries
-    `basis`: `worker-credential` or `agent`. `by-person` and a damaged setting are unchanged.
+    credential on this task (project setting agent_approval: by-agent).", the web route
+    refuses a caller who writes any of the server's basis texts (`422`, below), and the audit event
+    of the write carries `basis`: `worker-credential` or `agent`. `by-person` and a damaged setting
+    are unchanged.
+  - **Which basis (kittrial-5bb.540):** the delivering author decides it whenever the author is of
+    the approver's party; the assignee decides it only when the author is independent
+    (`http_authority.by_agent_approval`, the author first, so the first basis found stands). The
+    sentence and the label therefore name the KIND of party on the task ("the agent on this task",
+    "the worker credential on this task"), which is true whichever of the two decided. The hint of
+    `GET /v1/agents/me/next` ("A contribution under a worker credential of your person …" or "… by
+    another agent of your person …") is read from the same decision, so it names the basis the
+    record will carry.
 - **People are not affected:** a person's approval follows the installation's setting as
   before.
 - **The setting:** `PUT /v1/projects/{id}/agent-approval` with
@@ -2558,7 +2567,9 @@ credential approved anything; this is the one place where that is lifted.
     release B). It does so only when the endpoint's machine-readable `review` help lists
     `approval_basis` under `optional_fields.approve`; for an endpoint that does not (a kit before
     the readers' release), it appends to the summary instead: "Approved by a coordinator agent of
-    the same person as the agent that delivered it (project setting agent_approval: by-agent)."
+    the same person as the agent on this task (project setting agent_approval: by-agent)."
+    (Before kittrial-5bb.540 the sentence said "the agent that delivered it"; records already
+    written keep their words.)
     The route answers `422` to a request body that names `approval_basis`. Release order and the
     rollback boundary are in [OPERATIONS.md](OPERATIONS.md#the-approval-basis-field-release-order-and-rollback-kittrial-5bb515).
   - The audit event of the review write carries `same_person_coordinator: true`, the author,
@@ -2566,10 +2577,19 @@ credential approved anything; this is the one place where that is lifted.
   - In the sentence form, if the caller's summary leaves no room for that sentence within the
     1200-character bound, the route answers `422` and says how many characters to cut. Nothing is
     written. The field form appends nothing, so the whole 1200 characters are the approver's.
-  - The web route refuses a caller-written basis sentence on `approve` or `recommend` with `422`
-    (after NFKC, casefold, Unicode format-character removal, whitespace collapse and
-    punctuation/bracket stripping; lookalike letters remain), while the host route does not, so
-    the audit entry stays the authority.
+  - The web route refuses a caller-written basis text on `approve` or `recommend` with `422`,
+    naming the text it found, and writes nothing (kittrial-5bb.540 widened it): either sentence as
+    it is now or was before, either field label as it is now or was before (with or without
+    "Allowed by:"), and a line starting "Approval basis:", the brief's label. Texts are compared
+    after NFKD, casefold, Unicode format-character and mark removal, whitespace removal and
+    punctuation/symbol/bracket stripping (lookalike letters remain); words that only resemble them
+    ("approved", "basis", "the agent that delivered it") are allowed. The field is the protection;
+    the gate is defence in depth, so a typed claim cannot pose as the server's line beside it. The
+    host route does not apply it, so the audit entry stays the authority.
+  - **A retry after the basis changed (kittrial-5bb.540).** If the answer to an approve is lost and
+    the task is reassigned before the retry, so that the basis would now be different, the retry
+    under the same `Idempotency-Key` is answered as recorded: the first record and its basis stand,
+    and nothing is written again. A retry needs the same key to be recognised as one.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer; the account is

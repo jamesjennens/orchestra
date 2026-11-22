@@ -7207,12 +7207,21 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: The cases approval_permission names (kittrial-5bb.518, with the worker-credential case of .519).
     APPROVAL_CASES = ('another-agent', 'worker-credential', 'own-work', 'own-person', 'own-worker-credential',
                       'independent')
-    #: Added to the summary of an approval that only this setting let through, so the record says so.
-    SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
+    #: Added to the summary of an approval that only this setting let through, so the record says so. It names
+    #: the KIND of party on the task (kittrial-5bb.540), which is true whether the author or the assignee decided.
+    SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent on this task '
                             '(project setting agent_approval: by-agent).')
     #: The same, for work under a worker credential of the approving agent's person (kittrial-5bb.519).
-    WORKER_CREDENTIAL_APPROVAL = ('Approved by a coordinator agent of the same person as the worker credential that '
-                                  'delivered it (project setting agent_approval: by-agent).')
+    WORKER_CREDENTIAL_APPROVAL = ('Approved by a coordinator agent of the same person as the worker credential on '
+                                  'this task (project setting agent_approval: by-agent).')
+    #: The sentences before kittrial-5bb.540. Records already written keep them; the text gate still refuses them.
+    RETIRED_APPROVAL_SENTENCES = (
+        'Approved by a coordinator agent of the same person as the agent that delivered it '
+        '(project setting agent_approval: by-agent).',
+        'Approved by a coordinator agent of the same person as the worker credential that '
+        'delivered it (project setting agent_approval: by-agent).')
+    #: The brief's label for the basis line (briefing.format_brief); a caller's line starting with it is refused.
+    BASIS_LINE_LABEL = 'Approval basis:'
     #: Said under by-agent about the three own-party cases that stay refused (kittrial-5bb.519).
     SHARED_NAME_NEXT = (' Issue a credential with a name no other account has held, or set the worker up from My '
                         'agents.')
@@ -7257,44 +7266,56 @@ class ApiHandler(BaseHTTPRequestHandler):
             detail = 'ValueError: %s' % error
             raise invalid(str(error) if recommending else 'Canonical command rejected the request', detail) from None
 
-    def _basis_sentence_in(self, summary, recommending=False):
-        """The fixed approval sentence a caller's text contains (either one), or None (kittrial-5bb.519).
+    def _basis_texts(self):
+        """Every text the server or a reader writes about the basis, in the order the gate tries them (kittrial-5bb.540).
 
-        A summary over the field limit is refused first, in the canonical write's words and before any
-        normalization (:meth:`_refuse_overlong_summary`, kittrial-5bb.516), on approve and on recommend.
+        The two sentences as they are and as they were, then the two field labels as they are and as they were.
+        A label is matched without its "Allowed by: " prefix, so a copy with or without it is found.
+        """
+        import review_workflow
+        sentences = (self.SAME_PERSON_APPROVAL, self.WORKER_CREDENTIAL_APPROVAL) + self.RETIRED_APPROVAL_SENTENCES
+        labels = tuple(review_workflow.APPROVAL_BASES.values()) + review_workflow.RETIRED_APPROVAL_BASIS_LABELS
+        return [(text, text) for text in sentences] + [
+            (label, label.split(': ', 1)[1] if label.startswith('Allowed by: ') else label) for label in labels]
+
+    def _basis_label_line_in(self, summary):
+        """Whether a line of ``summary`` starts with the brief's "Approval basis:" label (kittrial-5bb.540).
+
+        Compared as the gate compares: NFKD and case folded, format characters, marks and whitespace dropped;
+        a hyphen or underscore may join the two words. "Approval basis" elsewhere in a line is allowed.
+        """
+        for line in summary.splitlines():
+            folded = unicodedata.normalize('NFKD', unicodedata.normalize('NFKD', line).casefold())
+            kept = ''.join(ch for ch in folded if unicodedata.category(ch) != 'Cf'
+                           and unicodedata.category(ch)[0] != 'M' and not ch.isspace())
+            if re.match(r'[\W_]*approval[-_]*basis:', kept):
+                return True
+        return False
+
+    def _basis_sentence_in(self, summary, recommending=False):
+        """The server's basis text a caller's summary contains, or None (kittrial-5bb.519, widened by .540).
+
+        The text gate is defence in depth: the record's ``approval_basis`` field is the protection, but a
+        caller's summary sits next to the server's line on the page and in the brief. It refuses either
+        sentence as it is now or was before kittrial-5bb.540, either field label now or before (with or
+        without "Allowed by:"), and a line starting "Approval basis:". A summary over the field limit is refused
+        first, in the canonical write's words and before any normalization (:meth:`_refuse_overlong_summary`,
+        kittrial-5bb.516), on approve and on recommend.
         """
         self._refuse_overlong_summary(summary, recommending)
         if not isinstance(summary, str):
             return None
         text = self._normalize_basis_text(summary)
-        for sentence in (self.SAME_PERSON_APPROVAL, self.WORKER_CREDENTIAL_APPROVAL):
-            target = self._normalize_basis_text(sentence)
+        for named, compared in self._basis_texts():
+            target = self._normalize_basis_text(compared)
             if target and target in text:
-                return sentence
+                return named
+        if self._basis_label_line_in(summary):
+            return self.BASIS_LINE_LABEL
         return None
 
     def _contains_same_person_approval(self, summary, recommending=False):
         return self._basis_sentence_in(summary, recommending) is not None
-
-    def _another_agent_only(self, agent_id, names, assignee, author, project):
-        """Whether the by-agent setting lets agent ``agent_id`` approve work of ``author`` and ``assignee`` (kittrial-5bb.438).
-
-        True when nothing of its party is there at all, or only other personal agents of the same account or
-        worker credentials of that account that the approve route lets through; False as soon as one is the
-        agent itself or a sub-label of it, the bare account id, or a shared name. It is
-        :func:`http_authority.by_agent_approval`, the one decision :meth:`_agent_approval_refusal` asks too
-        (kittrial-5bb.560), so the list and the route have one source. The caller has already asked that the
-        setting is ``by-agent`` and the agent's grant is effective; the decision asks both again.
-        """
-        _, decision = self.service.by_agent_approval(project, agent_id, author, assignee, names)
-        return decision.allowed
-
-    def _credential_work_in(self, agent_id, names, parties, project):
-        """Whether one of ``parties`` of the approver's party is a worker credential of its person (kittrial-5bb.519)."""
-        return any(isinstance(target, str) and target
-                   and not self._independent_all(names, [target], project, True)
-                   and self.service.worker_credential_of_same_person(agent_id, target, project)
-                   for target in parties)
 
     def _agent_approval_refusal(self, principal, names, assignee, author, project, setting=None):
         """``(refusal or None, setting)`` for an agent approver the party rule refused (kittrial-5bb.438).
@@ -11604,8 +11625,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
                 continue
             parties = [row.get('assignee'), row.get('contribution_author')]
-            same_person = by_agent and self._another_agent_only(agent_id, [actor], row.get('assignee'),
-                                                                row.get('contribution_author'), project_id)
+            # One decision for the list, the hint and the approve route (kittrial-5bb.540): its ``basis`` is the
+            # one the approval record would carry, the author's when the author is of this agent's party.
+            decision = (self.service.by_agent_approval(project_id, agent_id, row.get('contribution_author'),
+                                                       row.get('assignee'), [actor])[1] if by_agent else None)
+            same_person = bool(decision and decision.allowed)
             if not same_person and not self._independent([actor], parties, project_id):
                 continue
             recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
@@ -11618,9 +11642,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 kind, count, who = 'to-review', 'to_review', 'agent'
                 reason = (('A reviewer recommends approving this contribution. ' if recommended_by else
                            'A contribution under a worker credential of your person awaits review. ' if same_person
-                           and self._credential_work_in(agent_id, [actor], parties, project_id) else
-                           'A contribution by another agent of your person awaits review. ' if same_person and
-                           not self._independent([actor], parties, project_id, True) else
+                           and decision.basis == 'worker-credential' else
+                           'A contribution by another agent of your person awaits review. ' if same_person
+                           and decision.basis == 'agent' else
                            'A contribution by another account awaits review. ')
                           + 'You hold the coordinator grant in this project: review it, then approve it or request '
                             'changes.')

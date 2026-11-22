@@ -84,11 +84,14 @@ B8 = ('This task is assigned to this agent itself. On this project a coordinator
     "person's own work, or work under a worker credential of that person: somebody of another party who "
     'may approve here must approve it (another coordinator or owner of this project, or a superuser).')
 
-# The words of the new rules, literally (the plan's sentences).
-WORKER_CREDENTIAL_BASIS = ('Approved by a coordinator agent of the same person as the worker credential that '
-                           'delivered it (project setting agent_approval: by-agent).')
-AGENT_BASIS = ('Approved by a coordinator agent of the same person as the agent that delivered it '
+# The words of the new rules, literally (the plan's sentences; kittrial-5bb.540 names the kind on the task).
+WORKER_CREDENTIAL_BASIS = ('Approved by a coordinator agent of the same person as the worker credential on this '
+                           'task (project setting agent_approval: by-agent).')
+AGENT_BASIS = ('Approved by a coordinator agent of the same person as the agent on this task '
                '(project setting agent_approval: by-agent).')
+#: The agent sentence before kittrial-5bb.540; records keep it and the gate still refuses it.
+OLD_AGENT_BASIS = ('Approved by a coordinator agent of the same person as the agent that delivered it '
+                   '(project setting agent_approval: by-agent).')
 OLD_BY_AGENT_NEXT = (" On this project a coordinator agent may approve the work of another agent of the same person "
                      "(agent approvals: by agent), but never its own work, its person's own work, or work under a "
                      "worker credential of that person: somebody of another party who may approve here must approve "
@@ -556,9 +559,9 @@ class SentenceTests(PinBase):
     def test_the_old_sentence_is_still_refused_on_credential_work(self):
         task, contribution = self.deliver(self.lane_c)
         refused = self.request('POST', self.base(task) + '/reviews', {
-            'operation': 'approve', 'contribution': contribution, 'summary': AGENT_BASIS}, token=self.agent)
+            'operation': 'approve', 'contribution': contribution, 'summary': OLD_AGENT_BASIS}, token=self.agent)
         self.assertEqual(422, refused.status, refused.data)
-        self.assertIn(AGENT_BASIS, refused.data['error']['message'])
+        self.assertIn(OLD_AGENT_BASIS, refused.data['error']['message'])
 
     def test_a_forged_sentence_on_the_agents_own_work_is_still_a_403_first(self):
         own, cid = self.deliver(self.agent)

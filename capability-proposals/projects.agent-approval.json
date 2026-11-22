@@ -24,8 +24,6 @@
     "http_service.py::ApiHandler.project_agent_approval",
     "http_service.py::ApiHandler._may_set_agent_approval",
     "http_service.py::ApiHandler._agent_approval_refusal",
-    "http_service.py::ApiHandler._another_agent_only",
-    "http_service.py::ApiHandler._credential_work_in",
     "http_service.py::ApiHandler.reviews_add",
     "http_service.py::ApiHandler.project_get",
     "http_auth.py::Service.agent_approval",

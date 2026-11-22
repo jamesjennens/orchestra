@@ -202,15 +202,26 @@ ASSIGNEE_SNAPSHOT = 'assignee_at_approval'
 # release that reads it (A) must reach every reader before any writer (B) uses it. The endpoint advertises it in
 # its machine-readable ``review`` help (``help_optional_fields``), which is the writer's one gate.
 APPROVAL_BASIS = 'approval_basis'
-#: The closed vocabulary: token -> the line a reader shows (apart from the approver's summary).
+#: The closed vocabulary: token -> the line a reader shows (apart from the approver's summary). The line names the
+#: KIND of party on the task (kittrial-5bb.540): the basis is the delivering author's when the author is of the
+#: approver's party and the assignee's only when the author is independent, so "the delivering ..." was not always
+#: true. Labels are looked up when a record is read, so every record, old or new, shows these.
 APPROVAL_BASES = {
-    'same-person-agent': 'Allowed by: coordinator agent of the same person as the delivering agent '
+    'same-person-agent': 'Allowed by: coordinator agent of the same person as the agent on this task '
                          '(project setting agent_approval: by-agent; the audit entry holds who set it and when)',
     # kittrial-5bb.519: a coordinator agent approving a worker credential of its own person.
-    'same-person-worker-credential': 'Allowed by: coordinator agent of the same person as the delivering worker '
-                                     'credential (project setting agent_approval: by-agent; the audit entry holds '
-                                     'who set it and when)',
+    'same-person-worker-credential': 'Allowed by: coordinator agent of the same person as the worker credential '
+                                     'on this task (project setting agent_approval: by-agent; the audit entry '
+                                     'holds who set it and when)',
 }
+#: The labels before kittrial-5bb.540. No reader shows them any more; the web service's text gate still refuses
+#: them in a caller's summary, so a typed copy cannot pose as the server's line.
+RETIRED_APPROVAL_BASIS_LABELS = (
+    'Allowed by: coordinator agent of the same person as the delivering agent '
+    '(project setting agent_approval: by-agent; the audit entry holds who set it and when)',
+    'Allowed by: coordinator agent of the same person as the delivering worker credential '
+    '(project setting agent_approval: by-agent; the audit entry holds who set it and when)',
+)
 # The audited revert record. A separate reserved kind (see the module docstring),
 # written only by the operator CLI; ``issued_revert`` is its exact schema and
 # ``revert_records`` its tolerant reader.

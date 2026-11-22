@@ -221,6 +221,16 @@ refuses a request body that names it). The projection carries it as `approval_ba
 line, and the task page shows it as its own line apart from the summary. A record without the field is the old
 form: its summary is the approver's text, whatever it says, and no basis is shown.
 
+**Which party decides the basis (kittrial-5bb.540).** The delivering author decides it whenever the author is of
+the approver's party; the assignee decides it only when the author is independent (`http_authority.by_agent_approval`
+walks the author first, and the first basis found stands). So the labels name the KIND of party on the task: "the
+agent on this task" or "the worker credential on this task". That is true whichever one decided, and labels are
+looked up when a record is read, so old records show the new words too. The sentence form keeps the words it was
+written with. The web service's text gate refuses, on `approve` and `recommend`, either sentence and either label as
+they are now or were before, and a line starting "Approval basis:". The hint in `GET /v1/agents/me/next` comes from
+the same decision. A retry under the same `Idempotency-Key` is answered as recorded, even if the task was reassigned
+meanwhile: the first record and its basis stand.
+
 Like `assignee_at_approval` the field is additive for readers and not for writers: a kit built before the
 field validates the approve field set exactly and refuses a record that carries it. It is therefore released
 in two steps, readers (A) and then writers (B), and B is gated by the endpoint listing `approval_basis` for
