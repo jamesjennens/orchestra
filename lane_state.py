@@ -192,9 +192,13 @@ def local_fact_problems(value):
         if key not in value:
             continue
         try:
-            check_text(value[key], 'local_fact.' + key, limit, nul=False)
-            if key == 'what' and not value[key].isprintable():
-                raise ValueError('local_fact.what must be one line without newlines or control characters')
+            check_text(value[key], 'local_fact.' + key, limit)
+            # kittrial-5bb.588 r2 (m2): both texts are one printable line. str.isprintable refuses
+            # every control (C0 with newline and tab, DEL, C1), format characters (bidi overrides
+            # and isolates) and line/paragraph separators.
+            if not value[key].isprintable():
+                raise ValueError('local_fact.%s must be one line without newlines, control or direction '
+                                 'characters' % key)
         except ValueError as error:
             found.append(str(error))
     if 'at' in value:
@@ -403,6 +407,36 @@ def newest(comments, task):
     raised, and so are needs-investigation records: a fault is its own channel (fault_clear)
     and is never the task's declared wait state; ``None`` means the task carries no usable record (an older checkpoint).
     """
+    usable, comments = _usable(comments, task)
+    if not usable:
+        return None
+    _, _, comment, payload = usable[-1]
+    checkpoint = next(item for item in comments if str(item.get('id')) == payload['checkpoint'])
+    return comment, payload, checkpoint
+
+
+def own_job_episode_start(comments, task):
+    """The checkpoint comment that began the newest record's own-job EPISODE (kittrial-5bb.588 r2, S4).
+
+    An episode is the unbroken run of ``waiting-on-own-job`` records by one author on this task, read
+    newest first. Re-posting the wait (a retrying wrapper, a re-checkpoint) does not restart its clock;
+    a record of any other state, or by another author, ends the run. This is the rule .598 states for
+    every wait, applied here to own-job only. ``None`` when the newest usable record is not an own-job wait.
+    """
+    usable, comments = _usable(comments, task)
+    if not usable or usable[-1][3].get('state') != OWN_JOB_STATE:
+        return None
+    author = usable[-1][2].get('author')
+    first = usable[-1]
+    for row in reversed(usable[:-1]):
+        if row[3].get('state') != OWN_JOB_STATE or row[2].get('author') != author:
+            break
+        first = row
+    return next(item for item in comments if str(item.get('id')) == first[3]['checkpoint'])
+
+
+def _usable(comments, task):
+    """``(records, comments)``: the usable records as ``(stamp, index, comment, payload)``, oldest first."""
     comments = [comment for comment in (comments or []) if isinstance(comment, dict)]
     ids = {str(comment.get('id')) for comment in comments if comment.get('id') is not None}
     usable = []
@@ -418,12 +452,8 @@ def newest(comments, task):
         if payload.get('state') == FAULT_STATE:
             continue
         usable.append((_stamp(comment), index, comment, payload))
-    if not usable:
-        return None
     usable.sort(key=lambda row: (row[0], row[1]))
-    _, _, comment, payload = usable[-1]
-    checkpoint = next(item for item in comments if str(item.get('id')) == payload['checkpoint'])
-    return comment, payload, checkpoint
+    return usable, comments
 
 
 def record(payload, task, checkpoint, now=None):

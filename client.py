@@ -1505,6 +1505,10 @@ def _wait_command(args,config,project,actor,out,config_path=None,clock=None,slee
                               state_file=state_file,
                               fresh=options.fresh,
                               comments=options.comments)
+        if local and code == wait.EXIT_TIMEOUT:
+            # kittrial-5bb.588 r2 (S3): the server answered first and had nothing; a local
+            # condition already true still wakes, even with --timeout 0 (no sleep ran).
+            local_check()
     except _LocalWake as woke:
         moment = datetime.datetime.fromtimestamp(wall_start + (clock() - started),
                                                  datetime.timezone.utc)

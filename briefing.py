@@ -1228,17 +1228,34 @@ def wake_summary(row,checkpoint_comment,fields,data=None):
     return wake_summary_text(checkpoint_comment.get('created_at'),fields.get('newer_activity_by_others'),
                              (newest.get('author'),newest.get('timestamp')) if after else None,
                              (last.get('author'),last.get('created_at')) if last else None,
-                             fields.get('newer_activity_coverage'))
+                             fields.get('newer_activity_coverage'),
+                             task_changed_unexplained(fields))
 
-def wake_summary_text(checkpoint_at,others,newest=None,later_checkpoint=None,coverage=None):
+#: kittrial-5bb.588 r2 (S1): said when the checkpoint's cursor is stale and no entry explains it.
+WAKE_TASK_CHANGED='the task itself changed after it (a field, its status, assignee, labels or dependencies)'
+
+def task_changed_unexplained(fields):
+    """True when the checkpoint is stale and no entry, by others or the lane, explains it (r2, S1).
+
+    The cursor hashes the task's own state (title, description, acceptance, design, notes, status,
+    assignee, labels, dependencies) with the entries, so a stale cursor with no new entry means that
+    state changed. The checkpoint records no per-field digest (its key set is closed), so WHICH
+    field cannot be told; the sentence says the task changed rather than "nothing new".
+    """
+    return (fields.get('newer_activity_coverage') not in (None,'current')
+            and not fields.get('newer_activity_by_others') and not fields.get('newer_activity_own'))
+
+def wake_summary_text(checkpoint_at,others,newest=None,later_checkpoint=None,coverage=None,task_changed=False):
     """The sentence itself, from plain values, so every backend builds it the same way.
 
     ``newest`` and ``later_checkpoint`` are ``(author, time)`` or None. Authors are actor
-    ids; each is cut at 96 characters.
+    ids; each is cut at 96 characters. ``task_changed`` (:func:`task_changed_unexplained`)
+    adds that the task itself changed: an edit of the title, description or acceptance moves
+    the wait fingerprint, so the sentence must not say only "nothing new".
     """
     at=checkpoint_at or 'an unknown time'
     if not others:
-        return 'Nothing new by others since your checkpoint at %s.'%at
+        return 'Nothing new by others since your checkpoint at %s%s.'%(at,'; '+WAKE_TASK_CHANGED if task_changed else '')
     parts=['%d new %s by others since your checkpoint at %s'%(others,'entry' if others==1 else 'entries',at)]
     if newest:
         parts.append('newest by %s at %s'%(str(newest[0] or 'an unknown actor')[:96],newest[1] or 'an unknown time'))
@@ -1946,7 +1963,11 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     notice_records=assignment_notices(issue,project,None,limit=20)
     from lane_state import newest as newest_lane_state
     declared_lane=newest_lane_state(issue.get('comments'),task)
-    fact=declared_lane[1].get('local_fact') if declared_lane is not None and isinstance(declared_lane[1].get('local_fact'),dict) else None
+    # kittrial-5bb.588 r2 (S2): only the record written WITH the checkpoint shown carries its local
+    # fact; a newer checkpoint without a lane-state record shows none, never an older one's.
+    fact=declared_lane[1].get('local_fact') if (declared_lane is not None and p is not None
+        and str(declared_lane[2].get('id'))==str(c['id'])
+        and isinstance(declared_lane[1].get('local_fact'),dict)) else None
     result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(owner_raw or 'unassigned',96),**({'owner_name':clip(owner_name,96),'assigned_to':clip(assigned_to,200)} if owner_name and owner_name!=owner_raw else {}),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 **({'local_fact':fact} if fact else {}),
@@ -2337,7 +2358,8 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
     stamp=checkpoint.get('timestamp')
     if current:coverage,entries,fresh,unverified='current',[],[],0
     else:coverage,entries,fresh,_changed,unverified=newer_selection(data,prov,stamp)
-    newest=sorted(entries,key=lambda e:(parse_moment(e['timestamp']),e['entry_id']),reverse=True)
+    # kittrial-5bb.588 r2 (N3): within a second, the tracker's own sequence (c10 after c9).
+    newest=sorted(entries,key=entry_order_key,reverse=True)
     shown=[];spent=0
     for entry in newest[:SECTION_ENTRIES_MAX]:
         body=clip(plain_text(entry.get('body')),SECTION_BODY_CHARS)

@@ -137,7 +137,11 @@ def declared_wait(row):
 
 
 def waiting_sentence(snapshot):
-    return DECLARED_WAIT % (snapshot.get('waiting_on') or snapshot['state'], snapshot.get('since') or 'an unknown time')
+    # kittrial-5bb.588 r2 (N1): an own-job wait has no waiting_on; it is "its own job", not
+    # "waiting on waiting-on-own-job".
+    party = snapshot.get('waiting_on') or ('its own job' if snapshot.get('state') == 'waiting-on-own-job'
+                                           else snapshot['state'])
+    return DECLARED_WAIT % (party, snapshot.get('since') or 'an unknown time')
 
 
 def new_record(project_id, fields, requested_by, snapshot, now, iso,
