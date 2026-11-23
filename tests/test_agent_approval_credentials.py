@@ -368,7 +368,8 @@ class NextActionsTests(ShapeSetup):
 
     LISTED = {'1-named-worker-cred': 'A contribution under a worker credential of your person awaits review.',
               '4-account-slash-label': 'A contribution under a worker credential of your person awaits review.',
-              '7a-assigned-lane-c': 'A contribution under a worker credential of your person awaits review.',
+              # The author (carl) is independent, so the assignee decided: the hint names the task's party.
+              '7a-assigned-lane-c': 'A contribution on a task assigned to a worker credential of your person awaits review.',
               '8-two-agents-setup-flow': 'A contribution by another agent of your person awaits review.'}
     NEVER = ('2-shared-name', '3-no-name-account-id', '6-copied-agent-credential', '9-coordinator-sub-label',
              '7b-assigned-shared-name', '7c-assigned-bare-account-id', '7f-assigned-coordinator-itself')

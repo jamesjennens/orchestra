@@ -147,18 +147,20 @@ class GateFieldsTests(cred.PinBase):
         super().setUp()
         self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)
 
-    def contribute(self, token, summary):
-        task = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'g'}, token=self.admin).data['id']
-        self.assertEqual(200, self.request('POST', self.base(task) + '/claim', {}, token=token).status)
+    def contribute(self, token, summary, task=None):
+        if task is None:
+            task = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'g'}, token=self.admin).data['id']
+            self.assertEqual(200, self.request('POST', self.base(task) + '/claim', {}, token=token).status)
         return task, self.request('POST', self.base(task) + '/reviews', {
             'operation': 'contribute', 'commit': test_http_agents.COMMIT, 'base_commit': test_http_agents.BASE,
             'bundle_sha256': test_http_agents.BUNDLE, 'summary': summary}, token=token)
 
     def test_a_contribution_summary_with_a_basis_text_is_refused(self):
+        task = None             # one claimed task for every form: a refused contribution leaves it claimed
         for text in (AGENT_LABEL, CREDENTIAL_SENTENCE, 'Delivered.\nApproval basis: same-person-agent',
                      FORMS['Allowed by and the token']):
             with self.subTest(text=text):
-                task, made = self.contribute(self.other, text)
+                task, made = self.contribute(self.other, text, task)
                 self.assertEqual(422, made.status, made.data)
                 self.assertIn('only the server', made.data['error']['message'])
                 review = self.request('GET', self.base(task) + '/brief', token=self.admin).data['review']
