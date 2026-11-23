@@ -185,6 +185,32 @@ class ApprovalBasisRealBd(integration.AgentApprovalIntegration):
         self.assertTrue(again.data.get('reconciled'), again.data)
         self.assertEqual(1, len(self.approvals(task)))
 
+    # -- r3 (SHOULD-2): the fourth path, a task reassigned to the approver's own work ----------------------
+    def test_reassigned_to_the_approvers_own_work_the_kept_answer_replays_and_otherwise_403(self):
+        self.worker('lane', 'lane-c')
+        self.lane_actor, heron = self.actor_of('lane'), self.actor_of('heron')
+        first_basis = 'same-person-worker-credential'
+        # 4a. The same key, the service kept the answer: 201, the very same body, before the route runs again.
+        task, contribution = self.held_by_lane()
+        op, key = 'op-o-' + secrets.token_hex(4), 'key-' + secrets.token_hex(6)
+        first = self.approve_as(task, contribution, op, key)
+        self.assertEqual(201, first.status, first.data)
+        self.reassign(task, heron)                                   # now the approver's own work
+        again = self.approve_as(task, contribution, op, key)
+        self.assertEqual((201, first.data), (again.status, again.data))
+        # 4c. The same operation_id under a new key: the route runs again and refuses own work, 403.
+        other = self.approve_as(task, contribution, op, 'key-' + secrets.token_hex(6))
+        self.assertEqual(403, other.status, other.data)
+        self.assertEqual([first_basis], [record.get('approval_basis') for record in self.approvals(task)])
+        # 4b. The same key after the answer was lost: 503, then 403.
+        task, contribution = self.held_by_lane()
+        op, key = 'op-o-' + secrets.token_hex(4), 'key-' + secrets.token_hex(6)
+        self.assertEqual(503, self.lost(lambda: self.approve_as(task, contribution, op, key)).status)
+        self.reassign(task, heron)
+        again = self.approve_as(task, contribution, op, key)
+        self.assertEqual(403, again.status, again.data)
+        self.assertEqual([first_basis], [record.get('approval_basis') for record in self.approvals(task)])
+
 
 if __name__ == '__main__':
     unittest.main()
