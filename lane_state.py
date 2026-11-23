@@ -75,6 +75,10 @@ REASON_LIMIT = 300
 JOB_LIMIT = 120
 #: With no ``expect_by`` a ``waiting-on-own-job`` is overdue this long after the state began.
 OWN_JOB_DEFAULT_EXPECT = timedelta(hours=4)
+#: kittrial-5bb.588 r3 (expect-by-cap): an own-job ``expect_by`` is at most this far after the record is written,
+#: as ``not_before`` is bounded, so a lane that died mid-wait is flagged within a day. A later value is refused at
+#: write; one that reached a record anyway is clamped on the board to this long after the episode began.
+OWN_JOB_EXPECT_MAX_AHEAD = timedelta(hours=24)
 TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
 
 #: ``local_fact`` (kittrial-5bb.588): what the worker saw LOCALLY (its job finished, a time reached, a file
@@ -332,9 +336,16 @@ def problems(payload, task, checkpoint=None, now=None):
         found.extend(local_fact_problems(payload['local_fact']))
     if 'expect_by' in payload:
         try:
-            parse_moment(payload['expect_by'])
+            expected = parse_moment(payload['expect_by'])
         except ValueError as error:
             found.append('Invalid lane state: ' + str(error))
+        else:
+            if now is not None and payload.get('state') == OWN_JOB_STATE \
+                    and expected - now > OWN_JOB_EXPECT_MAX_AHEAD:
+                found.append('Invalid lane state: expect_by of a %s wait is more than %d hours ahead; your own '
+                             'job is expected back within %d hours, and you can declare the wait again then'
+                             % (OWN_JOB_STATE, OWN_JOB_EXPECT_MAX_AHEAD.total_seconds() // 3600,
+                                OWN_JOB_EXPECT_MAX_AHEAD.total_seconds() // 3600))
     if 'not_before' in payload:
         try:
             moment = parse_moment(payload['not_before'], 'not_before')
@@ -426,10 +437,13 @@ def own_job_episode_start(comments, task):
     usable, comments = _usable(comments, task)
     if not usable or usable[-1][3].get('state') != OWN_JOB_STATE:
         return None
+    # r3 (note 1): a repost under a sub-label of the same actor (A/sub1) is the same author, by the claim
+    # namespace rule every activity comparison uses (briefing.same_activity_actor).
+    from briefing import same_activity_actor
     author = usable[-1][2].get('author')
     first = usable[-1]
     for row in reversed(usable[:-1]):
-        if row[3].get('state') != OWN_JOB_STATE or row[2].get('author') != author:
+        if row[3].get('state') != OWN_JOB_STATE or not same_activity_actor(row[2].get('author'), author):
             break
         first = row
     return next(item for item in comments if str(item.get('id')) == first[3]['checkpoint'])

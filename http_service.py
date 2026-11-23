@@ -10334,7 +10334,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     # screens are the separate task kittrial-5bb.20 and are not built here.
     #: The version of the AGENT.md text the set-up page writes (web/js/agentSetup.js; its first line says it too),
     #: and what an agent with an older copy is told (kittrial-5bb.518). The server never touches the agent's file.
-    AGENT_MD_VERSION = 3
+    AGENT_MD_VERSION = 4
     AGENT_MD_NOTE = ('If your .orchestra/AGENT.md has no version line or an older one, it predates current guidance. '
                      'The server\'s reads are authoritative over it: the brief\'s approval_permission decides whether '
                      'you may approve. Ask your owner to re-run set-up from My agents to refresh the file.')

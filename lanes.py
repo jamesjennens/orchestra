@@ -22,7 +22,7 @@ act; ``next_actor`` is that same decision's caller-neutral role.
 import argparse
 from datetime import datetime, timezone
 
-from lane_state import OWN_JOB_DEFAULT_EXPECT, OWN_JOB_STATE, WAITING_ON_STATES
+from lane_state import OWN_JOB_DEFAULT_EXPECT, OWN_JOB_EXPECT_MAX_AHEAD, OWN_JOB_STATE, WAITING_ON_STATES
 
 DEFAULT_IDLE_MINUTES = 15
 IDLE_MINUTES_MIN, IDLE_MINUTES_MAX = 1, 10080          # one minute .. seven days
@@ -404,6 +404,14 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         if began is not None:
             expect_effective = (began + OWN_JOB_DEFAULT_EXPECT).isoformat().replace('+00:00', 'Z')
     expect_moment = moment(expect_effective) if isinstance(expect_effective, str) else None
+    if wait_state == OWN_JOB_STATE and declared and expect_by and expect_moment is not None:
+        # kittrial-5bb.588 r3 (expect-by-cap): the writer refuses an own-job expect_by more than a day ahead; one that
+        # reached a record anyway (a raw comment) ends the quiet time a day after the episode began, and the board
+        # shows the clamped value as expect_by_effective.
+        began = moment(since) if isinstance(since, str) else None
+        if began is not None and expect_moment - began > OWN_JOB_EXPECT_MAX_AHEAD:
+            expect_moment = began + OWN_JOB_EXPECT_MAX_AHEAD
+            expect_effective = expect_moment.isoformat().replace('+00:00', 'Z')
     idle_seconds = holder_idle_seconds(row, actor, now)
     flags = []
     # The own-job wait ages by its (effective) expect_by, not by the idle threshold: a long
