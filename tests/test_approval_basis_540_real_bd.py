@@ -13,14 +13,18 @@ worker credentials.
 Skipped where the endpoint cannot run (it imports fcntl: Windows) or there is no real bd. The same rules are
 tested everywhere by tests/test_approval_basis_540.py.
 """
+import json
+import secrets
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import test_agent_approval_integration_560 as integration
+import http_service
 import test_approval_basis_540 as basis
 
 rb = integration.rb
@@ -99,6 +103,87 @@ class ApprovalBasisRealBd(integration.AgentApprovalIntegration):
         self.assertTrue(self.hint(task).startswith(CREDENTIAL_HINT), self.hint(task))
         self.assertEqual((201, ''), self.route(task, contribution))
         self.assertIn('"approval_basis":"same-person-worker-credential"', self.comments(task)[-1][1])
+
+
+    # -- r2 (retry-test): the three retry paths after a moved basis, and the two controls -------------------
+    def approve_as(self, task, contribution, operation_id, key):
+        return self.request('POST', '%s/%s/reviews' % (self.tasks, task), dict(
+            operation='approve', schema_version=1, operation_id=operation_id, previous=contribution,
+            contribution=contribution, summary='Accepted'), token=self.agent, key=key)
+
+    def lost(self, call):
+        """``call()`` with the endpoint's answer to the approve write lost AFTER the real write: the 503 an endpoint
+        timeout after the write becomes (http_service.py:3394-3403), so the service keeps no result."""
+        real = http_service.EndpointBackend._run
+        armed = [True]
+
+        def run(backend, action, *args, **kwargs):
+            reply = real(backend, action, *args, **kwargs)
+            if armed[0] and action == 'review' and kwargs.get('operation_id'):
+                armed[0] = False
+                raise http_service.HttpError(503, 'unavailable', 'The endpoint did not answer in time')
+            return reply
+        with mock.patch.object(http_service.EndpointBackend, '_run', run):
+            answer = call()
+        self.assertFalse(armed[0], 'the approve write was not reached')
+        return answer
+
+    def approvals(self, task):
+        return [json.loads(text.split('\n', 1)[1]) for _author, text in self.comments(task)
+                if text.startswith('Kind: contribution-review-v1') and '"operation":"approve"' in text.replace(' ', '')]
+
+    def held_by_lane(self):
+        """A task casey delivers, then held by cora's worker credential: the assignee decides worker-credential."""
+        task, contribution = self.deliver('casey')
+        self.reassign(task, self.lane_actor)
+        return task, contribution
+
+    def test_the_retry_paths_after_a_moved_basis_and_the_first_basis_stands(self):
+        self.worker('lane', 'lane-c')
+        self.lane_actor, egret = self.actor_of('lane'), self.actor_of('egret')
+        first_basis = 'same-person-worker-credential'
+        # 1. Same key, the service kept the answer: 201, the very same body.
+        task, contribution = self.held_by_lane()
+        op, key = 'op-r-' + secrets.token_hex(4), 'key-' + secrets.token_hex(6)
+        first = self.approve_as(task, contribution, op, key)
+        self.assertEqual(201, first.status, first.data)
+        self.reassign(task, egret)                                   # the basis would now be 'agent'
+        again = self.approve_as(task, contribution, op, key)
+        self.assertEqual((201, first.data), (again.status, again.data))
+        # 3. The same operation_id under a new key: 422, the canonical writer's refusal.
+        other = self.approve_as(task, contribution, op, 'key-' + secrets.token_hex(6))
+        self.assertEqual(422, other.status, other.data)
+        self.assertIn('Operation ID already used with different payload or actor', json.dumps(other.data))
+        self.assertEqual([first_basis], [record.get('approval_basis') for record in self.approvals(task)])
+        # 2. Same key after the answer was lost: 503, then 422, the journal's refusal.
+        task, contribution = self.held_by_lane()
+        op, key = 'op-r-' + secrets.token_hex(4), 'key-' + secrets.token_hex(6)
+        lost = self.lost(lambda: self.approve_as(task, contribution, op, key))
+        self.assertEqual(503, lost.status, lost.data)
+        self.reassign(task, egret)
+        again = self.approve_as(task, contribution, op, key)
+        self.assertEqual(422, again.status, again.data)
+        self.assertIn('Operation identity reused with a different request', json.dumps(again.data))
+        self.assertEqual([first_basis], [record.get('approval_basis') for record in self.approvals(task)])
+
+    def test_the_controls_without_a_moved_basis_are_answered(self):
+        self.worker('lane', 'lane-c')
+        self.lane_actor = self.actor_of('lane')
+        # Same key after a lost answer, nothing moved: 201 from the journal's stored answer.
+        task, contribution = self.held_by_lane()
+        op, key = 'op-c-' + secrets.token_hex(4), 'key-' + secrets.token_hex(6)
+        self.assertEqual(503, self.lost(lambda: self.approve_as(task, contribution, op, key)).status)
+        again = self.approve_as(task, contribution, op, key)
+        self.assertEqual(201, again.status, again.data)
+        self.assertEqual(1, len(self.approvals(task)))
+        # The same operation_id under a new key, nothing moved: 201, reconciled.
+        task, contribution = self.held_by_lane()
+        op = 'op-c-' + secrets.token_hex(4)
+        self.assertEqual(201, self.approve_as(task, contribution, op, 'key-' + secrets.token_hex(6)).status)
+        again = self.approve_as(task, contribution, op, 'key-' + secrets.token_hex(6))
+        self.assertEqual(201, again.status, again.data)
+        self.assertTrue(again.data.get('reconciled'), again.data)
+        self.assertEqual(1, len(self.approvals(task)))
 
 
 if __name__ == '__main__':

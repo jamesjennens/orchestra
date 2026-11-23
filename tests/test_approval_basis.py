@@ -79,9 +79,9 @@ class NewReader(unittest.TestCase):
     def test_each_value_reads_with_its_own_label(self):
         labels = {
             # kittrial-5bb.540: the kind of party on the task, not which one delivered.
-            'same-person-agent': 'Allowed by: coordinator agent of the same person as the agent on this task '
+            'same-person-agent': 'Allowed by: coordinator agent of the same person as an agent on this task '
                                  '(project setting agent_approval: by-agent; the audit entry holds who set it and when)',
-            'same-person-worker-credential': 'Allowed by: coordinator agent of the same person as the worker '
+            'same-person-worker-credential': 'Allowed by: coordinator agent of the same person as a worker '
                                              'credential on this task (project setting agent_approval: by-agent; the '
                                              'audit entry holds who set it and when)'}
         self.assertEqual(labels, w.APPROVAL_BASES)                  # exactly these two values (kittrial-5bb.519)

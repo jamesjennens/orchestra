@@ -33,14 +33,24 @@ OLD_AGENT_LABEL = ('Allowed by: coordinator agent of the same person as the deli
                    '(project setting agent_approval: by-agent; the audit entry holds who set it and when)')
 OLD_CREDENTIAL_LABEL = ('Allowed by: coordinator agent of the same person as the delivering worker credential '
                         '(project setting agent_approval: by-agent; the audit entry holds who set it and when)')
-#: The texts from kittrial-5bb.540 on: the kind of party on the task, not which one delivered.
-AGENT_SENTENCE = ('Approved by a coordinator agent of the same person as the agent on this task '
+#: The texts of kittrial-5bb.540 r1: the kind of party, with "the" (two possible referents in four shapes, so
+#: retired in r2 and still refused).
+R1_AGENT_SENTENCE = ('Approved by a coordinator agent of the same person as the agent on this task '
+                     '(project setting agent_approval: by-agent).')
+R1_CREDENTIAL_SENTENCE = ('Approved by a coordinator agent of the same person as the worker credential on this task '
+                          '(project setting agent_approval: by-agent).')
+R1_AGENT_LABEL = ('Allowed by: coordinator agent of the same person as the agent on this task '
+                  '(project setting agent_approval: by-agent; the audit entry holds who set it and when)')
+R1_CREDENTIAL_LABEL = ('Allowed by: coordinator agent of the same person as the worker credential on this task '
+                       '(project setting agent_approval: by-agent; the audit entry holds who set it and when)')
+#: The texts from kittrial-5bb.540 r2 on: the KIND of party, with the indefinite article, true in every shape.
+AGENT_SENTENCE = ('Approved by a coordinator agent of the same person as an agent on this task '
                   '(project setting agent_approval: by-agent).')
-CREDENTIAL_SENTENCE = ('Approved by a coordinator agent of the same person as the worker credential on this task '
+CREDENTIAL_SENTENCE = ('Approved by a coordinator agent of the same person as a worker credential on this task '
                        '(project setting agent_approval: by-agent).')
-AGENT_LABEL = ('Allowed by: coordinator agent of the same person as the agent on this task '
+AGENT_LABEL = ('Allowed by: coordinator agent of the same person as an agent on this task '
                '(project setting agent_approval: by-agent; the audit entry holds who set it and when)')
-CREDENTIAL_LABEL = ('Allowed by: coordinator agent of the same person as the worker credential on this task '
+CREDENTIAL_LABEL = ('Allowed by: coordinator agent of the same person as a worker credential on this task '
                     '(project setting agent_approval: by-agent; the audit entry holds who set it and when)')
 
 
@@ -52,6 +62,10 @@ def bare(label):
 REFUSED = {
     'old agent sentence': OLD_AGENT_SENTENCE,
     'old credential sentence': OLD_CREDENTIAL_SENTENCE,
+    'r1 agent sentence': R1_AGENT_SENTENCE,
+    'r1 credential sentence': R1_CREDENTIAL_SENTENCE,
+    'r1 agent label': R1_AGENT_LABEL,
+    'r1 credential label without Allowed by': bare(R1_CREDENTIAL_LABEL),
     'new agent sentence': AGENT_SENTENCE,
     'new credential sentence': CREDENTIAL_SENTENCE,
     'old agent label': OLD_AGENT_LABEL,
@@ -136,11 +150,13 @@ class WordingTests(cred.PinBase):
                          w.APPROVAL_BASES)
 
     def test_the_old_labels_are_kept_for_the_gate(self):
-        self.assertEqual((OLD_AGENT_LABEL, OLD_CREDENTIAL_LABEL), w.RETIRED_APPROVAL_BASIS_LABELS)
+        self.assertEqual((OLD_AGENT_LABEL, OLD_CREDENTIAL_LABEL, R1_AGENT_LABEL, R1_CREDENTIAL_LABEL),
+                         w.RETIRED_APPROVAL_BASIS_LABELS)
 
     def test_the_sentences_name_the_kind_on_the_task(self):
         self.assertEqual((AGENT_SENTENCE, CREDENTIAL_SENTENCE), (API.SAME_PERSON_APPROVAL, API.WORKER_CREDENTIAL_APPROVAL))
-        self.assertEqual((OLD_AGENT_SENTENCE, OLD_CREDENTIAL_SENTENCE), API.RETIRED_APPROVAL_SENTENCES)
+        self.assertEqual((OLD_AGENT_SENTENCE, OLD_CREDENTIAL_SENTENCE, R1_AGENT_SENTENCE, R1_CREDENTIAL_SENTENCE),
+                         API.RETIRED_APPROVAL_SENTENCES)
 
     def test_a_new_approval_is_written_with_the_new_sentence(self):
         by_agent, c1 = self.deliver(self.other)
@@ -165,6 +181,8 @@ class HintTests(cred.ShapeSetup):
 
     CREDENTIAL = 'A contribution under a worker credential of your person awaits review.'
     AGENT = 'A contribution by another agent of your person awaits review.'
+    #: r2 (hint-words): when the author is independent the ASSIGNEE decided, and the hint says so.
+    ASSIGNED_CREDENTIAL = 'A contribution on a task assigned to a worker credential of your person awaits review.'
 
     def offered(self):
         data = self.request('GET', '/v1/agents/me/next', token=self.agent).data
@@ -191,7 +209,7 @@ class HintTests(cred.ShapeSetup):
     def test_an_independent_author_and_a_credential_assignee_the_hint_says_a_worker_credential(self):
         task, cid = self.deliver(self.tokens['carl'])
         self.backend._task(self.project, task)['assignee'] = 'lane-c'
-        self.check(task, cid, self.CREDENTIAL, 'worker-credential')
+        self.check(task, cid, self.ASSIGNED_CREDENTIAL, 'worker-credential')
 
     def test_the_credential_helper_is_gone(self):
         self.assertFalse(hasattr(API, '_credential_work_in'))

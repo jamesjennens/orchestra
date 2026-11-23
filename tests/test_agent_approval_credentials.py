@@ -84,10 +84,10 @@ B8 = ('This task is assigned to this agent itself. On this project a coordinator
     "person's own work, or work under a worker credential of that person: somebody of another party who "
     'may approve here must approve it (another coordinator or owner of this project, or a superuser).')
 
-# The words of the new rules, literally (the plan's sentences; kittrial-5bb.540 names the kind on the task).
-WORKER_CREDENTIAL_BASIS = ('Approved by a coordinator agent of the same person as the worker credential on this '
+# The words of the new rules, literally (the plan's sentences; kittrial-5bb.540 names the kind on the task, r2 with "an"/"a").
+WORKER_CREDENTIAL_BASIS = ('Approved by a coordinator agent of the same person as a worker credential on this '
                            'task (project setting agent_approval: by-agent).')
-AGENT_BASIS = ('Approved by a coordinator agent of the same person as the agent on this task '
+AGENT_BASIS = ('Approved by a coordinator agent of the same person as an agent on this task '
                '(project setting agent_approval: by-agent).')
 #: The agent sentence before kittrial-5bb.540; records keep it and the gate still refuses it.
 OLD_AGENT_BASIS = ('Approved by a coordinator agent of the same person as the agent that delivered it '
