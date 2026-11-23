@@ -99,7 +99,7 @@ The three `waiting-on-coordinator|review|user` states also require `waiting_on` 
 state). `waiting-on-own-job` is for waiting on your OWN job (a test run, a replay, a build): it
 requires `job` (one line, at most 120 characters), refuses `waiting_on`, allows `expect_by` and
 `not_before`, is not a question for the coordinator, and with no `expect_by` counts as overdue
-4 hours after it began. Every other state refuses `job`. `expect_by` is an optional
+4 hours after it began; its `expect_by` may be at most 24 hours ahead (kittrial-5bb.588 r3). Every other state refuses `job`. `expect_by` is an optional
 ISO-8601 time with an offset; a past value is accepted and flagged, and only an
 unparseable one is refused. `not_before` (kittrial-5bb.509) is an optional full ISO-8601
 time with seconds and an offset, strictly in the future and at most 14 days ahead, set
