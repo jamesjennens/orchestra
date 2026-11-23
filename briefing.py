@@ -2715,10 +2715,14 @@ def format_brief(result):
     # summary; present only when the approval record carries the field.
     basis=result['review'].get('approval_basis')
     if isinstance(basis,dict) and isinstance(basis.get('text'),str):lines.append('Approval basis: '+basis['text'])
+    # kittrial-5bb.540 r2 (gate-fields): these fields are a caller's own text, printed as lines right after the
+    # server's "Approval basis:" line. A continuation line is indented, so no caller line can start a line of the
+    # brief (and pose as that line); splitlines() also splits on \r, \u2028 and the other line breaks.
+    def continued(text):return '\n  '.join(str(text).splitlines())
     lines+=[
-           'Intent: '+excerpt(result['intent']),'Acceptance: '+excerpt(result['acceptance']),
-           'Current position: '+result['current_position'],'Next: '+result['next_action']]
-    lines.extend(item['message'] for item in (result.get('assignment_notices') or {}).get('items',[]))
+           'Intent: '+continued(excerpt(result['intent'])),'Acceptance: '+continued(excerpt(result['acceptance'])),
+           'Current position: '+continued(result['current_position']),'Next: '+continued(result['next_action'])]
+    lines.extend(continued(item['message']) for item in (result.get('assignment_notices') or {}).get('items',[]))
     guidance=result.get('guidance')
     if guidance and guidance.get('present') and guidance.get('unbound'):
         # Unbound text has no version anyone may follow (kittrial-5bb.105); the warning line below says why.
