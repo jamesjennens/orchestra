@@ -223,13 +223,15 @@ form: its summary is the approver's text, whatever it says, and no basis is show
 
 **Which party decides the basis (kittrial-5bb.540).** The delivering author decides it whenever the author is of
 the approver's party; the assignee decides it only when the author is independent (`http_authority.by_agent_approval`
-walks the author first, and the first basis found stands). So the labels name the KIND of party on the task: "the
-agent on this task" or "the worker credential on this task". That is true whichever one decided, and labels are
-looked up when a record is read, so old records show the new words too. The sentence form keeps the words it was
-written with. The web service's text gate refuses, on `approve` and `recommend`, either sentence and either label as
-they are now or were before, and a line starting "Approval basis:". The hint in `GET /v1/agents/me/next` comes from
-the same decision. A retry under the same `Idempotency-Key` is answered as recorded, even if the task was reassigned
-meanwhile: the first record and its basis stand.
+walks the author first, and the first basis found stands). So the labels name the KIND of party on the task, with the
+indefinite article (r2): "an agent on this task" or "a worker credential on this task". That is true whichever one
+decided and whoever else is on the task, and labels are looked up when a record is read, so old records show the new
+words too. The sentence form keeps the words it was written with. The web service's text gate refuses, on `approve`,
+`recommend` and `contribute`, either sentence and either label as they are now or were before, the "Approval basis"
+label followed by a colon anywhere and in any markup, and "Allowed by:" followed by a basis
+([HTTP_DEPLOYMENT.md](HTTP_DEPLOYMENT.md), the text gate). The hint in `GET /v1/agents/me/next` comes from the same
+decision and names who decided: "by" (or "under") the author's party, or "on a task assigned to" the assignee's.
+What a retry after a reassignment is answered is under the approve's retry, below.
 
 Like `assignee_at_approval` the field is additive for readers and not for writers: a kit built before the
 field validates the approve field set exactly and refuses a record that carries it. It is therefore released
@@ -565,6 +567,8 @@ Over HTTP a refused recommendation says which rule it hit: the 422 message is th
 A new revision, a decision or a withdrawal of the contribution makes it lapse.
 
 **One standing recommendation for a contribution from each reviewer (kittrial-5bb.154).** While a recommendation stands, a second one for the same contribution by the same reviewer is refused and nothing is stored: `NAME has already recommended this contribution, and that recommendation stands until the contribution is revised or decided. To ask for changes instead, request changes: the recommendation then stops counting. A recommendation cannot be withdrawn.` "The same reviewer" is the same actor by the name rule in the canonical action (over SSH), and the same PERSON in the web service: the reviewer, the person who owns the agent, or another agent of that person (409, with `detail.recommended_by`). The web service compares against EVERY standing recommendation of the contribution, not only the twenty a read lists, so a person whose record is not among the newest twenty is refused too. An exact retry is answered as recorded and writes nothing again, whatever Idempotency-Key it arrives under: the same operation id with the same record reconciles, and the same operation id carrying other content is refused as an operation id already used. A recommendation by another person is a second voice and is stored.
+
+**An approve's retry when the basis moved (kittrial-5bb.540).** An approve's exact retry reconciles like a recommendation's while its basis is unchanged: the same key after an uncertain `503` answers `201`, and the same operation id under a new key answers `201` with `reconciled: true`. If the task was reassigned between the approve and its retry, so that the basis would now be different, the first record and its basis stand on every path and nothing is written again, but only a retry under the same `Idempotency-Key` whose first answer the service kept is answered as recorded (`201`, the same body). After an uncertain `503` the same key is answered `422` ("Operation identity reused with a different request"); the same operation id under a new key is answered `422` ("Operation ID already used with different payload or actor"); and a task reassigned to the approver's own work answers `403`. After any of these, re-read the brief: the approval is recorded.
 
 How a reviewer changes their mind:
 

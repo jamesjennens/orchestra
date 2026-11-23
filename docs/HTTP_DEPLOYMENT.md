@@ -2502,19 +2502,22 @@ credential approved anything; this is the one place where that is lifted.
     account id, which the account's own session also writes ("Issue the worker's credential with
     a name, or set the worker up from My agents."), and the agent itself, as when another worker
     uses a copy of its credential ("set it up as a new agent from My agents.").
-  - The approval then ends with "Approved by a coordinator agent of the same person as the worker
-    credential on this task (project setting agent_approval: by-agent).", the web route
-    refuses a caller who writes any of the server's basis texts (`422`, below), and the audit event
-    of the write carries `basis`: `worker-credential` or `agent`. `by-person` and a damaged setting
-    are unchanged.
+  - The approval record then carries the basis as its `approval_basis` field (below). Only on an
+    endpoint that does not advertise that field does it end with the sentence instead ("Approved by
+    a coordinator agent of the same person as a worker credential on this task (project setting
+    agent_approval: by-agent)."). The web route refuses a caller who writes any of the server's basis
+    texts (`422`, below), and the audit event of the write carries `basis`: `worker-credential` or
+    `agent`. `by-person` and a damaged setting are unchanged.
   - **Which basis (kittrial-5bb.540):** the delivering author decides it whenever the author is of
     the approver's party; the assignee decides it only when the author is independent
     (`http_authority.by_agent_approval`, the author first, so the first basis found stands). The
-    sentence and the label therefore name the KIND of party on the task ("the agent on this task",
-    "the worker credential on this task"), which is true whichever of the two decided. The hint of
-    `GET /v1/agents/me/next` ("A contribution under a worker credential of your person …" or "… by
-    another agent of your person …") is read from the same decision, so it names the basis the
-    record will carry.
+    sentence and the label therefore name the KIND of party, with the indefinite article ("an agent
+    on this task", "a worker credential on this task", r2), which is true whichever of the two
+    decided and whoever else is on the task. The hint of `GET /v1/agents/me/next` is read from the
+    same decision and names the party that decided: "A contribution by another agent of your person
+    …" or "… under a worker credential of your person …" when the author decided, and "A
+    contribution on a task assigned to another agent of your person …" or "… assigned to a worker
+    credential of your person …" when the author is independent and the assignee decided.
 - **People are not affected:** a person's approval follows the installation's setting as
   before.
 - **The setting:** `PUT /v1/projects/{id}/agent-approval` with
@@ -2567,9 +2570,10 @@ credential approved anything; this is the one place where that is lifted.
     release B). It does so only when the endpoint's machine-readable `review` help lists
     `approval_basis` under `optional_fields.approve`; for an endpoint that does not (a kit before
     the readers' release), it appends to the summary instead: "Approved by a coordinator agent of
-    the same person as the agent on this task (project setting agent_approval: by-agent)."
-    (Before kittrial-5bb.540 the sentence said "the agent that delivered it"; records already
-    written keep their words.)
+    the same person as an agent on this task (project setting agent_approval: by-agent)." (or "…
+    as a worker credential on this task …"). Before kittrial-5bb.540 the sentences said "the agent
+    that delivered it" and "the worker credential that delivered it", and in its r1 "the agent on
+    this task" and "the worker credential on this task"; records already written keep their words.
     The route answers `422` to a request body that names `approval_basis`. Release order and the
     rollback boundary are in [OPERATIONS.md](OPERATIONS.md#the-approval-basis-field-release-order-and-rollback-kittrial-5bb515).
   - The audit event of the review write carries `same_person_coordinator: true`, the author,
@@ -2577,19 +2581,41 @@ credential approved anything; this is the one place where that is lifted.
   - In the sentence form, if the caller's summary leaves no room for that sentence within the
     1200-character bound, the route answers `422` and says how many characters to cut. Nothing is
     written. The field form appends nothing, so the whole 1200 characters are the approver's.
-  - The web route refuses a caller-written basis text on `approve` or `recommend` with `422`,
-    naming the text it found, and writes nothing (kittrial-5bb.540 widened it): either sentence as
-    it is now or was before, either field label as it is now or was before (with or without
-    "Allowed by:"), and a line starting "Approval basis:", the brief's label. Texts are compared
-    after NFKD, casefold, Unicode format-character and mark removal, whitespace removal and
-    punctuation/symbol/bracket stripping (lookalike letters remain); words that only resemble them
-    ("approved", "basis", "the agent that delivered it") are allowed. The field is the protection;
-    the gate is defence in depth, so a typed claim cannot pose as the server's line beside it. The
-    host route does not apply it, so the audit entry stays the authority.
-  - **A retry after the basis changed (kittrial-5bb.540).** If the answer to an approve is lost and
-    the task is reassigned before the retry, so that the basis would now be different, the retry
-    under the same `Idempotency-Key` is answered as recorded: the first record and its basis stand,
-    and nothing is written again. A retry needs the same key to be recognised as one.
+  - **The text gate (kittrial-5bb.540).** The web route refuses a caller-written basis text with
+    `422`, naming the text it found and saying that only the server writes the basis, and writes
+    nothing. It checks the `approve` and `recommend` summaries and the `contribute` summary, which
+    the task page draws directly above the server's line. It refuses:
+    - either sentence and either field label, as they are now or were before (with or without
+      "Allowed by:"), compared after NFKD, casefold, and dropping format characters, marks,
+      whitespace, punctuation, symbols and brackets;
+    - the label "Approval basis" followed by a colon, anywhere and in any markup (`**Approval
+      basis**:`, quotes before the colon, `Approval.basis:`, `approval_basis:`, the two words on two
+      lines, mid-line), compared after NFKD, casefold and dropping format characters and marks;
+    - "Allowed by" and a colon when a basis token or "coordinator agent" follows it.
+
+    A quoted mention followed by prose ("'Approval basis:' was wrong on the previous review.") is
+    allowed, and so are words that only resemble the texts ("approved", "basis", "Allowed by: the CI
+    run"). Lookalike letters of another script (Cyrillic, dotless i) remain. HTML entities
+    (`&#65;pproval basis:`) pass, but every surface draws summaries as plain text, so they show
+    literally. In the host's text brief, a caller's multi-line field (intent, acceptance, current
+    position, next step, an assignment reason) has its continuation lines indented, so only the
+    server's line starts with "Approval basis:". The field is the protection; the gate is defence in
+    depth for the texts drawn beside the server's line. The host route does not apply it, so the
+    audit entry stays the authority.
+  - **A retry after the basis moved (kittrial-5bb.540).** If the task is reassigned between an
+    approve and its retry, so that the basis would now be different, the first record and its basis
+    stand on every path and nothing is written again, but the answer depends on the path:
+    - the same `Idempotency-Key`, and the service kept the first answer: `201`, the same body;
+    - the same key after an uncertain `503` (the service kept no answer, so the route runs again
+      with the new basis): `422` "Canonical command rejected the request", detail "Operation
+      identity reused with a different request";
+    - the same `operation_id` under a new key: `422`, detail "ValueError: Operation ID already used
+      with different payload or actor";
+    - reassigned to the approver's own work: `403`, the approve route's own refusal.
+
+    After either `422` or the `403`, re-read the brief: the approval is recorded, with its first
+    basis. With the basis unchanged, the same key after a `503` answers `201`, and the same
+    `operation_id` under a new key answers `201` with `reconciled: true`.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer; the account is
@@ -2672,9 +2698,14 @@ another agent of its account under the project's default `agent_approval: by-age
 (kittrial-5bb.438), which it lists as "A contribution by another agent of your person awaits
 review.", and the work of a worker credential of its person that the approve route lets through
 (kittrial-5bb.519), listed as "A contribution under a worker credential of your person awaits
-review.". It decides both with the same functions as the approve route, so it never lists work
-the route would refuse: not the agent's own work or a sub-label of it, not the bare account id,
-and not a name another account has held.
+review.". When the author is independent and the task is assigned to such an agent or worker
+credential, the assignee decides, and the hint says "A contribution on a task assigned to another
+agent of your person awaits review." or "… assigned to a worker credential of your person …"
+(kittrial-5bb.540 r2). It decides each with the same functions as the approve route, so it never
+lists work the route would refuse: not the agent's own work or a sub-label of it, not the bare
+account id, and not a name another account has held. It lists no closed task, although the
+approve route and the endpoint approve one with the same decision, the same record and the same
+label (pre-existing; the hint is the only place that is silent).
 
 Like the setting above, this is the web route's: an approval on the host route
 (`endpoint.py` over SSH, or run on the server) knows no accounts and no grants.
