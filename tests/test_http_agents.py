@@ -2279,15 +2279,48 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(0, done.returncode, done.stderr[-3000:])
         seen = json.loads(done.stdout.strip().splitlines()[-1])
         first = seen['first']
-        # kittrial-5bb.511: machine and notes are the owner's; the folder form sends only changes.
-        self.assertIn('Machine: tomasz-laptop', seen['machineNotesText'])
+        # kittrial-5bb.511: machine and notes are the owner's; empty fields show nothing; Notes is
+        # a single-line input with the required hint; the folder form sends only changes, clears
+        # stale errors, and shows refusals under the offending field; values render as text in <bdi>.
+        self.assertEqual(0, seen['emptyMachineNotesCount'], 'empty machine and notes show nothing')
+        self.assertIsNone(seen['emptyMachineNotesText'])
+        self.assertEqual('Machine: tomasz-laptop \u00b7 Notes: Wake with the Teams ping.', seen['machineNotesText'])
+        self.assertEqual('Change folder, machine and notes', seen['ownerFolderSummary'])
+        self.assertEqual(['INPUT', 'text'], seen['notesControl'], 'Notes is a single-line text input matching server printable-char rule')
+        self.assertEqual('Where it runs and how to wake it', seen['notesHint'])
         self.assertEqual(0, seen['unchangedSent'])
         self.assertEqual([{'machine': 'tomasz-desk'}], seen['machineOnlySent'])
-        self.assertIn('<b>wake</b> <img src=x onerror=alert(1)>', seen['markupText'])
+        self.assertEqual('Machine: tomasz-desk \u00b7 Notes: <b>wake</b> <img src=x onerror=alert(1)>', seen['markupText'])
         self.assertEqual(0, seen['markupElements'], 'notes are text, never markup')
+        self.assertEqual({
+            'text': 'Machine: tomasz-desk \u00b7 Notes: <b>wake</b> <img src=x onerror=alert(1)>',
+            'ownInnerHTML': False,
+            'childTags': ['BDI', 'BDI'],
+            'bdis': [
+                {'tag': 'BDI', 'ownInnerHTML': False, 'childElementCount': 0, 'nodeCount': 1, 'firstIsElement': False, 'text': 'tomasz-desk'},
+                {'tag': 'BDI', 'ownInnerHTML': False, 'childElementCount': 0, 'nodeCount': 1, 'firstIsElement': False, 'text': '<b>wake</b> <img src=x onerror=alert(1)>'},
+            ],
+        }, seen['markupLineStructure'])
         self.assertIn('at most 1000', seen['tooLongError'])
+        self.assertIn('at most 120', seen['tooLongMachineError'])
+        self.assertEqual(['', True], seen['staleNotesErrorAfterMachine'])
         self.assertEqual([False, False], seen['adminMachineNotes'])
         self.assertEqual(0, seen['adminMachineFields'])
+        self.assertEqual('Change folder', seen['adminFolderSummary'])
+        self.assertEqual('Notes: <b>wake</b> <img src=x onerror=alert(1)>', seen['notesOnlyLine']['text'])
+        self.assertEqual(['BDI'], seen['notesOnlyLine']['childTags'])
+        self.assertEqual('Machine: tomasz-desk', seen['machineOnlyLine']['text'])
+        self.assertEqual(['BDI'], seen['machineOnlyLine']['childTags'])
+        self.assertIsNone(seen['bothClearedLine'])
+        edge = seen['machineNotesEdge']
+        self.assertIsInstance(edge, dict)
+        for empty_case in ('bothNull', 'bothMissing', 'bothEmpty', 'bothSpaces', 'nonStringsZero', 'nonStringsArray', 'nonStringsNumber'):
+            self.assertIsNone(edge[empty_case], empty_case)
+        self.assertEqual(('Machine: box-1', ['BDI']), (edge['machineOnly']['text'], edge['machineOnly']['childTags']))
+        self.assertEqual(('Notes: ping me', ['BDI']), (edge['notesOnly']['text'], edge['notesOnly']['childTags']))
+        self.assertEqual(['BDI', 'BDI'], edge['bidi']['childTags'])
+        self.assertEqual(['\u202erev', 'real note'], [b['text'] for b in edge['bidi']['bdis']])
+        self.assertNotIn('.innerHTML', (web / 'views' / 'agents.js').read_text(encoding='utf-8'))
         self.assertIn('inferred', seen['ownerInferredAsked'])
         self.assertIn('not confirmed', seen['ownerInferredAsked'])
         self.assertIn('stored scopes: read', seen['ownerInferredAsked'])
@@ -2392,12 +2425,17 @@ class AgentsPageTests(RenewalScopeTests):
             ['alex', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read', 'tasks']}],
             ['admin', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read']}],
             ['alex', 'POST', credentials, {'label': 'web: new secret'}]])
-        # kittrial-5bb.511: the folder form sent only what changed: the machine alone, then the notes
-        # (markup, then the over-long value the server refused). Nothing was sent for an unchanged form.
+        # kittrial-5bb.511: the folder form sent only what changed: machine alone, notes (markup,
+        # then over-long refused), over-long machine refused, then clearing machine/notes/machine.
+        # Nothing was sent for an unchanged form.
         self.assertEqual(seen['sent'][5:], [
             ['alex', 'PATCH', '/v1/agents/AGENT', {'machine': 'tomasz-desk'}],
             ['alex', 'PATCH', '/v1/agents/AGENT', {'notes': '<b>wake</b> <img src=x onerror=alert(1)>'}],
-            ['alex', 'PATCH', '/v1/agents/AGENT', {'notes': 'x' * 1001}]])
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'notes': 'x' * 1001}],
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'machine': 'm' * 121}],
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'machine': ''}],
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'machine': 'tomasz-desk', 'notes': ''}],
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'machine': ''}]])
         self.assertEqual(self.stored(kestrel), (['read'], 'set'))
         self.assertEqual(self.stored(nothing['Dove']), (None, None))
 

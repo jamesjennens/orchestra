@@ -171,10 +171,20 @@ function resumeBlock(agent, folder, compact) {
 const createdByNote = (raw) => (raw.created_by && raw.created_by !== raw.owner ? h('p', { class: 'small muted', 'data-created-by': raw.created_by },
   'Created by ', raw.created_by_display_name || raw.created_by, '. That superuser saw the first secret. Issue a new secret if this matters to you.') : null);
 const projectsLine = (agent) => h('div', { class: 'small muted' }, 'Projects: ', agent.projects.map((p) => `${p.name} (${p.role})`).join(', ') || 'none');
+const presentText = (value) => (typeof value === 'string' && value.trim() ? value.trim() : '');
 // Owner-only: the server sends machine and notes to the owner (http_auth.py agent_view).
-// They are plain text, so they render as text nodes, never as markup.
-const machineNotesLine = (raw) => h('div', { class: 'small muted', 'data-machine-notes': raw.id || '' },
-  'Machine: ', raw.machine || h('span', null, 'Not recorded'), ' · Notes: ', raw.notes || h('span', null, 'Not recorded'));
+// Plain escaped text inside <bdi> (never HTML); an empty field shows nothing.
+export function machineNotesLine(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const machine = presentText(raw.machine);
+  const notes = presentText(raw.notes);
+  if (!machine && !notes) return null;
+  const parts = [];
+  if (machine) parts.push('Machine: ', h('bdi', null, machine));
+  if (machine && notes) parts.push(' · ');
+  if (notes) parts.push('Notes: ', h('bdi', null, notes));
+  return h('div', { class: 'small muted', 'data-machine-notes': raw.id || '' }, ...parts);
+}
 
 // What the My agents page keeps behind "Details" for each agent (kittrial-5bb.456 item 1): the parts of
 // the full card that the one-line row leaves out.
@@ -470,18 +480,26 @@ export async function list(ctx) {
   }
 
   // Folder, and for the owner also machine and notes. Only fields the person changed are sent.
-  // A refusal for machine or notes sits under its own field; anything else toasts as before.
+  // Notes is a single-line input because the server refuses control characters including newlines
+  // (http_auth.py _agent_text). A refusal for machine or notes sits under its own field;
+  // anything else toasts as before.
   function editFolder(agent) {
     const owner = ownedBy(ctx, agent);
+    const initialMachine = presentText(agent.machine);
+    const initialNotes = presentText(agent.notes);
     const details = h('details', { class: 'deliver' });
     const fields = [field({ id: 'wd-' + agent.id, label: 'Folder on your computer', value: agent.working_directory || '', hint: 'Only you and administrators can see this.' })];
     if (owner) {
-      fields.push(field({ id: 'mc-' + agent.id, label: 'Machine', value: agent.machine || '', hint: 'Which computer it runs on.' }),
-        field({ id: 'nt-' + agent.id, label: 'Notes', type: 'textarea', value: agent.notes || '', hint: 'Where it runs and how to wake it' }));
+      fields.push(field({ id: 'mc-' + agent.id, label: 'Machine', value: initialMachine, hint: 'Which computer it runs on.' }),
+        field({ id: 'nt-' + agent.id, label: 'Notes', value: initialNotes, hint: 'Where it runs and how to wake it' }));
     }
     const form = h('form', { class: 'form', novalidate: true }, ...fields, h('div', null, h('button', { type: 'submit' }, 'Save')));
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
+      if (owner) {
+        setFieldError(form, 'mc-' + agent.id, '');
+        setFieldError(form, 'nt-' + agent.id, '');
+      }
       const values = formValues(form);
       const body = {};
       const folder = values['wd-' + agent.id].trim();
@@ -489,8 +507,8 @@ export async function list(ctx) {
       if (owner) {
         const machine = values['mc-' + agent.id].trim();
         const notes = values['nt-' + agent.id].trim();
-        if (machine !== (agent.machine || '')) body.machine = machine;
-        if (notes !== (agent.notes || '')) body.notes = notes;
+        if (machine !== initialMachine) body.machine = machine;
+        if (notes !== initialNotes) body.notes = notes;
       }
       if (!Object.keys(body).length) return;
       const saved = await act(form.querySelector('button'), () => ctx.api.updateAgent(agent.id, body), {

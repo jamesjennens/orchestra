@@ -242,14 +242,43 @@ out.odd = [
   {}, { scopes: null, scopes_source: 'unknown' }, { scopes: ['read'], credentials: 'x' }, { scopes: ['read'], credentials: [null, 5, { scopes: 'x', working: true }, { working: true }] },
   { scopes_source: 'unknown', credentials: [{ scopes: ['read'], revoked: false }, { scopes: 7, revoked: false }] }, { scopes: 'read', scopes_differ: 5, credentials: {} },
 ].map((raw) => { try { const line = view.scopesLine(raw); return [view.otherCredentials(raw).length, line ? line.attributes['data-scopes'] : null]; } catch (error) { return 'threw: ' + error.message; } });
-// 9. kittrial-5bb.511: machine and notes show to the owner only; the folder form sends only what
-// changed; markup stays text; a refusal from the server sits under its own field.
+// 9. kittrial-5bb.511: machine and notes show to the owner only (empty field shows nothing,
+// plain text inside <bdi>); the folder form uses a single-line Notes input with the required
+// hint, sends only what changed, clears stale field errors, and shows server refusals under
+// the offending field.
 {
   let page = await open(who.alex);
   const kid = block(page, 'Kestrel').attributes['data-agent'];
+  const detailsOf = (p, name, id) => block(p, name).all((e) => e.tagName === 'DETAILS' && e.className === 'deliver' && e.all((x) => x.attributes.id === id).length > 0)[0];
   const formOf = (p) => block(p, 'Kestrel').all((e) => e.tagName === 'FORM' && e.all((x) => x.attributes.id === 'mc-' + kid).length > 0)[0];
   const fieldOf = (p, id) => formOf(p).all((e) => e.attributes.id === id)[0];
+  const lineInfo = (el) => {
+    if (!el) return null;
+    const kids = Array.from(el.children);
+    return {
+      text: el.textContent,
+      ownInnerHTML: Object.prototype.hasOwnProperty.call(el, 'innerHTML'),
+      childTags: kids.map((c) => c.tagName),
+      bdis: kids.map((c) => ({
+        tag: c.tagName,
+        ownInnerHTML: Object.prototype.hasOwnProperty.call(c, 'innerHTML'),
+        childElementCount: c.childElementCount,
+        nodeCount: c._childNodes.length,
+        firstIsElement: c._childNodes[0] instanceof Element,
+        text: c.textContent,
+      })),
+    };
+  };
+  // Empty fields on Wren (no machine or notes recorded) render nothing.
+  const wrenLine = block(page, 'Wren').all((e) => e.attributes['data-machine-notes'] !== undefined)[0] || null;
+  out.emptyMachineNotesCount = wrenLine ? 1 : 0;
+  out.emptyMachineNotesText = wrenLine ? wrenLine.textContent : null;
   out.machineNotesText = block(page, 'Kestrel').all((e) => e.attributes['data-machine-notes'] !== undefined).map((e) => e.textContent)[0] || null;
+  const ownerDetails = detailsOf(page, 'Kestrel', 'mc-' + kid);
+  out.ownerFolderSummary = ownerDetails ? ownerDetails.all((e) => e.tagName === 'SUMMARY')[0].textContent : null;
+  const notesInput = fieldOf(page, 'nt-' + kid);
+  out.notesControl = notesInput ? [notesInput.tagName, notesInput.attributes.type || null] : null;
+  out.notesHint = (formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-hint')[0] || {}).textContent || null;
   let before = sent.length;
   await formOf(page).dispatch('submit');
   await settle();
@@ -265,18 +294,63 @@ out.odd = [
   await settle();
   page = await open(who.alex);
   const shown = block(page, 'Kestrel');
-  out.markupText = shown.all((e) => e.attributes['data-machine-notes'] !== undefined).map((e) => e.textContent)[0] || null;
+  const shownLine = shown.all((e) => e.attributes['data-machine-notes'] !== undefined)[0] || null;
+  out.markupText = shownLine ? shownLine.textContent : null;
   out.markupElements = shown.all((e) => e.tagName === 'IMG' || e.tagName === 'B').length;
+  out.markupLineStructure = lineInfo(shownLine);
   fieldOf(page, 'nt-' + kid).value = 'x'.repeat(1001);
   await formOf(page).dispatch('submit');
   await settle();
   out.tooLongError = (formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {}).textContent || null;
+  // Fixing notes and submitting an over-long machine clears the stale notes error and routes
+  // the machine refusal under mc-.
+  fieldOf(page, 'nt-' + kid).value = '<b>wake</b> <img src=x onerror=alert(1)>';
+  fieldOf(page, 'mc-' + kid).value = 'm'.repeat(121);
+  await formOf(page).dispatch('submit');
+  await settle();
+  const ntErr = formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {};
+  out.tooLongMachineError = (formOf(page).all((e) => e.attributes.id === 'mc-' + kid + '-error')[0] || {}).textContent || null;
+  out.staleNotesErrorAfterMachine = [ntErr.textContent || '', Boolean(ntErr.hidden)];
   const admin = await open(who.admin);
   await admin.all((e) => e.attributes['data-mine-choice'] === 'All')[0].dispatch('click');
   await settle();
   const adminKestrel = block(admin, 'Kestrel');
   out.adminMachineNotes = adminKestrel ? [adminKestrel.textContent.includes('tomasz-desk'), adminKestrel.textContent.includes('<b>wake</b>')] : null;
   out.adminMachineFields = adminKestrel ? adminKestrel.all((e) => e.attributes.id && /^(mc|nt)-/.test(e.attributes.id)).length : null;
+  const adminFolderDetails = adminKestrel ? detailsOf(admin, 'Kestrel', 'wd-' + kid) : null;
+  out.adminFolderSummary = adminFolderDetails ? adminFolderDetails.all((e) => e.tagName === 'SUMMARY')[0].textContent : null;
+  // Clearing one field at a time on the real server renders only the remaining field; clearing
+  // both renders no line at all.
+  page = await open(who.alex);
+  fieldOf(page, 'mc-' + kid).value = '';
+  await formOf(page).dispatch('submit');
+  await settle();
+  page = await open(who.alex);
+  out.notesOnlyLine = lineInfo(block(page, 'Kestrel').all((e) => e.attributes['data-machine-notes'] !== undefined)[0] || null);
+  fieldOf(page, 'mc-' + kid).value = 'tomasz-desk';
+  fieldOf(page, 'nt-' + kid).value = '';
+  await formOf(page).dispatch('submit');
+  await settle();
+  page = await open(who.alex);
+  out.machineOnlyLine = lineInfo(block(page, 'Kestrel').all((e) => e.attributes['data-machine-notes'] !== undefined)[0] || null);
+  fieldOf(page, 'mc-' + kid).value = '';
+  await formOf(page).dispatch('submit');
+  await settle();
+  page = await open(who.alex);
+  out.bothClearedLine = lineInfo(block(page, 'Kestrel').all((e) => e.attributes['data-machine-notes'] !== undefined)[0] || null);
+  // Direct unit checks for empty, non-string (C2), and RTL-override bidi isolation (C3).
+  out.machineNotesEdge = typeof view.machineNotesLine === 'function' ? {
+    bothNull: lineInfo(view.machineNotesLine({ id: 'a', machine: null, notes: null })),
+    bothMissing: lineInfo(view.machineNotesLine({ id: 'a' })),
+    bothEmpty: lineInfo(view.machineNotesLine({ id: 'a', machine: '', notes: '' })),
+    bothSpaces: lineInfo(view.machineNotesLine({ id: 'a', machine: '   ', notes: ' ' })),
+    nonStringsZero: lineInfo(view.machineNotesLine({ id: 'a', machine: 0, notes: 0 })),
+    nonStringsArray: lineInfo(view.machineNotesLine({ id: 'a', machine: [], notes: ['box', '2'] })),
+    nonStringsNumber: lineInfo(view.machineNotesLine({ id: 'a', machine: 42, notes: 99 })),
+    machineOnly: lineInfo(view.machineNotesLine({ id: 'a', machine: 'box-1', notes: '' })),
+    notesOnly: lineInfo(view.machineNotesLine({ id: 'a', machine: null, notes: 'ping me' })),
+    bidi: lineInfo(view.machineNotesLine({ id: 'a', machine: '\u202erev', notes: 'real note' })),
+  } : 'not-exported';
 }
 out.sent = sent;
 // ASCII only: the page's text has typographic quotes, and a Windows pipe is not UTF-8.
