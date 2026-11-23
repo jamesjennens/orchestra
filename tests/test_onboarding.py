@@ -232,3 +232,46 @@ class WebWorkerToolsWordingTests(unittest.TestCase):
                     self.assertIn(read, text)
                 self.assertIn('latest checkpoint with all open items', text)
                 self.assertIn('never tell it to install the kit', text.lower())
+
+
+class PollPromptWaitTests(unittest.TestCase):
+    """kittrial-5bb.598 Slice 0 (test #36): poll prompts and onboarding docs pin wait & idle-stop rules under caps."""
+
+    KIT = Path(__file__).resolve().parents[1]
+
+    def test_poll_prompts_keep_waiting_on_expect_by_and_idle_stop_under_cap(self):
+        for name, relative in (
+            ('poll-prompt', 'templates/WORKER_POLL_PROMPT.md'),
+            ('poll-prompt-agent', 'templates/AGENT_POLL_PROMPT.md'),
+        ):
+            with self.subTest(document=name):
+                raw = (self.KIT / relative).read_text(encoding='utf-8')
+                prompt = o.prompt_of(raw)
+                self.assertIsNotNone(prompt)
+                self.assertLessEqual(len(prompt), o.POLL_PROMPT_LIMIT,
+                                     '%s is %d chars (limit %d)' % (relative, len(prompt), o.POLL_PROMPT_LIMIT))
+                lower = prompt.lower()
+                for required in ('waiting_on', 'expect_by', 'idle stop', 'waiting-on-*', 'never ends it', 'never locally'):
+                    self.assertIn(required, lower, '%s missing %r' % (relative, required))
+                self.assertNotIn('lanesup', lower)
+
+    def test_worker_start_and_worker_prompt_state_on_task_questions_and_idle_stop_rule(self):
+        start_bytes = (self.KIT / 'docs/WORKER_START.md').read_bytes()
+        self.assertLessEqual(len(start_bytes), o.START_LIMIT,
+                             'docs/WORKER_START.md is %d bytes (limit %d)' % (len(start_bytes), o.START_LIMIT))
+        start_text = start_bytes.decode('utf-8').lower()
+        self.assertIn('docs checkpoint-template', start_text)
+        self.assertIn('ask questions on the task, never a local prompt', start_text)
+
+        worker_prompt = ' '.join((self.KIT / 'templates/WORKER_PROMPT.md').read_text(encoding='utf-8').split()).lower()
+        for required in (
+            'never open a local interactive prompt',
+            'waiting_on',
+            'expect_by',
+            'waiting-on-*',
+            'idle stop',
+            'tools/wake/wake.sh',
+            'never ends the wait',
+        ):
+            self.assertIn(required, worker_prompt, 'templates/WORKER_PROMPT.md missing %r' % required)
+        self.assertNotIn('lanesup', worker_prompt)

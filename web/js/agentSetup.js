@@ -443,7 +443,7 @@ export function agentJson(payload) {
 
 //: The first line of the AGENT.md this page writes (kittrial-5bb.518). Change the text of the file, change this number:
 //: tests/test_agent_md_version.py fails otherwise. GET /v1/agents/me answers the number the server knows (agent_md.version).
-export const AGENT_MD_VERSION_LINE = 'AGENT.md version 2 (kittrial-5bb.518)';
+export const AGENT_MD_VERSION_LINE = 'AGENT.md version 3 (kittrial-5bb.598)';
 
 // A no-Bridge worker needs a tool-tracked watch, not a detached shell daemon.
 export function workerWaitLoop(server, file) {
@@ -565,7 +565,7 @@ export function agentGuide(payload, { hasCertificate = false, bridge = true, nop
     '',
     ...runSteps(server, file),
     troubleStep(6, payload, file),
-    '7. Stop and ask your owner if anything is unclear.',
+    '7. If anything is unclear, post your question on the task (comment plus checkpoint open item of kind question with lane_state waiting_on and expect_by) and wait; never open a local interactive prompt. Keep waiting-on-* on any idle-stop checkpoint.',
     ...(!bridge ? workerWaitLoop(server, file) : []),
     ]),
     '',

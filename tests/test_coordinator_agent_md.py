@@ -110,7 +110,12 @@ class CoordinatorGuideTests(unittest.TestCase):
         # The worker's steps keep their numbers: the shared 401 step is the worker's 6 (the coordinator's 7).
         lines = plain['guide'].split('\n')
         self.assertTrue(any(line.startswith('6. If a call returns 401, the secret file is missing or wrong') for line in lines))
-        self.assertIn('7. Stop and ask your owner if anything is unclear.', lines)
+        self.assertIn(
+            '7. If anything is unclear, post your question on the task (comment plus checkpoint open item of kind '
+            'question with lane_state waiting_on and expect_by) and wait; never open a local interactive prompt. '
+            'Keep waiting-on-* on any idle-stop checkpoint.',
+            lines,
+        )
         self.assertEqual(['1.', '2.', '3.', '4.', '5.', '6.', '7.'], [line[:2] for line in lines if line[:2] in ('1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.')])
         self.assertIn("7. This window's role is reviewer", plain['prompt'])
 

@@ -21,7 +21,10 @@ import test_coordinator_agent_md as md
 #: (worker, worker with certificate, coordinator, coordinator with certificate), each ended by a NUL.
 #: Candidate 1112a: version 2 first ships with this candidate, so its pin is the text as integrated (with .521/.541,
 #: .550 and .559), not the text on .518's own base (01c340cc...), which was never on main.
-PINS = {2: '1eeed6d71b17d7e6fe6230e1aa52f8138da23118fe6964d1bb90a9af00c8acd1'}
+PINS = {
+    2: '1eeed6d71b17d7e6fe6230e1aa52f8138da23118fe6964d1bb90a9af00c8acd1',
+    3: '91d2bdeff75ec2ddbd8c15996c329cce4c08eaf3d1ae7519097d43ddaa39d197',
+}
 
 
 class VersionTests(md.CoordinatorGuideTests):
@@ -34,7 +37,7 @@ class VersionTests(md.CoordinatorGuideTests):
     def test_the_first_line_is_the_version_line_and_the_server_knows_the_same_version(self):
         for text in self.texts():
             first = text.split('\n', 1)[0]
-            self.assertEqual('AGENT.md version 2 (kittrial-5bb.518)', first)
+            self.assertEqual('AGENT.md version 3 (kittrial-5bb.598)', first)
             self.assertTrue(text.split('\n')[1].startswith('# '))
             found = int(re.fullmatch(r'AGENT\.md version (\d+) \(kittrial-5bb\.\d+\)', first).group(1))
             self.assertEqual(http_service.ApiHandler.AGENT_MD_VERSION, found)

@@ -391,7 +391,7 @@ class Reads(approval_matrix.MatrixFixture):
 
     def test_me_answers_the_agent_md_version_and_note(self):
         found = self.request('GET', '/v1/agents/me', token=self.agent).data['agent_md']
-        self.assertEqual({'version': 2, 'note': (
+        self.assertEqual({'version': 3, 'note': (
             "If your .orchestra/AGENT.md has no version line or an older one, it predates current guidance. The "
             "server's reads are authoritative over it: the brief's approval_permission decides whether you may "
             "approve. Ask your owner to re-run set-up from My agents to refresh the file.")}, found)
