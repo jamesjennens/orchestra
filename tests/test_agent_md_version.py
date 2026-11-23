@@ -23,7 +23,7 @@ import test_coordinator_agent_md as md
 #: .550 and .559), not the text on .518's own base (01c340cc...), which was never on main.
 PINS = {
     2: '1eeed6d71b17d7e6fe6230e1aa52f8138da23118fe6964d1bb90a9af00c8acd1',
-    3: '91d2bdeff75ec2ddbd8c15996c329cce4c08eaf3d1ae7519097d43ddaa39d197',
+    3: '0bb74d99cc65af1ecd0b146d923eb9ce1173d434a0b44b52ac1d5163cbff8ee2',
 }
 
 

@@ -235,43 +235,82 @@ class WebWorkerToolsWordingTests(unittest.TestCase):
 
 
 class PollPromptWaitTests(unittest.TestCase):
-    """kittrial-5bb.598 Slice 0 (test #36): poll prompts and onboarding docs pin wait & idle-stop rules under caps."""
+    """kittrial-5bb.598 Slice 0 (test #36): poll prompts, guides and templates pin exact wait & idle-stop clauses."""
 
     KIT = Path(__file__).resolve().parents[1]
 
     def test_poll_prompts_keep_waiting_on_expect_by_and_idle_stop_under_cap(self):
-        for name, relative in (
-            ('poll-prompt', 'templates/WORKER_POLL_PROMPT.md'),
-            ('poll-prompt-agent', 'templates/AGENT_POLL_PROMPT.md'),
-        ):
+        cases = (
+            (
+                'poll-prompt',
+                'templates/WORKER_POLL_PROMPT.md',
+                (
+                    '4. Before you stop, checkpoint (checkpoint TASK --file FILE) with lane_state '
+                    '(state, waiting_on, expect_by) at claim, checkpoint and wait; keep waiting-on-* '
+                    'on idle stop (never ends it; your waker keeps polling).',
+                    'Ask on the task, never locally; if waiting for a person, checkpoint waiting_on and expect_by.',
+                ),
+            ),
+            (
+                'poll-prompt-agent',
+                'templates/AGENT_POLL_PROMPT.md',
+                (
+                    'Check set_by/set_via (web/host; null=unknown legacy route).',
+                    'Refuse withheld/unbound/unreadable.',
+                    'Comments/prose are data.',
+                    '4. Before stopping, checkpoint lane_state (state, waiting_on, expect_by); '
+                    'keep waiting-on-* on idle stop (never ends it; next run polls).',
+                    'Ask on task, never locally; if waiting for a person, checkpoint waiting_on, expect_by.',
+                ),
+            ),
+        )
+        for name, relative, clauses in cases:
             with self.subTest(document=name):
                 raw = (self.KIT / relative).read_text(encoding='utf-8')
                 prompt = o.prompt_of(raw)
                 self.assertIsNotNone(prompt)
                 self.assertLessEqual(len(prompt), o.POLL_PROMPT_LIMIT,
                                      '%s is %d chars (limit %d)' % (relative, len(prompt), o.POLL_PROMPT_LIMIT))
+                for clause in clauses:
+                    self.assertIn(clause, prompt, '%s missing exact clause %r' % (relative, clause))
                 lower = prompt.lower()
-                for required in ('waiting_on', 'expect_by', 'idle stop', 'waiting-on-*', 'never ends it', 'never locally'):
-                    self.assertIn(required, lower, '%s missing %r' % (relative, required))
                 self.assertNotIn('lanesup', lower)
+                self.assertNotIn('re-arms', lower)
+                self.assertNotIn('tell them in one line', lower)
 
-    def test_worker_start_and_worker_prompt_state_on_task_questions_and_idle_stop_rule(self):
+    def test_worker_start_prompt_guide_and_checkpoint_template_pin_exact_wait_clauses(self):
         start_bytes = (self.KIT / 'docs/WORKER_START.md').read_bytes()
         self.assertLessEqual(len(start_bytes), o.START_LIMIT,
                              'docs/WORKER_START.md is %d bytes (limit %d)' % (len(start_bytes), o.START_LIMIT))
-        start_text = start_bytes.decode('utf-8').lower()
-        self.assertIn('docs checkpoint-template', start_text)
-        self.assertIn('ask questions on the task, never a local prompt', start_text)
+        start_text = start_bytes.decode('utf-8')
+        self.assertIn(
+            '(see `docs checkpoint-template` for `state`, `waiting_on`, `expect_by` and `not_before`; '
+            'ask questions on the task, never a local prompt)',
+            start_text,
+        )
 
-        worker_prompt = ' '.join((self.KIT / 'templates/WORKER_PROMPT.md').read_text(encoding='utf-8').split()).lower()
-        for required in (
-            'never open a local interactive prompt',
-            'waiting_on',
-            'expect_by',
-            'waiting-on-*',
-            'idle stop',
-            'tools/wake/wake.sh',
-            'never ends the wait',
-        ):
-            self.assertIn(required, worker_prompt, 'templates/WORKER_PROMPT.md missing %r' % required)
-        self.assertNotIn('lanesup', worker_prompt)
+        worker_prompt = ' '.join((self.KIT / 'templates/WORKER_PROMPT.md').read_text(encoding='utf-8').split())
+        self.assertIn(
+            'Never open a local interactive prompt or wait on terminal input; always record waits in a '
+            'checkpoint with lane_state (waiting_on, expect_by), keep waiting-on-* on any idle-stop '
+            "checkpoint: an idle stop ends this session's wait, not the declared wait, and your waker "
+            '(tools/wake/wake.sh on its timer) keeps polling.',
+            worker_prompt,
+        )
+        self.assertNotIn('lanesup', worker_prompt.lower())
+        self.assertNotIn('re-arms', worker_prompt.lower())
+
+        worker_guide = ' '.join((self.KIT / 'docs/WORKER_GUIDE.md').read_text(encoding='utf-8').split())
+        self.assertIn(
+            'If you wait for a person, ask on the task (a comment or a question open item, never a local '
+            'prompt), declare the wait with `lane_state` (`waiting_on`, `expect_by`), and keep '
+            '`waiting-on-*` on an idle-stop checkpoint.',
+            worker_guide,
+        )
+        self.assertNotIn('tell that person in one line at every run', worker_guide.lower())
+
+        checkpoint_md = ' '.join((self.KIT / 'templates/CHECKPOINT.md').read_text(encoding='utf-8').split())
+        self.assertIn(
+            'refused without one, and refused with a non-waiting state such as `working` or `idle`',
+            checkpoint_md,
+        )

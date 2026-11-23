@@ -697,7 +697,7 @@ function coordinatorSection(payload, file, { hasCertificate = false } = {}) {
     '',
     ...coordinatorSteps(payload.server, file, payload.certificateFile),
     troubleStep(11, payload, file),
-    '12. Stop and ask your owner if anything is unclear.',
+    '12. If anything is unclear, post your question on the task, or to your owner in a task comment, and wait; never open a local interactive prompt.',
     '',
     '## If this project is in a program',
     '',

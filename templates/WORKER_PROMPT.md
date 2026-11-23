@@ -58,7 +58,7 @@ applies to it. Otherwise, if nothing new is actionable, leave it unchanged and s
 rather than inventing work. Stop without acting only when every task of yours is with the
 reviewer or the coordinator.
 
-When you need a decision or information, ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you. Never open a local interactive prompt or wait on terminal input; always record waits in a checkpoint with lane_state (waiting_on, expect_by), keep waiting-on-* on any idle-stop checkpoint, and note that an idle stop re-arms your waker (tools/wake/wake.sh) and never ends the wait.
+When you need a decision or information, ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you. Never open a local interactive prompt or wait on terminal input; always record waits in a checkpoint with lane_state (waiting_on, expect_by), keep waiting-on-* on any idle-stop checkpoint: an idle stop ends this session's wait, not the declared wait, and your waker (tools/wake/wake.sh on its timer) keeps polling.
 
 At the start of every run, read the coordinator's current standing guidance with the
 client `guidance get` action, using your saved config, project and actor. It is an

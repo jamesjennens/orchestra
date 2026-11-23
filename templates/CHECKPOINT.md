@@ -92,7 +92,8 @@ not send `checkpoint`: the writer sets that to the comment id it publishes.
 The required fields are `schema_version` (1), `task` and `state`. `state` is one of
 `working`, `waiting-on-coordinator`, `waiting-on-review`, `waiting-on-user` or `idle`.
 A waiting state also requires `waiting_on` (a role `coordinator`/`reviewer`/`user`, or an
-actor id, at most 96 characters; refused without one). `expect_by` is an optional
+actor id, at most 96 characters; refused without one, and refused with a non-waiting state
+such as `working` or `idle`). `expect_by` is an optional
 ISO-8601 time with an offset; a past value is accepted and flagged, and only an
 unparseable one is refused. `not_before` (kittrial-5bb.509) is an optional full ISO-8601
 time with seconds and an offset, strictly in the future and at most 14 days ahead, set
