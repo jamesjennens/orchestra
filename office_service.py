@@ -653,6 +653,7 @@ def run(root, logs, config, port, stop_seconds):
         try:
             env = admin.environment(root)
             db_env = office_dolt.db_server_env(env)
+            office_dolt.cleanup_stale_restore_logs(root)
             office_dolt.cleanup_stale_socket(root)
             db = _spawn(office_dolt.dolt_command(root), root, logs/'dolt.log', db_env)
             until = time.monotonic() + startup_seconds

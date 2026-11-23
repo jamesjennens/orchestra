@@ -7099,12 +7099,7 @@ def temporary_office_dolt(root,holds_office_lock=False):
             )
         # Clean up leftovers from a prior SIGKILL/SIGHUP now that we hold office-service.lock
         # and confirmed no Dolt is listening on this runtime's port.
-        for stale in root.glob('.restore-dolt-*.log'):
-            try:
-                if not stale.is_symlink() and stale.is_file():
-                    stale.unlink()
-            except OSError:
-                pass
+        office_dolt.cleanup_stale_restore_logs(root)
         office_dolt.cleanup_stale_socket(root)
         fd,temp_log=tempfile.mkstemp(dir=str(root),prefix='.restore-dolt-',suffix='.log')
         os.close(fd)
@@ -7115,10 +7110,14 @@ def temporary_office_dolt(root,holds_office_lock=False):
             try:
                 child=office_dolt.spawn_process(office_dolt.dolt_command(root),root,log_path,db_env)
             except (OSError,subprocess.SubprocessError) as exc:
+                detail=office_dolt.format_error_detail(exc,max_chars=240)
+                if isinstance(exc,subprocess.SubprocessError) or 'PR_SET_PDEATHSIG' in str(exc):
+                    raise ValueError(
+                        'Refusing restore-new: could not start temporary Dolt with parent-death protection '
+                        '(PR_SET_PDEATHSIG): %s. Nothing was changed.'%detail
+                    ) from None
                 raise ValueError(
-                    'Refusing restore-new: could not start temporary Dolt with parent-death protection '
-                    '(PR_SET_PDEATHSIG): %s. Nothing was changed.'
-                    %office_dolt.bounded_diagnostic(detail=str(exc),max_chars=240)
+                    'Refusing restore-new: could not start the temporary Dolt: %s. Nothing was changed.'%detail
                 ) from None
             until=time.monotonic()+startup_seconds
             ready=False
@@ -12797,6 +12796,7 @@ def _main():
             # One termination guard spans startup, the restore body, AND temporary Dolt shutdown so a
             # SIGTERM during shutdown cannot end restore-new silently without printing the notice.
             project_restored=False
+            warning=None
             try:
                 with signal_termination_guard():
                     with temporary_office_dolt(root,holds_office_lock=bool(args.restore_http_state)):
@@ -12853,21 +12853,27 @@ def _main():
                         finally:
                             restoring.close()
             except BaseException as error:
-                if project_restored and args.restore_http_state:
-                    print('The project %s was restored, but restore-new was stopped while its temporary Dolt '
-                          'was being stopped (%s): the HTTP state was NOT restored. To restore it, run '
-                          'restore-new %s NEWNAME --restore-http-state --credentials %s into a NEW name; '
-                          'the clone %s can then be retired (admin.py retire-project %s --actor OPERATOR '
-                          '--reason REASON, with --force when it holds issues), and its name stays reserved: '
-                          'a retired name is never reused.'
-                          %(args.destination,str(error).rstrip('.'),args.project,args.credentials,
-                            args.destination,args.destination),
-                          file=sys.stderr)
-                elif project_restored:
-                    print('The project %s was restored, but restore-new was stopped while its temporary Dolt '
-                          'was being stopped (%s).'
-                          %(args.destination,str(error).rstrip('.')),
-                          file=sys.stderr)
+                if project_restored:
+                    stop_reason=(str(error).strip().rstrip('.')
+                                 or ('SIGINT' if isinstance(error,KeyboardInterrupt) else type(error).__name__))
+                    if args.restore_http_state:
+                        print('The project %s was restored, but restore-new was stopped while its temporary Dolt '
+                              'was being stopped (%s): the HTTP state was NOT restored. To restore it, run '
+                              'restore-new %s NEWNAME --restore-http-state --credentials %s into a NEW name; '
+                              'the clone %s can then be retired (admin.py retire-project %s --actor OPERATOR '
+                              '--reason REASON, with --force when it holds issues), and its name stays reserved: '
+                              'a retired name is never reused.'
+                              %(args.destination,stop_reason,args.project,args.credentials,
+                                args.destination,args.destination),
+                              file=sys.stderr)
+                    else:
+                        print('The project %s was restored, but restore-new was stopped while its temporary Dolt '
+                              'was being stopped (%s).'
+                              %(args.destination,stop_reason),
+                              file=sys.stderr)
+                    end_warnings=[text for text in (warning,getattr(args,'task_files_warning',None)) if text]
+                    for text in end_warnings:
+                        print(text,file=sys.stderr)
                 raise
             # Still under the office lock (F3): the state is written once the project has restored
             # and any temporary Dolt has already been stopped.

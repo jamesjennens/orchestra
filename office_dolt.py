@@ -156,6 +156,19 @@ def cleanup_stale_socket(root):
     return False
 
 
+def cleanup_stale_restore_logs(root):
+    """Remove stale ``.restore-dolt-*.log`` regular files left by an ungraceful stop."""
+    removed = 0
+    for stale in Path(root).glob('.restore-dolt-*.log'):
+        try:
+            if not stale.is_symlink() and stale.is_file():
+                stale.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def after_fork():
     """Child-side hook: ask Linux to SIGKILL this child if its parent dies (SIGKILL included)."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -336,6 +349,12 @@ def _collapse_diagnostic(text, max_chars, keep_tail=False):
             return '...' + result[-(max_chars - 3):].lstrip()
         return result[:max_chars - 3].rstrip() + '...'
     return result
+
+
+def format_error_detail(exc, max_chars=240):
+    """Format an exception message as one bounded line without a trailing period."""
+    text = _collapse_diagnostic(str(exc), max_chars, keep_tail=False).rstrip('.')
+    return text or type(exc).__name__
 
 
 def bounded_diagnostic(log_path=None, detail='', max_bytes=4096, max_chars=500):

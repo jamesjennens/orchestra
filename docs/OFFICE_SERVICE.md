@@ -784,11 +784,15 @@ on a stopped `office-foreground` runtime using the same spawn, parent-death
 `deployment.private.json`, default 30 s, valid 1–600 — the same setting also
 governs `office_service.py run`, and an invalid value refuses to start), and
 stops the temporary Dolt before restoring HTTP state and on any failure,
-`SIGTERM`, or `SIGINT` (if `SIGTERM` arrives during Dolt shutdown after the
-project is restored, it finishes stopping Dolt and prints a notice that HTTP
-state was not restored; `SIGKILL` or `SIGHUP` cannot run cleanup, so the
-kernel's `PR_SET_PDEATHSIG` sends `SIGTERM` to Dolt and the next start or
-restore removes any stale `.restore-dolt-*.log` or dead Unix socket). It never
+`SIGTERM`, or `SIGINT` (if `SIGTERM` or `SIGINT` arrives during Dolt shutdown
+after the project is restored, it finishes stopping Dolt and prints a notice
+that HTTP state was not restored; `SIGKILL` or `SIGHUP` cannot run cleanup, so
+the kernel's `PR_SET_PDEATHSIG` sends `SIGKILL` to Dolt, leaving any
+`.restore-dolt-*.log`, dead `mysql.sock`, and `data/.dolt/sql-server.info`
+behind — `office_service.py run` removes stale `.restore-dolt-*.log` files and
+a dead Unix socket on start, `restore-new` removes both whenever it is about to
+start a temporary Dolt, and `data/.dolt/sql-server.info` is harmless so every
+later Dolt starts normally). It never
 bootstraps or sets database credentials (a never-run runtime missing
 `privileges.db` is refused before spawning Dolt, and an auth refusal stops the
 child and refuses with `Nothing was changed.`), and it refuses without starting

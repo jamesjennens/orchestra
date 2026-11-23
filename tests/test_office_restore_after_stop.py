@@ -970,21 +970,143 @@ except admin.TerminatedBySignal as exc:
         self.assertFalse((self.root / 'projects' / 'dstneverrun').exists())
 
     def test_pin_prctl_unavailable_gives_one_line_refusal_no_traceback(self):
-        """NOTE-2: missing or ENOSYS prctl gives a one-line refusal with 'Nothing was changed.' and no traceback."""
+        """NOTE-2 / r3 NOTE-F: missing or ENOSYS prctl gives exact parent-death refusal without 'last probe:' or '..'."""
         import errno
+        expected = (
+            'ValueError: Refusing restore-new: could not start temporary Dolt with parent-death protection '
+            '(PR_SET_PDEATHSIG): Exception occurred in preexec_fn. Nothing was changed.'
+        )
         for err_obj in (OSError(errno.ENOSYS, 'PR_SET_PDEATHSIG failed'), AttributeError('undefined symbol: prctl')):
             with self.subTest(error=type(err_obj).__name__):
                 with mock.patch.object(office_dolt, 'after_fork', side_effect=err_obj):
                     code, _, err = self.run_cli('restore-new', 'src', 'dstnoprctl')
                 self.assertEqual(code, 1)
-                self.assertIn('PR_SET_PDEATHSIG', err)
-                self.assertIn('Nothing was changed.', err)
+                self.assertEqual(err.strip(), expected)
+                self.assertNotIn('last probe:', err)
+                self.assertNotIn('..', err)
                 self.assertNotIn('Traceback', err)
                 self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
                 self.assertFalse((self.root / 'projects' / 'dstnoprctl').exists())
 
+    def test_pin_spawn_oserror_gives_generic_temporary_dolt_refusal_exact(self):
+        """r3 NOTE-F: non-prctl spawn OSError says 'could not start the temporary Dolt' without PR_SET_PDEATHSIG."""
+        import errno
+        cases = [
+            ('missing_binary', FileNotFoundError(errno.ENOENT, 'No such file or directory', '/missing/dolt'),
+             "ValueError: Refusing restore-new: could not start the temporary Dolt: "
+             "[Errno 2] No such file or directory: '/missing/dolt'. Nothing was changed."),
+            ('log_open_denied', PermissionError(errno.EACCES, 'Permission denied.', '/tmp/restore.log'),
+             "ValueError: Refusing restore-new: could not start the temporary Dolt: "
+             "[Errno 13] Permission denied.: '/tmp/restore.log'. Nothing was changed."),
+            ('trailing_dot_message', OSError('exec failed.'),
+             "ValueError: Refusing restore-new: could not start the temporary Dolt: exec failed. Nothing was changed."),
+        ]
+        for label, err_obj, expected in cases:
+            with self.subTest(case=label):
+                with mock.patch.object(office_dolt, 'spawn_process', side_effect=err_obj):
+                    code, _, err = self.run_cli('restore-new', 'src', 'dstspawnerr')
+                self.assertEqual(code, 1)
+                self.assertEqual(err.strip(), expected)
+                self.assertNotIn('PR_SET_PDEATHSIG', err)
+                self.assertNotIn('last probe:', err)
+                self.assertNotIn('..', err)
+                self.assertNotIn('Traceback', err)
+                self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+                self.assertFalse((self.root / 'projects' / 'dstspawnerr').exists())
+
+    def test_pin_sigint_during_temporary_dolt_stop_names_sigint_and_keeps_warnings(self):
+        """r3 NOTE-C & NOTE-G: Ctrl-C during temporary Dolt stop names (SIGINT), never (), and repeats end-of-run warnings."""
+        self.set_fake_dolt_behavior(ignore_sigterm_seconds=3.5)
+        before_http = self.state_path.read_bytes()
+        runner = self.base / 'run_sigint_stop.py'
+        runner.write_text('''import sys
+from unittest import mock
+sys.path.insert(0, %r)
+import admin
+root = %r
+def fake_add(r, name, **kw):
+    (r / 'projects' / name).mkdir(parents=True, exist_ok=True)
+    return {'project': name, 'database': name, 'prefix': name}
+def fake_finish(r, args, snapshot, step):
+    args.task_files_warning = 'task files of dstsigint: mismatch warning'
+    return 'Authority was NOT re-granted warning'
+sys.argv = ['admin.py', '--root', root, 'restore-new', 'src', 'dstsigint',
+            '--restore-http-state', '--credentials', 'keep']
+with mock.patch.object(admin, 'add_project', side_effect=fake_add), \\
+     mock.patch.object(admin, 'native_restore', return_value='restored'), \\
+     mock.patch.object(admin, 'finish_restore', side_effect=fake_finish):
+    admin.run_main()
+''' % (str(KIT), str(self.root)), encoding='utf-8')
+        proc = subprocess.Popen(
+            [sys.executable, str(runner)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
+        self.addCleanup(self.stop_proc, proc)
+        sigterm_flag = self.root / 'fake-dolt-sigterm.flag'
+        self.assertTrue(wait_for(lambda: sigterm_flag.is_file(), timeout=15),
+                        'temporary Dolt did not enter its stop phase')
+        dolt_pid = int(sigterm_flag.read_text(encoding='utf-8').strip())
+        self.addCleanup(kill_pid, dolt_pid)
+        time.sleep(0.2)
+        proc.send_signal(signal.SIGINT)
+        _, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 130, 'expected SIGINT exit 130, got %r (stderr=%r)' % (proc.returncode, err))
+        expected_notice = (
+            'The project dstsigint was restored, but restore-new was stopped while its temporary Dolt '
+            'was being stopped (SIGINT): the HTTP state was NOT restored. To restore it, run '
+            'restore-new src NEWNAME --restore-http-state --credentials keep into a NEW name; '
+            'the clone dstsigint can then be retired (admin.py retire-project dstsigint --actor OPERATOR '
+            '--reason REASON, with --force when it holds issues), and its name stays reserved: '
+            'a retired name is never reused.'
+        )
+        err_lines = err.strip().splitlines()
+        self.assertEqual(err_lines[0], expected_notice)
+        self.assertIn('Authority was NOT re-granted warning', err_lines)
+        self.assertIn('task files of dstsigint: mismatch warning', err_lines)
+        self.assertNotIn('()', err)
+        self.assertEqual(self.state_path.read_bytes(), before_http)
+        self.assertTrue(wait_for(lambda: not pid_alive(dolt_pid), timeout=8))
+        self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+
+        # Plain restore-new (without --restore-http-state) on SIGINT during Dolt stop
+        (self.root / 'fake-dolt-sigterm.flag').unlink()
+        runner_plain = self.base / 'run_sigint_stop_plain.py'
+        runner_plain.write_text('''import sys
+from unittest import mock
+sys.path.insert(0, %r)
+import admin
+root = %r
+def fake_add(r, name, **kw):
+    (r / 'projects' / name).mkdir(parents=True, exist_ok=True)
+    return {'project': name, 'database': name, 'prefix': name}
+sys.argv = ['admin.py', '--root', root, 'restore-new', 'src', 'dstsigintplain']
+with mock.patch.object(admin, 'add_project', side_effect=fake_add), \\
+     mock.patch.object(admin, 'native_restore', return_value='restored'), \\
+     mock.patch.object(admin, 'finish_restore', return_value=None):
+    admin.run_main()
+''' % (str(KIT), str(self.root)), encoding='utf-8')
+        proc2 = subprocess.Popen(
+            [sys.executable, str(runner_plain)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
+        self.addCleanup(self.stop_proc, proc2)
+        self.assertTrue(wait_for(lambda: sigterm_flag.is_file(), timeout=15))
+        dolt_pid2 = int(sigterm_flag.read_text(encoding='utf-8').strip())
+        self.addCleanup(kill_pid, dolt_pid2)
+        time.sleep(0.2)
+        proc2.send_signal(signal.SIGINT)
+        _, err2 = proc2.communicate(timeout=15)
+        self.assertEqual(proc2.returncode, 130, 'expected SIGINT exit 130, got %r (stderr=%r)' % (proc2.returncode, err2))
+        self.assertEqual(
+            err2.strip(),
+            'The project dstsigintplain was restored, but restore-new was stopped while its temporary Dolt '
+            'was being stopped (SIGINT).',
+        )
+        self.assertNotIn('()', err2)
+        self.assertTrue(wait_for(lambda: not pid_alive(dolt_pid2), timeout=8))
+
     def test_pin_stale_restore_log_and_dead_socket_cleaned_on_next_run(self):
-        """NOTE-3: stale .restore-dolt-*.log and dead mysql.sock from a prior SIGKILL are cleaned on the next run."""
+        """NOTE-3 / r3 SHOULD-1: stale .restore-dolt-*.log and dead mysql.sock are cleaned by both restore-new and office_service.py run."""
         stale_log = self.root / '.restore-dolt-stale123.log'
         stale_log.write_text('old crash log\n', encoding='utf-8')
         sock_path = self.root / 'mysql.sock'
@@ -998,8 +1120,27 @@ except admin.TerminatedBySignal as exc:
                 mock.patch.object(admin, 'finish_restore', return_value=None):
             code, _, err = self.run_cli('restore-new', 'src', 'dstclean')
         self.assertEqual(code, 0, err)
-        self.assertFalse(stale_log.exists(), 'stale .restore-dolt-*.log should be cleaned up')
-        self.assertFalse(sock_path.exists(), 'dead mysql.sock should be cleaned up')
+        self.assertFalse(stale_log.exists(), 'stale .restore-dolt-*.log should be cleaned up by restore-new')
+        self.assertFalse(sock_path.exists(), 'dead mysql.sock should be cleaned up by restore-new')
+
+        # Now verify office_service.py run also cleans stale .restore-dolt-*.log and dead mysql.sock on start.
+        stale_log2 = self.root / '.restore-dolt-stale456.log'
+        stale_log2.write_text('old crash log 2\n', encoding='utf-8')
+        s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s2.bind(str(sock_path))
+        s2.close()
+        self.assertTrue(stale_log2.exists())
+        self.assertTrue(sock_path.exists())
+        proc = subprocess.Popen(
+            [sys.executable, str(KIT / 'office_service.py'), 'run',
+             '--root', str(self.root), '--port', str(self.web_port),
+             '--logs', str(self.logs), '--config', str(self.config)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
+        self.addCleanup(self.stop_proc, proc)
+        self.assertTrue(wait_for(lambda: not stale_log2.exists() and not sock_path.exists(), timeout=15),
+                        'office_service.py run must remove stale .restore-dolt-*.log and dead mysql.sock on start')
+        self.stop_proc(proc)
 
     def test_pin_existing_dolt_auth_refusal_refuses_without_spawning(self):
         """SHOULD-3 (R8): existing Dolt refusing root with real Dolt 2.2.0 text refuses without spawning."""
