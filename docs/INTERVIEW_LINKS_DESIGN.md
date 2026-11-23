@@ -4,6 +4,8 @@
 
 - **Base:** main `b1f2356c`.
 - **r2:** answers the Opus security review of r1 (`84d0bd67`, REQUEST CHANGES). Each change is marked with the review's id, for example **[M1]** or **[S4]**. The table at the end of the note says where each item is answered.
+- **r3:** answers the coordinator's REQUEST CHANGES on r2 (`da57eede`), which draws on the Opus delta review (R2-M1, R2-S1, R2-S2, R2-N1 to N7) and the Neon review (M1-M6, S1-S8, N1-N6). Each r3 change is marked with the coordinator's item id, for example **[interviewer-scope]** or **[guest-resume]**. The second table at the end says where each item is answered.
+- **r3 depends on kittrial-5bb.607** for how an interviewer credential is stored so that an older kit cannot use it (section 7). The note follows .607's verified plan, option (b): fenced credentials.
 
 **How to read the marks.** Every mechanism this note leans on is marked:
 
@@ -34,19 +36,20 @@ There is no account, no password and no set-up page. The guest sees only their o
   - a guest token is stored only as a hash in its link record;
   - no session, credential or user record is ever made for a guest;
   - the guest routes are the only ones that read the guest cookie.
-- **The interviewer can reach one interview and nothing else [M1]:**
-  - it gets a credential for that one interview, made when it is assigned and revoked when the interview ends;
-  - an agent marked as an interviewer is refused every room route;
+- **The interviewer can reach one interview and nothing else [M1, interviewer-scope]:**
+  - it is a **dedicated** agent, flagged as an interviewer. Its ordinary credentials hold no project capability at all, as the nudge carrier's hold none (`http_authority.py:837-840`). It works only through a credential for each interview;
+  - that credential is made when the interviewer is assigned and revoked when the interview ends. Its secret reaches the runner only through its owner's consent step, a person's session, never through an agent credential **[credential-delivery]**;
+  - the runner of an interview has no tools but that interview's read and post **[runner-tools]**;
   - each interview runs in a fresh model context.
 - **Guest polling costs no state-file write [M3].** Presence comes from what the guest types, not from an open tab, and fast polling is capped per interview per day.
-- **A restore ends every unfinished link [M2]**, and a rollback suspends interviews.
+- **A restore ends every unfinished link [M2]**, and a rollback suspends interviews. On an older kit an interviewer credential answers 401, because it is kept where an older kit does not look (kittrial-5bb.607) **[rollback]**.
 
-**What a guest can see.** A guest can ask the interviewer about anything it holds, so the brief is written as if the guest may read it **[M1]**. Until the inviter confirms "that was them", or the guest entered the check code, items read "answered by whoever opened LABEL's link" and cannot be accepted **[S2]**.
+**What a guest can see.** A guest can ask the interviewer about anything it holds: the brief, the notes, and everything said earlier in that interview. So the brief is written as if the guest may read it **[M1]**, and every re-issued link needs a new check code **[should (1)]**. Until the inviter confirms "that was them", or the guest entered the check code, items read "answered by whoever opened LABEL's link" and cannot be accepted **[S2]**.
 
 **The decisions for James** (each is argued in its section; the recommendation is in bold; section 9 adds the review's security view to each):
 
 1. **The credential** (section 1): **a single-use link that binds to one browser on an explicit Start**, not a password, a passkey or an e-mailed link.
-2. **Another browser or PC** (section 1.6): **the inviter re-issues the link**, which revokes the old one. The new session sees no earlier answers **[S4]**. A transfer code is a later slice at most, since the office is desk only.
+2. **Another browser or PC** (section 1.6): **the inviter re-issues the link**, which revokes the old one. The new session sees no earlier answers **[S4]**, and the new link always needs a new check code **[should (1)]**. A transfer code is a later slice at most, since the office is desk only.
 3. **Does the guest see the brief?** (section 2.1): **the guest is shown a short intro**. The brief is not shown, but it is written as if the guest may read it **[M1]**.
 4. **Who reads an interview** (section 2.6): **the inviter, the project's coordinators and owners, and whoever runs the interviewer agent [M1]**, not every member.
 5. **How long a guest session lasts** (section 1.4): **until the interview is finished, revoked or 7 days old**, with an idle limit of 24 hours that **only answers refresh [S6]**.
@@ -62,7 +65,7 @@ There is no account, no password and no set-up page. The guest sees only their o
 | Piece | State | Where |
 |---|---|---|
 | Rooms: append-only room files, list, read, post, create, archive, moderate, export, own backup file (slice 1, .385) | **[built]** | `rooms.py`; routes `http_service.py:7762-8504` **[N1]** |
-| Room items and acceptance by a person (slice 2, .388); accepted items become requirements, proposals and decisions with an `orchestra:room/<id>#<seq>` pointer | **[built]** | `rooms.py:1244-1643`; person-only check `http_service.py:7812-7815` |
+| Room items and acceptance by a person (slice 2, .388); accepted items become requirements, proposals and decisions with an `orchestra:room/<id>#<seq>` pointer | **[built]** | `rooms.py:1244-1645` (`answer_item` is `:1643-1645`) **[notes: Neon N5]**; person-only check `http_service.py:7812-7815` |
 | The rooms page, all text through `textContent` (.427) | **[built]** | `web/js/views/rooms.js:2-3`, `web/js/dom.js:1` |
 | The `rooms` scope and a rooms-only scribe credential (R1, slice 3) | **[designed]** | docs/PROJECT_ROOMS_DESIGN.md sections 3 and 5 |
 | The scribe's wake through me/next and post limits R3-R6 (slice 4) | **[designed]** | same, section 4 |
@@ -78,7 +81,7 @@ There is no account, no password and no set-up page. The guest sees only their o
 | Redeem runs inside `Service._widening` (all or nothing) | **[built]** | `invites.py:600-650` |
 | The token rides in the fragment (`#/invite/TOKEN`), is wiped from the address bar, and goes to the server only in a POST body | **[built]** | `web/js/views/invites.js:20`, `:220-221`; `http_service.py:8750-8753` |
 | The invite switch, off by default | **[built]** | `http_service.py:683`, `:4204-4205` |
-| `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY` on pages | **[built]** | `http_service.py:6369`, `:6421-6422` |
+| `Referrer-Policy: no-referrer` on every answer (`_send_json`, `http_service.py:6369`), and `X-Frame-Options: DENY` on pages (`_serve_static`, `:6421-6422`) | **[built]** | **[notes: Neon N5]** |
 | Session cookie `HttpOnly; SameSite=Strict`, with `Secure` only when the request came over TLS | **[built]** | `http_service.py:6080-6093`, `:6430-6434` |
 | CSRF token on every cookie-authenticated write | **[built]** | `http_service.py:6257-6264` |
 | Anonymous writes are guarded today by the JSON-only body and the lack of any CORS answer | **[built]** | `http_service.py:6229-6232` **[N2]** |
@@ -96,6 +99,9 @@ There is no account, no password and no set-up page. The guest sees only their o
 | A held request (.207) | **[designed, in progress]** | kittrial-5bb.207 |
 | Single sign-on (.34) | **[designed, open]** | kittrial-5bb.34 |
 | An Origin check on anonymous writes | **not present** | **[new]**, section 1.3 |
+| Every refused request (401 or 403) writes an unthrottled audit line and saves the whole state, unless the route already audited it (`_note_denied`, `http_service.py:5953`, `:6337-6350`; the opt-out flag `_audited_refusal`, set at `:6528`, `:6657`, `:8921`) | **[built]** | **[should (3)]**, section 1.10 |
+| The page's start calls `GET /v1/sessions/current` (`web/js/app.js:318-319`); for a visitor with no session that is a 401, so the refusal path above | **[built]** | **[should (3)]**, section 1.5 |
+| The fenced credentials: a credential an older kit cannot find (kittrial-5bb.607) | **[designed, .607]** | kittrial-5bb.607's plan; section 2.6 and 7 **[rollback]** |
 
 ### Two facts that decide where the new data lives
 
@@ -151,7 +157,7 @@ Finished, revoked and expired link records are pruned: kept 90 days, at most 500
   - expiry is checked on both clocks, as `Service._expired` does for invites (`http_auth.py:1344`).
 - **[new] the link** is `https://<site>/#/interview/<TOKEN>`.
 - **What the fragment protects, and what it does not [S2]:**
-  - **It protects:** the browser never sends the fragment in a request, so the token does not appear in the request line, the server's access log, a `Referer` or a plain proxy log. The page also wipes it from the address bar at once, as `invites.js:220-221` does.
+  - **It protects:** the browser never sends the fragment in a request, so the token does not appear in the request line, the server's access log, a `Referer` or a plain proxy log. The page also takes it out of the address bar at once, as `web/js/views/invites.js:220-221` does. **[guest-resume]** Unlike an invite, it replaces the address with `#/interview/session/<link-id>`, not `#/`. The link id is not a secret, so a reload or a bookmark finds the interview again (1.6).
   - **It does not protect:**
     - the mail or chat message that carries the link: anything that reads the message reads the token, and a link scanner receives the whole link;
     - a mail gateway that rewrites links: it carries the original URL, fragment and all, inside its own link's query string. The token then reaches the gateway's logs, and, on the click, any proxy that inspects TLS. **The office should check its own gateway**;
@@ -164,13 +170,18 @@ Finished, revoked and expired link records are pruned: kept 90 days, at most 500
   {schema_version, id, project, inviter (user id), label, interview_id,
    created_at, expires_at, check_code_hash | null, check_code_misses,
    state: pending | bound | finished | revoked | expired,
-   bound_at, bound_session_hash, bound_csrf_hash, bound_from (address group, browser family),
-   bind_nonce_hash, binding_confirmed_by, binding_confirmed_at,
+   bound_at, bound_session_hash, bound_csrf, bound_from (address group, browser family),
+   bind_nonce_hash, bind_nonce_until, binding_confirmed_by, binding_confirmed_at,
+   binding_confirmed_how: button | check code,
+   interviewer_agent_id | null, interviewer_credential_id | null,
    reissued_from | null, finished_at, revoked_by, revoked_at}
   ```
 
   - `label` is how the guest is named everywhere (section 1.8).
   - The intro and the brief live in `.interviews/`, not in this record.
+  - **[guest-resume]** `bound_csrf` is the guest session's CSRF value itself, as a member session keeps its own (`session['csrf']`, written at `http_auth.py:2140`, returned at `http_service.py:8556-8560`). r2 kept only its hash, so a reloaded page could never send it again. It is not a bearer secret on its own: a write needs the guest cookie as well.
+  - **[credential-delivery; Neon M5]** `interviewer_agent_id` and `interviewer_credential_id` name the interviewer and its credential for this interview. Finish, revoke, expiry and a restore find the credential through them, even when a restore keeps credentials (`--credentials keep`, `admin.py:6729-6730`).
+  - **[notes: Neon N3]** When a finished link record is pruned (section 0), what provenance needs is already in `.interviews/<id>/interview.json`: the label, the inviter, and who confirmed the binding, how and when. Viewing and exporting an old interview never read the link record.
 
 ### 1.3 Binding: on Start, never on opening
 
@@ -179,13 +190,15 @@ Corporate mail and chat often **open links automatically**, through safe-link sc
 1. **Opening the link does nothing on the server.** The page shell loads, and the script reads the fragment.
 2. **The view.**
    - The page POSTs the token **in the body** to `POST /v1/interview/view` **[new]**, which is anonymous, like `/v1/invites/view` (`http_service.py:8750`).
-   - The answer is only the inviter's name, the guest label, the intro, the expected length, whether a check code is needed, and the link's state.
-   - A miss counts as a sign-in failure for that address, as `invites._lookup` does (`invites.py:497-518`).
-   - **[N5]** If the browser also carries a member's session, the page says "You are signed in as NAME. This link is for LABEL: pressing Start uses it up." The create page and the link panel say the same: "Don't open this link yourself."
+   - The answer is the **link id**, the link's state and whether a check code is needed. When no code is needed it also gives the inviter's name, the guest label, the intro and the expected length. **[notes: Neon S2]** When a code is needed, those wait for the code: the page asks only for the 6 digits, and the bind answer carries the intro. So an interceptor without the code learns neither the project nor the topic, as the table of 1.9 says.
+   - Like bind, it takes no query string, and it is rate-limited per link and per address group (1.10) **[notes: Neon S2]**.
+   - **[guest-resume]** For a **bound** link the answer is the link id and `bound`, and nothing else. The page then reads `GET /v1/interview/<link-id>/me` with the cookie the browser already holds (1.5). If that answers, the guest is back at the open question. That is the common path: the trader opens the mail link again the next morning. It is not a miss, and nobody is told. Only when the cookie is absent or refused does the page say "This link has already been used. Ask NAME for a new one."
+   - A miss (an unknown token, a revoked or expired link) is counted in the interview links' own bucket (1.10) **[should (5)]**, never in the sign-in counts.
+   - **[N5, should (4)]** If the request also carries an `orchestra_session` cookie, the answer says so (`member_cookie: true`). It never resolves that cookie, so nothing is authenticated and nothing is written. The page then says "This browser is signed in to Orchestra. This link is for LABEL: pressing Start uses it up." The create page and the link panel say the same: "Don't open this link yourself."
 3. **The guest presses Start the interview.** The page POSTs the token, the check code if one is needed, and a **bind nonce** (16 random bytes the page makes once) to `POST /v1/interview/bind` **[new]**. This route:
    - **requires TLS [S7]**: view and bind refuse when `_is_secure()` is false (`http_service.py:6080-6093`). A plain-HTTP installation cannot offer interview links: the guest cookie would be dropped and the token would cross the network in clear.
    - **checks `Origin` [N2]**:
-     - the expected origin is the scheme (from TLS, or a trusted proxy's `X-Forwarded-Proto`) plus the request's `Host`. The documented proxy passes `Host` (`docs/HTTP_DEPLOYMENT.md:515-517`);
+     - **[notes: Neon S4]** the expected origin is a **configured public origin** (`--public-origin https://site[:port]`), which interview links require, as they require TLS. r2 built it from the request's `Host`, but the documented proxy sends `Host $host` (`docs/HTTP_DEPLOYMENT.md:515`), and nginx's `$host` drops a non-default port, so every bind on such a port would be refused;
      - if `Origin` is absent, the route requires `Sec-Fetch-Site: same-origin`;
      - **`Origin: null` is refused.**
      - This is extra defence. The guard today is the JSON-only body and the lack of any CORS answer (`http_service.py:6229-6232`; probe A7).
@@ -194,16 +207,17 @@ Corporate mail and chat often **open links automatically**, through safe-link sc
    - **runs inside `Service._widening` [S10]**, under the store lock, as `invites.redeem` does (`invites.py:600-650`). It:
      - finds the record by hash, and refuses it unless it is `pending` and unexpired;
      - checks the code (section 1.9);
-     - marks the record `bound`, recording `bound_at`, `bound_from` (the address group and browser family, never the full user-agent), the nonce's hash, and the hashes of a fresh guest token and a fresh **per-session CSRF value [S7]**.
+     - marks the record `bound`, recording `bound_at`, `bound_from` (the address group and browser family, never the full user-agent), the nonce's hash with `bind_nonce_until` (2 minutes on), the hash of a fresh guest token, and a fresh **per-session CSRF value [S7]**, kept as itself **[guest-resume]**.
 
      A failed save undoes all of it, so a cookie is never issued for a link the file still calls pending.
-   - **answers with the cookie** `orchestra_guest_<link-id>=<token>; Path=/v1/interview/<link-id>/; HttpOnly; SameSite=Strict; Secure`, and the CSRF value in the body.
+   - **answers with the cookie** `orchestra_guest_<link-id>=<token>; Path=/v1/interview/<link-id>/; HttpOnly; SameSite=Strict; Secure`, and the CSRF value and the intro in the body.
+   - **[should (4)]** It ignores an `orchestra_session` cookie, as every guest route does (1.5). A member's session in the same browser (`Path=/`, `http_service.py:6431`) therefore neither stops a bind nor breaks the guest session after it. The view's warning (step 2) is what keeps a member from using a guest's link by mistake.
      - The cookie is named for the link **[S7]**, so a trader invited to two interviews can keep both in one browser.
      - The path is tidiness, not isolation (RFC 6265 section 8.5). The isolation is the server rule in 1.5 **[S7]**.
 4. **A retry, and a second bind.**
-   - **[N11]** A second bind with the **same nonce**, within 2 minutes, from the same address group, gets the same session again. This covers the guest's own double click, or a bind answer the proxy dropped. It is not an "already used" event.
+   - **[N11; notes: R2-N1]** A second bind with the **same nonce**, before `bind_nonce_until`, **issues a fresh guest token and CSRF value and replaces both** in the record (the service keeps only the token's hash, so it has nothing to send twice). The same nonce means the same page, so nothing else is cut off. This covers the guest's own double click, or a bind answer the proxy dropped. It is not an "already used" event. r2's "from the same address group" is dropped: at the office every guest shares one address, so it added nothing; the nonce is the check.
    - Any other second bind gets one fixed answer: "This link has already been used. Ask NAME for a new one."
-     - It **counts as a miss** for that address **[S1]**.
+     - It **counts as a miss** in the interview links' bucket **[S1, should (5)]**.
      - The inviter is told, at most once per link per hour, with a count **[N11]**.
 
 **The two rules that keep a guest from being an account [M4].** These are stated rules of the design, each held by a test (section 6):
@@ -218,7 +232,7 @@ Why both: a session with no membership can, today, create a project, create an a
 | Thing | Default | Bounds (settings) | Why |
 |---|---|---|---|
 | An unbound link | 72 h | 1 h to 7 days | As invites. |
-| A guest session, idle | 24 h, **refreshed only by an answer, skip or pause [S6]** | 1 h to 72 h | A trader answers between other work and may return the next morning. Page polls never refresh it. |
+| A guest session, idle | 24 h, **refreshed only by an answer, a skip, or a pause that really pauses [S6, should (6)]** | 1 h to 72 h | A trader answers between other work and may return the next morning. Page polls never refresh it, and neither does a pause sent while already paused. |
 | A guest session, absolute | 7 days, and never past the interview's end | 1 to 14 days | Short sittings over a week; then the inviter re-issues. |
 | At `finished`, `revoked` or `expired` | **the session ends at once [S6]** | none | The transcript has already been handed over in the confirm step (2.5). The next guest request is answered "This interview is closed." |
 
@@ -228,12 +242,13 @@ Why both: a session with no membership can, today, create a project, create an a
 ### 1.5 What a guest can see and do
 
 - **[new] the guest routes**, all under `/v1/interview/<link-id>/`:
-  - `GET me`: the intro, the progress line, the open question, the guest's own messages and the interviewer's **from this session only [S4]**, and the summary to confirm;
+  - `GET me`: the intro, the progress line, the open question, the guest's own messages and the interviewer's **from this session only [S4]**, the summary to confirm, and **the session's CSRF value [guest-resume]**. It is returned only to the guest cookie it belongs to, as `GET /v1/sessions/current` returns a member's (`http_service.py:8556-8560`). So a reloaded page can write again;
   - `POST answer`, `POST skip` and `POST pause`;
   - `POST typing`: the presence signal, accepted at most once every 30 s (section 3) **[M3]**;
-  - `POST confirm` and `POST correct`: the end summary. A confirm answers with the transcript (2.5) **[S6]**.
+  - `POST confirm` and `POST correct`: the end summary. A confirm answers with the transcript (2.5) **[S6]**;
+  - `POST forget` **[should (4)]**: the page's **"Forget this browser"** button. It ends the guest session (its hash is cleared from the record), answers with the cookie expired (`Max-Age=0`), and the page clears the draft. The interview pauses; to go on, the inviter re-issues (1.6).
 - **[new] the isolation rule [M4]:** **no route but the guest routes reads `orchestra_guest_*`, and the guest routes read nothing else.**
-  - A guest route ignores `Authorization` and `orchestra_session`, and **refuses** a request that carries either (a member session or a Bearer credential), with 403 **[M4]**.
+  - **[should (4)]** A guest route **refuses a request with an `Authorization` header** (a Bearer credential), with 403 **[M4]**, and **ignores `orchestra_session`**: it neither reads it nor refuses because of it. r2 said both "ignores" and "refuses", and refusing would strand a guest whose browser holds any member cookie, even an expired one on a shared desk PC: the page cannot clear an HttpOnly cookie. The isolation holds either way, because a guest route resolves only its own cookie, and no other route reads that one.
   - A request carrying two cookies for the same link is refused **[S7]**.
   - **Every guest route re-checks [S5]:**
     - the switch is on;
@@ -242,9 +257,13 @@ Why both: a session with no membership can, today, create a project, create an a
     - the link is `bound` and the session unexpired;
     - the interview is open.
 
-    A failed check closes the interview with "This interview is closed."
+    **[notes: R2-N3]** A failed check answers "This interview is closed" for that request, but what it changes depends on the cause:
+    - **the switch is off:** nothing is written. The interviews are *suspended*, and they go on when the switch is on again;
+    - **the project is archived or unusable, or the inviter lost `interviews.invite`:** the link is revoked (`revoked_by: "(re-check)"`) and the inviter is told. An archive or a lost authority is a decision about the interview, and the switch is not;
+    - **the link is not bound or the session has expired:** already recorded, so nothing more is written.
   - The six anonymous routes (sign-in, reset redeem, invite view, invite redeem, `/healthz`, `/v1/service/certificate`) answer as they do today whatever cookies a request carries. A request that also carries a member's `orchestra_session` belongs to that member on every non-guest route (probe A10). This rule does not change either.
-- **No guest route writes the state document [M3].** Answers, pauses and stamps go to the interview's folder; presence stays in memory.
+- **No guest route writes the state document [M3]**, except the rare record changes named above: bind, forget and a revoke by a re-check. Answers, pauses and stamps go to the interview's folder, and presence stays in memory.
+- **No guest refusal writes it either [should (3); Neon M4].** Every guest route and view and bind set `_audited_refusal` before they refuse (`http_service.py:6338-6340`). So `_note_denied` neither audits nor saves, and the refusal is audited only through the throttle of 1.10. The interview page's start does not call `GET /v1/sessions/current` (`web/js/app.js:318-319`), so a guest's page load is never a 401. Rule W1 counts refusals too.
 - A guest **cannot**:
   - see the brief document, the project, its tasks, members, rooms or other interviews;
   - see the items made from the interview, or accept, reject or amend them;
@@ -254,15 +273,20 @@ Why both: a session with no membership can, today, create a project, create an a
 
 ### 1.6 Coming back, and another PC
 
-- **The same browser:** the cookie brings the guest back to the open question (section 2.4).
+- **The same browser [guest-resume]:** there are two ways back, and both find the link id without the token:
+  - a reload, or the tab left open: the address is `#/interview/session/<link-id>` (1.2), and the page reads `GET me` with the cookie;
+  - the mail link opened again: the view returns the link id of a bound link (1.3), and the page reads `GET me` the same way.
+
+  `GET me` returns the CSRF value (1.5), so the next answer is accepted. The guest is back at the open question (section 2.4). The test is rule G16.
 - **Another PC or browser:**
 
   | Option | What | Recommendation |
   |---|---|---|
-  | A | The inviter presses **Re-issue**. The old link and its guest session are revoked, and a new link is made for the same interview. **The new session sees only the progress line and the open question, never earlier answers [S4].** Earlier messages stay with the session that wrote them. A re-issued link needs the check code if the first one did. | **Recommended for version 1.** It is one click for the inviter and adds no new secret. |
+  | A | The inviter presses **Re-issue**. The old link and its guest session are revoked, and a new link is made for the same interview. **The new session sees only the progress line and the open question, never earlier answers [S4].** Earlier messages stay with the session that wrote them. **[should (1)]** **Every re-issued link needs a new check code**, told by another way, whether or not the first link had one. A re-issue is the moment the holder's identity is in doubt, and the page hiding earlier answers does not hide them from the interviewer: **what the interviewer read, it can repeat**, so whoever binds the new link can ask it "what did I tell you last time?". | **Recommended for version 1.** It is one click for the inviter, plus the code. |
   | B | The bound guest asks for a **transfer code** (8 characters, 10 minutes, single use, 5 tries) and types it on the other PC. | A later slice at most. The office is desk only (coordinator, 2026-11-15), so moving devices is rare. |
   | C | No way back except a new interview. | Too harsh: one closed browser would lose the guest's place. |
 
+- **[should (2); Neon S5] "Not them: revoke" closes the interview.** Whoever bound the link was not the guest, so their answers must not shape the interview: the notes would mark points covered, and the summary would carry their words. So the interview is **closed for good** and kept only as evidence of the event: its messages and notes are never read again by an interviewer, and nothing in it can become an item. The inviter's page offers **"Start again for LABEL"**, which makes a new interview with the same brief and intro, and a new link that needs a check code. Only a re-issue for another PC (option A) keeps the interview open.
 - Nothing in this note needs a phone or a home connection.
 
 ### 1.7 The inviter is told
@@ -279,6 +303,8 @@ The site sends no mail. Notices appear in Orchestra **[new]**: on the inviter's 
 | Expired unused | "LABEL's link expired unused." |
 | Revoked by a restore | "LABEL's link was ended by a restore of the web state on DATE; re-issue it if the interview should go on." **[M2]** |
 | Suspended | "Interviews are switched off on this installation" (shown while the switch is off) **[S5]**. |
+| Revoked by a re-check | "LABEL's interview ended: the project was archived" (or "you no longer hold the right to run interviews in PROJECT") **[notes: R2-N3]**. |
+| Not them | "LABEL's interview was closed because the link was used by someone else. Start again for LABEL?" **[should (2)]** |
 
 ### 1.8 How a guest is named
 
@@ -286,21 +312,24 @@ The site sends no mail. Notices appear in Orchestra **[new]**: on the inviter's 
 - **[new] refused at create:**
   - a label equal to an account's username or display name, ignoring case and spaces;
   - a label starting with `@`;
-  - a label holding the word "agent", "coordinator" or "owner";
+  - a label holding the word "agent", "coordinator" or "owner", or **[notes: Neon N2]** "superuser", "admin", "operator", "viewer", "contributor", "member", "guest", "system", or the words "invited by";
   - a label with control or bidirectional characters (`rooms._plain_text`, `rooms.py:205`, as names are checked today).
 - **The service names the author on every message and item, from the session and never from text:**
   - the guest as **"LABEL (guest, invited by INVITER)"**, with the author id `guest:<link-id>` and the author role `guest`;
   - the interviewer as "NAME, agent of OWNER", as rooms designed (docs/PROJECT_ROOMS_DESIGN.md section 3).
 - **Before the binding is confirmed [S2]**, the guest's words are named "**whoever opened LABEL's link**", and so are the items made from them.
 - **An item's provenance is written by the service, never by the interviewer [S8].**
-  - The service takes "answered by guest LABEL, invited by INVITER, binding confirmed by NAME at TIME" from the link record.
+  - The service takes "answered by guest LABEL, invited by INVITER, binding confirmed by NAME at TIME" from the link record. **[notes: Neon N2]** When the check code confirmed the binding, it reads "binding confirmed by the check code at TIME" (`binding_confirmed_how`, 1.2).
+  - **[notes: R2-N7; Neon N1]** An accepted item also carries a field **`source: guest interview`**, which briefs and the Bridge show to every agent beside the item's text. An accepted item is otherwise an ordinary requirement or decision, and worker agents act on those; the field keeps text from outside the firm from being read as a member's.
   - The pointer is `orchestra:interview/<interview-id>#<sequence>`, where the sequence is **that of the confirmed summary**; the interviewer does not choose it.
   - The accepting person is recorded exactly as for a room item today.
-- **The pointer needs code [S8].** Both built pointer checks refuse `orchestra:interview/` today:
+- **The pointer needs code [S8].** The built pointer checks refuse `orchestra:interview/` today:
   - `rooms.check_evidence` (`rooms.py:125`, `:295-298`);
-  - `requirement_http.checked_body` (`requirement_http.py:383-387`).
+  - `requirement_http.checked_body` (`requirement_http.py:383-387`);
+  - **[notes: Neon S8]** the room decision route checks a room id with `rooms.check_room_id` (`requirement_http.py:822-823`);
+  - **[notes: Neon S8]** an accepted room item's record must name exactly that item (`_item_evidence`, `rooms.py:1581`), whereas an interview item's pointer names the confirmed summary's sequence.
 
-  Slice 2 extends both. An older kit still reads a record that carries it, because the pointer is plain text in the description (`requirement_http.py:504-505`).
+  Slice 2 extends all four. An older kit still reads a record that carries it, because the pointer is plain text in the description (`requirement_http.py:504-505`).
 
 ### 1.9 If the link is intercepted
 
@@ -313,7 +342,7 @@ The site sends no mail. Notices appear in Orchestra **[new]**: on the inviter's 
 
 **Never exposed through a guest link** **[M1]:**
 
-- any project data the interviewer does not hold;
+- any project data. The interviewer holds none beyond its own interview: its credentials hold no project capability (2.6) **[interviewer-scope]**. r2's line, "any project data the interviewer does not hold", was true only because the interviewer then held the whole project;
 - any other interview or room;
 - any account;
 - any credential.
@@ -332,9 +361,13 @@ The site sends no mail. Notices appear in Orchestra **[new]**: on the inviter's 
 
 | What | Limit |
 |---|---|
-| View and bind misses (an unknown token, a used, revoked or expired link, a wrong code) | Each **counts as a miss** for the address group, like a sign-in failure (`invites.py:497-518`) **[S1]**. |
+| View and bind misses (an unknown token, a used, revoked or expired link, a wrong code) | Each **counts as a miss [S1]** in the interview links' **own bucket** per address group **[should (5)]**: 30 misses in 15 minutes, then each further view or bind waits its turn (one every 10 s, answered 429 with Retry-After). It never locks out, and it never feeds the sign-in counts (`http_auth.py:114-126`, `:1912-1918`). |
+| Views of a valid token | At most 1 per 3 s per link, and 60 per hour per address group **[notes: Neon S2]**. |
 | Wrong check codes | 5 per link, then the link ends **[S3]**. |
 | Guest answers | At most 1 per 2 s, at most 4,000 characters each (`rooms.py:56-61`), and at most 300 per interview. |
+| **[should (6); R2-N5]** Guest skips, pauses, corrections and confirms | The answer route's limit: at most 1 per 2 s, shared with answers, within the 300. A pause writes a line and refreshes the idle limit only when the interview was not already paused. A correction is at most 4,000 characters, and at most 3 per interview (2.5). |
+| `POST forget` | At most 1 per minute per session. |
+| **[should (6); Neon S6]** The interviewer's posts | A `question` is at most 600 characters (I2) and an `ack` 200. A `note` is one line of at most 300 characters per point, and at most one per guest answer (2.3). A `summary` is at most 4,000 characters, with at most 4 per interview (the first and 3 revisions). Every post is plain text through `rooms._plain_text` (`rooms.py:205`), and a reserved `Kind:` prefix is refused (`reserved_match`), as for room posts. |
 | Guest page reads | At most 1 per 3 s per session. No read writes anything **[M3]**. |
 | The typing signal | At most 1 per 30 s per session **[M3]**. |
 | The interviewer's live read | At most 1 per second per credential, within the daily fast-poll cap (3.2) **[M3]**. |
@@ -359,7 +392,7 @@ They go into the installation's audit with the project id, as `invites.redeemed`
 **An office behind one address [N6].** At the office every guest may arrive from one address (a NAT or the proxy):
 
 - **The connection cap.** The cap of 100 connections per address (`http_service.py:16592`) is shared by every guest's page. Each page holds at most one keep-alive connection, closed after 30 s idle (`:16581`). At the 30-open-interview cap this fits, with room for members. If the office's proxy is named with `--trusted-proxy`, the limit is per forwarded address instead.
-- **The miss count.** The per-address-group failure count (`http_auth.py:123-125`) is fed by every guest's misses, for example guests reopening dead links. The guest page therefore never retries a refused view or bind by itself.
+- **The miss count [should (5); Neon S3].** r2 counted guest misses with sign-in failures. An office behind one NAT address is not a "shared source" at `b1f2356c` (`_source_is_shared`, `http_service.py:6107-6125`), so 10 misses would have locked every guest at the office out for 5 minutes, and would have counted towards the source limit for members' sign-ins (`http_auth.py:114-126`, `:1912-1918`). So interview misses have their own soft bucket (the table above), and a guest's reopened dead link costs a member nothing. The guest page still never retries a refused view or bind by itself.
 
 ### 1.11 The alternatives, compared
 
@@ -424,6 +457,7 @@ Buttons read **Start**, **Send**, **Skip this one**, **Pause**, **That's right**
 The interviewer keeps **interview notes** **[new]**, a small structured record per interview: for each point of the brief, `open | covered | not applicable`, plus a one-line note.
 
 - It is posted as a `note` line, at most one per guest answer.
+- **[should (6); Neon S6]** The read route marks the interviewer's own `note` and `summary` lines `trust: "unreviewed"` too, as it marks guest text (I8). They are distilled from guest text and read again on every wake, so an injected instruction could otherwise pass through a note into the next wake as if the service had vouched for it.
 - The guest sees only a progress line: **"4 of 7 covered"**.
 - The interviewer's prompt says to read the notes before asking, so it never asks again what is covered.
 - The guest therefore never retypes. When they come back, they start at the open question.
@@ -438,8 +472,9 @@ This is the part of rooms slice 5 (the running summary) that interview mode need
   - an answer being typed is kept in the browser's **`sessionStorage`** (r1 said `localStorage`), under a key made from the link id;
   - it holds **only the unsent text**, never the token, the code or the CSRF value;
   - it is cleared on send, on finish, on revoke (the next guest read that says "closed") and on the page's **"Forget this browser"** button;
+  - **[should (4); Neon M6]** "Forget this browser" also calls `POST forget` (1.5), which ends the guest session and expires the HttpOnly cookie. r2 cleared only the draft, so the cookie stayed live for the next person at that desk, for example after Edge restored the window;
   - `sessionStorage` ends when the tab closes, so an abandoned sitting leaves nothing on a shared desk PC. The cost: a draft does not survive closing the tab. That is the right side of the trade on a shared PC;
-  - the cookie is HttpOnly and ends with the session, and the page keeps nothing else.
+  - the cookie is HttpOnly and ends with the session or with "Forget this browser". The page keeps nothing else: the CSRF value is held in memory only and read again from `GET me` after a reload **[guest-resume]**.
 - **The page is one column** and readable in a narrow window beside the trading screens, down to 360 px wide. Nothing in it needs a phone.
 
 ### 2.5 The end: a summary the guest confirms
@@ -461,46 +496,59 @@ This is the part of rooms slice 5 (the running summary) that interview mode need
 
 - the **inviter**;
 - the project's **coordinators and owners**;
-- **whoever runs the interviewer agent.** They hold its credential and its model context, so they read every interview it serves. This is why only certain agents may interview (below);
+- **whoever runs the interviewer agent.** They hold the credentials of the interviews it serves and their model contexts, so they read every interview it serves. This is why only certain agents may interview (below);
 - the guest, who reads only their own guest view.
 
 Other members do not. This departs from rooms version 1 ("every member reads", docs/PROJECT_ROOMS_DESIGN.md section 3) on purpose: a guest has agreed to talk to the people who asked, not to the whole project (Q4). **Accepted items are ordinary project records**, which members read as before.
 
-**Who may interview [M1]:**
+**[member-routes] The interview's member routes take a person's session only.** That covers list, read, the brief, export and the items page, as creation does (`invites.PERSON_ONLY`, `invites.py:87-88`). r2 said who reads them but not by which means. A coordinator's agent with the coordinator grant holds `CAP_COORDINATE` (`GRANT_CAPABILITIES`, `http_authority.py:400`), so had those routes taken an agent credential, an interviewer that was such an agent would have read every interview of the project through them. No agent or worker credential reaches a member route, whatever it holds.
 
-- only an agent **owned by the inviter**, or by **a coordinator or owner of the project**;
-- the inviter assigns it, and **the agent's owner consents** with their own session. Rooms rule R9 lets a contributor's agent join a room; that does **not** carry over to interviews.
+**Who may interview [M1, interviewer-scope]:**
+
+- **a dedicated interviewer agent [interviewer-scope; Neon S7].** The `interviews` flag is set when the agent is made, by a person's session, and is never set on an existing agent. So an interviewer is never the inviter's working agent, and a working agent never becomes an interviewer;
+- it is owned by the inviter, or by **a coordinator or owner of the project**;
+- the inviter assigns it, and **the agent's owner consents** with their own session. Rooms rule R9 lets a contributor's agent join a room; that does **not** carry over to interviews;
+- **[Neon S7]** every interview-agent route re-checks that the agent's owner **still holds `interviews.invite`** in the interview's project, as the guest routes re-check the inviter's (1.5). A demoted owner's interviewer is refused at its next request.
 
 **What the interviewer may reach, the security core:**
 
-- **I6 [M1]:** **a per-interview credential.**
-  - At assignment, the service makes a credential bound to **that one interview id**. It holds only the interview routes of that interview, and it is **revoked at finish, revoke, expiry or restore**.
-  - Its agent's record carries an `interviews` flag. **An agent with that flag is refused every room route and every task, checkpoint and review route.** This builds on rooms slice 3's mixed-credential refusal **[designed; a prerequisite]**.
-  - So **reads are scoped exactly as posts are**. The interviewer of guest A's interview cannot read guest B's interview, B's brief, or any room, whatever A types.
-  - It also bounds what a leaked interviewer token can reach: one interview.
-- **I7 [M1]:** every interview read and post route checks that the path's interview id is the one the credential was made for, and that the interview is open. A read of another interview, of its brief, or of a room is refused, as is a post.
-- **I8:** **the service never puts guest text in a prompt.** The wake carries the interview id and counts only. The agent reads the text through the read route, where every guest text is an excerpt object marked `trust: "unreviewed"` (docs/PROJECT_ROOMS_DESIGN.md section 4, the Bridge tools table **[N1]**; rooms rule R2 for "never in a prompt").
+- **I6 [M1, interviewer-scope]: the flagged agent holds no project capability.**
+  - **Its ordinary credentials hold nothing.** `credential_capabilities` gives a flagged agent's credentials the empty set, as it gives the nudge carrier's (`http_authority.py:837-840`), never the baseline `CAP_READ` that every other credential starts from (`:841`). Any scope on such a credential is damage and fails closed, as on the carrier's. The request filter refuses every route but the interview-agent routes, as it refuses the carrier everything outside `CARRIER_ROUTES` (`http_service.py:5946-5948`).
+  - **It is not a member of any project.** Its `projects` list stays empty, so on any kit the project reach of its ordinary credential (`http_authority.py:1218-1226`) is nothing. Its access to an interview comes only from that interview's credential.
+  - **Its own record.** `CAP_AGENT_SELF` (`PATCH /v1/agents/me`, `http_authority.py:1206-1217`) is refused to a flagged agent. It has no claim limit to lower.
+  - **r2 refused only four route families** (rooms, tasks, checkpoints, reviews). The review's probe showed a read-scoped agent getting 200 on the project, members, tasks, references, capabilities, coordination, feedback and program routes, and at least 25 more routes check nothing but `CAP_READ`. A list of refusals cannot keep up with new routes, so r3 lists what is allowed instead.
+- **The per-interview credential.** At assignment, the service makes a credential for **that one interview id**. It holds exactly the interview-agent routes of that interview (below), nothing else, and it is **revoked at finish, revoke, expiry or restore** (`interviewer_credential_id`, 1.2).
+  - **It is a fenced credential (kittrial-5bb.607) [rollback].** It is stored where an older kit's lookup (`credential_tokens`, `http_auth.py:2142-2143`) cannot find it, so on an older kit it answers 401 on every route (section 7).
+  - So **reads are scoped exactly as posts are**. The interviewer of guest A's interview cannot read guest B's interview, B's brief or any room, whatever A types. A leaked interviewer token reaches one interview.
+- **The interview-agent routes, the whole allowlist:** `GET /v1/interview-agent/<interview-id>` (the brief, the notes, the messages since a position, as excerpts, I8), `POST /v1/interview-agent/<interview-id>/post` (the post kinds of 2.2), and `GET /v1/interview-agent/<interview-id>/live` (counts only, section 3). There is no other route for a per-interview credential or a flagged agent.
+- **I7 [M1]:** each of those routes checks that the path's interview id is the one the credential was made for, and that the interview is open. A read of another interview, of its brief, or of a room is refused, as is a post.
+- **[credential-delivery] How the credential reaches the runner.** Its secret is shown **once, in the owner's consent step**, to the owner's own session, as an agent's secret is shown once when it is made (`http_service.py:515-518`, `:8786`). The owner gives it to the runner, for example the Bridge's "add interview" field, which keeps it in the runner's own credential store under the interview id. **It is never fetched with an agent credential**: no route returns it to one, and a flagged agent has no working credential to fetch it with. So no agent token is a master key to every interview.
+  - **Several interviews at once (I6's test):** one credential per interview, each independent. Revoking one leaves the others. The runner keeps a map from interview id to credential and uses each only for its own interview (I11).
+  - **me/next is not used [credential-delivery].** r2 said "me/next names the interview when the guest posts", but me/next answers repositories, hand-over notes, coordinator notes and attention (`http_service.py:10436-10469`). A flagged agent's credentials are refused on it, like on every route outside the allowlist. The runner wakes each interview from that interview's own `live` route (section 3), with that interview's credential.
+- **I8:** **the service never puts guest text in a prompt.** The wake carries the interview id and counts only. The agent reads the text through the read route, where every guest text, and every interviewer `note` and `summary` (2.3), is an excerpt object marked `trust: "unreviewed"` (docs/PROJECT_ROOMS_DESIGN.md section 4, the Bridge tools table **[N1]**; rooms rule R2 for "never in a prompt").
 - **I9:** the interviewer never accepts an item and never confirms a summary. Both need a person's session or the guest session (I4, I5).
 - **I10:** guest text is limited to 4,000 characters. Text starting with a reserved `Kind:` prefix is refused, and text is rendered as text (rooms rule R8).
-- **I11 [M1], the runner's contract** (`tools/wake`, the Bridge, `templates/INTERVIEWER_PROMPT.md`):
+- **I11 [M1, member-routes, runner-tools], the runner's contract** (`tools/wake`, the Bridge, `templates/INTERVIEWER_PROMPT.md`):
+  - **a wake of interview X is given X's credential alone**, and its tools are bound to X: the read and post tools take **no interview id**, so a guest's request to "read the other interview" names nothing the tools can reach;
+  - **[runner-tools; Neon M2] the interview runner has no tools beyond that interview's read and post.** It has no shell, no file reading or writing, no network or fetch, no other MCP tool, and no other credential of the host. A coding agent's ordinary tools are exactly what a guest's injected text would reach for, and server-side scoping does not cover the runner's own host;
   - **a fresh model context per interview, and per wake of it;**
-  - **no text carried from one interview to another**, and none kept in the runner's own memory or files between interviews;
-  - the service cannot check the runner, so this is a written contract. The service-side scoping of I6 and I7 holds whatever the runner does.
+  - **no text carried from one interview to another**, and none kept in the runner's own memory or files between interviews.
+  - The service cannot check the runner, so this is a written contract, and the kit's own runners (`tools/wake` and the Bridge's interview mode) are built to it. r2's "the service-side scoping of I6 and I7 holds whatever the runner does" is struck: it holds only while a wake of X is given X's credential alone.
 
 ### 2.7 Keeping, exporting and restoring
 
 - **Keeping.** Interviews are kept beside the project as rooms are, and never deleted automatically. An archived interview stays as evidence for its items.
-- **No purge yet [N8].** Rooms' R10 says text stays "until an operator purges it", but no purge is built. So transcripts of people who are not members are kept with no way to erase them. A purge (an operator command that removes one interview's folder, its backup entry and its link record, and writes one audit line) is a slice of its own. It is **needed before Q7's option C** can be chosen.
+- **No purge yet [N8].** Rooms' R10 says text stays "until an operator purges it", but no purge is built. So transcripts of people who are not members are kept with no way to erase them. A purge (an operator command that removes one interview's folder, its backup entry and its link record, and writes one audit line) is a slice of its own. It is **needed before Q7's option C** can be chosen. **[notes: Neon N5]** Even then, older backup generations and the `last-complete` copies (`admin.py:5148`) keep the transcript until they are rotated out; the purge says so in its answer.
 - **Backup:**
   - interviews get their own file, `backups/<name>.interviews.json`, beside the rooms backup file and built the same way (`rooms.py:1802-1916`);
   - an older kit ignores the file (section 7).
 - **Export:** a member who may read the interview exports it as Markdown and JSON lines, as rooms do (`rooms.py:1706`, `:1762`). The guest gets their own transcript only in the confirm step **[S6]**.
 - **Restoring the web state [M2].** `restore-new --restore-http-state` runs `_restore_http_state` (`admin.py:6693-6756`). Today it revokes every session, marks resets used and withdraws pending invites (`:6715-6726`), and it knows nothing of `interview_links` (probe A3). Slice 1 adds one step there. **Every link that is not finished:**
   - is set to `revoked`, with `revoked_by: "(restore)"`;
-  - has its `bound_session_hash` and `bound_csrf_hash` cleared;
-  - has its interviewer credential revoked (I6);
-  - is reported to its inviter with the notice of 1.7;
-  - is listed in the restore's report (`http_state_changes`, `admin.py:6831-6877`).
+  - has its `bound_session_hash` and `bound_csrf` cleared;
+  - has its interviewer credential revoked (I6), found through `interviewer_credential_id` (1.2), **whether the restore keeps or revokes credentials** (`--credentials keep`, `admin.py:6729-6730`) **[Neon M5]**;
+  - is reported to its inviter with the notice of 1.7. **[notes: Neon S8]** The restore runs with the service stopped (`admin.py:6781`), so the notice is made from `revoked_by: "(restore)"` when the service next starts;
+  - is listed in the restore's report, written by `_write_restored_http_state` (`admin.py:6816-6825`) **[notes: Neon S8]**. r2 named `http_state_changes` (`:6831-6877`), which only compares users and agents.
 
   So a link used or revoked after the backup cannot bind again, and a revoked session cannot come back. The test is rule G11.
 
@@ -548,11 +596,11 @@ A room answers within one wake gap: 5 minutes with the kit's wake (`waiting.py:7
 2. **Presence comes from guest input, not reads.** An answer, skip or pause, or the typing signal (at most once every 30 s while the guest types), sets `present_until = now + 60 s`. **An open tab sends nothing**, so it keeps nothing alive. An impostor's script could send typing signals, so the fast poll is also capped:
 3. **The fast poll is capped per interview per day:** at most 30 minutes of 2 s polling a day. After that, 30 s polling until the next day, and the guest page says "Answers may take a little longer now."
 
-**The agent's live read.** `GET /v1/agents/me/interviews/live` (the per-interview credential, I6) returns the counts for its one interview: present or not, and whether the guest posted since its last read. It returns no text. The agent's speeds:
+**The agent's live read.** `GET /v1/interview-agent/<interview-id>/live` (that interview's credential, I6) returns the counts for its one interview: present or not, and whether the guest posted since its last read. It returns no text. **[credential-delivery]** It is the only wake signal: the runner polls it for each interview it serves, each with that interview's credential, and never uses me/next. The agent's speeds:
 
 | Situation | The agent checks |
 |---|---|
-| The interview is open and the guest is not present | Its normal wake (5 min); me/next names the interview when the guest posts. |
+| The interview is open and the guest is not present | Its normal wake (5 min), on the interview's own live read. |
 | The guest is present (input in the last 60 s), within the day's cap | Every 2 s. |
 | The guest is present, the day's cap used | Every 30 s. |
 
@@ -577,7 +625,7 @@ A and B keep the interviewer an ordinary agent with a credential for one intervi
 
 How long a held request survives depends on the office's path: proxy idle timeouts, PAC bypass, or none. Nobody knows it today. **The office runs the measurement itself, with no home connection:**
 
-- a page on the site, **Settings → Check held requests** (operator only), and a matching `admin.py check-held-requests` for the agent's machine;
+- a page on the site, **Settings → Check held requests**, and a matching `admin.py check-held-requests` for the agent's machine. **[notes: Neon N4]** On the web the page needs a **superuser** (`CAP_ACCOUNTS_ADMIN`, `http_authority.py:1257`): the web service has no operator role, since operators are users of the host's command line. At most 2 checks run at once on the installation, so the check cannot tie up the server's threads. The documented proxy ends a request after 60 s (`proxy_read_timeout 60s`, `docs/HTTP_DEPLOYMENT.md:518`), so on that path the check reports that, unless the office has raised it;
 - each opens a request to `GET /v1/service/hold-check?seconds=N` for N = 10, 30, 60, 120 and 300, which answers after N seconds, and reports which came back intact;
 - the operator runs it once **from a desk PC's browser** and once **from the agent's machine**.
 
@@ -643,12 +691,12 @@ Nothing in this note blocks SSO: the guest path is a separate cookie and route f
 ## 5. Office first
 
 - **The desk:** an ordinary browser (Edge), nothing to install, a narrow window, desk only (coordinator, 2026-11-15). No step needs a phone or a home connection.
-- **TLS is required** for interview links (1.3) **[S7]**.
+- **TLS is required** for interview links (1.3) **[S7]**, and so is a configured public origin, which may name a port **[notes: Neon S4]**.
 - **The proxy and the mail system [S2]:**
   - the token is never in a URL the browser sends, so request lines, access logs and `Referer` never carry it;
   - **the message carrying the link does**, and so may a link-rewriting mail gateway's logs, a TLS-inspecting proxy and the browser's history. The office should check its gateway; the check code (1.9) is on by default for links sent by mail or chat;
   - every request in A is short (3.2), and B waits for the office's own measurement (3.4).
-- **One office address [N6]:** the connection cap and the miss count are shared by all guests (1.10).
+- **One office address [N6]:** the connection cap is shared by all guests (1.10). The miss count is the interview links' own soft bucket, so guests' misses never lock the office out or slow members' sign-ins **[should (5)]**.
 - **No mail and no outbound route:** every notice is inside Orchestra (1.7).
 - **Where answers go:** to the interviewer agent and its model service. The intro says so, and the inviter's page names where the interviewer runs (2.1) **[S8]**.
 - **The interviewing agent** is whatever the office runs (2.8).
@@ -663,10 +711,10 @@ Nothing in this note blocks SSO: the guest path is a separate cookie and route f
 | G1 | Only a coordinator or owner, by session, makes a link; never an agent. | Create route; `interviews.invite` not in `GRANT_CAPABILITIES`. | A contributor and an agent with the coordinator grant are refused; a coordinator by session succeeds. |
 | G2 | Opening a link changes nothing; only bind does. | View route is read-only. | After any number of views, the record is still `pending` and binds once. |
 | G3 | Bind requires TLS, checks Origin (or `Sec-Fetch-Site`), refuses `Origin: null` and takes the token only from the body. **[S7, N2]** | Bind route. | A plain-HTTP bind, a cross-origin bind, an `Origin: null` bind and a bind with any query string are each refused, and the link stays pending. |
-| G4 | A link binds once; the same nonce may retry once **[N11]**. | Bind inside `_widening`. | Two binds with different nonces: the second gets "already used", counts as a miss and raises one coalesced notice. The same nonce within 2 minutes gets the same session. |
-| G5a | **[M4]** No non-guest route accepts a guest token. | `_authenticate` unchanged. | For **every non-anonymous route generated from `ROUTES`** (196 of 202 at `b1f2356c`), the guest token sent as `Authorization: Bearer`, as `orchestra_session` and as `orchestra_guest_<id>` gets 401 each time. |
-| G5b | **[M4]** A bind makes no account, session or credential. | Bind. | `users`, `usernames`, `sessions`, `credentials` and `credential_tokens` are byte-identical before and after a bind. |
-| G5c | **[M4]** Guest routes accept nothing but their own cookie. | Guest routes. | A guest route with a member session, with a Bearer credential, or with two cookies for the link is refused. |
+| G4 | A link binds once; the same nonce may retry once **[N11]**. | Bind inside `_widening`. | Two binds with different nonces: the second gets "already used", counts as a miss and raises one coalesced notice. **[notes: R2-N1]** The same nonce within 2 minutes gets a fresh token and CSRF value; the first token is then refused, and the second works. |
+| G5a | **[M4]** No non-guest route accepts a guest token. | `_authenticate` unchanged. | For **every route generated from `ROUTES` except the anonymous ones and the guest routes [notes: R2-N4]** (the six anonymous routes of 1.5, the guest routes, view and bind), the guest token sent as `Authorization: Bearer`, as `orchestra_session` and as `orchestra_guest_<id>` gets 401 each time. The guest routes accept the guest cookie by design, so r2's "every non-anonymous route" would have failed on them. |
+| G5b | **[M4]** A bind makes no account, session or credential. | Bind. | `users`, `usernames`, `sessions`, `credentials`, `credential_tokens`, **`agents` and `memberships` [notes: Neon N5]** are byte-identical before and after a bind. |
+| G5c | **[M4, should (4)]** Guest routes accept nothing but their own cookie. | Guest routes. | A guest route with a Bearer credential, or with two cookies for the link, is refused. A guest route with the guest cookie **and** a member's `orchestra_session` (even an expired one) answers as the guest; a bind with a member cookie binds, and the next `GET me` answers. |
 | G6 | A guest session never passes a person-session check. | Follows from G5a. | Kept as a named case of G5a: the item accept route. |
 | G7 | Revoke, finish, expiry, the switch, archiving the project, or the inviter losing `interviews.invite` ends the guest session at once. **[S5, S6]** | Every guest route re-checks. | Each of the six causes: the next guest read is "closed" and the page clears the draft. |
 | G8 | A guest label never matches or imitates an account. | Create route. | A label equal to a username, a display name, `@x` or "x agent" is refused. |
@@ -675,20 +723,25 @@ Nothing in this note blocks SSO: the guest path is a separate cookie and route f
 | G11 | **[M2]** A restore of the web state ends every unfinished link. | `_restore_http_state`. | Back up a state with one pending and one bound link. After the backup, bind the first and revoke the second. Restore: both are `revoked` by "(restore)", neither binds, neither session is accepted, both are in the report. |
 | G12 | **[S2]** Items cannot be accepted before the binding is confirmed or the code was used. | Accept route on interview items. | Accept is refused; after "That was them", it succeeds. |
 | G13 | **[S3]** 5 wrong codes end the link. | Bind. | The 5th wrong code revokes the link; the right code after it is refused. |
-| G14 | **[S4]** A re-issued session sees no earlier answers. | `GET me`. | After re-issue, `me` holds the progress line and the open question only. |
-| G15 | **[S6]** Only answers, skips and pauses refresh the idle limit. | Guest routes. | 25 h of page reads with no answer: the session is idle-expired. |
+| G14 | **[S4, should (1)]** A re-issued session sees no earlier answers, and a re-issued link needs a new check code. | `GET me`; bind. | After re-issue, `me` holds the progress line and the open question only. A bind of the re-issued link without the code is refused, as is one with the first link's code; with the new code it binds. |
+| G15 | **[S6, should (6)]** Only answers, skips and real pauses refresh the idle limit. | Guest routes. | 25 h of page reads with no answer: the session is idle-expired. 25 h of pauses sent while already paused: idle-expired too, and the folder gained one line. |
+| G16 | **[guest-resume]** A guest comes back in the same browser. | View; `GET me`; the page. | A browser-page test: bind and answer; reload the page, then send an answer; close the tab, open the mail link again, then send an answer. Each answer is accepted, neither return counts as a miss or tells the inviter, and the link is still `bound`. |
+| G17 | **[should (4)]** "Forget this browser" ends the guest session. | `POST forget`; the page. | After it, the browser holds no guest cookie and no draft, the record holds no session hash, and the old cookie, sent again by hand, is refused. |
+| G18 | **[should (2)]** "Not them" closes the interview. | Bind notice; read route; items. | After "Not them: revoke", the interview is closed; its interviewer credential is refused on the read; no item can be made from it; "Start again" makes a new interview whose read holds none of the old messages or notes. |
+| G19 | **[should (3)]** A guest refusal writes nothing. | Guest routes, view, bind; the page's start. | 1,000 refused guest requests of every kind (no cookie, a bad cookie, a bad CSRF value, a Bearer header) and 1,000 interview page loads with no session: a count of `Store._write` is exactly 0, and the audit gains at most one line per kind per interview per hour. |
 | I1-I3 | One question at a time; one `ack` between answer and question **[N10]**. | Interviewer post route. | A second open question is refused; one `ack` after an answer is accepted and a second is refused. |
 | I4 | A guest confirms only the summary. | Confirm route. | A guest call to any item route is refused. |
 | I5 | Only a member decides items. | Built person-only check, extended to interviews. | An agent and a guest are refused; a coordinator's session accepts (after G12). |
-| I6 | **[M1]** The interviewer's credential is for one interview; a flagged agent is refused every room, task, checkpoint and review route. | Credential scope; slice 3's mixed-credential refusal. | With one agent serving interviews A and B and added to one room, A's credential is refused on B's read, on B's brief, on the room and on a task route. |
+| I6 | **[M1, interviewer-scope, member-routes]** A flagged agent holds no project capability; a per-interview credential reaches only its own interview's agent routes. | `credential_capabilities`; the request filter's allowlist; the fenced store (.607). | **For every route generated from `ROUTES`**, both the flagged agent's ordinary credential and interview A's credential are refused, except the three interview-agent routes, which only A's credential passes, and only for A. Named cases besides: with one agent serving A and B, A's credential is refused on B's read and B's brief; the ordinary credential is refused on a requirement read, the members list, me/next, `PATCH /v1/agents/me` and every interview member route; **a coordinator-granted ordinary agent is refused on the interview member read**; after the owner loses `interviews.invite`, A's credential is refused. |
 | I7 | **[M1]** Reads and posts only into the credential's own open interview. | Interview routes. | A read and a post into another interview, into a closed one or into a room are each refused. |
-| I8 | No guest text in a wake or prompt. | The live read and me/next. | A guest answer holding a prompt-like string appears in neither. |
+| I8 | No guest text in a wake or prompt; guest text and the interviewer's own notes are read as unreviewed. | The live read; the read route. | A guest answer holding a prompt-like string is absent from the live read and the wake. In the read route it, and a `note` quoting it, carry `trust: "unreviewed"`. |
+| I11 | **[runner-tools]** The kit's runners give a wake of X only X's credential, and only the read and post tools. | `tools/wake`'s interview mode; the Bridge's interview mode. | A wake of X lists exactly two tools, neither takes an interview id, and its environment holds no other credential. (A runner the office brings is bound by the written contract only.) |
 | I10 | Text bounds, reserved prefixes, text-only rendering. | Answer route; `dom.js`. | Oversize and `Kind:`-prefixed answers are refused; markup renders as text. |
 | D1 | **[N4]** The draft is in `sessionStorage`, holds no token, and is cleared on send, finish, revoke and "Forget this browser". | Page. | A browser-page test reads `sessionStorage` and `localStorage` after each of the four. |
-| W1 | **[M3]** No live read, guest read or typing signal writes the state. | Guest routes; the coarse-save authentication path. | A count of `Store._write` across them is exactly 0. |
+| W1 | **[M3, should (3)]** No live read, guest read, typing signal or guest refusal writes the state. | Guest routes; the coarse-save authentication path; `_audited_refusal`. | A count of `Store._write` across them, refusals included (G19), is exactly 0. |
 | W2 | **[M3]** Five present guests do not slow members. | All of section 3. | A load run at a full audit; the member read median within 20% of K = 0. |
 | A1 | **[S1]** Guest-triggered audit lines are bounded. | Audit throttle per interview. | 1,000 refused binds and 1,000 wrong codes add only a bounded number of lines. |
-| R | The rate limits of 1.10. | Routes. | The (N+1)th request within the window is refused with Retry-After. |
+| R | The rate limits of 1.10, the interviewer's post caps included **[should (6)]**. | Routes. | The (N+1)th request within the window is refused with Retry-After; an oversize `note`, `summary` or correction and a fifth `summary` are refused. The 31st miss from one address group is slowed, not locked out, and a member's sign-in from that group is not slowed **[should (5)]**. |
 
 ---
 
@@ -701,11 +754,14 @@ Nothing in this note blocks SSO: the guest path is a separate cookie and route f
 | `backups/<name>.interviews.json` | Ignored, as `<name>.rooms.json` is by a kit older than rooms. The rest of the restore works. |
 | Items accepted from an interview | Ordinary requirements, proposals and decisions. An older kit reads a record carrying the `orchestra:interview/` pointer, since the pointer is plain text in the description (`requirement_http.py:504-505`). It would refuse to **make** a new one (S8), which an older kit never does. |
 | The guest cookie | Unknown to an older kit, so not authenticated. **An older kit has no interview page, so a guest sees the old sign-in page [N9].** |
-| The `interviews.invite` capability, the switch and the interviewer credentials | Unknown, so nothing is granted. An interviewer credential is in `credential_tokens` with a scope the older kit does not know, which grants nothing (as rooms section 7 says of the `rooms` scope). |
+| The `interviews.invite` capability and the switch | Unknown, so nothing is granted: no role in an older kit holds the capability, and an older kit has no interview routes for the switch to open. |
+| **The interviewer credentials [rollback]** | **401 on every route.** r2 said an older kit grants nothing for an interviewer credential's unknown scope. **That was false.** `credential_capabilities` gives every credential but the nudge carrier's `CAP_READ` as a baseline, and an unknown scope adds and removes nothing (`http_authority.py:837-855`). An interviewer token would have read every project of its agent. The same false claim about the `rooms` scope is in docs/PROJECT_ROOMS_DESIGN.md:206, and it is kittrial-5bb.607's to correct. **The interview design does not rely on an older kit ignoring a scope.** It relies on what .607 decides: a per-interview credential is a **fenced credential**, kept in `fenced_credentials` / `fenced_credential_tokens` and never in `credentials` / `credential_tokens`. An older kit's only credential lookup (`http_auth.py:2142-2143`) cannot find it, and its store keeps the two keys untouched (`:928-929`). After the next upgrade the credential is found again, and the step below revokes it. |
+| **The flagged interviewer agent [rollback]** | An older kit does not know the flag. But the agent holds no ordinary credential an older kit could use for a project: it belongs to no project (2.6), so its reach on any kit is no project (`http_authority.py:1218-1226`). |
 
 **A rollback suspends interviews; it does not end them [M2].** An older kit keeps `state['interview_links']` as it was. After the next upgrade, every guest session whose absolute life has not passed would work again. So:
 
-- **the upgrade after a rollback revokes every unfinished link**, with `revoked_by: "(upgrade after rollback)"`. It uses the same step as the restore of 2.7, and tells the inviters;
+- **[rollback; R2-N2, Neon S1] an operator step, not a guess.** r2 said "the upgrade after a rollback revokes every unfinished link", but nothing could trigger it: the state records no writer kit (`_blank_state`, `http_auth.py:539-554`), and an older kit leaves `interview_links` untouched (`:928-929`). So the re-upgraded kit cannot tell that an older one ran. r3 makes it a named command, **`admin.py interview-links revoke-unfinished --reason "upgrade after rollback"`**, run with the service stopped, before the re-upgraded service starts. It uses the restore step of 2.7: every link that is not finished is revoked with `revoked_by: "(upgrade after rollback)"`, the sessions and interviewer credentials are ended, and the inviters are told when the service starts;
+- **the upgrade notes name it**, in the rollback section of docs/OPERATIONS.md (beside `:395-416`): "If you rolled back below the interview links release and are upgrading again, run `admin.py interview-links revoke-unfinished` first." The command's answer lists what it revoked;
 - **if the rollback was made because of interviews**, the operator also switches `interview_links_enabled` off before upgrading. The upgrade notes say so.
 
 ---
@@ -715,13 +771,14 @@ Nothing in this note blocks SSO: the guest path is a separate cookie and route f
 **Prerequisites:**
 
 - **rooms slice 3**: the `rooms` scope and the rooms-only credential with the mixed-credential refusal (R1). It is security-critical and needed anyway, so no weaker copy is folded in here (QC1);
-- **the kit fix for the per-request save** (filed separately; M3). Slice 4 depends on it.
+- **the kit fix for the per-request save** (filed separately; M3). Slice 4 depends on it;
+- **kittrial-5bb.607, the fenced credentials [rollback]**. Slice 3's per-interview credential is one. The PM integrates no rooms slice 3 change until .607 is approved, and the same holds for slice 3 here.
 
 | # | Slice | Holds |
 |---|---|---|
-| 1 | **Guest links and the guest session, no agent:** `state['interview_links']`; create, list, revoke, re-issue, confirm binding, the check code; view and bind (TLS, Origin, nonce, `_widening`); the per-link guest cookie and route family with the re-checks; the switch and caps; notices and the throttled audit; the restore step and the upgrade-after-rollback step; pruning; the guest page with intro, Start, answer, pause and the `sessionStorage` draft; the `.interviews/` folder (reusing the rooms code) and its backup file. A member can interview **by hand** from the interview's member page. | G1-G5c, G7-G8, G10-G15, D1, A1, R, the rollback tests of section 7 |
+| 1 | **Guest links and the guest session, no agent:** `state['interview_links']`; create, list, revoke, re-issue, confirm binding, the check code; view and bind (TLS, Origin, nonce, `_widening`); the per-link guest cookie and route family with the re-checks; the switch and caps; notices and the throttled audit, with every guest refusal opted out of `_note_denied`; the interview links' own miss bucket; the restore step and the `admin.py interview-links revoke-unfinished` command, named in the upgrade notes; pruning; the guest page with intro, Start, answer, pause, "Forget this browser" and the `sessionStorage` draft, the return path (`#/interview/session/<link-id>`, the CSRF value from `GET me`), and a start that does not call `GET /v1/sessions/current`; the `.interviews/` folder (reusing the rooms code) and its backup file. A member can interview **by hand** from the interview's member page. | G1-G5c, G7-G8, G10-G19, D1, A1, R, W1's refusal half, the rollback tests of section 7 |
 | 2 | **Interview mode:** the brief and points with the editor's warning; the post kinds; notes and the progress line; one question at a time; the end summary with confirm, correct and the transcript hand-over; items (capped, service-written provenance, the `orchestra:interview/` pointer in both checks); member acceptance after G12, with the summary beside each item. | I1-I5, I10, G9 |
-| 3 | **The interviewer:** who may interview and the owner's consent; the per-interview credential and the `interviews` flag; the I6 and I7 checks for reads and posts; the read route with untrusted excerpts; `templates/INTERVIEWER_PROMPT.md` and the runner's contract I11; the me/next `interview` kind. Needs rooms slice 3. | I6-I8 |
+| 3 | **The interviewer:** the dedicated flagged agent with no project capability and no project; who may interview, the owner's consent, and the per-interview credential's secret shown only in that consent step; the per-interview credential as a fenced credential; the allowlist of three interview-agent routes, with I7 and the owner's `interviews.invite` re-checked on each; the read route with untrusted excerpts, the interviewer's notes included; the interviewer's post caps; `templates/INTERVIEWER_PROMPT.md`, the runner's contract I11, and `tools/wake`'s interview mode with two tools. No me/next kind. Needs rooms slice 3 and .607. | I6-I8, I11 |
 | 4 | **The fast wake (A):** presence from input, the typing signal, the daily cap, the live read; the "writing…" and "away" lines; the speeds in `tools/wake` and the Bridge's fixed prompt. Needs the kit fix. | W1, W2, section 3 rate and no-text tests |
 | 5 | **Members' sign-up:** sign in at redeem (with the Origin check). The repeat field stays. | The redeem cookie and Origin tests |
 | later | The purge command (N8); the held-request check page and admin command, then B on .207. | Section 3.4; a purge test |
@@ -731,11 +788,11 @@ Nothing in this note blocks SSO: the guest path is a separate cookie and route f
 
 ## 9. Questions for James
 
-Each question is as in r1, with the recommendation in bold. Under each, **"Security view (review r1)"** gives what the security review says about it.
+Each question is as in r1, with r1's recommendation in bold. Where the note's text now recommends something else, the question says so beside the bold (Q2, Q9). Under each, **"Security view (review r1)"** gives what the security review says about it.
 
 1. **Another PC (section 1.6).** **(A) the inviter re-issues** (recommended); (B) a transfer code; (C) none.
    - *Security view (review r1):* (A), with S4: the new session does not see earlier answers (now in 1.6). (B) would add a second secret that can be guessed and also needs an attempt cap.
-2. **A spoken check code (section 1.9).** (A) never; **(B) a tick-box per link, off by default** (recommended); (C) always.
+2. **A spoken check code (section 1.9).** (A) never; **(B) a tick-box per link, off by default** (r1's recommendation; **r2 and r3 now say: on by default for a link sent by mail or chat, and always for a re-issued link**, section 1.9 and 1.6) **[notes: R2-N6]**; (C) always.
    - *Security view (review r1):* not (A). Offer the code with a per-link attempt cap (S3), on by default for links sent by mail or chat (S2). r2 follows this: 6 digits, 5 tries, on by default unless the inviter hands the link over in person.
 3. **Does the guest see the brief? (section 2.1).** **(A) no, only the intro** (recommended); (B) yes, the whole brief.
    - *Security view (review r1):* the brief cannot be kept from the guest (M1). (A) is acceptable only if the brief editor says the guest may see it (now in 2.1); otherwise (B) is the honest choice.
@@ -749,7 +806,7 @@ Each question is as in r1, with the recommendation in bold. Under each, **"Secur
    - *Security view (review r1):* (A) only with the transcript handed over in the confirm step (S6, now in 2.5). (C) needs a purge path, which does not exist (N8, now in 2.7).
 8. **Model calls in the server (section 3.3).** **(A) no** (recommended); (B) yes, behind a spend gate.
    - *Security view (review r1):* (A), no. Agreed.
-9. **Members' sign-up (section 4.2).** **(A) sign in at redeem and drop the repeat field** (recommended); (B) leave it until SSO.
+9. **Members' sign-up (section 4.2).** **(A) sign in at redeem and drop the repeat field** (r1's recommendation; **r2 and r3 now say: sign in at redeem, and keep the repeat field**, section 4.2) **[notes: R2-N6]**; (B) leave it until SSO.
    - *Security view (review r1):* sign in at redeem, yes. Keep the repeat field (S9): a typo costs a superuser's reset. r2's section 4.2 now recommends keeping it; the question's options are left as James first saw them.
 
 ---
@@ -784,3 +841,33 @@ Each question is as in r1, with the recommendation in bold. Under each, **"Secur
 | N10 | 2.2 (post kinds; I3 reworded); 6 (I1-I3) |
 | N11 | 1.3 (the bind nonce; coalesced notices); 1.7; 6 (G4) |
 | N12 | Not in the note: the r2 bundle is made to clone cleanly (delivery evidence) |
+
+## The coordinator's r2 items, and where each is answered (r3)
+
+| Item | Where in r3 |
+|---|---|
+| interviewer-scope | One page; 0 (`_note_denied` and fenced rows); 1.9 (never exposed); 2.6 (who may interview: dedicated, the owner re-checked; I6: no project capability, no project, no `CAP_AGENT_SELF`, the allowlist); 6 (I6); 7 (the flagged agent); 8 slice 3 |
+| credential-delivery | One page; 1.2 (`interviewer_agent_id`, `interviewer_credential_id`); 2.6 (the secret only in the consent step; several interviews; me/next not used); 2.7 (revoked under `--credentials keep`); 3.2 (the live read is the wake) |
+| member-routes | 2.6 (person-only member routes; I11: one credential per wake, tools without an interview id, r2's sentence struck); 6 (I6's ROUTES-wide test and named cases) |
+| runner-tools | One page; 2.6 (I11: no tools beyond the interview's read and post); 6 (I11) |
+| guest-resume | 1.2 (`bound_csrf` kept as itself; `#/interview/session/<link-id>`); 1.3 (the view of a bound link); 1.5 (`GET me` returns the CSRF value); 1.6 (both ways back); 2.4; 6 (G16) |
+| rollback | Header; one page; 0; 2.6 (fenced credential); 7 (L704 corrected; relies on .607, not on an older kit ignoring a scope; the named `admin.py interview-links revoke-unfinished` and the upgrade notes); 8 (.607 a prerequisite) |
+| should (1) R2-S1 | One page; 1.6 (a new code on every re-issue; what the interviewer read it can repeat); 6 (G14) |
+| should (2) Neon S5 | 1.6 ("Not them" closes the interview; "Start again"); 1.7; 6 (G18) |
+| should (3) Neon M4 | 0 (two rows); 1.5 (`_audited_refusal`; the page's start); 6 (G19, W1); 8 slice 1 |
+| should (4) Neon M6 | 1.3 (the view's `member_cookie`; bind ignores `orchestra_session`); 1.5 (ignore, not refuse; `POST forget`); 2.4; 6 (G5c, G17) |
+| should (5) Neon S3 | 1.3; 1.10 (the interview links' own soft bucket); 5; 6 (R) |
+| should (6) Neon S6, R2-N5 | 1.4 (a real pause only); 1.10 (caps and limits on every guest and interviewer post); 2.3 (notes unreviewed); 6 (G15, I8, R) |
+| should (7) Neon S7 | Folded into interviewer-scope: 2.6 (dedicated; the owner re-checked) |
+| notes: R2-N1 | 1.3 (a fresh token and CSRF value); 6 (G4) |
+| notes: Neon S2 | 1.3 (the view withholds intro and label until the code; no query string; rate-limited); 1.10 |
+| notes: Neon S4 | 1.3 (a configured public origin); 5 |
+| notes: Neon S8 | 1.8 (all four pointer checks); 2.7 (`_write_restored_http_state`; the notice made at start) |
+| notes: R2-N3 | 1.5 (the switch suspends; archive and lost authority revoke); 1.7 |
+| notes: R2-N4 | 6 (G5a's route set) |
+| notes: R2-N6, Neon N6 | 9 (Q2, Q9) |
+| notes: R2-N7, Neon N1 | 1.8 (`source: guest interview`) |
+| notes: Neon N2 | 1.8 (the label words; the check-code provenance) |
+| notes: Neon N3 | 1.2 (`interview.json` keeps provenance) |
+| notes: Neon N4 | 3.4 (superuser; 2 at once; the proxy's 60 s) |
+| notes: Neon N5 | 0 (`rooms.py:1244-1645`; the headers row); 2.7 (older backups); 6 (G5b) |
