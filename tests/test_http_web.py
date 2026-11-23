@@ -2480,7 +2480,8 @@ console.log(JSON.stringify({
 
     def test_rotation_and_setup_produce_identical_non_secret_lines(self):
         """kittrial-5bb.524: credentialFileCommand and credentialFileLines share credentialManagedLines
-        and produce byte-identical non-secret lines for the same agent on POSIX (real bash) and Windows."""
+        and produce byte-identical non-secret lines for the same agent on POSIX (real bash) and
+        Windows (real PowerShell on nt)."""
         setup_code = self.code(self.SETUP_JS)
         cmd_body = self.function_body(setup_code, 'credentialFileCommand')
         lines_body = self.function_body(setup_code, 'credentialFileLines')
@@ -2499,6 +2500,7 @@ const file = m.secretFile('Kestrel');
 const cert = m.certificateFile('Kestrel');
 const comments = m.credentialCommentLines(server, fp);
 const posixHome = process.argv[2];
+const runnerWinHome = process.argv[3] || '';
 const winWorkDir = 'C:\\Users\\Jane Doe\\agents\\kestrel';
 const winHome = m.userHomeFromWorkingDirectory(winWorkDir, { windows: true });
 const out = {};
@@ -2509,6 +2511,9 @@ for (const noproxy of [false, true]) {
     posixLines: m.credentialFileLines(server, fp, secret, { certFile: cert, hasCertificate: true, noproxy, windows: false, homeDir: posixHome }),
     winCmd: m.credentialFileCommand(file, comments, { certFile: cert, hasCertificate: true, noproxy, server }).powershell,
     winLines: m.credentialFileLines(server, fp, secret, { certFile: cert, hasCertificate: true, noproxy, windows: true, homeDir: winHome }),
+    runnerWinLines: runnerWinHome
+      ? m.credentialFileLines(server, fp, secret, { certFile: cert, hasCertificate: true, noproxy, windows: true, homeDir: runnerWinHome })
+      : null,
   };
 }
 console.log(JSON.stringify(out));
@@ -2516,23 +2521,51 @@ console.log(JSON.stringify(out));
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp) / 'olive'
             fake_home.mkdir()
-            done = run_node_module(self, node, script, self.SETUP_JS.as_uri(), str(fake_home))
+            posix_home = str(fake_home) if os.name != 'nt' else '/home/olive'
+            ps = (shutil.which('pwsh') or shutil.which('powershell')) if os.name == 'nt' else None
+            ps_env = None
+            runner_win_home = ''
+            if ps:
+                ps_env = dict(os.environ, USERPROFILE=str(fake_home), LOCALAPPDATA=str(fake_home))
+                runner_win_home = subprocess.check_output(
+                    [ps, '-NoProfile', '-NonInteractive', '-Command',
+                     "[Environment]::GetFolderPath('UserProfile')"],
+                    env=ps_env,
+                    text=True,
+                    timeout=120,
+                ).strip()
+            done = run_node_module(self, node, script, self.SETUP_JS.as_uri(), posix_home, runner_win_home)
             self.assertEqual(0, done.returncode, done.stderr)
             data = json.loads(done.stdout)
             secret = 'orc_TEST_524_SECRET'
+            expected_posix_cacert = (
+                f'cacert = "{posix_home}/.orchestra-agent-kestrel.crt"'
+                if any(ch.isspace() for ch in posix_home)
+                else f'cacert = {posix_home}/.orchestra-agent-kestrel.crt'
+            )
             for key in ('plain', 'noproxy'):
-                # POSIX: run the real rewrite command under bash and compare non-secret lines.
-                # (Not subprocess.run: reserved for run_node_module.)
-                cred = fake_home / '.orchestra-agent-kestrel.curlrc'
-                cred.write_text(f'header = "Authorization: Bearer {secret}"\n', encoding='utf-8')
-                subprocess.check_output(
-                    ['bash', '-c', data[key]['posixCmd']],
-                    env=dict(os.environ, HOME=str(fake_home)),
-                    text=True,
-                )
-                rewritten = cred.read_text(encoding='utf-8')
-                self.assertEqual(rewritten, data[key]['posixLines'])
-                # Windows: verify managed lines match the PowerShell prefix byte-for-byte.
+                # POSIX managed lines: verify exact lines on every OS, and execute real bash on POSIX.
+                posix_non_secret = [l for l in data[key]['posixLines'].splitlines() if not l.startswith('header = ')]
+                expected_posix = [
+                    '# server = https://orchestra.example:8765',
+                    '# server certificate sha256 = AA:BB:CC',
+                    *(('noproxy = "orchestra.example"',) if key == 'noproxy' else ()),
+                    expected_posix_cacert,
+                ]
+                self.assertEqual(expected_posix, posix_non_secret)
+                if os.name != 'nt' and shutil.which('bash'):
+                    # (Not subprocess.run: reserved for run_node_module.)
+                    cred = fake_home / '.orchestra-agent-kestrel.curlrc'
+                    cred.write_text(f'header = "Authorization: Bearer {secret}"\n', encoding='utf-8')
+                    subprocess.check_output(
+                        ['bash', '-c', data[key]['posixCmd']],
+                        env=dict(os.environ, HOME=str(fake_home)),
+                        text=True,
+                    )
+                    rewritten = cred.read_text(encoding='utf-8')
+                    self.assertEqual(rewritten, data[key]['posixLines'])
+                # Windows: verify managed lines match the PowerShell prefix byte-for-byte, and
+                # on Windows execute the real PowerShell rewrite and compare lines byte-for-byte.
                 win_lines = data[key]['winLines'].splitlines()
                 win_non_secret = [l for l in win_lines if not l.startswith('header = ')]
                 expected_win = [
@@ -2545,6 +2578,19 @@ console.log(JSON.stringify(out));
                 self.assertEqual(expected_win, win_non_secret)
                 self.assertIn('([Environment]::GetFolderPath(\'UserProfile\') -replace \'\\\\\',\'/\') + "/.orchestra-agent-kestrel.crt`"`r`n"', data[key]['winCmd'])
                 self.assertIn('"ssl-no-revoke`r`n"', data[key]['winCmd'])
+                if ps and data[key]['runnerWinLines'] is not None:
+                    cred = fake_home / '.orchestra-agent-kestrel.curlrc'
+                    cred.write_bytes(f'header = "Authorization: Bearer {secret}"\r\n'.encode('utf-8'))
+                    subprocess.check_output(
+                        [ps, '-NoProfile', '-NonInteractive', '-Command', data[key]['winCmd']],
+                        env=ps_env,
+                        cwd=str(fake_home),
+                        text=True,
+                        timeout=120,
+                    )
+                    raw_win = cred.read_bytes().decode('utf-8')
+                    self.assertIn('\r\n', raw_win)
+                    self.assertEqual(raw_win.replace('\r\n', '\n'), data[key]['runnerWinLines'])
 
     def test_windows_cacert_path_with_space_and_ssl_no_revoke_windows_only(self):
         """kittrial-5bb.524 condition 3: Windows space path keeps exact forward-slash double quoting,
