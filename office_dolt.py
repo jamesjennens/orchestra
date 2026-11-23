@@ -10,13 +10,17 @@ it) and free of Python 3.7+ syntax or stdlib APIs (the office host runs Python 3
 """
 import csv
 import ctypes
+import errno
 import io
 import os
 import signal
 import socket
+import stat
 import subprocess
 import time
 from pathlib import Path
+
+import record_json
 
 DOLT_STARTUP_SECONDS_KEY = 'dolt_startup_seconds'
 DEFAULT_DOLT_STARTUP_SECONDS = 30
@@ -67,6 +71,89 @@ def dolt_command(root):
     """Return the ``dolt sql-server`` command for ``root``."""
     base = Path(root)
     return [base / 'bin' / 'dolt', 'sql-server', '--config', base / 'server.json']
+
+
+def _server_json(root):
+    """Read ``<root>/server.json`` as a dict, or return ``{}`` if missing or unreadable."""
+    try:
+        with open(str(Path(root) / 'server.json'), 'r', encoding='utf-8') as stream:
+            doc = record_json.loads(stream.read())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def privileges_db_path(root):
+    """Return the Dolt ``privileges.db`` path configured by ``<root>/server.json``."""
+    base = Path(root)
+    doc = _server_json(base)
+    cfg_dir = doc.get('cfg_dir')
+    if isinstance(cfg_dir, str) and cfg_dir:
+        path = Path(cfg_dir)
+        if not path.is_absolute():
+            path = base / path
+        return path / 'privileges.db'
+    data_dir = doc.get('data_dir')
+    if isinstance(data_dir, str) and data_dir:
+        path = Path(data_dir)
+        if not path.is_absolute():
+            path = base / path
+        return path / '.doltcfg' / 'privileges.db'
+    return base / 'data' / '.doltcfg' / 'privileges.db'
+
+
+def socket_path(root):
+    """Return the Unix socket path configured by ``<root>/server.json``, or None."""
+    base = Path(root)
+    doc = _server_json(base)
+    listener = doc.get('listener')
+    if not isinstance(listener, dict):
+        return None
+    raw = listener.get('socket')
+    if not isinstance(raw, str) or not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = base / path
+    return path
+
+
+def cleanup_stale_socket(root):
+    """Remove a dead Unix socket left by a killed Dolt process when nothing listens on it.
+
+    Only removes an existing Unix domain socket (never a regular file or symlink) when a
+    probe connect fails with ``ECONNREFUSED`` or ``ENOENT``. Returns True if removed.
+    """
+    af_unix = getattr(socket, 'AF_UNIX', None)
+    if af_unix is None:
+        return False
+    path = socket_path(root)
+    if path is None:
+        return False
+    try:
+        st = os.lstat(str(path))
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(st.st_mode):
+        return False
+    sock = socket.socket(af_unix, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.2)
+        sock.connect(str(path))
+    except OSError as exc:
+        if exc.errno in (errno.ECONNREFUSED, errno.ENOENT):
+            try:
+                os.unlink(str(path))
+                return True
+            except OSError:
+                return False
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return False
 
 
 def after_fork():
@@ -189,6 +276,11 @@ def port_listening(port, host='127.0.0.1', timeout=0.5):
     return True
 
 
+def _sql_quote_literal(value):
+    """Escape backslashes and single quotes for a MySQL/Dolt single-quoted string literal."""
+    return value.replace('\\', '\\\\').replace("'", "''")
+
+
 def bootstrap_database(root, cfg, env):
     """Set the fresh Dolt root password on first start (supervisor only; never restore).
 
@@ -203,10 +295,10 @@ def bootstrap_database(root, cfg, env):
         return False
     if users.returncode != 0:
         return False
-    escaped = cfg['password'].replace("'", "''")
+    escaped = _sql_quote_literal(cfg['password'])
     changes = [
         "ALTER USER '%s'@'%s' IDENTIFIED BY '%s';" % (
-            row['User'].replace("'", "''"), row['Host'].replace("'", "''"), escaped
+            _sql_quote_literal(row['User']), _sql_quote_literal(row['Host']), escaped
         )
         for row in csv.DictReader(io.StringIO(users.stdout))
         if row.get('User') == 'root'
@@ -215,9 +307,10 @@ def bootstrap_database(root, cfg, env):
         raise RuntimeError('The fresh Dolt server has no root account to secure')
     changed = sql_probe(root, '\n'.join(changes), cfg, env, password='')
     if changed.returncode != 0:
+        # Never include client stdout/stderr: Dolt SQL errors echo the full ALTER USER
+        # statement, which would put the root password into the supervisor's error/log.
         raise RuntimeError(
-            'Could not set the Dolt root password: %s'
-            % (changed.stderr or changed.stdout or '').strip()[:200]
+            'Could not set the Dolt root password (dolt sql exited %d)' % changed.returncode
         )
     return database_ready(root, cfg, env)
 

@@ -463,7 +463,7 @@ if os.environ.get('BD_DISABLE_METRICS') != '1':
         import office_service
         source = inspect.getsource(office_service.run)
         self.assertLess(source.index('certificate_preflight(settings, root)'), source.index('start_warnings(settings)'))
-        self.assertLess(source.index('start_warnings(settings)'), source.index("_spawn([root/'bin/dolt'"))
+        self.assertLess(source.index('start_warnings(settings)'), source.index('_spawn(office_dolt.dolt_command(root)'))
         self.assertLess(source.index('certificate_preflight(settings, root)'), source.index('web_command('))
         self.assertIn("settings = dict(settings, cert=checked[0], key=checked[1])", source)
 

@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - POSIX-only
 
 
 FAKE_DOLT_SCRIPT = '''#!__PYTHON__
-import json, os, socket, sys, time
+import json, os, signal, socket, sys, time
 
 ROOT = os.getcwd()
 BEHAVIOR_PATH = os.path.join(ROOT, 'fake-dolt-behavior.json')
@@ -47,6 +47,8 @@ PROBES_LOG = os.path.join(ROOT, 'fake-dolt-probes.jsonl')
 BOOTSTRAP_LOG = os.path.join(ROOT, 'fake-dolt-bootstrap.jsonl')
 PID_FILE = os.path.join(ROOT, 'fake-dolt.pid')
 PIDS_LOG = os.path.join(ROOT, 'fake-dolt-pids.txt')
+SIGTERM_FLAG = os.path.join(ROOT, 'fake-dolt-sigterm.flag')
+CLEAN_EXIT_FLAG = os.path.join(ROOT, 'fake-dolt-clean-exit.flag')
 
 
 def load_behavior():
@@ -65,6 +67,20 @@ args = sys.argv[1:]
 behavior = load_behavior()
 
 if 'sql-server' in args:
+    ignore_sigterm = float(behavior.get('ignore_sigterm_seconds', 0))
+    if ignore_sigterm > 0:
+        stopping = {'active': False}
+        def _slow_term(_signum, _frame):
+            if stopping['active']:
+                return
+            stopping['active'] = True
+            with open(SIGTERM_FLAG, 'w', encoding='utf-8') as f:
+                f.write(str(os.getpid()))
+            time.sleep(ignore_sigterm)
+            with open(CLEAN_EXIT_FLAG, 'w', encoding='utf-8') as f:
+                f.write(str(os.getpid()))
+            os._exit(0)
+        signal.signal(signal.SIGTERM, _slow_term)
     has_cli_pw = 'DOLT_CLI_PASSWORD' in os.environ
     has_beads_pw = 'BEADS_DOLT_PASSWORD' in os.environ
     append_jsonl(STARTS_LOG, {
@@ -123,11 +139,19 @@ if 'sql-server' in args:
             pw = req.get('password')
             query = req.get('query', '')
             if mode == 'auth_refusal' or (expected_pw is not None and pw != expected_pw):
-                resp = {'ok': False, 'error': "Error 1045 (28000): Access denied for user 'root' (using password: %s)" % ('YES' if pw else 'NO')}
+                # Real Dolt 2.2.0 prints only "Access denied for user 'root'" (no "(using password: YES)").
+                resp = {'ok': False, 'error': "Access denied for user 'root'"}
             else:
                 if 'ALTER USER' in query.upper():
                     append_jsonl(BOOTSTRAP_LOG, {'query': query, 'password': pw})
-                if 'mysql.user' in query:
+                    if behavior.get('bootstrap_fail_echo_query'):
+                        resp = {
+                            'ok': False,
+                            'error': 'error on line 1 for query %s\\nError parsing SQL: syntax error' % query.strip(),
+                        }
+                    else:
+                        resp = {'ok': True, 'out': ''}
+                elif 'mysql.user' in query:
                     resp = {'ok': True, 'out': 'User,Host\\nroot,localhost\\n'}
                 else:
                     resp = {'ok': True, 'out': '1\\n1\\n'}
@@ -280,9 +304,12 @@ class OfficeRuntimeMixin:
         self.web_port = free_port()
         self.password = 'disposable-only'
         self.write_deployment()
+        (self.root / 'data' / '.doltcfg').mkdir(parents=True, exist_ok=True)
+        (self.root / 'data' / '.doltcfg' / 'privileges.db').write_bytes(b'initialized')
         (self.root / 'server.json').write_text(json.dumps({
-            'listener': {'host': '127.0.0.1', 'port': self.db_port},
+            'listener': {'host': '127.0.0.1', 'port': self.db_port, 'socket': str(self.root / 'mysql.sock')},
             'data_dir': str(self.root / 'data'),
+            'cfg_dir': str(self.root / 'data' / '.doltcfg'),
         }), encoding='utf-8')
         self.config = self.base / 'office.json'
         self.config.write_text('{"schema_version":1}', encoding='utf-8')
@@ -738,110 +765,294 @@ class OfficeRestoreAfterStopTests(OfficeRuntimeMixin, unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux foreground office supervisor only')
-class RefusalMutantTests(OfficeRuntimeMixin, unittest.TestCase):
-    """Condition 6(c): one named mutant for each refusal guard, proving each guard bites."""
+class RefusalPinTests(OfficeRuntimeMixin, unittest.TestCase):
+    """Condition 6(c) & r2 pins: every test exercises real code and fails when its source mutant is injected."""
 
-    def test_mutant_tcp_connect_as_ready_lets_non_dolt_listener_pass(self):
-        """Mutant: treating TCP connect as 'already running' skips refusal on a non-Dolt listener."""
-        other = NonDoltListener(self.db_port, banner=b'NOT-DOLT\r\n')
-        self.addCleanup(other.close)
-        with self.assertRaises(ValueError):
-            admin._check_existing_dolt(self.root, admin.config(self.root), admin.environment(self.root))
-        with mock.patch.object(office_dolt, 'probe_database',
-                               side_effect=lambda r, c, e, timeout=5: (office_dolt.port_listening(c['port']), '')):
-            self.assertTrue(admin._check_existing_dolt(self.root, admin.config(self.root), admin.environment(self.root)))
+    def test_pin_sigterm_during_temporary_dolt_stop_prints_http_notice_and_cleans_up(self):
+        """SHOULD-1 (stop-guard): SIGTERM while stopping temporary Dolt exits 143 with the HTTP notice and cleans up."""
+        self.set_fake_dolt_behavior(ignore_sigterm_seconds=3.5)
+        before_http = self.state_path.read_bytes()
+        runner = self.base / 'run_stop_guard.py'
+        runner.write_text('''import sys
+from unittest import mock
+sys.path.insert(0, %r)
+import admin
+root = %r
+def fake_add(r, name, **kw):
+    (r / 'projects' / name).mkdir(parents=True, exist_ok=True)
+    return {'project': name, 'database': name, 'prefix': name}
+sys.argv = ['admin.py', '--root', root, 'restore-new', 'src', 'dststop',
+            '--restore-http-state', '--credentials', 'keep']
+with mock.patch.object(admin, 'add_project', side_effect=fake_add), \\
+     mock.patch.object(admin, 'native_restore', return_value='restored'), \\
+     mock.patch.object(admin, 'finish_restore', return_value=None):
+    admin.run_main()
+''' % (str(KIT), str(self.root)), encoding='utf-8')
+        proc = subprocess.Popen(
+            [sys.executable, str(runner)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
+        self.addCleanup(self.stop_proc, proc)
+        sigterm_flag = self.root / 'fake-dolt-sigterm.flag'
+        self.assertTrue(wait_for(lambda: sigterm_flag.is_file(), timeout=15),
+                        'temporary Dolt did not enter its stop phase')
+        dolt_pid = int(sigterm_flag.read_text(encoding='utf-8').strip())
+        self.addCleanup(kill_pid, dolt_pid)
+        time.sleep(0.2)
+        proc.terminate()
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 143, 'expected guarded exit 143, got %r (stderr=%r)' % (proc.returncode, err))
+        self.assertIn('The project dststop was restored', err)
+        self.assertIn('the HTTP state was NOT restored', err)
+        self.assertIn('restore-new src NEWNAME --restore-http-state --credentials keep into a NEW name', err)
+        self.assertEqual(self.state_path.read_bytes(), before_http, 'live HTTP state must stay unchanged')
+        self.assertTrue(wait_for(lambda: not pid_alive(dolt_pid), timeout=8),
+                        'temporary Dolt survived interrupted stop')
+        self.assertFalse(port_up(self.db_port))
+        self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+        self.assertTrue((self.root / 'fake-dolt-clean-exit.flag').is_file(),
+                        'restore-new must wait for temporary Dolt to finish stopping before exiting')
 
-    def test_mutant_skip_port_in_use_refusal_spawns_second_dolt(self):
-        """Mutant: skipping port_listening check attempts to spawn a second Dolt when port is held."""
-        other = NonDoltListener(self.db_port)
-        self.addCleanup(other.close)
-        self.write_deployment(dolt_startup_seconds=1)
-        code, _, _ = self.run_cli('restore-new', 'src', 'dstctrlport')
-        self.assertEqual(code, 1)
-        self.assertEqual(self.read_starts(), [])
-        with mock.patch.object(office_dolt, 'port_listening', return_value=False):
-            self.run_cli('restore-new', 'src', 'dstmutport')
-        self.assertGreaterEqual(len(self.read_starts()), 1, 'mutant should have tried spawning a second Dolt')
+    def test_pin_bootstrap_database_escapes_backslashes_and_never_leaks_password(self):
+        """SHOULD-2 (bootstrap-password): failing bootstrap escapes backslashes and never leaks password to error or logs."""
+        secret = "Secr3t'Part\\"
+        self.password = secret
+        self.write_deployment(password=secret, dolt_startup_seconds=3)
+        self.set_fake_dolt_behavior(server_mode='normal', expected_password='', bootstrap_fail_echo_query=True)
 
-    def test_mutant_bootstrap_on_auth_refusal_sets_credentials_during_restore(self):
-        """Mutant: calling bootstrap_database instead of refusing auth failure writes ALTER USER."""
-        self.set_fake_dolt_behavior(server_mode='normal', expected_password='')
-        code, _, err = self.run_cli('restore-new', 'src', 'dstctrlauth')
-        self.assertEqual(code, 1)
-        self.assertIn('Nothing was changed.', err)
-        self.assertEqual(self.read_bootstrap(), [])
         db_env = office_dolt.db_server_env(admin.environment(self.root))
-        child = office_dolt.spawn_process(office_dolt.dolt_command(self.root), self.root, self.base / 'mut.log', db_env)
+        child = office_dolt.spawn_process(
+            office_dolt.dolt_command(self.root), self.root, self.base / 'boot-dolt.log', db_env)
         self.addCleanup(office_dolt.stop_process, child, time.monotonic() + 5)
         self.assertTrue(wait_for(lambda: port_up(self.db_port), timeout=10))
-        office_dolt.bootstrap_database(self.root, admin.config(self.root), admin.environment(self.root))
-        self.assertTrue(self.read_bootstrap(), 'mutant bootstrap should have executed ALTER USER')
-        office_dolt.stop_process(child, time.monotonic() + 5)
+        try:
+            with self.assertRaises(RuntimeError) as exc:
+                office_dolt.bootstrap_database(self.root, admin.config(self.root), admin.environment(self.root))
+            msg = str(exc.exception)
+            self.assertNotIn(secret, msg)
+            self.assertNotIn("Secr3t", msg)
+            self.assertNotIn('ALTER USER', msg)
+            boot_entries = self.read_bootstrap()
+            self.assertTrue(boot_entries)
+            self.assertIn("IDENTIFIED BY 'Secr3t''Part\\\\';", boot_entries[-1]['query'])
+        finally:
+            office_dolt.stop_process(child, time.monotonic() + 5)
 
-    def test_mutant_skip_plain_restore_lock_ignores_held_office_lock(self):
-        """Mutant: passing holds_office_lock=True on plain restore bypasses the held office-service.lock refusal."""
-        fd = os.open(str(self.root / 'office-service.lock'), os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        self.addCleanup(os.close, fd)
-        with self.assertRaises(ValueError):
-            with admin.temporary_office_dolt(self.root, holds_office_lock=False):
-                pass
-        with admin.temporary_office_dolt(self.root, holds_office_lock=True):
-            self.assertTrue(office_service._database_ready(self.root))
-        self.assertFalse(port_up(self.db_port))
-
-    def test_mutant_skip_startup_seconds_validation_accepts_invalid_value(self):
-        """Mutant: falling back silently to default on invalid dolt_startup_seconds bypasses refusal."""
-        self.write_deployment(dolt_startup_seconds='not-a-number')
-        with self.assertRaises(ValueError):
-            office_dolt.dolt_startup_seconds(admin.config(self.root))
-        with mock.patch.object(office_dolt, 'dolt_startup_seconds', return_value=30):
-            with admin.temporary_office_dolt(self.root, holds_office_lock=False):
-                self.assertTrue(office_service._database_ready(self.root))
-
-    def test_mutant_keep_passwords_in_dolt_env_breaks_dolt_startup(self):
-        """Mutant: failing to strip DOLT_CLI_PASSWORD/BEADS_DOLT_PASSWORD causes dolt sql-server to exit 17."""
-        with admin.temporary_office_dolt(self.root, holds_office_lock=False):
-            self.assertTrue(office_service._database_ready(self.root))
-        with mock.patch.object(office_dolt, 'db_server_env', side_effect=lambda env: dict(env)):
-            with self.assertRaises(ValueError) as exc:
-                with admin.temporary_office_dolt(self.root, holds_office_lock=False):
-                    pass
-        self.assertIn('exited with status 17', str(exc.exception))
-
-    def test_mutant_skip_pdeathsig_leaves_dolt_alive_after_sigkill(self):
-        """Mutant: spawning without preexec_fn=after_fork leaves Dolt alive after parent SIGKILL."""
-        helper = self.base / 'spawn_without_pdeathsig.py'
-        pid_out = self.base / 'orphan-dolt.pid'
-        helper.write_text('''import os, subprocess, sys, time
-sys.path.insert(0, %r)
-import admin, office_dolt
-from pathlib import Path
-root = Path(%r)
-db_env = office_dolt.db_server_env(admin.environment(root))
-cmd = [str(p) for p in office_dolt.dolt_command(root)]
-child = subprocess.Popen(cmd, cwd=str(root), env=db_env, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-Path(%r).write_text(str(child.pid), encoding='utf-8')
-time.sleep(30)
-''' % (str(KIT), str(self.root), str(pid_out)), encoding='utf-8')
-        proc = subprocess.Popen([sys.executable, str(helper)])
+        proc = subprocess.Popen(
+            [sys.executable, str(KIT / 'office_service.py'), 'run',
+             '--root', str(self.root), '--port', str(self.web_port),
+             '--logs', str(self.logs), '--config', str(self.config)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
         self.addCleanup(self.stop_proc, proc)
-        self.assertTrue(wait_for(lambda: pid_out.is_file() and port_up(self.db_port), timeout=10))
-        orphan_pid = int(pid_out.read_text(encoding='utf-8').strip())
-        self.addCleanup(kill_pid, orphan_pid)
-        os.kill(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=5)
-        time.sleep(0.4)
-        self.assertTrue(pid_alive(orphan_pid), 'without PR_SET_PDEATHSIG, Dolt survives parent SIGKILL')
-        kill_pid(orphan_pid)
+        _, stderr = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn(secret, stderr)
+        self.assertNotIn('Secr3t', stderr)
+        self.assertNotIn('ALTER USER', stderr)
+        for log_file in self.logs.glob('*'):
+            text = log_file.read_text(encoding='utf-8', errors='replace')
+            self.assertNotIn(secret, text)
+            self.assertNotIn('Secr3t', text)
 
-    def test_mutant_stop_dolt_after_http_restore_leaves_dolt_up_during_http_write(self):
-        """Mutant: keeping temporary Dolt open across restore_http_state fails the 'Dolt stopped before HTTP restore' invariant."""
-        dolt_during_http = []
-        with admin.temporary_office_dolt(self.root, holds_office_lock=False):
-            dolt_during_http.append(port_up(self.db_port))
-        self.assertEqual(dolt_during_http, [True])
+    def test_pin_sigterm_during_startup_wait_stops_temporary_dolt_and_cleans_log(self):
+        """SHOULD-3 (R1, CLI): SIGTERM during the startup wait exits 143, stops Dolt, and cleans temp log."""
+        self.write_deployment(dolt_startup_seconds=30)
+        self.set_fake_dolt_behavior(server_mode='hang')
+        proc = subprocess.Popen(
+            [sys.executable, str(KIT / 'admin.py'), '--root', str(self.root),
+             'restore-new', 'src', 'dstwaitterm', '--restore-http-state', '--credentials', 'keep'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
+        self.addCleanup(self.stop_proc, proc)
+        self.assertTrue(wait_for(lambda: (self.root / 'fake-dolt.pid').is_file()
+                                 and bool(list(self.root.glob('.restore-dolt-*.log'))), timeout=15),
+                        'restore-new did not enter startup wait')
+        dolt_pid = int((self.root / 'fake-dolt.pid').read_text(encoding='utf-8').strip())
+        self.addCleanup(kill_pid, dolt_pid)
+        proc.terminate()
+        proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 143)
+        self.assertTrue(wait_for(lambda: not pid_alive(dolt_pid), timeout=8))
+        self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+
+    def test_pin_direct_temporary_office_dolt_startup_wait_is_signal_guarded(self):
+        """SHOULD-3 (R1, direct): calling temporary_office_dolt directly guards SIGTERM during startup wait."""
+        self.write_deployment(dolt_startup_seconds=30)
+        self.set_fake_dolt_behavior(server_mode='hang')
+        runner = self.base / 'run_direct_wait.py'
+        runner.write_text('''import sys
+from pathlib import Path
+sys.path.insert(0, %r)
+import admin
+try:
+    with admin.temporary_office_dolt(Path(%r), holds_office_lock=False):
+        pass
+except admin.TerminatedBySignal as exc:
+    sys.exit(128 + exc.signum)
+''' % (str(KIT), str(self.root)), encoding='utf-8')
+        proc = subprocess.Popen(
+            [sys.executable, str(runner)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
+        self.addCleanup(self.stop_proc, proc)
+        self.assertTrue(wait_for(lambda: (self.root / 'fake-dolt.pid').is_file()
+                                 and bool(list(self.root.glob('.restore-dolt-*.log'))), timeout=15),
+                        'direct temporary_office_dolt did not enter startup wait')
+        dolt_pid = int((self.root / 'fake-dolt.pid').read_text(encoding='utf-8').strip())
+        self.addCleanup(kill_pid, dolt_pid)
+        proc.terminate()
+        proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 143)
+        self.assertTrue(wait_for(lambda: not pid_alive(dolt_pid), timeout=8))
+        self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+
+    def test_pin_supervisor_honors_dolt_startup_seconds(self):
+        """SHOULD-3 (R3): office_service.py run honors dolt_startup_seconds rather than hardcoded 30 s."""
+        self.write_deployment(dolt_startup_seconds=2)
+        self.set_fake_dolt_behavior(server_mode='hang')
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            [sys.executable, str(KIT / 'office_service.py'), 'run',
+             '--root', str(self.root), '--port', str(self.web_port),
+             '--logs', str(self.logs), '--config', str(self.config)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+        )
+        self.addCleanup(self.stop_proc, proc)
+        _, stderr = proc.communicate(timeout=15)
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 1)
+        self.assertLess(elapsed, 10.0, 'supervisor did not honor dolt_startup_seconds=2 (elapsed=%.2fs)' % elapsed)
+        self.assertIn('within 2 seconds', stderr)
+        starts = self.read_starts()
+        self.assertEqual(len(starts), 1)
+        self.assertFalse(pid_alive(starts[0]['pid']))
+
+    def test_pin_restore_http_state_reuses_hand_started_dolt_and_leaves_it_running(self):
+        """NOTE-7 (R2b): --restore-http-state reuses an already-running hand-started Dolt without spawning another."""
+        db_env = office_dolt.db_server_env(admin.environment(self.root))
+        external_log = self.base / 'hand-dolt.log'
+        external = office_dolt.spawn_process(
+            office_dolt.dolt_command(self.root), self.root, external_log, db_env)
+        self.addCleanup(office_dolt.stop_process, external, time.monotonic() + 5)
+        self.assertTrue(wait_for(lambda: office_service._database_ready(self.root), timeout=10))
+        starts_before = len(self.read_starts())
+
+        with mock.patch.object(admin, 'add_project', side_effect=self.make_fake_add()), \
+                mock.patch.object(admin, 'native_restore', return_value='restored'), \
+                mock.patch.object(admin, 'finish_restore', return_value=None):
+            code, _, err = self.run_cli(
+                'restore-new', 'src', 'dstreuse',
+                '--restore-http-state', '--credentials', 'keep',
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.read_starts()), starts_before, 'must reuse hand-started Dolt without spawning a second one')
+        self.assertTrue(pid_alive(external.pid), 'hand-started Dolt must remain running after restore-new')
+        self.assertTrue(office_service._database_ready(self.root))
+        office_dolt.stop_process(external, time.monotonic() + 5)
+
+    def test_pin_never_run_runtime_refused_before_spawn_without_touching_data(self):
+        """NOTE-1: a prepared, never-run runtime (missing privileges.db) is refused before spawning Dolt."""
+        priv = self.root / 'data' / '.doltcfg' / 'privileges.db'
+        priv.unlink()
+        (self.root / 'data' / '.doltcfg').rmdir()
+        before_data = sorted(str(p.relative_to(self.root / 'data')) for p in (self.root / 'data').rglob('*'))
+
+        code, _, err = self.run_cli('restore-new', 'src', 'dstneverrun',
+                                    '--restore-http-state', '--credentials', 'keep')
+        self.assertEqual(code, 1)
+        self.assertIn('privileges.db', err)
+        self.assertIn('Start the office service once, stop it, then run restore-new again.', err)
+        self.assertIn('Nothing was changed.', err)
+        self.assertEqual(self.read_starts(), [], 'must not spawn Dolt in a never-run runtime')
+        after_data = sorted(str(p.relative_to(self.root / 'data')) for p in (self.root / 'data').rglob('*'))
+        self.assertEqual(after_data, before_data)
+        self.assertFalse((self.root / 'projects' / 'dstneverrun').exists())
+
+    def test_pin_prctl_unavailable_gives_one_line_refusal_no_traceback(self):
+        """NOTE-2: missing or ENOSYS prctl gives a one-line refusal with 'Nothing was changed.' and no traceback."""
+        import errno
+        for err_obj in (OSError(errno.ENOSYS, 'PR_SET_PDEATHSIG failed'), AttributeError('undefined symbol: prctl')):
+            with self.subTest(error=type(err_obj).__name__):
+                with mock.patch.object(office_dolt, 'after_fork', side_effect=err_obj):
+                    code, _, err = self.run_cli('restore-new', 'src', 'dstnoprctl')
+                self.assertEqual(code, 1)
+                self.assertIn('PR_SET_PDEATHSIG', err)
+                self.assertIn('Nothing was changed.', err)
+                self.assertNotIn('Traceback', err)
+                self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+                self.assertFalse((self.root / 'projects' / 'dstnoprctl').exists())
+
+    def test_pin_stale_restore_log_and_dead_socket_cleaned_on_next_run(self):
+        """NOTE-3: stale .restore-dolt-*.log and dead mysql.sock from a prior SIGKILL are cleaned on the next run."""
+        stale_log = self.root / '.restore-dolt-stale123.log'
+        stale_log.write_text('old crash log\n', encoding='utf-8')
+        sock_path = self.root / 'mysql.sock'
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(str(sock_path))
+        s.close()
+        self.assertTrue(sock_path.exists())
+
+        with mock.patch.object(admin, 'add_project', side_effect=self.make_fake_add()), \
+                mock.patch.object(admin, 'native_restore', return_value='restored'), \
+                mock.patch.object(admin, 'finish_restore', return_value=None):
+            code, _, err = self.run_cli('restore-new', 'src', 'dstclean')
+        self.assertEqual(code, 0, err)
+        self.assertFalse(stale_log.exists(), 'stale .restore-dolt-*.log should be cleaned up')
+        self.assertFalse(sock_path.exists(), 'dead mysql.sock should be cleaned up')
+
+    def test_pin_existing_dolt_auth_refusal_refuses_without_spawning(self):
+        """SHOULD-3 (R8): existing Dolt refusing root with real Dolt 2.2.0 text refuses without spawning."""
+        self.set_fake_dolt_behavior(server_mode='normal', expected_password='other-root-password')
+        db_env = office_dolt.db_server_env(admin.environment(self.root))
+        external = office_dolt.spawn_process(
+            office_dolt.dolt_command(self.root), self.root, self.base / 'ext-auth.log', db_env)
+        self.addCleanup(office_dolt.stop_process, external, time.monotonic() + 5)
+        self.assertTrue(wait_for(lambda: port_up(self.db_port), timeout=10))
+        starts_before = len(self.read_starts())
+
+        code, _, err = self.run_cli('restore-new', 'src', 'dstextauth')
+        self.assertEqual(code, 1)
+        self.assertIn('refused the root connection', err)
+        self.assertIn('Nothing was changed.', err)
+        self.assertEqual(len(self.read_starts()), starts_before)
+        self.assertTrue(pid_alive(external.pid))
+        office_dolt.stop_process(external, time.monotonic() + 5)
+
+    def test_pin_temporary_dolt_early_exit_refuses_immediately_with_status_and_log(self):
+        """SHOULD-3 (R14): temporary Dolt exiting during startup refuses immediately with status and log tail."""
+        self.write_deployment(dolt_startup_seconds=15)
+        self.set_fake_dolt_behavior(server_mode='exit_early', exit_code=11,
+                                    stderr_message='fatal: database demo is locked by another dolt process\n')
+        started = time.monotonic()
+        code, _, err = self.run_cli('restore-new', 'src', 'dstearlypin')
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, 1)
+        self.assertLess(elapsed, 6.0, 'early exit must not wait out dolt_startup_seconds')
+        self.assertIn('exited with status 11', err)
+        self.assertIn('locked by another dolt process', err)
+        self.assertIn('Nothing was changed.', err)
+        self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+
+    def test_pin_temporary_dolt_not_ready_in_time_refuses_and_stops_child(self):
+        """SHOULD-3 (R15): temporary Dolt that never becomes ready refuses after dolt_startup_seconds and stops child."""
+        self.write_deployment(dolt_startup_seconds=1)
+        self.set_fake_dolt_behavior(server_mode='hang', stderr_message='still opening table\n')
+        code, _, err = self.run_cli('restore-new', 'src', 'dstnotreadypin')
+        self.assertEqual(code, 1)
+        self.assertIn('within 1 seconds', err)
+        self.assertIn('still opening table', err)
+        self.assertIn('Nothing was changed.', err)
+        starts = self.read_starts()
+        self.assertEqual(len(starts), 1)
+        self.assertFalse(pid_alive(starts[0]['pid']))
+        self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+
+    def test_pin_office_service_uses_shared_dolt_command(self):
+        """NOTE-5: office_service.py uses office_dolt.dolt_command instead of duplicating sql-server argv."""
+        src = (KIT / 'office_service.py').read_text(encoding='utf-8')
+        self.assertIn('office_dolt.dolt_command(', src)
+        self.assertNotIn("'sql-server', '--config'", src)
 
 
 if __name__ == '__main__':

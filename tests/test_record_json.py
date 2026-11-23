@@ -329,6 +329,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # set, and the guard bounds its nesting before it is parsed.
             # endpoint.py (kittrial-5bb.384): the framed task-file header line, and the request text read
             # whole (the same guarded parse the old reader made, now in two places: a pipe and a text stream).
+            # kittrial-5bb.520 r2: office_dolt.py reads server.json for cfg_dir/data_dir (privileges.db)
+            # and listener.socket (stale Unix socket cleanup) through the guard.
+            'office_dolt.py': 1,
             'task_files.py': 9,
             'artifacts.py': 1, 'briefing.py': 4, 'coordination.py': 4, 'endpoint.py': 17,
             'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,

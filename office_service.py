@@ -653,8 +653,8 @@ def run(root, logs, config, port, stop_seconds):
         try:
             env = admin.environment(root)
             db_env = office_dolt.db_server_env(env)
-            db = _spawn([root/'bin/dolt', 'sql-server', '--config', root/'server.json'],
-                        root, logs/'dolt.log', db_env)
+            office_dolt.cleanup_stale_socket(root)
+            db = _spawn(office_dolt.dolt_command(root), root, logs/'dolt.log', db_env)
             until = time.monotonic() + startup_seconds
             ready = False
             while time.monotonic() < until and not stop:
@@ -720,7 +720,7 @@ def main(argv=None):
             if not args.config or not args.logs:
                 parser.error('run requires --config and --logs')
             run(root, args.logs, args.config, args.port, args.stop_seconds)
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print('office-service: %s' % error, file=sys.stderr)
         return 1
     return 0
