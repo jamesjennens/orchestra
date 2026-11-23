@@ -64,11 +64,12 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(answer['stderr'], 'PermissionError: %s\n' % closed)        # the line it always was, for the log
         self.assertEqual(self.answer(IsADirectoryError(21, 'Is a directory', marker))['fault'], 'configuration')
         self.assertEqual(self.answer(FileNotFoundError(2, 'No such file or directory', marker))['fault'], 'configuration')
-        # Another file, an error that names none, and a lock wait are what they were.
-        self.assertNotIn('fault', self.answer(PermissionError(13, 'Permission denied', '/srv/rt/projects/pp/views')))
-        self.assertNotIn('fault', self.answer(PermissionError(13, 'Permission denied', marker + '.lock')))
-        self.assertNotIn('fault', self.answer(OSError('disk')))
-        self.assertNotIn('fault', self.answer(OSError(9, 'Bad file descriptor', 7)))
+        # Another file or an escaping OSError carries fault 'os-error' (kittrial-5bb.570 r8/r9) so HTTP
+        # redacts host paths only on real OS errors; a lock wait still returns 75.
+        self.assertEqual(self.answer(PermissionError(13, 'Permission denied', '/srv/rt/projects/pp/views')).get('fault'), 'os-error')
+        self.assertEqual(self.answer(PermissionError(13, 'Permission denied', marker + '.lock')).get('fault'), 'os-error')
+        self.assertEqual(self.answer(OSError('disk')).get('fault'), 'os-error')
+        self.assertEqual(self.answer(OSError(9, 'Bad file descriptor', 7)).get('fault'), 'os-error')
         self.assertEqual(self.answer(TimeoutError(110, 'Timed out', marker))['returncode'], 75)
 
     def project(self, tmp, configuration):

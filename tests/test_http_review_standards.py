@@ -354,6 +354,8 @@ class FastRealEndpointBackend(http_service.EndpointBackend):
                 )
             except Exception as exc:
                 ans = {'returncode': 2, 'stdout': '', 'stderr': '%s: %s\n' % (type(exc).__name__, exc)}
+                if isinstance(exc, OSError):
+                    ans['fault'] = 'os-error'
                 if isinstance(exc, rw.CoordinatorRuleRefusal):
                     ans['stderr'] = 'ValueError: %s\n' % exc
                     ans['refused'] = 'coordinator-rule'
@@ -2217,9 +2219,10 @@ class _HttpStandardsMixin:
             else _make_child_spawning_slow_git(self.tmp, pid_log, slow_subcmd='unbundle')
         )
         spawned_pids = []
+        unbundle_elapsed_warn = []
         try:
             with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
-                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0)), \
+                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0, unbundle_elapsed_warn)), \
                  mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 1.0):
                 r_warn = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid1), {
                     'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-warn-ok',
@@ -2227,6 +2230,9 @@ class _HttpStandardsMixin:
                     'summary': 'Plain warn-mode approve under slow unbundle.',
                 }, token=olga_tok, headers={'Idempotency-Key': 'idem-r6-warn-ok'})
             self.assertEqual(201, r_warn.status, r_warn.data)
+            self.assertGreaterEqual(len(unbundle_elapsed_warn), 1)
+            for dt in unbundle_elapsed_warn:
+                self.assertLess(dt, 4.0, 'HTTP warn unbundle kill exceeded 1.0 + 2.0 + 1.0 s bound: %.3fs' % dt)
             self.assertTrue(r_warn.data['sign_off']['git_inspection_timed_out'])
             self.assertEqual('diff_unverified', r_warn.data['sign_off']['diff_status'])
             self.assertEqual(
@@ -2266,9 +2272,10 @@ class _HttpStandardsMixin:
             else _make_child_spawning_slow_git(self.tmp, pid_log_block, slow_subcmd='unbundle')
         )
         spawned_pids2 = []
+        unbundle_elapsed_block = []
         try:
             with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git_block), \
-                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0)), \
+                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0, unbundle_elapsed_block)), \
                  mock.patch.object(rs, 'BUNDLE_INSPECT_MAX_SECONDS', 1.0):
                 r_blk_missing = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (pid, tid2), {
                     'schema_version': 1, 'operation': 'approve', 'operation_id': 'op-r6-blk-missing',
@@ -2286,6 +2293,9 @@ class _HttpStandardsMixin:
                 }, token=oscar_tok, headers={'Idempotency-Key': 'idem-r6-blk-cite-retry'})
                 self.assertEqual(503, r_blk_cite.status, r_blk_cite.data)
                 self.assertIn(rs.refusal_git_inspection_timeout(commit2), r_blk_cite.data['error']['message'])
+            self.assertGreaterEqual(len(unbundle_elapsed_block), 2)
+            for dt in unbundle_elapsed_block:
+                self.assertLess(dt, 4.0, 'HTTP block unbundle kill exceeded 1.0 + 2.0 + 1.0 s bound: %.3fs' % dt)
             self.assertTrue(pid_log_block.exists(), 'slow git unbundle never spawned a child helper in block section')
             spawned_pids2 = [int(x) for x in pid_log_block.read_text(encoding='utf-8').splitlines() if x.strip()]
             self.assertGreaterEqual(len(spawned_pids2), 2)

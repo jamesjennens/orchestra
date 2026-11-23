@@ -981,6 +981,8 @@ def main():
             answer = dispatch(canonical, request, tmp, run_callable)
     except Exception as error:  # noqa: BLE001 - report, never traceback
         answer = envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
+        if isinstance(error, OSError):
+            answer['fault'] = 'os-error'
         try:
             from review_workflow import SameCommitChangesRequested
         except ImportError:

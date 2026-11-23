@@ -340,14 +340,20 @@ def _make_wrapper_spawned_slow_git(work_dir, pid_log_path, slow_subcmd='unbundle
     return str(wrapper)
 
 
-def _run_git_with_unbundle_deadline(real_run, budget):
-    """opusrev r7 TRIAL (n3e): only `bundle unbundle` gets a deadline, and a fresh one, so no step before it can use
-    up the budget; the code under test (run_confined_git's kill on timeout) is unchanged."""
+def _run_git_with_unbundle_deadline(real_run, budget, elapsed_log=None):
+    """opusrev r7 TRIAL (n3e) + r9 kill-bound: only `bundle unbundle` gets a deadline, and a fresh one,
+    so no step before it can use up the budget; records elapsed time (kill included) for each unbundle call."""
     def run(args, **kw):
-        if 'unbundle' in [str(a) for a in args]:
+        is_unbundle = 'unbundle' in [str(a) for a in args]
+        if is_unbundle:
             kw['deadline'] = time.monotonic() + budget
-        else:
-            kw['deadline'] = None
+            t_start = time.monotonic()
+            try:
+                return real_run(args, **kw)
+            finally:
+                if elapsed_log is not None:
+                    elapsed_log.append(time.monotonic() - t_start)
+        kw['deadline'] = None
         return real_run(args, **kw)
     return run
 
@@ -4102,11 +4108,11 @@ class PortableReviewStandardsUnitTests(unittest.TestCase):
         fake_git = _make_wrapper_spawned_slow_git(self.base, pid_log, slow_subcmd='unbundle') if os.name != 'nt' \
             else _make_child_spawning_slow_git(self.base, pid_log, slow_subcmd='unbundle')
         spawned = []
+        unbundle_elapsed = []
         try:
             with mock.patch.object(rs, 'GIT_EXECUTABLE', fake_git), \
-                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0)):
+                 mock.patch.object(rs, 'run_confined_git', _run_git_with_unbundle_deadline(rs.run_confined_git, 1.0, unbundle_elapsed)):
                 for _ in range(3):
-                    t0 = time.monotonic()
                     to_obs = rs.inspect_delivery_git(
                         {'commit': bcommit, 'delivery': {'kind': 'bundle', 'path': _bundle_delivery_path(bpath), 'sha256': bsha}},
                         delivery_roots=[str(bpath.parent)],
@@ -4116,6 +4122,9 @@ class PortableReviewStandardsUnitTests(unittest.TestCase):
                     )
                     self.assertTrue(to_obs['inspect_timed_out'])
                     self.assertFalse(to_obs['tree_available'])
+            self.assertEqual(3, len(unbundle_elapsed), unbundle_elapsed)
+            for dt in unbundle_elapsed:
+                self.assertLess(dt, 4.0, 'timed-out unbundle kill exceeded 1.0 + 2.0 + 1.0 s bound: %.3fs' % dt)
             self.assertTrue(pid_log.exists(), 'slow git unbundle never spawned a child helper')
             spawned = [int(x) for x in pid_log.read_text(encoding='utf-8').splitlines() if x.strip()]
             self.assertEqual(3, len(spawned), spawned)
