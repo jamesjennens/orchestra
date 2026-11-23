@@ -328,8 +328,8 @@ def bootstrap_database(root, cfg, env):
     return database_ready(root, cfg, env)
 
 
-def _collapse_diagnostic(text, max_chars, keep_tail=False):
-    """Sanitize control characters to single spaces and bound output length."""
+def _normalize_diagnostic_line(text):
+    """Sanitize control characters to single spaces."""
     cleaned = []
     space = False
     for ch in text:
@@ -341,7 +341,12 @@ def _collapse_diagnostic(text, max_chars, keep_tail=False):
         else:
             cleaned.append(ch)
             space = False
-    result = ''.join(cleaned).strip()
+    return ''.join(cleaned).strip()
+
+
+def _collapse_diagnostic(text, max_chars, keep_tail=False):
+    """Sanitize control characters to single spaces and bound output length."""
+    result = _normalize_diagnostic_line(text)
     if len(result) > max_chars:
         if max_chars <= 3:
             return result[-max_chars:] if keep_tail else result[:max_chars]
@@ -353,7 +358,13 @@ def _collapse_diagnostic(text, max_chars, keep_tail=False):
 
 def format_error_detail(exc, max_chars=240):
     """Format an exception message as one bounded line without a trailing period."""
-    text = _collapse_diagnostic(str(exc), max_chars, keep_tail=False).rstrip('.')
+    text = _normalize_diagnostic_line(str(exc)).rstrip('.')
+    if len(text) > max_chars:
+        marker = ' [truncated]'
+        if max_chars <= len(marker):
+            text = text[:max_chars].rstrip('.')
+        else:
+            text = text[:max_chars - len(marker)].rstrip(' .') + marker
     return text or type(exc).__name__
 
 

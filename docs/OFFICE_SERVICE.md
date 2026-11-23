@@ -784,9 +784,10 @@ on a stopped `office-foreground` runtime using the same spawn, parent-death
 `deployment.private.json`, default 30 s, valid 1–600 — the same setting also
 governs `office_service.py run`, and an invalid value refuses to start), and
 stops the temporary Dolt before restoring HTTP state and on any failure,
-`SIGTERM`, or `SIGINT` (if `SIGTERM` or `SIGINT` arrives during Dolt shutdown
+`SIGTERM`, or `SIGINT` (if one `SIGTERM` or Ctrl-C arrives during Dolt shutdown
 after the project is restored, it finishes stopping Dolt and prints a notice
-that HTTP state was not restored; `SIGKILL` or `SIGHUP` cannot run cleanup, so
+that HTTP state was not restored; a second signal stops waiting and leaves Dolt
+to `PR_SET_PDEATHSIG` (`SIGKILL`); `SIGKILL` or `SIGHUP` cannot run cleanup, so
 the kernel's `PR_SET_PDEATHSIG` sends `SIGKILL` to Dolt, leaving any
 `.restore-dolt-*.log`, dead `mysql.sock`, and `data/.dolt/sql-server.info`
 behind — `office_service.py run` removes stale `.restore-dolt-*.log` files and

@@ -12871,8 +12871,30 @@ def _main():
                               'was being stopped (%s).'
                               %(args.destination,stop_reason),
                               file=sys.stderr)
-                    end_warnings=[text for text in (warning,getattr(args,'task_files_warning',None)) if text]
-                    for text in end_warnings:
+                    end_notes=[]
+                    noted=restore_degraded_note(root,args.project,args.destination)
+                    if noted:
+                        end_notes.append(noted)
+                    if getattr(args,'native_only',None) is not None:
+                        end_notes.append(native_only_note(root,args,args.native_only))
+                    elif getattr(args,'flag_had_nothing',False):
+                        end_notes.append(
+                            '--without-coordination: this backup has no coordination sidecar at all, so there was '
+                            'nothing to leave out; it was restored as a legacy backup, exactly as without the flag.'
+                        )
+                    if warning:
+                        stop_warning=warning
+                        if stop_warning.startswith('WARNING: the restore is complete, '):
+                            stop_warning='WARNING: the project was restored, '+stop_warning[len('WARNING: the restore is complete, '):]
+                        exit_tail=('restore-new exits %d: the restore is complete, but the authority above was NOT re-granted.'
+                                   %RESTORE_AUTHORITY_NOT_REGRANTED)
+                        if stop_warning.endswith(exit_tail):
+                            stop_warning=stop_warning[:-len(exit_tail)]+'restore-new was stopped; the authority above was NOT re-granted.'
+                        end_notes.append(stop_warning)
+                    files_warning=getattr(args,'task_files_warning',None)
+                    if files_warning:
+                        end_notes.append(files_warning)
+                    for text in end_notes:
                         print(text,file=sys.stderr)
                 raise
             # Still under the office lock (F3): the state is written once the project has restored

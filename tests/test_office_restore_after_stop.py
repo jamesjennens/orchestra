@@ -1014,12 +1014,46 @@ except admin.TerminatedBySignal as exc:
                 self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
                 self.assertFalse((self.root / 'projects' / 'dstspawnerr').exists())
 
+        # r4 NOTE-C: an overlong spawn OSError (>240 chars) preserves a clear [truncated] marker without '..'.
+        long_path = '/home/beads/' + ('x' * 310) + '/.restore-dolt-x.log'
+        long_err = PermissionError(errno.EACCES, 'Permission denied', long_path)
+        with mock.patch.object(office_dolt, 'spawn_process', side_effect=long_err):
+            code, _, err = self.run_cli('restore-new', 'src', 'dstspawnlong')
+        self.assertEqual(code, 1)
+        self.assertIn('[truncated]. Nothing was changed.', err.strip())
+        self.assertNotIn('PR_SET_PDEATHSIG', err)
+        self.assertNotIn('last probe:', err)
+        self.assertNotIn('..', err)
+        self.assertLessEqual(len(office_dolt.format_error_detail(long_err, max_chars=240)), 240)
+        self.assertTrue(office_dolt.format_error_detail(long_err, max_chars=240).endswith(' [truncated]'))
+
     def test_pin_sigint_during_temporary_dolt_stop_names_sigint_and_keeps_warnings(self):
-        """r3 NOTE-C & NOTE-G: Ctrl-C during temporary Dolt stop names (SIGINT), never (), and repeats end-of-run warnings."""
+        """r3/r4 NOTE-C, NOTE-G, NOTE-A, NOTE-E: Ctrl-C during Dolt stop names (SIGINT), rewrites exit-3 authority text, and keeps end notes."""
         self.set_fake_dolt_behavior(ignore_sigterm_seconds=3.5)
         before_http = self.state_path.read_bytes()
+        # Plant a valid degraded backup-status.json to also pin NOTE-E (restore_degraded_note kept in stop window).
+        backup_status = self.root / 'backups' / 'backup-status.json'
+        old_backup_status = backup_status.read_bytes() if backup_status.exists() else None
+        stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        admin.write_backup_status(
+            self.root,
+            admin.backup_status_record(
+                [{'name': 'src', 'status': 'complete', 'completed_at': stamp,
+                  'degraded': 'task-files checksum mismatch in backup'}],
+                'named', stamp,
+            ),
+        )
+        def restore_backup_status():
+            if old_backup_status is None:
+                if backup_status.exists():
+                    backup_status.unlink()
+            else:
+                backup_status.write_bytes(old_backup_status)
+        self.addCleanup(restore_backup_status)
+
         runner = self.base / 'run_sigint_stop.py'
         runner.write_text('''import sys
+from pathlib import Path
 from unittest import mock
 sys.path.insert(0, %r)
 import admin
@@ -1029,7 +1063,7 @@ def fake_add(r, name, **kw):
     return {'project': name, 'database': name, 'prefix': name}
 def fake_finish(r, args, snapshot, step):
     args.task_files_warning = 'task files of dstsigint: mismatch warning'
-    return 'Authority was NOT re-granted warning'
+    return admin.authority_not_regranted(Path(r), 'src', ['alice'], [], actor='op1', reason='restore')
 sys.argv = ['admin.py', '--root', root, 'restore-new', 'src', 'dstsigint',
             '--restore-http-state', '--credentials', 'keep']
 with mock.patch.object(admin, 'add_project', side_effect=fake_add), \\
@@ -1061,12 +1095,20 @@ with mock.patch.object(admin, 'add_project', side_effect=fake_add), \\
         )
         err_lines = err.strip().splitlines()
         self.assertEqual(err_lines[0], expected_notice)
-        self.assertIn('Authority was NOT re-granted warning', err_lines)
+        self.assertIn('task-files checksum mismatch in backup', err)
+        self.assertIn('WARNING: the project was restored, but deployment authority the backup records was NOT re-granted:', err)
+        self.assertIn('restore-new was stopped; the authority above was NOT re-granted.', err_lines)
+        self.assertNotIn('restore-new exits 3', err)
+        self.assertNotIn('the restore is complete', err)
+        self.assertIn('backup-authority src', err)
         self.assertIn('task files of dstsigint: mismatch warning', err_lines)
         self.assertNotIn('()', err)
         self.assertEqual(self.state_path.read_bytes(), before_http)
         self.assertTrue(wait_for(lambda: not pid_alive(dolt_pid), timeout=8))
         self.assertEqual(list(self.root.glob('.restore-dolt-*.log')), [])
+
+        # Clear degraded backup-status before plain restore-new check so expected stderr is exact.
+        restore_backup_status()
 
         # Plain restore-new (without --restore-http-state) on SIGINT during Dolt stop
         (self.root / 'fake-dolt-sigterm.flag').unlink()
@@ -1104,6 +1146,80 @@ with mock.patch.object(admin, 'add_project', side_effect=fake_add), \\
         )
         self.assertNotIn('()', err2)
         self.assertTrue(wait_for(lambda: not pid_alive(dolt_pid2), timeout=8))
+
+    def test_pin_cleanup_stale_restore_logs_keeps_symlinks_dirs_subfolders_and_other_logs(self):
+        """r4 SHOULD-1 (C1, C1b, C2, C2b): cleanup_stale_restore_logs removes only regular root .restore-dolt-*.log files."""
+        sandbox = self.base / 'cleanup-sandbox'
+        outside = sandbox / 'outside'
+        rt = sandbox / 'rt'
+        outside.mkdir(parents=True)
+        rt.mkdir(parents=True)
+
+        outside_target = outside / 'target.txt'
+        outside_target.write_text('outside-secret\n', encoding='utf-8')
+        inside_target = rt / 'inside.txt'
+        inside_target.write_text('inside-keep\n', encoding='utf-8')
+
+        reg_stale = rt / '.restore-dolt-old.log'
+        reg_stale.write_text('stale\n', encoding='utf-8')
+        outside_link = rt / '.restore-dolt-outlink.log'
+        outside_link.symlink_to(outside_target)
+        inside_link = rt / '.restore-dolt-inlink.log'
+        inside_link.symlink_to('inside.txt')
+
+        matching_dir = rt / '.restore-dolt-dir.log'
+        matching_dir.mkdir()
+        dir_inner = matching_dir / '.restore-dolt-inner.log'
+        dir_inner.write_text('inner\n', encoding='utf-8')
+
+        sub = rt / 'sub'
+        sub.mkdir()
+        sub_file = sub / '.restore-dolt-sub.log'
+        sub_file.write_text('sub\n', encoding='utf-8')
+
+        notes_log = rt / 'notes.log'
+        notes_log.write_text('notes\n', encoding='utf-8')
+        dolt_log = rt / 'dolt.log'
+        dolt_log.write_text('dolt\n', encoding='utf-8')
+        plain_name = rt / 'restore-dolt-x.log'
+        plain_name.write_text('plain\n', encoding='utf-8')
+
+        removed = office_dolt.cleanup_stale_restore_logs(rt)
+        self.assertEqual(removed, 1)
+        self.assertFalse(reg_stale.exists(), 'regular root .restore-dolt-*.log must be removed')
+        self.assertTrue(outside_link.is_symlink(), 'symlink to outside file must stay (C1b)')
+        self.assertTrue(outside_target.is_file(), 'outside symlink target must not be deleted (C1)')
+        self.assertEqual(outside_target.read_text(encoding='utf-8'), 'outside-secret\n')
+        self.assertTrue(inside_link.is_symlink(), 'relative symlink must stay (C1b)')
+        self.assertTrue(inside_target.is_file(), 'inside symlink target must stay (C1)')
+        self.assertEqual(inside_target.read_text(encoding='utf-8'), 'inside-keep\n')
+        self.assertTrue(matching_dir.is_dir(), 'directory with matching name must stay')
+        self.assertTrue(dir_inner.is_file(), 'file inside matching directory must stay')
+        self.assertTrue(sub_file.is_file(), 'subfolder matching file must stay (C2b)')
+        self.assertTrue(notes_log.is_file(), 'notes.log must stay (C2)')
+        self.assertTrue(dolt_log.is_file(), 'dolt.log must stay (C2)')
+        self.assertTrue(plain_name.is_file(), 'restore-dolt-x.log without leading dot must stay (C2)')
+
+    def test_pin_office_service_run_keeps_live_restore_log_when_lock_held(self):
+        """r4 SHOULD-1 (C3): office_service.py run refuses at office-service.lock before cleaning stale logs."""
+        live_log = self.root / '.restore-dolt-live.log'
+        live_log.write_text('live restore-new temporary dolt log\n', encoding='utf-8')
+        live_inode = live_log.stat().st_ino
+        lock_file = (self.root / 'office-service.lock').open('a')
+        self.addCleanup(lock_file.close)
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        proc = subprocess.run(
+            [sys.executable, str(KIT / 'office_service.py'), 'run',
+             '--root', str(self.root), '--port', str(self.web_port),
+             '--logs', str(self.logs), '--config', str(self.config)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', timeout=15,
+        )
+        self.assertEqual(proc.returncode, 1, 'expected rc 1 when office-service.lock is held, got %r (err=%r)' % (proc.returncode, proc.stderr))
+        self.assertIn('Office service is already running for this runtime', proc.stderr)
+        self.assertTrue(live_log.is_file(), 'live .restore-dolt-*.log must NOT be deleted before lock acquisition (C3)')
+        self.assertEqual(live_log.stat().st_ino, live_inode)
+        self.assertEqual(live_log.read_text(encoding='utf-8'), 'live restore-new temporary dolt log\n')
 
     def test_pin_stale_restore_log_and_dead_socket_cleaned_on_next_run(self):
         """NOTE-3 / r3 SHOULD-1: stale .restore-dolt-*.log and dead mysql.sock are cleaned by both restore-new and office_service.py run."""
