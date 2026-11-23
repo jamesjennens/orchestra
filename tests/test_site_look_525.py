@@ -380,6 +380,12 @@ class FreshStates(unittest.TestCase):
         self.assertEqual('1px dashed var(--line-strong)', self.win('.state', 'border'))
         self.assertEqual('var(--ground)', self.win('.state', 'background', 'background-color'))
 
+    def test_machine_notes_line_wraps_and_clips_overflow(self):
+        # kittrial-5bb.511 r3: a long machine/notes value (Teams link, hostname, or stacked marks)
+        # must wrap inside its card and clip any unbreakable cluster instead of widening the page.
+        self.assertEqual('anywhere', self.win('[data-machine-notes]', 'overflow-wrap'))
+        self.assertEqual('hidden', self.win('[data-machine-notes]', 'overflow'))
+
 
 def harness_page(theme):
     js = (ROOT / 'web' / 'js').as_uri()
@@ -493,6 +499,30 @@ try {{
   await go('task-plain', '/p/proj_portal/t/task_port007');
   await go('people', '/p/proj_portal/people');
   await go('agents', '/agents');
+  // kittrial-5bb.511 r3 (wrap): long unbreakable notes (Teams link + stacked marks) must stay inside the card.
+  await ctx.api.updateAgent('usr_wren', {{
+    machine: 'build-agent-0001.eu-west-1.compute.internal.example',
+    notes: 'https://teams.microsoft.com/l/meetup-join/19%3ameeting_' + 'a'.repeat(90) + ' ' + 'a' + '\\u20dd'.repeat(60),
+  }});
+  ctx.go('/agents'); await wait(600);
+  const wrenCard = document.querySelector('[data-agent="usr_wren"]');
+  if (wrenCard) wrenCard.querySelectorAll('details').forEach((d) => {{ d.open = true; }});
+  await wait(50);
+  const mnLine = document.querySelector('[data-machine-notes="usr_wren"]');
+  if (mnLine && wrenCard) {{
+    const cs = getComputedStyle(mnLine);
+    out.machineNotesWrap = {{
+      found: true,
+      overflowWrap: cs.overflowWrap,
+      overflow: cs.overflow,
+      lineRight: Math.round(mnLine.getBoundingClientRect().right),
+      cardRight: Math.round(wrenCard.getBoundingClientRect().right),
+      scrollWidth: document.documentElement.scrollWidth,
+      innerWidth: window.innerWidth,
+    }};
+  }} else {{
+    out.machineNotesWrap = {{ found: false }};
+  }}
   await go('reviews', '/p/proj_portal/reviews');
   await go('settings', '/p/proj_portal/settings');
   // slice (e): the three states, rendered by the real helpers inside the app's own main
@@ -569,6 +599,13 @@ class FreshContrastMeasured(unittest.TestCase):
             self.assertEqual({'body': rgb(tokens['surface']), 'rail': rgb(tokens['ground'])}, found['grounds'], page)
         # r2: the Tasks tab names the project (the mock's portal project is "Customer portal")
         self.assertEqual('Tasks · Customer portal · Orchestra', dict(data['pages'])['tasks']['tab'])
+        # kittrial-5bb.511 r3: a long machine/notes value wraps inside its card and never widens the page
+        wrap = data.get('machineNotesWrap') or {}
+        self.assertTrue(wrap.get('found'), wrap)
+        self.assertEqual('anywhere', wrap.get('overflowWrap'), wrap)
+        self.assertEqual('hidden', wrap.get('overflow'), wrap)
+        self.assertLessEqual(wrap['lineRight'], wrap['cardRight'] + 1, wrap)
+        self.assertLessEqual(wrap['scrollWidth'], wrap['innerWidth'], wrap)
         buttons = {page: found['cellButtons'] for page, found in data['pages']}
         self.assertTrue(buttons['settings'], 'the members table has its Remove buttons to measure')
         self.assertEqual([], [(page, b) for page, found in buttons.items() for b in found if b['lines'] > 1])

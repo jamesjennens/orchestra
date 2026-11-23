@@ -212,8 +212,9 @@ class StaticServingCase(StaticHarness):
         for script in (WEB / 'js').rglob('*.js'):
             text = script.read_text(encoding='utf-8')
             self.assertNotIn("setAttribute('style'", text, script)
-            self.assertIsNone(re.search(r'\.innerHTML\s*=|insertAdjacentHTML|eval\(|new Function',
-                                        text), script)
+            self.assertIsNone(re.search(
+                r'\.innerHTML\s*=|insertAdjacentHTML|\beval\(|new Function|createContextualFragment|DOMParser|setHTMLUnsafe',
+                text), script)
 
 
 class StaticConfigurationCase(StaticHarness):

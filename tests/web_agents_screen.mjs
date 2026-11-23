@@ -279,10 +279,39 @@ out.odd = [
   const notesInput = fieldOf(page, 'nt-' + kid);
   out.notesControl = notesInput ? [notesInput.tagName, notesInput.attributes.type || null] : null;
   out.notesHint = (formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-hint')[0] || {}).textContent || null;
+  const toastTexts = (critOnly = false) => document.body.all((e) => {
+    const cls = (e.className || '').split(/\s+/);
+    return cls.includes('toast') && (!critOnly || cls.includes('crit'));
+  }).map((e) => e.textContent);
   let before = sent.length;
   await formOf(page).dispatch('submit');
+  out.unchangedToast = toastTexts().slice(-1)[0] || null;
   await settle();
   out.unchangedSent = sent.length - before;
+  // NOTE-1: tab and NBSP are caught client-side with a message naming the character.
+  const origNotes = fieldOf(page, 'nt-' + kid).value;
+  before = sent.length;
+  fieldOf(page, 'nt-' + kid).value = 'wake\tnow';
+  await formOf(page).dispatch('submit');
+  out.tabError = (formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {}).textContent || null;
+  fieldOf(page, 'nt-' + kid).value = 'wake\u00a0now';
+  await formOf(page).dispatch('submit');
+  out.nbspError = (formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {}).textContent || null;
+  out.forbiddenCharSent = sent.length - before;
+  fieldOf(page, 'nt-' + kid).value = origNotes;
+  // M4c: a refusal other than machine or notes (e.g. invalid folder path) toasts and leaves mc-/nt- errors empty.
+  const origFolder = fieldOf(page, 'wd-' + kid).value;
+  fieldOf(page, 'wd-' + kid).value = 'not-a-path';
+  await formOf(page).dispatch('submit');
+  await settle();
+  const mcErrAfterFolder = formOf(page).all((e) => e.attributes.id === 'mc-' + kid + '-error')[0] || {};
+  const ntErrAfterFolder = formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {};
+  out.folderRefusalToast = toastTexts(true).slice(-1)[0] || null;
+  out.folderRefusalFieldErrors = [
+    [mcErrAfterFolder.textContent || '', Boolean(mcErrAfterFolder.hidden)],
+    [ntErrAfterFolder.textContent || '', Boolean(ntErrAfterFolder.hidden)],
+  ];
+  fieldOf(page, 'wd-' + kid).value = origFolder;
   fieldOf(page, 'mc-' + kid).value = 'tomasz-desk';
   before = sent.length;
   await formOf(page).dispatch('submit');
@@ -311,6 +340,20 @@ out.odd = [
   const ntErr = formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {};
   out.tooLongMachineError = (formOf(page).all((e) => e.attributes.id === 'mc-' + kid + '-error')[0] || {}).textContent || null;
   out.staleNotesErrorAfterMachine = [ntErr.textContent || '', Boolean(ntErr.hidden)];
+  // S2f and S2j: back at the stored values after a machine refusal, Save sends nothing,
+  // clears BOTH mc- and nt- errors, and shows 'Nothing changed'.
+  fieldOf(page, 'mc-' + kid).value = 'tomasz-desk';
+  before = sent.length;
+  await formOf(page).dispatch('submit');
+  out.backToStoredToast = toastTexts().slice(-1)[0] || null;
+  await settle();
+  const mcErrBack = formOf(page).all((e) => e.attributes.id === 'mc-' + kid + '-error')[0] || {};
+  const ntErrBack = formOf(page).all((e) => e.attributes.id === 'nt-' + kid + '-error')[0] || {};
+  out.backToStoredSent = sent.length - before;
+  out.backToStoredErrors = [
+    [mcErrBack.textContent || '', Boolean(mcErrBack.hidden)],
+    [ntErrBack.textContent || '', Boolean(ntErrBack.hidden)],
+  ];
   const admin = await open(who.admin);
   await admin.all((e) => e.attributes['data-mine-choice'] === 'All')[0].dispatch('click');
   await settle();
@@ -350,6 +393,8 @@ out.odd = [
     machineOnly: lineInfo(view.machineNotesLine({ id: 'a', machine: 'box-1', notes: '' })),
     notesOnly: lineInfo(view.machineNotesLine({ id: 'a', machine: null, notes: 'ping me' })),
     bidi: lineInfo(view.machineNotesLine({ id: 'a', machine: '\u202erev', notes: 'real note' })),
+    bidiPdi: lineInfo(view.machineNotesLine({ id: 'a', machine: '\u2069\u202eabc', notes: 'real note' })),
+    invisibleOnly: lineInfo(view.machineNotesLine({ id: 'a', machine: '\u200b\u2060', notes: '\u00ad\u200e' })),
   } : 'not-exported';
 }
 out.sent = sent;

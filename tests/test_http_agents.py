@@ -2289,6 +2289,12 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(['INPUT', 'text'], seen['notesControl'], 'Notes is a single-line text input matching server printable-char rule')
         self.assertEqual('Where it runs and how to wake it', seen['notesHint'])
         self.assertEqual(0, seen['unchangedSent'])
+        self.assertEqual('Nothing changed', seen['unchangedToast'])
+        self.assertEqual(0, seen['forbiddenCharSent'])
+        self.assertIn('tab (U+0009)', seen['tabError'])
+        self.assertIn('non-breaking space (U+00A0)', seen['nbspError'])
+        self.assertIn('working_directory', seen['folderRefusalToast'])
+        self.assertEqual([['', True], ['', True]], seen['folderRefusalFieldErrors'])
         self.assertEqual([{'machine': 'tomasz-desk'}], seen['machineOnlySent'])
         self.assertEqual('Machine: tomasz-desk \u00b7 Notes: <b>wake</b> <img src=x onerror=alert(1)>', seen['markupText'])
         self.assertEqual(0, seen['markupElements'], 'notes are text, never markup')
@@ -2304,6 +2310,9 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('at most 1000', seen['tooLongError'])
         self.assertIn('at most 120', seen['tooLongMachineError'])
         self.assertEqual(['', True], seen['staleNotesErrorAfterMachine'])
+        self.assertEqual(0, seen['backToStoredSent'])
+        self.assertEqual([['', True], ['', True]], seen['backToStoredErrors'])
+        self.assertEqual('Nothing changed', seen['backToStoredToast'])
         self.assertEqual([False, False], seen['adminMachineNotes'])
         self.assertEqual(0, seen['adminMachineFields'])
         self.assertEqual('Change folder', seen['adminFolderSummary'])
@@ -2319,7 +2328,11 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(('Machine: box-1', ['BDI']), (edge['machineOnly']['text'], edge['machineOnly']['childTags']))
         self.assertEqual(('Notes: ping me', ['BDI']), (edge['notesOnly']['text'], edge['notesOnly']['childTags']))
         self.assertEqual(['BDI', 'BDI'], edge['bidi']['childTags'])
-        self.assertEqual(['\u202erev', 'real note'], [b['text'] for b in edge['bidi']['bdis']])
+        self.assertEqual(['[U+202E]rev', 'real note'], [b['text'] for b in edge['bidi']['bdis']])
+        self.assertEqual(['BDI', 'BDI'], edge['bidiPdi']['childTags'])
+        self.assertEqual(['[U+2069][U+202E]abc', 'real note'], [b['text'] for b in edge['bidiPdi']['bdis']])
+        self.assertEqual(['BDI', 'BDI'], edge['invisibleOnly']['childTags'])
+        self.assertEqual(['[U+200B][U+2060]', '[U+00AD][U+200E]'], [b['text'] for b in edge['invisibleOnly']['bdis']])
         self.assertNotIn('.innerHTML', (web / 'views' / 'agents.js').read_text(encoding='utf-8'))
         self.assertIn('inferred', seen['ownerInferredAsked'])
         self.assertIn('not confirmed', seen['ownerInferredAsked'])
@@ -2429,6 +2442,7 @@ class AgentsPageTests(RenewalScopeTests):
         # then over-long refused), over-long machine refused, then clearing machine/notes/machine.
         # Nothing was sent for an unchanged form.
         self.assertEqual(seen['sent'][5:], [
+            ['alex', 'PATCH', '/v1/agents/AGENT', {'working_directory': 'not-a-path'}],
             ['alex', 'PATCH', '/v1/agents/AGENT', {'machine': 'tomasz-desk'}],
             ['alex', 'PATCH', '/v1/agents/AGENT', {'notes': '<b>wake</b> <img src=x onerror=alert(1)>'}],
             ['alex', 'PATCH', '/v1/agents/AGENT', {'notes': 'x' * 1001}],

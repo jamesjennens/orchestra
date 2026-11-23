@@ -172,6 +172,21 @@ const createdByNote = (raw) => (raw.created_by && raw.created_by !== raw.owner ?
   'Created by ', raw.created_by_display_name || raw.created_by, '. That superuser saw the first secret. Issue a new secret if this matters to you.') : null);
 const projectsLine = (agent) => h('div', { class: 'small muted' }, 'Projects: ', agent.projects.map((p) => `${p.name} (${p.role})`).join(', ') || 'none');
 const presentText = (value) => (typeof value === 'string' && value.trim() ? value.trim() : '');
+// Keep stored text unchanged; make control, bidi and invisible format characters explicit in reading views
+// (same [U+XXXX] pattern as requirement_baselines.js / owner_requirements.js, preventing U+2069 from closing <bdi>).
+const CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+const FORBIDDEN_INPUT_CHAR = /[\u0000-\u001f\u007f-\u00a0\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const codeTag = (c) => `U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
+const shownText = (text) => text.replace(CONTROL_OR_BIDI, (c) => `[${codeTag(c)}]`);
+function forbiddenCharMessage(label, value) {
+  const m = FORBIDDEN_INPUT_CHAR.exec(value);
+  if (!m) return '';
+  const ch = m[0];
+  const named = ch === '\t' ? `a tab (${codeTag(ch)})`
+    : ch === '\u00a0' ? `a non-breaking space (${codeTag(ch)})`
+    : `character ${codeTag(ch)}`;
+  return `${label} cannot contain ${named}.`;
+}
 // Owner-only: the server sends machine and notes to the owner (http_auth.py agent_view).
 // Plain escaped text inside <bdi> (never HTML); an empty field shows nothing.
 export function machineNotesLine(raw) {
@@ -180,9 +195,9 @@ export function machineNotesLine(raw) {
   const notes = presentText(raw.notes);
   if (!machine && !notes) return null;
   const parts = [];
-  if (machine) parts.push('Machine: ', h('bdi', null, machine));
+  if (machine) parts.push('Machine: ', h('bdi', null, shownText(machine)));
   if (machine && notes) parts.push(' · ');
-  if (notes) parts.push('Notes: ', h('bdi', null, notes));
+  if (notes) parts.push('Notes: ', h('bdi', null, shownText(notes)));
   return h('div', { class: 'small muted', 'data-machine-notes': raw.id || '' }, ...parts);
 }
 
@@ -510,7 +525,22 @@ export async function list(ctx) {
         if (machine !== initialMachine) body.machine = machine;
         if (notes !== initialNotes) body.notes = notes;
       }
-      if (!Object.keys(body).length) return;
+      if (!Object.keys(body).length) {
+        toast('Nothing changed');
+        return;
+      }
+      if (owner) {
+        let invalid = false;
+        if (body.machine !== undefined) {
+          const bad = forbiddenCharMessage('Machine', body.machine);
+          if (bad) { setFieldError(form, 'mc-' + agent.id, bad); invalid = true; }
+        }
+        if (body.notes !== undefined) {
+          const bad = forbiddenCharMessage('Notes', body.notes);
+          if (bad) { setFieldError(form, 'nt-' + agent.id, bad); invalid = true; }
+        }
+        if (invalid) return;
+      }
       const saved = await act(form.querySelector('button'), () => ctx.api.updateAgent(agent.id, body), {
         success: 'Saved',
         onError: (error) => {

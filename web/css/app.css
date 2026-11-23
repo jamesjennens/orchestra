@@ -452,6 +452,7 @@ pre.json { font-family: var(--mono); font-size: 12px; background: var(--surface-
 .resume-row { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
 .resume-label { font-size: var(--t-xs); font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--muted); }
 .resume .path { overflow-wrap: anywhere; }
+[data-machine-notes] { overflow-wrap: anywhere; overflow: hidden; }
 .resume .prompt { color: var(--ink-2); }
 .resume button { min-height: 26px; padding: 0 8px; }
 fieldset.checks { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin: 0; display: flex; flex-direction: column; gap: 8px; }
