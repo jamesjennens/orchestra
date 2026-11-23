@@ -260,7 +260,7 @@ class ProcessAliveTests(unittest.TestCase):
 
     def test_posix_touches_no_other_process_function(self):
         kill = FakeKill([None])
-        with mock.patch.object(os, 'killpg', side_effect=AssertionError('killpg')), \
+        with mock.patch.object(os, 'killpg', side_effect=AssertionError('killpg'), create=True), \
                 mock.patch.object(os, 'kill', side_effect=AssertionError('os.kill')), \
                 mock.patch.object(os, '_exit', side_effect=AssertionError('exit')):
             self.assertTrue(client._process_alive(5, platform='linux', _kill=kill))

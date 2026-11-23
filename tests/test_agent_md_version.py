@@ -24,6 +24,9 @@ import test_coordinator_agent_md as md
 PINS = {
     2: '1eeed6d71b17d7e6fe6230e1aa52f8138da23118fe6964d1bb90a9af00c8acd1',
     3: '0bb74d99cc65af1ecd0b146d923eb9ce1173d434a0b44b52ac1d5163cbff8ee2',
+    #: Version 4 (kittrial-5bb.588 r3, on .598's version 3): the coordinator's nudge rule names waiting-on-own-job
+    #: among the declared waits.
+    4: '06ed4196fc735e5cd800df34ffb0b471bdb20fb628556b2b4ad090690fa8fd7a',
 }
 
 
@@ -37,7 +40,7 @@ class VersionTests(md.CoordinatorGuideTests):
     def test_the_first_line_is_the_version_line_and_the_server_knows_the_same_version(self):
         for text in self.texts():
             first = text.split('\n', 1)[0]
-            self.assertEqual('AGENT.md version 3 (kittrial-5bb.598)', first)
+            self.assertEqual('AGENT.md version 4 (kittrial-5bb.588)', first)
             self.assertTrue(text.split('\n')[1].startswith('# '))
             found = int(re.fullmatch(r'AGENT\.md version (\d+) \(kittrial-5bb\.\d+\)', first).group(1))
             self.assertEqual(http_service.ApiHandler.AGENT_MD_VERSION, found)
