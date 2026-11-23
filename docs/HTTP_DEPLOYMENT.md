@@ -2586,21 +2586,28 @@ credential approved anything; this is the one place where that is lifted.
     nothing. It checks the `approve` and `recommend` summaries and the `contribute` summary, which
     the task page draws directly above the server's line. It refuses:
     - either sentence and either field label, as they are now or were before (with or without
-      "Allowed by:"), compared after NFKD, casefold, and dropping format characters, marks,
-      whitespace, punctuation, symbols and brackets;
-    - the label "Approval basis" followed by a colon, anywhere and in any markup (`**Approval
-      basis**:`, quotes before the colon, `Approval.basis:`, `approval_basis:`, the two words on two
-      lines, mid-line), compared after NFKD, casefold and dropping format characters and marks;
-    - "Allowed by" and a colon when a basis token or "coordinator agent" follows it.
+      "Allowed by:"), and either sentence without its "(project setting ...)" tail, compared after
+      NFKD, casefold, and dropping format characters, marks, whitespace, punctuation, symbols and
+      brackets;
+    - the label "Approval basis" followed by a colon (`:` or `∶`), anywhere and in any markup
+      (`**Approval** **basis**:`, any number of spaces, none, or a newline between the words,
+      quotes or `>` `}` `)` `]` before the colon, `Approval.basis:`, `approval_basis:`, mid-line),
+      compared after NFKD, casefold and dropping format characters and marks; and the label
+      followed by a dash when a basis follows it;
+    - "Allowed by" and a colon or dash when a basis follows it, on the same line or the next: a
+      basis token, "coordinator agent" (with or without "a" or "the"), "project setting",
+      `agent_approval` or `by-agent`.
 
     A quoted mention followed by prose ("'Approval basis:' was wrong on the previous review.") is
-    allowed, and so are words that only resemble the texts ("approved", "basis", "Allowed by: the CI
+    allowed unless a basis token or "coordinator agent" follows it anywhere, and so are words that only resemble the texts ("approved", "basis", "Allowed by: the CI
     run"). Lookalike letters of another script (Cyrillic, dotless i) remain. HTML entities
     (`&#65;pproval basis:`) pass, but every surface draws summaries as plain text, so they show
-    literally. In the host's text brief, a caller's multi-line field (intent, acceptance, current
-    position, next step, an assignment reason) has its continuation lines indented, so only the
-    server's line starts with "Approval basis:". The field is the protection; the gate is defence in
-    depth for the texts drawn beside the server's line. The host route does not apply it, so the
+    literally. In the host's text brief, a caller's multi-line field (the title, the owner, intent,
+    acceptance, current position, next step, an assignment reason, and each field of `brief
+    --full`) has its continuation lines indented; behind that, any other line of the brief that
+    starts with the label is indented too, so only the server's line starts with "Approval basis:".
+    The field is the protection; the gate is defence in depth for the texts drawn beside the
+    server's line. The host route does not apply it, so the
     audit entry stays the authority.
   - **A retry after the basis moved (kittrial-5bb.540).** If the task is reassigned between an
     approve and its retry, so that the basis would now be different, the first record and its basis
@@ -2611,7 +2618,9 @@ credential approved anything; this is the one place where that is lifted.
       identity reused with a different request";
     - the same `operation_id` under a new key: `422`, detail "ValueError: Operation ID already used
       with different payload or actor";
-    - reassigned to the approver's own work: `403`, the approve route's own refusal.
+    - reassigned to the approver's own work: with the same key and a kept answer, `201`, the same
+      body, as on the first path; after an uncertain `503`, or under a new key, `403`, the approve
+      route's own refusal.
 
     After either `422` or the `403`, re-read the brief: the approval is recorded, with its first
     basis. With the basis unchanged, the same key after a `503` answers `201`, and the same
