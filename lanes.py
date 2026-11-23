@@ -304,9 +304,11 @@ def holder_idle_seconds(row, actor, now):
     return seconds_since(row.get('updated_at') or row.get('created_at'), now)
 
 
-def held_task(row, task, actor, now, threshold, review=None, error=None, comment_authority=None):
-    """One held task's row: the shared review facts plus the declared wait state."""
+def held_task(row, task, actor, now, threshold, review=None, error=None, comment_authority=None,
+              operators=None, owners=None, authority_state=None, project=None, journal=None):
+    """One held task's row: the shared review facts plus the server-computed wait state."""
     from lane_state import parse_moment
+    import waits as waits_mod
     if error is not None:
         state = work_state = 'error'
         move, next_actor_value, text = 'unknown', 'operator', error
@@ -364,21 +366,47 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
                 not_before = value
             except ValueError:
                 not_before = not_before_due = None
-    else:
-        if checkpoint is not None:
-            checkpoint_id = str(checkpoint[1].get('id'))
-            since = checkpoint[1].get('created_at')
-            guessed = inferred_wait(checkpoint[0])
-            if guessed is not None:
-                wait_state, waiting_on = guessed
+    elif checkpoint is not None:
+        checkpoint_id = str(checkpoint[1].get('id'))
+        since = checkpoint[1].get('created_at')
+
+    # Delegate active wait determination to waits.py (ONE canonical implementation, kittrial-5bb.598).
+    # Non-waiting declared states ('working', 'idle') and wake timers (not_before) remain above;
+    # active wait state, episode origin age, inferred fallback (including 'decision' and all roles),
+    # delivery waits, and verdict-cleared wait flags come from waits.py.
+    open_waits = waits_mod.task_wait_summary(
+        row, task, actor, now, review=None if error is not None else review,
+        operators=operators, owners=owners, authority_state=authority_state,
+        project=project, journal=journal,
+    )
+    active_wait = open_waits[0] if open_waits else None
+    inferred_flag = False
+    if active_wait is not None:
+        wait_state = active_wait.get('state') or wait_state
+        waiting_on = active_wait.get('waiting_on')
+        inferred_flag = bool(active_wait.get('inferred'))
+        declared = not inferred_flag
+        if active_wait.get('origin_checkpoint'):
+            checkpoint_id = active_wait['origin_checkpoint']
+        if active_wait.get('started_at'):
+            since = active_wait['started_at']
+        # Preserve raw declared expect_by string when present on the matching declared record;
+        # keep None when no explicit expect_by was declared (so existing lanes views stay unchanged).
+        if not (found is not None and found[1].get('expect_by') is not None):
+            expect_by = None
+    elif wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user'):
+        # Wait was answered by a qualifying verdict or dropped by a newer holder checkpoint:
+        # clear stale waiting flags (kittrial-5bb.598 §1.1 gaps 1-2).
+        wait_state = waiting_on = expect_by = None
+        declared = False
     age = seconds_since(since, now)
     expect_moment = moment(expect_by) if isinstance(expect_by, str) else None
     idle_seconds = holder_idle_seconds(row, actor, now)
     flags = []
-    if wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user') \
+    if active_wait is not None and wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user') \
             and age is not None and age > threshold:
         flags.append('waiting_too_long')
-    if expect_moment is not None and expect_moment < now:
+    if active_wait is not None and expect_moment is not None and expect_moment < now:
         flags.append('expect_by_passed')
     if move == 'you' and idle_seconds is not None and idle_seconds > threshold:
         flags.append('your_move_idle')
@@ -397,7 +425,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         'not_before_due': not_before_due,
         'timer_due': False,
         'declared': declared,
-        'inferred': not declared,
+        'inferred': inferred_flag if active_wait is not None else not declared,
         'checkpoint': checkpoint_id,
         'state_since': since,
         'state_age_seconds': age,
@@ -490,7 +518,9 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
         for task, row in held:
             review, error = _review(row, task, evidence, revert_map, revert_problems, operators, journal)
             entries.append(held_task(row, task, holder, now, threshold, review=review, error=error,
-                                     comment_authority=comment_authority))
+                                     comment_authority=comment_authority, operators=operators,
+                                     owners=(registry or {}).get('owners'), authority_state=authority_state,
+                                     project=project_id, journal=journal))
         retired = holder_retired(holder, live_sessions=live_sessions, project=project_id,
                                  authority_state=authority_state, operators=operators, now=now)
         if retired:

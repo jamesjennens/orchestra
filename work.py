@@ -215,7 +215,7 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
                  '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
                  '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset',
-                 '--recent', '--last', '--kind'}
+                 '--recent', '--last', '--kind', '--role', '--silent-hours', '--days'}
 
 #: At most this many request ids are named per work item (a review record holds at most 20 items).
 PENDING_REQUEST_IDS_MAX = 20
@@ -544,6 +544,7 @@ def help_payload(action='work'):
                    '[--since-checkpoint | --since-my-checkpoint] [--kind comment|event] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
         'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | checkpoint TASK --directions [--offset N] [--limit N]',
+        'waiting': 'waiting [--on-me | --all | --role ROLE] [--silent-hours N] [--limit N] [--offset N] [--json] | waiting --metrics [--days N] [--json]',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -815,6 +816,18 @@ def help_options(action):
             {'flag': '--verify', 'description': 'classify current entries using newest retained evidence in linked checkpoint order without writing'},
             {'flag': '--json', 'description': 'accepted in any position; the saved checkpoint is always returned as JSON'},
             {'flag': '-h, --help', 'description': 'return this help as JSON on stdout with exit code 0'},
+        ]
+    if action == 'waiting':
+        return [
+            {'flag': '--on-me', 'description': 'show waits addressed to your actor or any live role you hold (plus silent lanes if you coordinate or own them)'},
+            {'flag': '--all', 'description': 'show all open waits and silent lanes in scope (oldest first)'},
+            {'flag': '--role ROLE', 'description': 'filter waits by waited-on role or actor id'},
+            {'flag': '--silent-hours N', 'description': 'silent-lane inactivity threshold in hours 1..168 (default 4)'},
+            {'flag': '--metrics', 'description': 'compute read-time daily wait metrics (closed tasks included; off default reads)'},
+            {'flag': '--days N', 'description': 'UTC days window for --metrics 1..90 (default 14)'},
+            {'flag': '--limit N', 'description': 'waits per page 1..200 (default 50)'},
+            {'flag': '--offset N', 'description': 'waits page offset >= 0 (default 0)'},
+            *common,
         ]
     return common
 
@@ -1468,7 +1481,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     if action in ('review','handoff'):
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
-    if action in ('work','wait'):
+    if action in ('work','wait','waiting'):
         summary_ids = None
         if action == 'work' and args[:1] == ['summary']:
             from work_summary import parse_args as summary_args
@@ -1485,6 +1498,12 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             return summary_read(rows, summary_ids, project=path.name)
         from lifecycle import host_snapshot
         rows=host_snapshot(rows, run=run, project=path)
+        if action=='waiting':
+            from waits import read as waits_read
+            from sessions import read_registry
+            return waits_read(rows,actor,read_registry(path),args,operators=operators,
+                              journal=path,scope=lanes_scope,project=path.name,
+                              authority_state=authority_state,identity_names=identity_names)
         if action=='wait':
             # The blocking wait's ONE read per poll (kittrial-5bb.285). The export is already
             # in hand: the worker form needs no further read, and the coordinator form's lane

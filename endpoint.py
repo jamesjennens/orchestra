@@ -1285,6 +1285,8 @@ READ_ONLY_ACTIONS={
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
     # and nothing is written, so it takes the project lock SHARED like the work read itself.
     'wait':_read_only_always,
+    # kittrial-5bb.598 Slice 1: server-computed open waits, silent lanes, and daily metrics (read-only).
+    'waiting':_read_only_always,
     'bd':lambda args,operation:not is_mutating_invocation(args),
     # The integration check (kittrial-5bb.374) is a read with no identity: it must never
     # take the project lock exclusively or write.
@@ -1663,7 +1665,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         if frame is None or authority_config is not None:
             raise ValueError('%s is a framed request: use the client\'s files command over SSH'%action)
         return framed_files(root,path,actor,request,frame)
-    if action in ('handoff','review','work','wait'):
+    if action in ('handoff','review','work','wait','waiting'):
         from work import execute as work_execute
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -1732,9 +1734,9 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
             read_context = {}
-            if action in ('work', 'wait') and args[:1] != ['summary']:
+            if action in ('work', 'wait', 'waiting') and args[:1] != ['summary']:
                 read_context['comment_authority'] = comment_contact_authority(root,path,operators,authority_config)
-                if (action == 'wait' and '--coordinator' in args) or (action == 'work' and args[:1] == ['lanes']):
+                if (action == 'wait' and '--coordinator' in args) or (action == 'work' and args[:1] == ['lanes']) or action == 'waiting':
                     store = authority_config.store if authority_config is not None else (root / 'http-state.json')
                     try:
                         import http_authority
@@ -3675,6 +3677,7 @@ CONTRIBUTOR_COMMANDS = (
     ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
     ('wait', 'block until something is your move, then print it and its fingerprint'),
+    ('waiting ...', 'open waits, silent lanes and wait metrics, oldest first (--on-me, --all, --role, --metrics)'),
     ('ready', 'the tasks nobody holds that you may claim'),
     ('files list|get|put ...', "a task's files over SSH: list them, get one by its sha256 into a folder, put one"),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
@@ -3732,7 +3735,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
-                  'wait','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
+                  'wait','waiting','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
                   'coordinator')
 
 

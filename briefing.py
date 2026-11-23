@@ -1063,12 +1063,13 @@ def comment_author_allowed(author, operators=None, owners=None, authority=None, 
     return CAP_COORDINATE in coordinator_grant_capabilities(state, {'agent_id': agent_id}, project, held)
 
 
-def pending_other_comments(entries, owner, selected=None, acknowledged=None, authority=None):
-    """One comment-attention decision over an already ordered activity snapshot.
+def qualifying_other_comments(entries, owner, selected=None, acknowledged=None, authority=None,
+                              predicate=None, allow_reserved=False):
+    """Shared other-party comment selection over an already ordered activity snapshot.
 
-    The caller supplies the shared newer_selection result and current-authority
-    predicate. Reserved records and unknown bodies are never plain comments.
-    A validated response consumes through its entry in that same snapshot.
+    Used by both ``pending_other_comments`` (``whose_move``) and ``waits.py`` so both
+    share the exact ``checkpoint_selection`` / ``newer_selection`` provenance base
+    (handling out-of-order native comments and backdated late arrivals identically).
     """
     from reserved_comments import reserved_match
     remaining = entries
@@ -1078,13 +1079,28 @@ def pending_other_comments(entries, owner, selected=None, acknowledged=None, aut
         if position is not None:
             remaining = entries[position + 1:]
     selected_ids = None if selected is None else {entry['entry_id'] for entry in selected}
-    return any(entry.get('kind') == 'comment'
-               and isinstance(entry.get('body'), str) and bool(entry['body'].strip())
-               and reserved_match(entry.get('body')) is None
-               and not same_activity_actor(entry.get('author'), owner)
-               and authority is not None and authority(entry.get('author'))
-               and (selected_ids is None or entry['entry_id'] in selected_ids)
-               for entry in remaining)
+    return [
+        entry for entry in remaining
+        if entry.get('kind') == 'comment'
+        and isinstance(entry.get('body'), str) and bool(entry['body'].strip())
+        and (allow_reserved or reserved_match(entry.get('body')) is None)
+        and not same_activity_actor(entry.get('author'), owner)
+        and authority is not None and authority(entry.get('author'))
+        and (selected_ids is None or entry['entry_id'] in selected_ids)
+        and (predicate is None or predicate(entry))
+    ]
+
+
+def pending_other_comments(entries, owner, selected=None, acknowledged=None, authority=None):
+    """One comment-attention decision over an already ordered activity snapshot.
+
+    The caller supplies the shared newer_selection result and current-authority
+    predicate. Reserved records and unknown bodies are never plain comments.
+    A validated response consumes through its entry in that same snapshot.
+    """
+    return bool(qualifying_other_comments(
+        entries, owner, selected=selected, acknowledged=acknowledged, authority=authority
+    ))
 
 
 def checkpoint_snapshot(rows, row, state):

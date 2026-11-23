@@ -354,7 +354,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # endpoint.py's seventeenth is the same action's request body. r6: the time a comment no journal
             # honours states, which is text nobody has validated.
             'decision_attest.py': 4,
-            'review_recommendations.py': 2, 'review_workflow.py': 5, 'work.py': 1, 'worker_gate.py': 1})
+            'review_recommendations.py': 2, 'review_workflow.py': 5,
+            'waits.py': 3,  # kittrial-5bb.598 Slice 1: review comment payload, .escalation-config.json, .wait-escalations ledger
+            'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):
         # Review of 7c14f6a: the capability and proposal record parsers, and load_json.

@@ -1727,6 +1727,7 @@ CONTRIBUTOR_COMMANDS = (
     ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
     ('wait', 'block until something is your move, then print it and its fingerprint'),
+    ('waiting ...', 'open waits, silent lanes and wait metrics, oldest first (--on-me, --all, --role, --metrics)'),
     ('ready', 'the tasks nobody holds that you may claim'),
     ('files list|get|put ...', "a task's files over SSH: list them, get one by its sha256 into a folder, put one"),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
@@ -1784,7 +1785,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
-                  'wait','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
+                  'wait','waiting','feedback','requirement','requirements','ref','capability','interface','proposal','guidance',
                   'coordinator')
 
 
@@ -1860,6 +1861,7 @@ _COMMAND_HELP_USAGE = {
                   'checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | '
                   'checkpoint TASK --directions [--offset N] [--limit N]',
     'docs': 'docs [NAME] | docs --status',
+    'waiting': 'waiting [--on-me | --all | --role ROLE] [--silent-hours N] [--limit N] [--offset N] [--json] | waiting --metrics [--days N] [--json]',
 }
 
 
