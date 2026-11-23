@@ -37,6 +37,7 @@ Object.defineProperty(globalThis, 'navigator', {
   configurable: true,
 });
 const body = globalThis.document.body;
+globalThis.document.title = 'Orchestra';
 const listeners = new Map();
 Object.assign(globalThis.document, {
   visibilityState: 'visible',
@@ -995,33 +996,34 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     origConsole[level] = console[level];
     console[level] = (...args) => { consoleMessages.push(args.map((a) => String(a)).join(' ')); };
   }
-  const secretContainmentOk = (secret) => {
-    const secretBlock = body.all((e) => e.getAttribute('data-secret-lines') === 'true');
-    if (secretBlock.length !== 1) return false;
-    const isInside = (node, root) => {
-      let cur = node;
-      while (cur) {
-        if (cur === root) return true;
-        cur = cur.parentNode;
-      }
-      return false;
-    };
-    const walkAttrs = (el) => {
+  // Strict containment scan (kittrial-5bb.524 r3 / SHOULD-2): allows the secret ONLY as text
+  // inside the single <pre data-secret-file-text="true"> (when expectPre is true), and scans
+  // every text node outside it plus attributes, dataset, value, className, document.title,
+  // sessionStorage, localStorage, location, and console output.
+  const secretContainmentOk = (secret, { expectPre = true } = {}) => {
+    const pres = body.all((e) => e.tagName === 'PRE' && e.getAttribute('data-secret-file-text') === 'true');
+    if (expectPre ? pres.length !== 1 : pres.length !== 0) return false;
+    const allowedPre = expectPre ? pres[0] : null;
+    for (const el of body.all(() => true)) {
       if (el.attributes) {
         for (const [k, v] of Object.entries(el.attributes)) {
           if (String(k).includes(secret) || String(v).includes(secret)) return false;
         }
       }
-      return true;
-    };
-    for (const el of body.all(() => true)) {
-      if (!walkAttrs(el)) return false;
-      if (!isInside(el, secretBlock[0])) {
+      if (el.dataset) {
+        for (const [k, v] of Object.entries(el.dataset)) {
+          if (String(k).includes(secret) || String(v).includes(secret)) return false;
+        }
+      }
+      if (typeof el.className === 'string' && el.className.includes(secret)) return false;
+      if (typeof el.value === 'string' && el.value.includes(secret)) return false;
+      if (el !== allowedPre) {
         for (const child of el.childNodes || []) {
           if (!child.tagName && String(child.textContent || '').includes(secret)) return false;
         }
       }
     }
+    if (String(globalThis.document.title || '').includes(secret)) return false;
     for (const [k, v] of store.entries()) {
       if (String(k).includes(secret) || String(v).includes(secret)) return false;
     }
@@ -1033,13 +1035,32 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     if (consoleMessages.some((m) => m.includes(secret))) return false;
     return true;
   };
+  const clickBothCopyButtonsAndScan = async (dialog, secret) => {
+    const pre = attr(dialog, 'data-secret-file-text', 'true')[0];
+    if (!pre) return false;
+    const mainCopy = dialog.all((e) => e.tagName === 'BUTTON'
+      && String(e.getAttribute('aria-label') || '').includes('credential file text'))[0];
+    const fileBlock = dialog.all((e) => e.getAttribute('data-command') === 'file name')[0];
+    const fileCopy = fileBlock ? fileBlock.all((e) => e.tagName === 'BUTTON')[0] : null;
+    if (!mainCopy || !fileCopy) return false;
+    copiedText = null;
+    await mainCopy.dispatch('click');
+    await tick();
+    if (copiedText !== pre.textContent) return false;
+    if (!secretContainmentOk(secret, { expectPre: true })) return false;
+    copiedText = null;
+    await fileCopy.dispatch('click');
+    await tick();
+    if (!copiedText || copiedText.includes(secret)) return false;
+    if (!secretContainmentOk(secret, { expectPre: true })) return false;
+    return true;
+  };
   const nonSecretLines = (text) => text.split(/\r?\n/).filter((l) => l.length > 0 && !l.startsWith('header = '));
   const evalPsRewriteNonSecret = (cmd, userProfile) => {
     const unixProfile = userProfile.replace(/\\/g, '/');
     const m = /\[IO\.File\]::WriteAllText\(\$p, \(([\s\S]*?)\) \+ \$c\)/.exec(cmd);
     if (!m) return null;
     const expr = m[1].replace(/\(\[Environment\]::GetFolderPath\('UserProfile'\) -replace '\\\\','\/'\)/g, JSON.stringify(unixProfile));
-    // Split PowerShell string concatenation parts joined by " + " and unescape PowerShell backtick sequences.
     const parts = expr.split(/\s*\+\s*/);
     let outStr = '';
     for (const part of parts) {
@@ -1057,14 +1078,18 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
   };
 
   try {
-    // (1) Windows curl agent with a space in the profile path keeps cacert + ssl-no-revoke on rotation,
-    // matching the set-up rewrite command's non-secret lines byte-for-byte.
+    // (1) Windows curl agent keeps cacert (placeholder, NEVER guessed from working_directory)
+    // + ssl-no-revoke on rotation, shows visible instruction for Add the certificate path,
+    // passes strict Copy + containment scan, and Next advances to rewrite whose non-secret lines
+    // match credentialFileLines for the machine's real UserProfile.
     for (const open of openDialogs()) await open.close();
     store.clear();
     localStore.clear();
     consoleMessages.length = 0;
+    document.title = 'Orchestra';
     server.certificate = { sha256: 'AB:CD:EF', certificate: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n' };
-    server.workingDirectory = 'C:\\Users\\Jane Doe\\agents\\kestrel';
+    // Hostile/shared working_directory must NEVER influence cacert (SHOULD-1 security).
+    server.workingDirectory = 'C:\\Users\\Public\\agents\\kestrel';
     server.credentials = [];
     d = await openWizard();
     await windowsChoice(d, 'setup-bridge', 'none').dispatch('change');
@@ -1079,18 +1104,39 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     const expectedWinCurlText = [
       '# server = https://127.0.0.1:8765',
       '# server certificate sha256 = AB:CD:EF',
-      'cacert = "C:/Users/Jane Doe/.orchestra-agent-kestrel.crt"',
+      'cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"',
       'ssl-no-revoke',
       'header = "Authorization: Bearer ' + SECRET + '"',
     ].join('\n') + '\n';
-    out.rotationCurlWindowsKeepsCacertAndSslNoRevoke = winCurlSecretText === expectedWinCurlText;
-    out.rotationWindowsSpacePathExactQuoting = winCurlSecretText.includes('cacert = "C:/Users/Jane Doe/.orchestra-agent-kestrel.crt"\nssl-no-revoke\n');
-    out.rotationWizardSecretOnlyInsideSecretBlock = secretContainmentOk(SECRET);
-    // Compare rotation's non-secret lines against set-up's rewrite command for the same agent.
-    d.wizard.show('rewrite');
-    const winSetupRewriteCmd = commandText(d, 'rewrite command');
+    const winRewriteNotice = attr(d, 'data-cert-rewrite-next', 'true')[0];
+    out.rotationCurlWindowsKeepsCacertAndSslNoRevoke = winCurlSecretText === expectedWinCurlText
+      && !winCurlSecretText.includes('Public')
+      && Boolean(winRewriteNotice && winRewriteNotice.textContent.includes('Add the certificate path'));
+    out.rotationWindowsSpacePathExactQuoting = setupText.credentialFileLines(
+      'https://127.0.0.1:8765', 'AB:CD:EF', SECRET,
+      { certFile: setupText.certificateFile('Kestrel'), hasCertificate: true, windows: true, homeDir: 'C:\\Users\\Jane Doe' },
+    ).includes('cacert = "C:/Users/Jane Doe/.orchestra-agent-kestrel.crt"\nssl-no-revoke\n');
+    out.rotationWizardSecretOnlyInsideSecretBlock = secretContainmentOk(SECRET, { expectPre: true })
+      && await clickBothCopyButtonsAndScan(d, SECRET);
+    // Next from secret goes to rewrite (Add the certificate path) and secret does not linger.
+    await d.wizard.next();
+    const winSetupRewriteCmd = screenOf(d) === 'rewrite' ? commandText(d, 'rewrite command') : '';
     const winSetupNonSecret = evalPsRewriteNonSecret(winSetupRewriteCmd, 'C:\\Users\\Jane Doe');
-    out.rotationAndSetupProduceIdenticalNonSecretLinesWindows = JSON.stringify(winSetupNonSecret) === JSON.stringify(nonSecretLines(winCurlSecretText));
+    const winLinesForProfile = setupText.credentialFileLines(
+      'https://127.0.0.1:8765', 'AB:CD:EF', SECRET,
+      { certFile: setupText.certificateFile('Kestrel'), hasCertificate: true, windows: true, homeDir: 'C:\\Users\\Jane Doe' },
+    );
+    out.rotationAndSetupProduceIdenticalNonSecretLinesWindows = screenOf(d) === 'rewrite'
+      && JSON.stringify(winSetupNonSecret) === JSON.stringify(nonSecretLines(winLinesForProfile))
+      && secretContainmentOk(SECRET, { expectPre: false });
+    // Test screen lists curl exit 77 with Move the certificate + Add the certificate path fix.
+    d.wizard.show('test');
+    const err77 = attr(d, 'data-curl-error', '77')[0];
+    out.curlExit77ErrorLinePresent = Boolean(err77)
+      && err77.textContent.includes('77')
+      && err77.textContent.includes('Move the certificate')
+      && err77.textContent.includes('Add the certificate path')
+      && secretContainmentOk(SECRET, { expectPre: false });
 
     // (2) With proxy bypass on, noproxy + cacert + ssl-no-revoke stay in exact set-up order.
     d.wizard.show('system');
@@ -1101,13 +1147,18 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     const winCurlNoProxyText = attr(d, 'data-secret-file-text', 'true')[0].textContent;
     d.wizard.show('rewrite');
     const winSetupNoProxyNonSecret = evalPsRewriteNonSecret(commandText(d, 'rewrite command'), 'C:\\Users\\Jane Doe');
-    out.rotationCurlWindowsWithNoProxyMatchesSetup = winCurlNoProxyText.includes('noproxy = "127.0.0.1"\ncacert = "C:/Users/Jane Doe/.orchestra-agent-kestrel.crt"\nssl-no-revoke\n')
-      && JSON.stringify(winSetupNoProxyNonSecret) === JSON.stringify(nonSecretLines(winCurlNoProxyText));
+    const winLinesNoProxy = setupText.credentialFileLines(
+      'https://127.0.0.1:8765', 'AB:CD:EF', SECRET,
+      { certFile: setupText.certificateFile('Kestrel'), hasCertificate: true, noproxy: true, windows: true, homeDir: 'C:\\Users\\Jane Doe' },
+    );
+    out.rotationCurlWindowsWithNoProxyMatchesSetup = winCurlNoProxyText.includes('noproxy = "127.0.0.1"\ncacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"\nssl-no-revoke\n')
+      && JSON.stringify(winSetupNoProxyNonSecret) === JSON.stringify(nonSecretLines(winLinesNoProxy));
 
-    // (3) POSIX (Linux) curl agent keeps cacert and NEVER includes ssl-no-revoke.
+    // (3) POSIX (Linux) curl agent keeps cacert (placeholder, NEVER /Users/Shared or working_directory),
+    // NEVER includes ssl-no-revoke, and tells the user Next runs Add the certificate path (chmod 600).
     for (const open of openDialogs()) await open.close();
     store.clear();
-    server.workingDirectory = '/home/olive/agents/kestrel';
+    server.workingDirectory = '/Users/Shared/agents/kestrel';
     d = await openWizard();
     await windowsChoice(d, 'setup-bridge', 'none').dispatch('change');
     await windowsChoice(d, 'setup-os', 'linux').dispatch('change');
@@ -1121,11 +1172,15 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     const expectedLinuxCurlText = [
       '# server = https://127.0.0.1:8765',
       '# server certificate sha256 = AB:CD:EF',
-      'cacert = /home/olive/.orchestra-agent-kestrel.crt',
+      'cacert = /home/<your-name>/.orchestra-agent-kestrel.crt',
       'header = "Authorization: Bearer ' + SECRET + '"',
     ].join('\n') + '\n';
+    const posixRewriteNotice = attr(d, 'data-cert-rewrite-next', 'true')[0];
     out.rotationCurlPosixKeepsCacertAndOmitsSslNoRevoke = linuxCurlSecretText === expectedLinuxCurlText
-      && !linuxCurlSecretText.includes('ssl-no-revoke');
+      && !linuxCurlSecretText.includes('ssl-no-revoke')
+      && !linuxCurlSecretText.includes('/Users/Shared')
+      && Boolean(posixRewriteNotice && posixRewriteNotice.textContent.includes('Add the certificate path') && posixRewriteNotice.textContent.includes('600'))
+      && await clickBothCopyButtonsAndScan(d, SECRET);
 
     // (4) Bridge agent credential text is byte-identical to b1f2356c (even with a certificate).
     for (const open of openDialogs()) await open.close();
@@ -1148,18 +1203,17 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     ].join('\n') + '\n';
     out.rotationBridgeAgentByteIdentical = bridgeSecretText === expectedBridgeB1f2356c
       && !bridgeSecretText.includes('cacert')
-      && !bridgeSecretText.includes('ssl-no-revoke');
+      && !bridgeSecretText.includes('ssl-no-revoke')
+      && await clickBothCopyButtonsAndScan(d, SECRET);
 
     // (5) Agent card's "Save and issue a new secret" path (editScopes):
-    // (a) With stored curl route in sessionStorage, opens directly on secret with cacert + ssl-no-revoke.
-    // (b) In a fresh tab (empty sessionStorage), starts with Bridge text and offers one-click toggle to include cacert.
     for (const open of openDialogs()) await open.close();
     store.clear();
     localStore.clear();
     consoleMessages.length = 0;
     const cardAgent = {
       id: 'agent_1', name: 'Kestrel', owner: 'u1', owner_display_name: 'Olive', role: 'worker',
-      enabled: true, projects: ['p1'], working_directory: 'C:\\Users\\Jane Doe\\agents\\kestrel',
+      enabled: true, projects: ['p1'], working_directory: '/Users/Shared/agents/kestrel',
       scopes: ['read', 'tasks'], scopes_source: 'stored', credentials: [],
     };
     const cardOverrides = {
@@ -1179,59 +1233,135 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       if (selector === 'input') return this.all((e) => e.tagName === 'INPUT');
       return origQA.call(this, selector);
     };
-    // (5a) Stored curl route in sessionStorage.
+    const openCardSecretDialog = async () => {
+      const cardPage = await agentsList({ ...ctx, api: cardApi, render() {}, refreshProjects: async () => {} });
+      await new Promise((r) => setTimeout(r, 50));
+      const scopeForm = cardPage.all((e) => e.tagName === 'FORM' && e.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Save and issue a new secret').length > 0)[0];
+      const cardSubmit = scopeForm.dispatch('submit');
+      await tick();
+      const cardConfirm = openDialogs().at(-1);
+      await cardConfirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
+      await cardSubmit; await new Promise((r) => setTimeout(r, 50));
+      return openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
+    };
+
+    // (5a) Stored curl route in sessionStorage -> opens on secret with placeholder cacert + ssl-no-revoke,
+    // never poisoned by working_directory, and Next goes to rewrite.
     store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'resume', runs: 'none', bridge: false, os: 'windows', role: 'worker', noproxy: false }));
-    let cardPage = await agentsList({ ...ctx, api: cardApi, render() {}, refreshProjects: async () => {} });
-    await new Promise((r) => setTimeout(r, 50));
-    let scopeForm = cardPage.all((e) => e.tagName === 'FORM' && e.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Save and issue a new secret').length > 0)[0];
-    let cardSubmit = scopeForm.dispatch('submit');
-    await tick();
-    let cardConfirm = openDialogs().at(-1);
-    await cardConfirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
-    await cardSubmit; await new Promise((r) => setTimeout(r, 50));
-    let cardWizard = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
+    let cardWizard = await openCardSecretDialog();
     const cardStoredCurlText = cardWizard ? attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent : '';
+    const cardStoredCopyOk = cardWizard ? await clickBothCopyButtonsAndScan(cardWizard, SECRET) : false;
     out.cardNewSecretPathKeepsCacert = Boolean(cardWizard)
       && screenOf(cardWizard) === 'secret'
       && cardStoredCurlText === expectedWinCurlText
-      && secretContainmentOk(SECRET);
+      && !cardStoredCurlText.includes('/Users/Shared')
+      && attr(cardWizard, 'data-include-cert', 'true').length === 0
+      && cardStoredCopyOk;
     for (const open of openDialogs()) await open.close();
 
-    // (5b) Fresh tab (empty sessionStorage): starts Bridge-identical, checking data-include-cert adds cacert + ssl-no-revoke.
+    // (5b) Reversed A1 (fresh tab, empty sessionStorage): NEVER silently picks Bridge!
+    // Asks "How does this agent connect?" (Orchestra Bridge / curl or another client) with NO default,
+    // hides secret text until answered, refuses Next while unanswered, and does not write sessionStorage yet.
+    // Choosing curl shows cacert + ssl-no-revoke, passes strict Copy scan, and Next advances to rewrite.
     store.clear();
     localStore.clear();
     consoleMessages.length = 0;
-    cardPage = await agentsList({ ...ctx, api: cardApi, render() {}, refreshProjects: async () => {} });
-    await new Promise((r) => setTimeout(r, 50));
-    scopeForm = cardPage.all((e) => e.tagName === 'FORM' && e.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Save and issue a new secret').length > 0)[0];
-    cardSubmit = scopeForm.dispatch('submit');
-    await tick();
-    cardConfirm = openDialogs().at(-1);
-    await cardConfirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
-    await cardSubmit; await new Promise((r) => setTimeout(r, 50));
-    Element.prototype.querySelectorAll = origQA;
-    cardWizard = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
-    const cardFreshBridgeText = cardWizard ? attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent : '';
-    const certToggle = cardWizard ? attr(cardWizard, 'data-include-cert', 'true')[0] : null;
-    let cardFreshToggledText = '';
-    let cardFreshToggledContained = false;
-    if (certToggle) {
-      certToggle.checked = true;
-      await certToggle.dispatch('change');
+    cardWizard = await openCardSecretDialog();
+    const choiceBlock = cardWizard ? attr(cardWizard, 'data-connection-choice', 'true')[0] : null;
+    const bridgeRadio = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'bridge') : null;
+    const curlRadio = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'curl') : null;
+    const bothUncheckedBefore = Boolean(bridgeRadio && !bridgeRadio.checked && curlRadio && !curlRadio.checked);
+    const preBeforeChoice = cardWizard ? attr(cardWizard, 'data-secret-file-text', 'true').length : -1;
+    const storedBeforeChoice = store.has(WIZARD_STORAGE_KEY);
+    const containedBeforeChoice = secretContainmentOk(SECRET, { expectPre: false });
+    const nextBlockedBeforeChoice = cardWizard ? (await cardWizard.wizard.next()) === false && screenOf(cardWizard) === 'secret' : false;
+    let cardFreshCurlText = '';
+    let cardFreshCurlCopyOk = false;
+    let cardFreshCurlNextScreen = '';
+    let cardFreshCurlAfterNextContained = false;
+    if (curlRadio) {
+      curlRadio.checked = true;
+      await curlRadio.dispatch('change');
       await tick();
-      cardFreshToggledText = attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '';
-      cardFreshToggledContained = secretContainmentOk(SECRET);
+      cardFreshCurlText = attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '';
+      cardFreshCurlCopyOk = await clickBothCopyButtonsAndScan(cardWizard, SECRET);
+      await cardWizard.wizard.next();
+      cardFreshCurlNextScreen = screenOf(cardWizard);
+      cardFreshCurlAfterNextContained = secretContainmentOk(SECRET, { expectPre: false });
     }
-    out.cardNewSecretFreshTabToggleIncludesCacert = Boolean(cardWizard)
-      && cardFreshBridgeText === expectedBridgeB1f2356c
-      && Boolean(certToggle)
-      && cardFreshToggledText === expectedWinCurlText
-      && cardFreshToggledContained;
+    out.cardNewSecretFreshTabAsksAndCurlKeepsCacert = Boolean(cardWizard && choiceBlock)
+      && choiceBlock.textContent.includes('How does this agent connect?')
+      && bothUncheckedBefore
+      && preBeforeChoice === 0
+      && !storedBeforeChoice
+      && containedBeforeChoice
+      && nextBlockedBeforeChoice
+      && cardFreshCurlText === expectedWinCurlText
+      && cardFreshCurlCopyOk
+      && cardFreshCurlNextScreen === 'rewrite'
+      && cardFreshCurlAfterNextContained;
     for (const open of openDialogs()) await open.close();
+
+    // (5c) Fresh tab choosing "Orchestra Bridge" keeps condition 4's byte-identical Bridge text.
+    store.clear();
+    localStore.clear();
+    consoleMessages.length = 0;
+    cardWizard = await openCardSecretDialog();
+    const bridgeRadio2 = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'bridge') : null;
+    let cardFreshBridgeChosenText = '';
+    let cardFreshBridgeCopyOk = false;
+    let cardFreshBridgeNextScreen = '';
+    if (bridgeRadio2) {
+      bridgeRadio2.checked = true;
+      await bridgeRadio2.dispatch('change');
+      await tick();
+      cardFreshBridgeChosenText = attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '';
+      cardFreshBridgeCopyOk = await clickBothCopyButtonsAndScan(cardWizard, SECRET);
+      await cardWizard.wizard.next();
+      cardFreshBridgeNextScreen = screenOf(cardWizard);
+    }
+    out.cardNewSecretFreshTabBridgeChoiceByteIdentical = Boolean(cardWizard && bridgeRadio2)
+      && cardFreshBridgeChosenText === expectedBridgeB1f2356c
+      && cardFreshBridgeCopyOk
+      && cardFreshBridgeNextScreen === 'vscode';
+    for (const open of openDialogs()) await open.close();
+
+    // (5d) B2 (sessionStorage holds ANOTHER agent's stored Bridge route): still asks before showing lines!
+    store.clear();
+    store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_other', screen: 'resume', runs: 'bridge', bridge: true, os: 'windows', role: 'worker', noproxy: false }));
+    cardWizard = await openCardSecretDialog();
+    Element.prototype.querySelectorAll = origQA;
+    out.cardNewSecretOtherAgentStoredStillAsks = Boolean(cardWizard)
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 1
+      && attr(cardWizard, 'data-secret-file-text', 'true').length === 0
+      && secretContainmentOk(SECRET, { expectPre: false });
+    for (const open of openDialogs()) await open.close();
+
+    // (6) NOTE-1 & NOTE-2 Node pins: userHomeFromWorkingDirectory removed; certificateCurlLines
+    // rejects controls/C1/bidi/separators/quotes/surrogates (S09), converts Windows backslashes (S10),
+    // and quotes POSIX $HOME / space paths without ssl-no-revoke.
+    const cert524 = setupText.certificateFile('Kestrel');
+    const badHomes = [
+      'C:\\Users\\Jane"Doe',
+      'C:\\Users\\Jane\noutput = pwn',
+      'C:\\Users\\Jane\x7fDoe',
+      '/home/olive\x85evil',
+      '/home/olive\u202eevil',
+      '/home/olive\u2028evil',
+      '/home/olive\ud800evil',
+    ];
+    out.certificateCurlLinesPathSafetyPinned = setupText.userHomeFromWorkingDirectory === undefined
+      && badHomes.every((h) => setupText.certificateCurlLines(cert524, { windows: true, homeDir: h })[0] === 'cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"')
+      && badHomes.every((h) => setupText.certificateCurlLines(cert524, { windows: false, homeDir: h })[0] === 'cacert = /home/<your-name>/.orchestra-agent-kestrel.crt')
+      && setupText.certificateCurlLines(cert524, { windows: true, homeDir: 'C:\\Users\\Jane Doe' }).join('\n') === 'cacert = "C:/Users/Jane Doe/.orchestra-agent-kestrel.crt"\nssl-no-revoke'
+      && setupText.certificateCurlLines(cert524, { windows: false, homeDir: '$HOME' }).join('\n') === 'cacert = "$HOME/.orchestra-agent-kestrel.crt"'
+      && setupText.certificateCurlLines(cert524, { windows: false, homeDir: '/home/jane doe' }).join('\n') === 'cacert = "/home/jane doe/.orchestra-agent-kestrel.crt"'
+      && setupText.certificateCurlLines(cert524, { windows: false, homeDir: null }).join('\n') === 'cacert = /home/<your-name>/.orchestra-agent-kestrel.crt';
   } finally {
     for (const level of ['log', 'warn', 'error', 'info', 'debug']) {
       console[level] = origConsole[level];
     }
+    document.title = 'Orchestra';
     server.certificate = null;
     server.workingDirectory = undefined;
     store.clear();

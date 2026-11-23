@@ -77,46 +77,47 @@ export function headerLine(secretValue = SECRET_PLACEHOLDER) {
   return `header = "Authorization: Bearer ${secretValue}"`;
 }
 
-// Extract the user's home/profile directory from an agent's recorded working directory so
-// credential files for curl / non-Bridge agents carry the real cacert path without asking the
-// person to replace <your-name> by hand (kittrial-5bb.524). Rejects control characters, quotes,
-// dot segments, and invalid Windows filename characters so nothing can inject a curl config line.
-export function userHomeFromWorkingDirectory(workingDirectory, { windows = false } = {}) {
-  if (typeof workingDirectory !== 'string') return null;
-  const trimmed = workingDirectory.trim();
-  if (!trimmed || /[\x00-\x1f\x7f"]/.test(trimmed)) return null;
-  if (windows) {
-    const match = /^([A-Za-z]:)[\\/](Users)[\\/]([^\\/]+)(?:[\\/]|$)/i.exec(trimmed);
-    if (!match) return null;
-    const user = match[3];
-    if (user === '.' || user === '..' || /[<>|?*]/.test(user)) return null;
-    return `${match[1]}/${match[2]}/${user}`;
+// Validate an optional home/profile directory passed to certificateCurlLines: rejects C0/DEL/C1
+// controls, double quotes, line/paragraph separators, bidi controls, and lone UTF-16 surrogates
+// so nothing can inject a curl config line or break quoting (kittrial-5bb.524).
+function safeHomeDir(homeDir) {
+  if (typeof homeDir !== 'string') return null;
+  const trimmed = homeDir.trim();
+  if (!trimmed || /[\x00-\x1f\x7f-\x9f"\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(trimmed)) {
+    return null;
   }
-  const match = /^(\/(?:home|Users)\/([^/]+))(?:\/|$)/.exec(trimmed);
-  if (!match) return null;
-  const user = match[2];
-  if (user === '.' || user === '..') return null;
-  return match[1];
+  for (let i = 0; i < trimmed.length; i++) {
+    const code = trimmed.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < trimmed.length ? trimmed.charCodeAt(i + 1) : 0;
+      if (next < 0xdc00 || next > 0xdfff) return null;
+      i++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return null;
+    }
+  }
+  return trimmed;
 }
 
 // The curl option lines for the service's own certificate. curl does NOT expand %USERPROFILE% or
 // ~ inside a config file: a literal placeholder answers rc 2 (file does not exist), and a
 // Windows path with backslashes also answers rc 2. The rewrite command writes these lines with
-// the real expanded path; when `homeDir` is supplied (from the agent's working directory or a
-// shell expansion), that path is used directly with exact quoting; otherwise <your-name> is shown
+// the real expanded path (always double-quoted so paths with spaces work on both Windows and
+// POSIX); otherwise <your-name> is shown and never guessed from working_directory
 // (kittrial-5bb.275 rev2, kittrial-5bb.524). ssl-no-revoke is Windows-only.
 export function certificateCurlLines(certFile, { windows = false, homeDir = null } = {}) {
   if (!certFile) return [];
   const name = certFile.name;
-  const safeHome = typeof homeDir === 'string' && homeDir.trim() && !/[\x00-\x1f\x7f"]/.test(homeDir)
-    ? homeDir.trim() : null;
+  const safeHome = safeHomeDir(homeDir);
   if (windows) {
     const base = safeHome ? safeHome.replace(/\\/g, '/').replace(/\/+$/, '') : 'C:/Users/<your-name>';
     return [`cacert = "${base}/${name}"`, 'ssl-no-revoke'];
   }
-  const base = safeHome ? safeHome.replace(/\/+$/, '') : '/home/<your-name>';
-  const path = `${base}/${name}`;
-  return [/\s/.test(base) ? `cacert = "${path}"` : `cacert = ${path}`];
+  if (safeHome) {
+    const base = safeHome.replace(/\/+$/, '');
+    return [`cacert = "${base}/${name}"`];
+  }
+  return [`cacert = /home/<your-name>/${name}`];
 }
 
 // Managed (non-secret) lines of the credential file, in exact order: server/fingerprint comments,

@@ -2905,14 +2905,23 @@ also gets other people's deliveries). The rest of the screens are `screenPlan()`
   agent*.
 
 *Save your secret* shows the lines to paste into the credential file: `# server = ...`,
-`# server certificate sha256 = ...` (when there is a certificate) and the header line with the
-secret, behind one Copy button, and the file name. With the server line in the file, the Bridge's
-Set up proposes the server itself. Opened without a secret (the agent's card), that screen says in
-one line why (`The secret is shown only once, when it is issued; issue a new one to continue.`) with
-the **Issue a new secret** button right there, and the new secret's lines appear on the screen at
-once. The secret is shown on that screen only, never stored (the secretless `sessionStorage` state
-`orchestra.agentSetup.v1` holds the agent, the path, the screen, the system and the role, so a
-reload resumes the screen), and never in the folder files, the prompts or a command line.
+`# server certificate sha256 = ...` (when there is a certificate), the `cacert` line (and
+`ssl-no-revoke` on Windows) for non-Bridge / `curl` agents, and the header line with the secret,
+behind one Copy button, and the file name (`kittrial-5bb.524`). When opened directly with a fresh
+secret on a service with its own certificate and no stored route for that agent in this tab, the
+screen first asks **How does this agent connect?** (**Orchestra Bridge** or **curl or another
+client**) with no preselected default before showing the credential lines: Orchestra Bridge keeps
+the comment lines and header line only, while curl / non-Bridge agents include the certificate
+lines (using `<your-name>`, never guessed from `working_directory`) and direct the person to click
+**Next** for **Add the certificate path** (which expands the real user profile path on their
+machine and sets mode `600` on macOS/Linux without touching the secret). With the server line in
+the file, the Bridge's Set up proposes the server itself. Opened without a secret (the agent's
+card), that screen says in one line why (`The secret is shown only once, when it is issued; issue
+a new one to continue.`) with the **Issue a new secret** button right there, and the new secret's
+lines appear on the screen at once. The secret is shown on that screen only, never stored (the
+secretless `sessionStorage` state `orchestra.agentSetup.v1` holds the agent, the path, the screen,
+the system and the role, so a reload resumes the screen), and never in the folder files, the prompts
+or a command line.
 
 **Every error raised while the wizard is open is shown inside it**, on the current screen, in full
 (the sentence and the request id). Before `kittrial-5bb.348` a failed issue showed only a toast,
@@ -2925,11 +2934,12 @@ into `Downloads`; the filled-in `Move-Item` / `mv` command moves it into the use
 dot restored, and with nothing in `Downloads` prints one plain sentence (`Click Save certificate
 first, then run this again.`). **Add the certificate path** runs the rewrite command
 (`credentialFileCommand`), which expands the real user profile path on that machine
-(`[Environment]::GetFolderPath('UserProfile')` on Windows, `$HOME` on macOS/Linux) and writes the
-comment lines and `cacert = ...` with no `<your-name>` to edit. **Test it** gives the self-check
-(`checkCommands`): it looks for `.curlrc.txt`, a leftover `<your-name>`, or a certificate still in
+(`[Environment]::GetFolderPath('UserProfile')` on Windows, double-quoted `"$HOME/..."` on
+macOS/Linux so paths with spaces work too) and writes the comment lines and `cacert = ...` with no
+`<your-name>` to edit. **Test it** gives the self-check (`checkCommands`): it looks for
+`.curlrc.txt`, a leftover `<your-name>`, or a certificate still in
 `Downloads/orchestra-agent-<slug>.crt`, then calls Orchestra; `CURL_ERROR_LINES` (behind "More
-about this") covers `curl` exit codes `2`, `26`, `35`, `60` and `HTTP 401`. **Save the agent's
+about this") covers `curl` exit codes `2`, `26`, `35`, `60`, `77` and `HTTP 401`. **Save the agent's
 files** is the **Save to agent folder…** button with the agent's recorded folder path printed beside
 it (it passes the last chosen directory handle as `startIn` to `showDirectoryPicker`); the setup
 prompt and the two files to copy by hand are behind "More about this".
