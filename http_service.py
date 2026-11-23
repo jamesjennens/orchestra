@@ -7283,17 +7283,32 @@ class ApiHandler(BaseHTTPRequestHandler):
         import review_workflow
         sentences = (self.SAME_PERSON_APPROVAL, self.WORKER_CREDENTIAL_APPROVAL) + self.RETIRED_APPROVAL_SENTENCES
         labels = tuple(review_workflow.APPROVAL_BASES.values()) + review_workflow.RETIRED_APPROVAL_BASIS_LABELS
-        return [(text, text) for text in sentences] + [
+        # r3 (SHOULD-1): each sentence also without its "(project setting ...)" tail, named as written.
+        shortened = [(text, text.split(' (project setting', 1)[0]) for text in sentences]
+        return [(text, text) for text in sentences] + shortened + [
             (label, label.split(': ', 1)[1] if label.startswith('Allowed by: ') else label) for label in labels]
 
-    #: kittrial-5bb.540 r2 (gate-forms): the label "approval basis" with 1-3 separators between the words (spaces, a
-    #: newline, ".", "-", "_"), then any closing markup or quotes, then a colon, ANYWHERE in the text; and "allowed
-    #: by" in the same shape. Matched on the folded text (:meth:`_folded_basis_text`), not on a line start.
-    BASIS_LABEL = re.compile('(?<![^\\W_])approval[\\s\\W_]{1,3}basis(?P<tail>[\\s*_~`\'"\u2018\u2019\u201c\u201d\u00bb\u203a)\\]]*):')
-    ALLOWED_BY_LABEL = re.compile('(?<![^\\W_])allowed[\\s\\W_]{1,3}by[\\s*_~`\'"\u2018\u2019\u201c\u201d\u00bb\u203a)\\]]*:'
-                                  '(?P<rest>[^\\n]*)')
+    #: kittrial-5bb.540 r2 (gate-forms), widened by r3 (gate-separators): the label "approval basis" with ANY run of
+    #: separators between the words (none, spaces, newlines, markup, ".", "-", "_"), then any closing markup, quotes
+    #: or brackets, then a colon (":" or U+2236), ANYWHERE in the text; and "allowed by" in the same shape. Matched on
+    #: the folded text (:meth:`_folded_basis_text`), not on a line start.
+    BASIS_TAIL = '[\\s*_~`\'"\u2018\u2019\u201c\u201d\u00bb\u203a)\\]>}]*'
+    BASIS_LABEL = re.compile('(?<![^\\W_])approval[\\s\\W_]*basis(?P<tail>' + BASIS_TAIL + ')[:\u2236]')
+    #: r3 (SHOULD-1): the label followed by a dash instead of a colon ("Approval basis \u2014 same-person-agent"). A
+    #: dash is ordinary prose after the two words, so this form is refused only when a basis follows it.
+    BASIS_DASH_LABEL = re.compile('(?<![^\\W_])approval[\\s\\W_]*basis' + BASIS_TAIL
+                                  + '[-\u2010\u2011\u2012\u2013\u2014\u2015\u2212](?P<rest>[\\s\\S]{0,400})')
+    #: What follows "allowed by" and its colon or dash, newlines included (r3: "Allowed by:\nsame-person-agent").
+    ALLOWED_BY_LABEL = re.compile('(?<![^\\W_])allowed[\\s\\W_]*by' + BASIS_TAIL
+                                  + '[:\u2236\u2013\u2014\u2212-](?P<rest>[\\s\\S]{0,400})')
     #: The quotes a mention of the label is written in ("'Approval basis:' was wrong ...").
     BASIS_QUOTES = '\'"`\u2018\u2019\u201a\u201c\u201d\u201e\u00ab\u00bb\u2039\u203a'
+    #: r3: how a basis may start after a label, compared normalized (:meth:`_normalize_basis_text`): a token, the
+    #: reason's words with or without an article, the project setting, or the setting's value.
+    BASIS_VALUE_STARTS = ('coordinatoragent', 'acoordinatoragent', 'thecoordinatoragent', 'projectsetting',
+                          'agentapproval', 'byagent')
+    #: r3: words that make a quoted mention of the label a claim wherever they follow it.
+    BASIS_VALUE_WORDS = ('coordinatoragent', 'agentapprovalbyagent')
 
     @staticmethod
     def _folded_basis_text(text):
@@ -7301,12 +7316,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         folded = unicodedata.normalize('NFKD', unicodedata.normalize('NFKD', text).casefold())
         return ''.join(ch for ch in folded if unicodedata.category(ch) != 'Cf' and unicodedata.category(ch)[0] != 'M')
 
-    def _basis_value_starts(self, rest):
-        """Whether ``rest`` (what follows a label's colon) starts with a basis: a token, or "coordinator agent"."""
+    def _basis_tokens(self):
         import review_workflow
+        return [self._normalize_basis_text(token) for token in review_workflow.APPROVAL_BASES]
+
+    def _basis_value_starts(self, rest):
+        """Whether ``rest`` (what follows a label's colon, newlines included) starts with a basis (r3: a token, "a" or
+        "the coordinator agent", "coordinator agent", "project setting", "agent_approval" or "by-agent")."""
         start = self._normalize_basis_text(rest)
-        values = [self._normalize_basis_text(token) for token in review_workflow.APPROVAL_BASES]
-        return bool(start) and any(start.startswith(value) for value in values + ['coordinatoragent'])
+        return bool(start) and any(start.startswith(value)
+                                   for value in self._basis_tokens() + list(self.BASIS_VALUE_STARTS))
+
+    def _basis_value_in(self, rest):
+        """Whether ``rest`` names a basis anywhere: :meth:`_basis_value_starts`, or a token or "coordinator agent"
+        later in it (r3: a quoted mention of the label followed by a basis in other words is a claim)."""
+        text = self._normalize_basis_text(rest)
+        return self._basis_value_starts(rest) or any(
+            value in text for value in self._basis_tokens() + list(self.BASIS_VALUE_WORDS))
 
     def _basis_label_in(self, summary):
         """The label ``summary`` carries ("Approval basis:", or "Allowed by:" naming a basis), or None (r2).
@@ -7322,9 +7348,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             start, end = found.start(), found.end()
             quoted = (not found.group('tail') and start > 0 and kept[start - 1] in self.BASIS_QUOTES
                       and end < len(kept) and kept[end] in self.BASIS_QUOTES)
-            after = kept[end + 1:].split('\n', 1)[0] if quoted else ''
-            if quoted and re.match(r'\s*[^\W\d_]', after) and not self._basis_value_starts(after):
+            after = kept[end + 1:] if quoted else ''
+            if quoted and re.match(r'\s*[^\W\d_]', after) and not self._basis_value_in(after):
                 continue
+            return self.BASIS_LINE_LABEL
+        if any(self._basis_value_starts(found.group('rest')) for found in self.BASIS_DASH_LABEL.finditer(kept)):
             return self.BASIS_LINE_LABEL
         if any(self._basis_value_starts(found.group('rest')) for found in self.ALLOWED_BY_LABEL.finditer(kept)):
             return self.ALLOWED_BY_TEXT

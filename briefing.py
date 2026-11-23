@@ -2709,16 +2709,19 @@ def format_context_pointers(item):
 
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
-    lines=[f'{result["task"]}: {excerpt(result["title"])}',f'Owner: {excerpt(result["owner"])} | Status: {result["status"]}',
+    # kittrial-5bb.540 r2 (gate-fields), r3 (brief-lines): every caller field is printed through continued(), so a
+    # continuation line is indented and no caller line can start a line of the brief (and pose as the server's
+    # "Approval basis:" line); splitlines() also splits on \r, \u2028 and the other line breaks.
+    def continued(text):return '\n  '.join(str(text).splitlines())
+    lines=[f'{result["task"]}: {continued(excerpt(result["title"]))}',
+           f'Owner: {continued(excerpt(result["owner"]))} | Status: {result["status"]}',
            'Review/contribution: '+json.dumps(result['review'],ensure_ascii=False)]
     # kittrial-5bb.515: why the server let the standing approval through, on its own line apart from any
     # summary; present only when the approval record carries the field.
     basis=result['review'].get('approval_basis')
-    if isinstance(basis,dict) and isinstance(basis.get('text'),str):lines.append('Approval basis: '+basis['text'])
-    # kittrial-5bb.540 r2 (gate-fields): these fields are a caller's own text, printed as lines right after the
-    # server's "Approval basis:" line. A continuation line is indented, so no caller line can start a line of the
-    # brief (and pose as that line); splitlines() also splits on \r, \u2028 and the other line breaks.
-    def continued(text):return '\n  '.join(str(text).splitlines())
+    server_line=None
+    if isinstance(basis,dict) and isinstance(basis.get('text'),str):
+        server_line=len(lines);lines.append('Approval basis: '+continued(basis['text']))
     lines+=[
            'Intent: '+continued(excerpt(result['intent'])),'Acceptance: '+continued(excerpt(result['acceptance'])),
            'Current position: '+continued(result['current_position']),'Next: '+continued(result['next_action'])]
@@ -2798,14 +2801,39 @@ def format_brief(result):
     full=result.get('full_context')
     if full:
         lines += ['Full context (bounded; omission_counts are characters the compact read clipped, full_omitted_chars what this cap removed):',
-                  'Title: '+full['title'],'Owner: '+full['owner'],'Intent: '+full['intent'],
-                  'Acceptance: '+full['acceptance'],'Current position: '+full['current_position'],
-                  'Next: '+full['next_action'],
+                  'Title: '+continued(full['title']),'Owner: '+continued(full['owner']),
+                  'Intent: '+continued(full['intent']),'Acceptance: '+continued(full['acceptance']),
+                  'Current position: '+continued(full['current_position']),'Next: '+continued(full['next_action']),
                   'Omission counts: '+json.dumps(full['omission_counts'],ensure_ascii=False),
                   'Bounded full context: omitted '+json.dumps(full['full_omitted_chars'],ensure_ascii=False)
                   +('; complete' if full['complete'] else '; truncated fields: '+', '.join(full['truncated']))
                   +' — '+full['note']]
-    return '\n'.join(lines)+'\n'
+    return brief_lines_text(lines,server_line)
+
+
+#: kittrial-5bb.540 r3 (brief-lines): a physical line that starts with the label, after any markup (not whitespace:
+#: an indented line does not start a line of the brief).
+BRIEF_LABEL_START=re.compile(r'[^\w\s]*approval[\s\W_]*basis')
+
+
+def brief_lines_text(lines,server_line=None):
+    """The brief's text from ``lines``; ``server_line`` is the index in ``lines`` of the server's own "Approval
+    basis:" line, or None (r3).
+
+    A backstop behind continued(): every other physical line that starts with the label is indented, whichever field
+    a caller's text reaches the brief through, so only the server's line starts with "Approval basis:" (compared
+    after NFKD and case folding, format characters and marks dropped). The server's line is known by its position,
+    never by a mark in the text.
+    """
+    import unicodedata
+    def folded(text):
+        text=unicodedata.normalize('NFKD',unicodedata.normalize('NFKD',text).casefold())
+        return ''.join(ch for ch in text if unicodedata.category(ch)!='Cf' and unicodedata.category(ch)[0]!='M')
+    server=None if server_line is None else sum(str(line).count('\n')+1 for line in lines[:server_line])
+    out=[]
+    for number,line in enumerate('\n'.join(lines).split('\n')):
+        out.append('  '+line if number!=server and BRIEF_LABEL_START.match(folded(line)) else line)
+    return '\n'.join(out)+'\n'
 
 def help_limits(action):
     """Documented limits for the machine-readable help of one briefing command."""
