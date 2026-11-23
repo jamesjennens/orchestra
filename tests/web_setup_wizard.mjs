@@ -71,7 +71,7 @@ globalThis.window = {
 };
 
 const { createApi } = await import(apiUrl);
-const { setupWizardPage, WIZARD_STORAGE_KEY, clearWizardStorage, list: agentsList } = await import(agentsUrl);
+const { setupWizardPage, WIZARD_STORAGE_KEY, clearWizardStorage, list: agentsList, SCREEN_TITLES, CURL_ERROR_LINES } = await import(agentsUrl);
 const setupText = await import(new URL('../agentSetup.js', agentsUrl).href);
 const { SESSION_IDLE_WARNING_EVENT } = await import(apiUrl);
 const { toast } = await import(domUrl);
@@ -1100,7 +1100,10 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     let confirm524 = openDialogs().find((x) => x !== d);
     await confirm524.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
     await issueNew524; await tick(); await tick();
-    const winCurlSecretText = attr(d, 'data-secret-file-text', 'true')[0].textContent;
+    // F12: assert choice block absent and secret text present before dereferencing so mutant F12
+    // fails as a clean false fact instead of throwing TypeError.
+    const winCurlSecretEl = attr(d, 'data-secret-file-text', 'true')[0];
+    const winCurlSecretText = winCurlSecretEl ? winCurlSecretEl.textContent : '';
     const expectedWinCurlText = [
       '# server = https://127.0.0.1:8765',
       '# server certificate sha256 = AB:CD:EF',
@@ -1109,16 +1112,18 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       'header = "Authorization: Bearer ' + SECRET + '"',
     ].join('\n') + '\n';
     const winRewriteNotice = attr(d, 'data-cert-rewrite-next', 'true')[0];
-    out.rotationCurlWindowsKeepsCacertAndSslNoRevoke = winCurlSecretText === expectedWinCurlText
+    out.rotationCurlWindowsKeepsCacertAndSslNoRevoke = attr(d, 'data-connection-choice', 'true').length === 0
+      && Boolean(winCurlSecretEl)
+      && winCurlSecretText === expectedWinCurlText
       && !winCurlSecretText.includes('Public')
-      && Boolean(winRewriteNotice && winRewriteNotice.textContent.includes('Add the certificate path'));
+      && Boolean(winRewriteNotice && winRewriteNotice.textContent.includes(SCREEN_TITLES.rewrite) && !winRewriteNotice.textContent.includes('Add the certificate path'));
     out.rotationWindowsSpacePathExactQuoting = setupText.credentialFileLines(
       'https://127.0.0.1:8765', 'AB:CD:EF', SECRET,
       { certFile: setupText.certificateFile('Kestrel'), hasCertificate: true, windows: true, homeDir: 'C:\\Users\\Jane Doe' },
     ).includes('cacert = "C:/Users/Jane Doe/.orchestra-agent-kestrel.crt"\nssl-no-revoke\n');
     out.rotationWizardSecretOnlyInsideSecretBlock = secretContainmentOk(SECRET, { expectPre: true })
       && await clickBothCopyButtonsAndScan(d, SECRET);
-    // Next from secret goes to rewrite (Add the certificate path) and secret does not linger.
+    // Next from secret goes to rewrite (Update the credential options) and secret does not linger.
     await d.wizard.next();
     const winSetupRewriteCmd = screenOf(d) === 'rewrite' ? commandText(d, 'rewrite command') : '';
     const winSetupNonSecret = evalPsRewriteNonSecret(winSetupRewriteCmd, 'C:\\Users\\Jane Doe');
@@ -1129,13 +1134,20 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     out.rotationAndSetupProduceIdenticalNonSecretLinesWindows = screenOf(d) === 'rewrite'
       && JSON.stringify(winSetupNonSecret) === JSON.stringify(nonSecretLines(winLinesForProfile))
       && secretContainmentOk(SECRET, { expectPre: false });
-    // Test screen lists curl exit 77 with Move the certificate + Add the certificate path fix.
+    // Test screen lists curl exit 2 and exit 77 naming the real SCREEN_TITLES.rewrite heading.
     d.wizard.show('test');
+    const err2 = attr(d, 'data-curl-error', '2')[0];
     const err77 = attr(d, 'data-curl-error', '77')[0];
-    out.curlExit77ErrorLinePresent = Boolean(err77)
+    out.curlExit77ErrorLinePresent = Boolean(err2 && err77)
+      && SCREEN_TITLES.rewrite === 'Update the credential options'
+      && err2.textContent.includes(SCREEN_TITLES.rewrite)
+      && !err2.textContent.includes('Add the certificate path')
       && err77.textContent.includes('77')
-      && err77.textContent.includes('Move the certificate')
-      && err77.textContent.includes('Add the certificate path')
+      && err77.textContent.includes(SCREEN_TITLES['cert-move'])
+      && err77.textContent.includes(SCREEN_TITLES.rewrite)
+      && !err77.textContent.includes('Add the certificate path')
+      && CURL_ERROR_LINES[2].includes(SCREEN_TITLES.rewrite)
+      && CURL_ERROR_LINES[77].includes(SCREEN_TITLES.rewrite)
       && secretContainmentOk(SECRET, { expectPre: false });
 
     // (2) With proxy bypass on, noproxy + cacert + ssl-no-revoke stay in exact set-up order.
@@ -1144,7 +1156,7 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     proxyOn524.checked = true;
     await proxyOn524.dispatch('change');
     d.wizard.show('secret');
-    const winCurlNoProxyText = attr(d, 'data-secret-file-text', 'true')[0].textContent;
+    const winCurlNoProxyText = attr(d, 'data-secret-file-text', 'true')[0]?.textContent || '';
     d.wizard.show('rewrite');
     const winSetupNoProxyNonSecret = evalPsRewriteNonSecret(commandText(d, 'rewrite command'), 'C:\\Users\\Jane Doe');
     const winLinesNoProxy = setupText.credentialFileLines(
@@ -1154,8 +1166,9 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     out.rotationCurlWindowsWithNoProxyMatchesSetup = winCurlNoProxyText.includes('noproxy = "127.0.0.1"\ncacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"\nssl-no-revoke\n')
       && JSON.stringify(winSetupNoProxyNonSecret) === JSON.stringify(nonSecretLines(winLinesNoProxy));
 
-    // (3) POSIX (Linux) curl agent keeps cacert (placeholder, NEVER /Users/Shared or working_directory),
-    // NEVER includes ssl-no-revoke, and tells the user Next runs Add the certificate path (chmod 600).
+    // (3) POSIX (Linux & macOS) curl agent keeps cacert (/home/<your-name> on Linux,
+    // /Users/<your-name> on macOS, NEVER /Users/Shared or working_directory), NEVER includes
+    // ssl-no-revoke, and tells the user Next runs Update the credential options (chmod 600).
     for (const open of openDialogs()) await open.close();
     store.clear();
     server.workingDirectory = '/Users/Shared/agents/kestrel';
@@ -1168,7 +1181,8 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     confirm524 = openDialogs().find((x) => x !== d);
     await confirm524.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
     await issueNew524; await tick(); await tick();
-    const linuxCurlSecretText = attr(d, 'data-secret-file-text', 'true')[0].textContent;
+    const linuxCurlSecretEl = attr(d, 'data-secret-file-text', 'true')[0];
+    const linuxCurlSecretText = linuxCurlSecretEl ? linuxCurlSecretEl.textContent : '';
     const expectedLinuxCurlText = [
       '# server = https://127.0.0.1:8765',
       '# server certificate sha256 = AB:CD:EF',
@@ -1176,11 +1190,31 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       'header = "Authorization: Bearer ' + SECRET + '"',
     ].join('\n') + '\n';
     const posixRewriteNotice = attr(d, 'data-cert-rewrite-next', 'true')[0];
-    out.rotationCurlPosixKeepsCacertAndOmitsSslNoRevoke = linuxCurlSecretText === expectedLinuxCurlText
+    out.rotationCurlPosixKeepsCacertAndOmitsSslNoRevoke = attr(d, 'data-connection-choice', 'true').length === 0
+      && Boolean(linuxCurlSecretEl)
+      && linuxCurlSecretText === expectedLinuxCurlText
       && !linuxCurlSecretText.includes('ssl-no-revoke')
       && !linuxCurlSecretText.includes('/Users/Shared')
-      && Boolean(posixRewriteNotice && posixRewriteNotice.textContent.includes('Add the certificate path') && posixRewriteNotice.textContent.includes('600'))
+      && Boolean(posixRewriteNotice && posixRewriteNotice.textContent.includes(SCREEN_TITLES.rewrite) && posixRewriteNotice.textContent.includes('600'))
       && await clickBothCopyButtonsAndScan(d, SECRET);
+
+    // (3b) N2: macOS curl agent uses /Users/<your-name> (both on secret screen and rewrite fallback).
+    d.wizard.show('system');
+    await windowsChoice(d, 'setup-os', 'macos').dispatch('change');
+    d.wizard.show('secret');
+    const macCurlSecretText = attr(d, 'data-secret-file-text', 'true')[0]?.textContent || '';
+    const expectedMacCurlText = [
+      '# server = https://127.0.0.1:8765',
+      '# server certificate sha256 = AB:CD:EF',
+      'cacert = /Users/<your-name>/.orchestra-agent-kestrel.crt',
+      'header = "Authorization: Bearer ' + SECRET + '"',
+    ].join('\n') + '\n';
+    d.wizard.show('rewrite');
+    const macRewriteBody = d.all((e) => e.tagName === 'PRE')[0]?.textContent || '';
+    out.rotationCurlMacosUsesUsersPlaceholder = macCurlSecretText === expectedMacCurlText
+      && !macCurlSecretText.includes('ssl-no-revoke')
+      && !macCurlSecretText.includes('/home/<your-name>')
+      && macRewriteBody.includes('cacert = /Users/<your-name>/.orchestra-agent-kestrel.crt');
 
     // (4) Bridge agent credential text is byte-identical to b1f2356c (even with a certificate).
     for (const open of openDialogs()) await open.close();
@@ -1195,18 +1229,21 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     confirm524 = openDialogs().find((x) => x !== d);
     await confirm524.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
     await issueNew524; await tick(); await tick();
-    const bridgeSecretText = attr(d, 'data-secret-file-text', 'true')[0].textContent;
+    const bridgeSecretEl = attr(d, 'data-secret-file-text', 'true')[0];
+    const bridgeSecretText = bridgeSecretEl ? bridgeSecretEl.textContent : '';
     const expectedBridgeB1f2356c = [
       '# server = https://127.0.0.1:8765',
       '# server certificate sha256 = AB:CD:EF',
       'header = "Authorization: Bearer ' + SECRET + '"',
     ].join('\n') + '\n';
-    out.rotationBridgeAgentByteIdentical = bridgeSecretText === expectedBridgeB1f2356c
+    out.rotationBridgeAgentByteIdentical = attr(d, 'data-connection-choice', 'true').length === 0
+      && Boolean(bridgeSecretEl)
+      && bridgeSecretText === expectedBridgeB1f2356c
       && !bridgeSecretText.includes('cacert')
       && !bridgeSecretText.includes('ssl-no-revoke')
       && await clickBothCopyButtonsAndScan(d, SECRET);
 
-    // (5) Agent card's "Save and issue a new secret" path (editScopes):
+    // (5) Agent card's "Save and issue a new secret" path (editScopes) + create-agent path:
     for (const open of openDialogs()) await open.close();
     store.clear();
     localStore.clear();
@@ -1222,6 +1259,11 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       agentHistory: async () => ({ items: [] }),
       agent: async () => cardAgent,
       certificate: async () => server.certificate,
+      createAgent: async (body) => ({
+        agent: { ...cardAgent, id: 'agent_new_524', name: body.name || 'Heron' },
+        credential: { id: 'cred_new_524', secret: SECRET, scopes: ['read', 'tasks'] },
+        setup: { config: { agent_id: 'agent_new_524', name: body.name || 'Heron', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } },
+      }),
       issueAgentCredential: async (_aid, scopes) => ({
         credential: { id: 'cred_card_1', secret: SECRET, scopes },
         setup: { config: { agent_id: 'agent_1', name: 'Kestrel', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } },
@@ -1229,9 +1271,17 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     };
     const cardApi = new Proxy(api, { get: (target, key) => (key in cardOverrides ? cardOverrides[key] : target[key]) });
     const origQA = Element.prototype.querySelectorAll;
+    const origQ = Element.prototype.querySelector;
     Element.prototype.querySelectorAll = function (selector) {
       if (selector === 'input') return this.all((e) => e.tagName === 'INPUT');
+      if (selector === 'input[name=project]:checked') return this.all((e) => e.tagName === 'INPUT' && e.getAttribute('name') === 'project' && e.checked);
+      if (selector === 'input, textarea, select') return this.all((e) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.tagName));
       return origQA.call(this, selector);
+    };
+    Element.prototype.querySelector = function (selector) {
+      if (selector === 'button[type=submit]') return this.all((e) => e.tagName === 'BUTTON' && e.getAttribute('type') === 'submit')[0] || null;
+      if (selector === '#a-owner') return this.all((e) => e.getAttribute('id') === 'a-owner')[0] || null;
+      return origQ.call(this, selector);
     };
     const openCardSecretDialog = async () => {
       const cardPage = await agentsList({ ...ctx, api: cardApi, render() {}, refreshProjects: async () => {} });
@@ -1244,46 +1294,97 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       await cardSubmit; await new Promise((r) => setTimeout(r, 50));
       return openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
     };
+    const openCreateAgentDialog = async (name = 'Heron') => {
+      const createCtx = {
+        ...ctx,
+        projects: [{ id: 'p1', name: 'Alpha', role: 'owner', archived: false }],
+        api: cardApi,
+        render() {},
+        refreshProjects: async () => {},
+      };
+      const cardPage = await agentsList(createCtx);
+      await new Promise((r) => setTimeout(r, 50));
+      const createForm = cardPage.all((e) => e.tagName === 'FORM' && e.all((i) => i.getAttribute('id') === 'a-name').length > 0)[0];
+      createForm.reset = () => {};
+      createForm.all((i) => i.getAttribute('id') === 'a-name')[0].value = name;
+      const projCb = createForm.all((i) => i.tagName === 'INPUT' && i.getAttribute('name') === 'project')[0];
+      if (projCb) projCb.checked = true;
+      await createForm.dispatch('submit');
+      await new Promise((r) => setTimeout(r, 50));
+      return openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
+    };
 
-    // (5a) Stored curl route in sessionStorage -> opens on secret with placeholder cacert + ssl-no-revoke,
-    // never poisoned by working_directory, and Next goes to rewrite.
+    // (5a) Stored curl route in sessionStorage (even without routeChosen flag) -> opens on secret
+    // with placeholder cacert + ssl-no-revoke, never poisoned by working_directory.
     store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'resume', runs: 'none', bridge: false, os: 'windows', role: 'worker', noproxy: false }));
     let cardWizard = await openCardSecretDialog();
     const cardStoredCurlText = cardWizard ? attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent : '';
     const cardStoredCopyOk = cardWizard ? await clickBothCopyButtonsAndScan(cardWizard, SECRET) : false;
     out.cardNewSecretPathKeepsCacert = Boolean(cardWizard)
       && screenOf(cardWizard) === 'secret'
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 0
       && cardStoredCurlText === expectedWinCurlText
       && !cardStoredCurlText.includes('/Users/Shared')
       && attr(cardWizard, 'data-include-cert', 'true').length === 0
       && cardStoredCopyOk;
     for (const open of openDialogs()) await open.close();
 
-    // (5b) Reversed A1 (fresh tab, empty sessionStorage): NEVER silently picks Bridge!
-    // Asks "How does this agent connect?" (Orchestra Bridge / curl or another client) with NO default,
-    // hides secret text until answered, refuses Next while unanswered, and does not write sessionStorage yet.
-    // Choosing curl shows cacert + ssl-no-revoke, passes strict Copy scan, and Next advances to rewrite.
+    // (5b) Reversed A1 + SHOULD-2 + N4 + F06 + F13 (fresh tab, empty sessionStorage):
+    // Offers all THREE routes (Bridge 0.14+, older Bridge, No Bridge) with NO preselected default,
+    // hides secret text until answered, refuses Next with checkStatus while unanswered, clears and
+    // hides checkStatus upon choice (F13), keeps the clicked radio mounted in place (N4) so a
+    // mis-click can switch routes in one click, and 'none' keeps cacert + omits vscode (F06).
     store.clear();
     localStore.clear();
     consoleMessages.length = 0;
     cardWizard = await openCardSecretDialog();
     const choiceBlock = cardWizard ? attr(cardWizard, 'data-connection-choice', 'true')[0] : null;
     const bridgeRadio = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'bridge') : null;
-    const curlRadio = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'curl') : null;
-    const bothUncheckedBefore = Boolean(bridgeRadio && !bridgeRadio.checked && curlRadio && !curlRadio.checked);
+    const olderRadio = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'older') : null;
+    const noneRadio = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'none') : null;
+    const allThreeUncheckedBefore = Boolean(
+      bridgeRadio && !bridgeRadio.checked
+      && olderRadio && !olderRadio.checked
+      && noneRadio && !noneRadio.checked
+      && choiceBlock && choiceBlock.textContent.includes('VS Code with Orchestra Bridge 0.14 or later')
+      && choiceBlock.textContent.includes('VS Code with an older Bridge, or none yet')
+      && choiceBlock.textContent.includes('No Bridge: Claude Code, Codex, a command-line agent')
+    );
     const preBeforeChoice = cardWizard ? attr(cardWizard, 'data-secret-file-text', 'true').length : -1;
     const storedBeforeChoice = store.has(WIZARD_STORAGE_KEY);
     const containedBeforeChoice = secretContainmentOk(SECRET, { expectPre: false });
     const nextBlockedBeforeChoice = cardWizard ? (await cardWizard.wizard.next()) === false && screenOf(cardWizard) === 'secret' : false;
+    const checkStatusEl = cardWizard ? attr(cardWizard, 'data-wizard-check-status', 'true')[0] : null;
+    const checkShownOnRefusal = Boolean(checkStatusEl && !checkStatusEl.hidden && checkStatusEl.textContent.includes('Choose how this agent connects first.'));
+    let checkClearedAfterChoice = false;
+    let radioKeptMountedForFocus = false;
+    let misClickRecoveredInPlace = false;
     let cardFreshCurlText = '';
     let cardFreshCurlCopyOk = false;
+    let cardFreshCurlNoVscode = false;
     let cardFreshCurlNextScreen = '';
     let cardFreshCurlAfterNextContained = false;
-    if (curlRadio) {
-      curlRadio.checked = true;
-      await curlRadio.dispatch('change');
+    if (bridgeRadio && noneRadio) {
+      // Simulate mis-clicking Bridge first: checkStatus clears (F13), radio stays in DOM (N4),
+      // Bridge text appears, then one click on 'none' switches straight to curl lines with cacert.
+      bridgeRadio.checked = true;
+      await bridgeRadio.dispatch('change');
+      await tick();
+      checkClearedAfterChoice = Boolean(checkStatusEl && checkStatusEl.hidden && checkStatusEl.textContent === '');
+      radioKeptMountedForFocus = cardWizard.all((e) => e === bridgeRadio).length === 1;
+      const misClickText = attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '';
+      bridgeRadio.checked = false;
+      noneRadio.checked = true;
+      await noneRadio.dispatch('change');
       await tick();
       cardFreshCurlText = attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '';
+      misClickRecoveredInPlace = misClickText === expectedBridgeB1f2356c
+        && cardWizard.all((e) => e === noneRadio).length === 1
+        && cardFreshCurlText === expectedWinCurlText;
+      const storedAfterNone = JSON.parse(store.get(WIZARD_STORAGE_KEY) || '{}');
+      cardFreshCurlNoVscode = !cardWizard.wizard.plan().includes('vscode')
+        && storedAfterNone.runs === 'none'
+        && storedAfterNone.routeChosen === true;
       cardFreshCurlCopyOk = await clickBothCopyButtonsAndScan(cardWizard, SECRET);
       await cardWizard.wizard.next();
       cardFreshCurlNextScreen = screenOf(cardWizard);
@@ -1291,18 +1392,55 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     }
     out.cardNewSecretFreshTabAsksAndCurlKeepsCacert = Boolean(cardWizard && choiceBlock)
       && choiceBlock.textContent.includes('How does this agent connect?')
-      && bothUncheckedBefore
+      && allThreeUncheckedBefore
       && preBeforeChoice === 0
       && !storedBeforeChoice
       && containedBeforeChoice
       && nextBlockedBeforeChoice
+      && checkShownOnRefusal
+      && checkClearedAfterChoice
+      && radioKeptMountedForFocus
+      && misClickRecoveredInPlace
       && cardFreshCurlText === expectedWinCurlText
+      && cardFreshCurlNoVscode
       && cardFreshCurlCopyOk
       && cardFreshCurlNextScreen === 'rewrite'
       && cardFreshCurlAfterNextContained;
     for (const open of openDialogs()) await open.close();
 
-    // (5c) Fresh tab choosing "Orchestra Bridge" keeps condition 4's byte-identical Bridge text.
+    // (5b-older) SHOULD-2: choosing "VS Code with an older Bridge, or none yet" keeps cacert +
+    // ssl-no-revoke, includes 'vscode' in plan, and advances to 'rewrite'.
+    store.clear();
+    localStore.clear();
+    consoleMessages.length = 0;
+    cardWizard = await openCardSecretDialog();
+    const olderRadio2 = cardWizard ? windowsChoice(cardWizard, 'secret-connect', 'older') : null;
+    let cardOlderText = '';
+    let cardOlderHasVscode = false;
+    let cardOlderNextScreen = '';
+    let cardOlderCopyOk = false;
+    if (olderRadio2) {
+      olderRadio2.checked = true;
+      await olderRadio2.dispatch('change');
+      await tick();
+      cardOlderText = attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '';
+      const storedOlder = JSON.parse(store.get(WIZARD_STORAGE_KEY) || '{}');
+      cardOlderHasVscode = cardWizard.wizard.plan().includes('vscode')
+        && storedOlder.runs === 'older'
+        && storedOlder.routeChosen === true;
+      cardOlderCopyOk = await clickBothCopyButtonsAndScan(cardWizard, SECRET);
+      await cardWizard.wizard.next();
+      cardOlderNextScreen = screenOf(cardWizard);
+    }
+    out.cardNewSecretFreshTabOlderBridgeKeepsCacert = Boolean(cardWizard && olderRadio2)
+      && cardOlderText === expectedWinCurlText
+      && cardOlderHasVscode
+      && cardOlderCopyOk
+      && cardOlderNextScreen === 'rewrite';
+    for (const open of openDialogs()) await open.close();
+
+    // (5c) Fresh tab choosing "VS Code with Orchestra Bridge 0.14 or later" keeps condition 4's
+    // byte-identical Bridge text, persists routeChosen: true, and a subsequent rotation remembers it.
     store.clear();
     localStore.clear();
     consoleMessages.length = 0;
@@ -1311,6 +1449,7 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     let cardFreshBridgeChosenText = '';
     let cardFreshBridgeCopyOk = false;
     let cardFreshBridgeNextScreen = '';
+    let cardSecondBridgeRemembers = false;
     if (bridgeRadio2) {
       bridgeRadio2.checked = true;
       await bridgeRadio2.dispatch('change');
@@ -1320,42 +1459,180 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       await cardWizard.wizard.next();
       cardFreshBridgeNextScreen = screenOf(cardWizard);
     }
-    out.cardNewSecretFreshTabBridgeChoiceByteIdentical = Boolean(cardWizard && bridgeRadio2)
+    for (const open of openDialogs()) await open.close();
+    cardWizard = await openCardSecretDialog();
+    cardSecondBridgeRemembers = Boolean(cardWizard)
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 0
+      && (attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '') === expectedBridgeB1f2356c;
+    out.cardNewSecretFreshTabBridgeChoiceByteIdentical = Boolean(bridgeRadio2)
       && cardFreshBridgeChosenText === expectedBridgeB1f2356c
       && cardFreshBridgeCopyOk
-      && cardFreshBridgeNextScreen === 'vscode';
+      && cardFreshBridgeNextScreen === 'vscode'
+      && cardSecondBridgeRemembers;
     for (const open of openDialogs()) await open.close();
 
-    // (5d) B2 (sessionStorage holds ANOTHER agent's stored Bridge route): still asks before showing lines!
+    // (5d) B2 (sessionStorage holds ANOTHER agent's explicitly chosen Bridge route): still asks!
     store.clear();
-    store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_other', screen: 'resume', runs: 'bridge', bridge: true, os: 'windows', role: 'worker', noproxy: false }));
+    store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_other', screen: 'resume', runs: 'bridge', bridge: true, routeChosen: true, os: 'windows', role: 'worker', noproxy: false }));
     cardWizard = await openCardSecretDialog();
-    Element.prototype.querySelectorAll = origQA;
     out.cardNewSecretOtherAgentStoredStillAsks = Boolean(cardWizard)
       && attr(cardWizard, 'data-connection-choice', 'true').length === 1
       && attr(cardWizard, 'data-secret-file-text', 'true').length === 0
       && secretContainmentOk(SECRET, { expectPre: false });
     for (const open of openDialogs()) await open.close();
 
-    // (6) NOTE-1 & NOTE-2 Node pins: userHomeFromWorkingDirectory removed; certificateCurlLines
-    // rejects controls/C1/bidi/separators/quotes/surrogates (S09), converts Windows backslashes (S10),
-    // and quotes POSIX $HOME / space paths without ssl-no-revoke.
+    // (5e) MUST-1 (FT6, FT7/F10, FT8, FT10, legacy stored Bridge): an untouched default Bridge
+    // persisted to sessionStorage NEVER suppresses the connection question!
+    // FT6: Back from unanswered question -> second rotation still asks.
+    store.clear();
+    cardWizard = await openCardSecretDialog();
+    cardWizard.wizard.back();
+    const storedAfterBack = JSON.parse(store.get(WIZARD_STORAGE_KEY) || '{}');
+    for (const open of openDialogs()) await open.close();
+    cardWizard = await openCardSecretDialog();
+    const ft6StillAsks = storedAfterBack.routeChosen === false
+      && Boolean(cardWizard)
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 1
+      && attr(cardWizard, 'data-secret-file-text', 'true').length === 0;
+    // FT7 / F10: Back twice to 'system', Next twice without clicking a route radio -> still asks!
+    cardWizard.wizard.back(); // role
+    cardWizard.wizard.back(); // system
+    const atSystem = screenOf(cardWizard) === 'system';
+    await cardWizard.wizard.next(); // role
+    await cardWizard.wizard.next(); // secret
+    const ft7StillAsks = atSystem
+      && screenOf(cardWizard) === 'secret'
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 1
+      && attr(cardWizard, 'data-secret-file-text', 'true').length === 0;
+    for (const open of openDialogs()) await open.close();
+    // FT8: Opening "Set up folder" (which saves default Bridge with routeChosen: false) and
+    // closing without picking a route -> rotation still asks!
+    store.clear();
+    d = await openWizard();
+    for (const open of openDialogs()) await open.close();
+    cardWizard = await openCardSecretDialog();
+    const ft8StillAsks = Boolean(cardWizard)
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 1
+      && attr(cardWizard, 'data-secret-file-text', 'true').length === 0;
+    // FT10: Back from unanswered question -> close -> resume wizard on role -> Next -> Issue new
+    // secret -> STILL asks!
+    cardWizard.wizard.back(); // role (persists routeChosen: false)
+    for (const open of openDialogs()) await open.close();
+    d = await openWizard(); // resumes on role
+    const resumedOnRole = screenOf(d) === 'role';
+    await d.wizard.next(); // secret (no secret yet -> issueBlock)
+    let issueFt10 = button(d, 'issue-secret').dispatch('click');
+    await tick();
+    let confirmFt10 = openDialogs().find((x) => x !== d);
+    await confirmFt10.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
+    await issueFt10; await tick(); await tick();
+    const ft10StillAsks = resumedOnRole
+      && screenOf(d) === 'secret'
+      && attr(d, 'data-connection-choice', 'true').length === 1
+      && attr(d, 'data-secret-file-text', 'true').length === 0;
+    for (const open of openDialogs()) await open.close();
+    // Legacy Bridge stored state (no routeChosen field) asks once.
+    store.clear();
+    store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'resume', runs: 'bridge', bridge: true, os: 'windows', role: 'worker', noproxy: false }));
+    cardWizard = await openCardSecretDialog();
+    const legacyBridgeStillAsks = Boolean(cardWizard)
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 1
+      && attr(cardWizard, 'data-secret-file-text', 'true').length === 0;
+    for (const open of openDialogs()) await open.close();
+    out.storedDefaultBridgeNeverSuppressesQuestion = ft6StillAsks
+      && ft7StillAsks
+      && ft8StillAsks
+      && ft10StillAsks
+      && legacyBridgeStillAsks;
+
+    // (5f) SHOULD-3 (create-path): newly created agent (created: true) choosing curl ('none') on
+    // the secret screen walks through cert-save -> cert-move -> rewrite -> test without skipping
+    // certificate setup or looping, and Back from cert-save returns to secret.
+    store.clear();
+    localStore.clear();
+    consoleMessages.length = 0;
+    const createWizard = await openCreateAgentDialog('Heron');
+    const createChoiceBlock = createWizard ? attr(createWizard, 'data-connection-choice', 'true')[0] : null;
+    const createNoneRadio = createWizard ? windowsChoice(createWizard, 'secret-connect', 'none') : null;
+    let createFlowOk = false;
+    if (createWizard && createChoiceBlock && createNoneRadio) {
+      createNoneRadio.checked = true;
+      await createNoneRadio.dispatch('change');
+      await tick();
+      const createSecretText = attr(createWizard, 'data-secret-file-text', 'true')[0]?.textContent || '';
+      const createNotice = attr(createWizard, 'data-cert-rewrite-next', 'true')[0]?.textContent || '';
+      const createCopyOk = await clickBothCopyButtonsAndScan(createWizard, SECRET);
+      await createWizard.wizard.next();
+      const step1 = screenOf(createWizard);
+      const step1Contained = secretContainmentOk(SECRET, { expectPre: false });
+      createWizard.wizard.back();
+      const backToSecret = screenOf(createWizard);
+      await createWizard.wizard.next();
+      const step1Again = screenOf(createWizard);
+      await createWizard.wizard.next();
+      const step2 = screenOf(createWizard);
+      await createWizard.wizard.next();
+      const step3 = screenOf(createWizard);
+      await createWizard.wizard.next();
+      const step4 = screenOf(createWizard);
+      createFlowOk = createSecretText.includes('cacert = "C:/Users/<your-name>/.orchestra-agent-heron.crt"\nssl-no-revoke\n')
+        && createNotice.includes(SCREEN_TITLES['cert-save'])
+        && createNotice.includes(SCREEN_TITLES['cert-move'])
+        && createNotice.includes(SCREEN_TITLES.rewrite)
+        && createCopyOk
+        && step1 === 'cert-save'
+        && step1Contained
+        && backToSecret === 'secret'
+        && step1Again === 'cert-save'
+        && step2 === 'cert-move'
+        && step3 === 'rewrite'
+        && step4 === 'test'
+        && !createWizard.wizard.plan().includes('vscode');
+    }
+    out.createAgentCurlVisitsCertSaveBeforeRewrite = createFlowOk;
+    for (const open of openDialogs()) await open.close();
+
+    // (5g) F11 behaviour pin: fresh rotation on a server WITHOUT a certificate shows secret lines
+    // directly and never asks the connection question.
+    const savedCert = server.certificate;
+    server.certificate = null;
+    store.clear();
+    cardWizard = await openCardSecretDialog();
+    server.certificate = savedCert;
+    Element.prototype.querySelectorAll = origQA;
+    Element.prototype.querySelector = origQ;
+    out.cardNewSecretWithoutCertificateSkipsQuestion = Boolean(cardWizard)
+      && attr(cardWizard, 'data-connection-choice', 'true').length === 0
+      && attr(cardWizard, 'data-secret-file-text', 'true').length === 1
+      && !(attr(cardWizard, 'data-secret-file-text', 'true')[0]?.textContent || '').includes('cacert');
+    for (const open of openDialogs()) await open.close();
+
+    // (6) NOTE-1, NOTE-2, N2 & C06/C07 Node pins: userHomeFromWorkingDirectory removed;
+    // certificateCurlLines rejects controls/C1/bidi (incl. LRM/RLM/isolates)/separators/quotes/
+    // surrogates, converts Windows backslashes, escapes POSIX backslashes, quotes POSIX $HOME /
+    // space paths without ssl-no-revoke, and emits /Users/<your-name> for macOS.
     const cert524 = setupText.certificateFile('Kestrel');
     const badHomes = [
       'C:\\Users\\Jane"Doe',
       'C:\\Users\\Jane\noutput = pwn',
       'C:\\Users\\Jane\x7fDoe',
       '/home/olive\x85evil',
+      '/home/olive\u200eevil',
+      '/home/olive\u200fevil',
       '/home/olive\u202eevil',
+      '/home/olive\u2066evil',
+      '/home/olive\u2069evil',
       '/home/olive\u2028evil',
       '/home/olive\ud800evil',
     ];
     out.certificateCurlLinesPathSafetyPinned = setupText.userHomeFromWorkingDirectory === undefined
       && badHomes.every((h) => setupText.certificateCurlLines(cert524, { windows: true, homeDir: h })[0] === 'cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"')
       && badHomes.every((h) => setupText.certificateCurlLines(cert524, { windows: false, homeDir: h })[0] === 'cacert = /home/<your-name>/.orchestra-agent-kestrel.crt')
+      && setupText.certificateCurlLines(cert524, { windows: false, macos: true, homeDir: null }).join('\n') === 'cacert = /Users/<your-name>/.orchestra-agent-kestrel.crt'
       && setupText.certificateCurlLines(cert524, { windows: true, homeDir: 'C:\\Users\\Jane Doe' }).join('\n') === 'cacert = "C:/Users/Jane Doe/.orchestra-agent-kestrel.crt"\nssl-no-revoke'
       && setupText.certificateCurlLines(cert524, { windows: false, homeDir: '$HOME' }).join('\n') === 'cacert = "$HOME/.orchestra-agent-kestrel.crt"'
       && setupText.certificateCurlLines(cert524, { windows: false, homeDir: '/home/jane doe' }).join('\n') === 'cacert = "/home/jane doe/.orchestra-agent-kestrel.crt"'
+      && setupText.certificateCurlLines(cert524, { windows: false, homeDir: '/tmp/back\\slash' }).join('\n') === 'cacert = "/tmp/back\\\\slash/.orchestra-agent-kestrel.crt"'
       && setupText.certificateCurlLines(cert524, { windows: false, homeDir: null }).join('\n') === 'cacert = /home/<your-name>/.orchestra-agent-kestrel.crt';
   } finally {
     for (const level of ['log', 'warn', 'error', 'info', 'debug']) {

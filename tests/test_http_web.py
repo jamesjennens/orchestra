@@ -1750,13 +1750,13 @@ class AgentSetupDialogCase(unittest.TestCase):
                 if not line.strip().startswith('//') and re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {', code)
         # (the second line is the screen's own name, the key of its builder, not the value)
-        self.assertEqual(['secretValue: secret,', 'secret: () => ['], uses)
+        self.assertEqual(['secretValue: secret,', 'secret: () => {'], uses)
         # (the first line only opens the dialog on the screen that shows a fresh secret)
         self.assertEqual(['const needsRouteChoice = () => hasCertificate && Boolean(state.secretValue) && !state.routeKnown;',
                           'if (state.secretValue) {', 'state.secretValue = value;',
+                          'const secretBlock = () => secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge, certFirst: state.createdHere });',
                           'state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,',
-                          ': (state.secretValue',
-                          '? secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge })'],
+                          ': (state.secretValue'],
                          [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
                           and not line.strip().startswith('secretValue:')])
         # The definition, the dialog's one call, and the invite page's (kittrial-5bb.578), which shows the
@@ -2124,11 +2124,13 @@ console.log(JSON.stringify({
         self.assertNotIn('cacert = `" +', result['psRewriteWithCert'])
         self.assertNotIn("+ '/.", result['psRewriteWithCert'])
         self.assertNotIn("+ \\'/", result['psRewriteWithCert'])
-        self.assertIn('cacert = \\"$HOME/', result['posixRewriteWithCert'])
+        self.assertIn('h=$(printf', result['posixRewriteWithCert'])
+        self.assertIn('"$HOME"', result['posixRewriteWithCert'])
+        self.assertIn('cacert = \\"$h/', result['posixRewriteWithCert'])
         self.assertIn('ssl-no-revoke', result['posixRewriteWithCert'])  # stripped if present
         self.assertNotIn('<your-name>', result['posixRewriteWithCert'])
         self.assertNotIn('%USERPROFILE%', result['posixRewriteWithCert'])
-        self.assertNotIn('cacert = \\"$HOME/', result['rewrite'])  # no cert: no curl option written
+        self.assertNotIn('cacert = \\"$h/', result['rewrite'])  # no cert: no curl option written
         self.assertNotIn('GetFolderPath', result['rewrite'])
 
     @unittest.skipIf(os.name == 'nt', 'the POSIX rewrite command runs in a POSIX shell; '
@@ -2161,7 +2163,7 @@ console.log(JSON.stringify({
   psBacktickQuote: command.powershell.includes('`"'),
   psStringCloses: command.powershell.includes('cacert = `""'),
   psNoSingleQuotedSlash: !command.powershell.includes("+ '/.") && !command.powershell.includes("+ \\'/"),
-  posixExpandsHome: command.posix.includes('cacert = \\"$HOME/'),
+  posixExpandsHome: command.posix.includes('"$HOME"') && command.posix.includes('cacert = \\"$h/'),
 }));
 """
         out = run_node_module(self, node, script, self.SETUP_JS.as_uri())
@@ -2475,11 +2477,16 @@ console.log(JSON.stringify({
             'curlExit77ErrorLinePresent',
             'rotationCurlWindowsWithNoProxyMatchesSetup',
             'rotationCurlPosixKeepsCacertAndOmitsSslNoRevoke',
+            'rotationCurlMacosUsesUsersPlaceholder',
             'rotationBridgeAgentByteIdentical',
             'cardNewSecretPathKeepsCacert',
             'cardNewSecretFreshTabAsksAndCurlKeepsCacert',
+            'cardNewSecretFreshTabOlderBridgeKeepsCacert',
             'cardNewSecretFreshTabBridgeChoiceByteIdentical',
             'cardNewSecretOtherAgentStoredStillAsks',
+            'storedDefaultBridgeNeverSuppressesQuestion',
+            'createAgentCurlVisitsCertSaveBeforeRewrite',
+            'cardNewSecretWithoutCertificateSkipsQuestion',
             'certificateCurlLinesPathSafetyPinned',
         }, set(observed))
 
@@ -2570,6 +2577,25 @@ console.log(JSON.stringify(out));
                     rewritten = cred.read_text(encoding='utf-8')
                     self.assertEqual(rewritten, data[key]['posixLines'])
                     self.assertEqual(0o600, cred.stat().st_mode & 0o777)
+                    # N1: POSIX $HOME containing space, backslash, and double quote escapes cleanly
+                    # in both sh and bash so curl -K parses the cacert line without breaking quotes.
+                    tricky_home = Path(tmp) / 'a\\b"c d'
+                    tricky_home.mkdir(exist_ok=True)
+                    tricky_cred = tricky_home / '.orchestra-agent-kestrel.curlrc'
+                    expected_escaped = str(tricky_home).replace('\\', '\\\\').replace('"', '\\"')
+                    for shell_name in ('sh', 'bash'):
+                        shell_bin = shutil.which(shell_name)
+                        if not shell_bin:
+                            continue
+                        tricky_cred.write_text(f'header = "Authorization: ******"\n', encoding='utf-8')
+                        subprocess.check_output(
+                            [shell_bin, '-c', data[key]['posixCmd']],
+                            env=dict(os.environ, HOME=str(tricky_home)),
+                            text=True,
+                        )
+                        tricky_text = tricky_cred.read_text(encoding='utf-8')
+                        self.assertIn(f'cacert = "{expected_escaped}/.orchestra-agent-kestrel.crt"\n', tricky_text)
+                        self.assertEqual(0o600, tricky_cred.stat().st_mode & 0o777)
                 # Windows: verify managed lines match the PowerShell prefix byte-for-byte, and
                 # on Windows execute the real PowerShell rewrite and compare lines byte-for-byte.
                 win_lines = data[key]['winLines'].splitlines()
@@ -2613,7 +2639,11 @@ const unsafeHomes = [
   'C:\\Users\\Jane\noutput = pwn',
   'C:\\Users\\Jane\x7fDoe',
   '/home/olive\x85evil',
+  '/home/olive\u200eevil',
+  '/home/olive\u200fevil',
   '/home/olive\u202eevil',
+  '/home/olive\u2066evil',
+  '/home/olive\u2069evil',
   '/home/olive\u2028evil',
   '/home/olive\ud800evil',
 ];
@@ -2624,6 +2654,7 @@ console.log(JSON.stringify({
   macSpaceLines: m.credentialFileLines('https://127.0.0.1:8765', 'AB:CD', 'S3', { certFile: cert, hasCertificate: true, windows: false, homeDir: '/Users/Jane Doe' }),
   fallbackWinLines: m.credentialFileLines('https://127.0.0.1:8765', 'AB:CD', 'S3', { certFile: cert, hasCertificate: true, windows: true, homeDir: null }),
   fallbackPosixLines: m.credentialFileLines('https://127.0.0.1:8765', 'AB:CD', 'S3', { certFile: cert, hasCertificate: true, windows: false, homeDir: null }),
+  fallbackMacLines: m.credentialFileLines('https://127.0.0.1:8765', 'AB:CD', 'S3', { certFile: cert, hasCertificate: true, windows: false, macos: true, homeDir: null }),
   unsafeWin: unsafeHomes.map((h) => m.certificateCurlLines(cert, { windows: true, homeDir: h })[0]),
   unsafePosix: unsafeHomes.map((h) => m.certificateCurlLines(cert, { windows: false, homeDir: h })[0]),
 }));
@@ -2639,8 +2670,9 @@ console.log(JSON.stringify({
         self.assertNotIn('ssl-no-revoke', data['macSpaceLines'])
         self.assertIn('cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"\nssl-no-revoke\n', data['fallbackWinLines'])
         self.assertIn('cacert = /home/<your-name>/.orchestra-agent-kestrel.crt\n', data['fallbackPosixLines'])
-        self.assertEqual(['cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"'] * 7, data['unsafeWin'])
-        self.assertEqual(['cacert = /home/<your-name>/.orchestra-agent-kestrel.crt'] * 7, data['unsafePosix'])
+        self.assertIn('cacert = /Users/<your-name>/.orchestra-agent-kestrel.crt\n', data['fallbackMacLines'])
+        self.assertEqual(['cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"'] * 11, data['unsafeWin'])
+        self.assertEqual(['cacert = /home/<your-name>/.orchestra-agent-kestrel.crt'] * 11, data['unsafePosix'])
 
     def test_bridge_agent_credential_file_text_unchanged(self):
         """kittrial-5bb.524 condition 4: Bridge agent credential file text is byte-identical to b1f2356c."""

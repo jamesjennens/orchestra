@@ -103,9 +103,10 @@ function safeHomeDir(homeDir) {
 // ~ inside a config file: a literal placeholder answers rc 2 (file does not exist), and a
 // Windows path with backslashes also answers rc 2. The rewrite command writes these lines with
 // the real expanded path (always double-quoted so paths with spaces work on both Windows and
-// POSIX); otherwise <your-name> is shown and never guessed from working_directory
-// (kittrial-5bb.275 rev2, kittrial-5bb.524). ssl-no-revoke is Windows-only.
-export function certificateCurlLines(certFile, { windows = false, homeDir = null } = {}) {
+// POSIX, with backslashes and double quotes escaped on POSIX); otherwise <your-name> is shown
+// (/Users/<your-name> on macOS, /home/<your-name> on Linux) and never guessed from
+// working_directory (kittrial-5bb.275 rev2, kittrial-5bb.524). ssl-no-revoke is Windows-only.
+export function certificateCurlLines(certFile, { windows = false, macos = false, homeDir = null } = {}) {
   if (!certFile) return [];
   const name = certFile.name;
   const safeHome = safeHomeDir(homeDir);
@@ -114,21 +115,21 @@ export function certificateCurlLines(certFile, { windows = false, homeDir = null
     return [`cacert = "${base}/${name}"`, 'ssl-no-revoke'];
   }
   if (safeHome) {
-    const base = safeHome.replace(/\/+$/, '');
+    const base = safeHome.replace(/\/+$/, '').replace(/\\/g, '\\\\');
     return [`cacert = "${base}/${name}"`];
   }
-  return [`cacert = /home/<your-name>/${name}`];
+  return [`cacert = ${macos ? '/Users' : '/home'}/<your-name>/${name}`];
 }
 
 // Managed (non-secret) lines of the credential file, in exact order: server/fingerprint comments,
 // optional noproxy, optional certificate curl options. Shared by both credentialFileCommand()
 // (set-up rewrite) and credentialFileLines() (secret screen) so set-up and rotation have one
 // single source of truth (kittrial-5bb.524).
-export function credentialManagedLines(comments, { certFile = null, hasCertificate = false, noproxy = false, server = null, windows = false, homeDir = null } = {}) {
+export function credentialManagedLines(comments, { certFile = null, hasCertificate = false, noproxy = false, server = null, windows = false, macos = false, homeDir = null } = {}) {
   const lines = comments.slice();
   if (noproxy) lines.push(noproxyLine(server));
   if (hasCertificate && certFile) {
-    lines.push(...certificateCurlLines(certFile, { windows, homeDir }));
+    lines.push(...certificateCurlLines(certFile, { windows, macos, homeDir }));
   }
   return lines;
 }
@@ -138,10 +139,10 @@ export function credentialManagedLines(comments, { certFile = null, hasCertifica
 // line, and AGENT.md stays `-K FILE` only), then the header line. The paths here are the
 // Notepad body: the person types their own full path (see certificateCurlLines); the rewrite
 // command writes the expanded path on their machine.
-export function credentialFileBody(secretValue, certFile, { windows = false, hasCertificate = false, noproxy = false, server = null } = {}) {
+export function credentialFileBody(secretValue, certFile, { windows = false, macos = false, hasCertificate = false, noproxy = false, server = null } = {}) {
   const lines = [];
   if (hasCertificate && certFile) {
-    lines.push(...certificateCurlLines(certFile, { windows }));
+    lines.push(...certificateCurlLines(certFile, { windows, macos }));
   }
   if (noproxy) lines.push(noproxyLine(server));
   lines.push(headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue));
@@ -204,12 +205,17 @@ function powershellLiteral(text) {
 const PS_USER_PROFILE_SENTINEL = '__ORCHESTRA_PS_USERPROFILE__';
 
 export function credentialFileCommand(file, comments, { certFile = null, hasCertificate = false, noproxy = false, server = null } = {}) {
-  // POSIX rewrite: managed lines built by credentialManagedLines with $HOME so the shell
-  // expands $HOME; curl does not expand ~ or $HOME inside a config file.
-  const posixManaged = credentialManagedLines(comments, { certFile, hasCertificate, noproxy, server, windows: false, homeDir: '$HOME' });
+  // POSIX rewrite: managed lines built by credentialManagedLines with $h (escaped $HOME) so the
+  // shell expands $HOME and escapes \ and " inside curl's double-quoted cacert value; curl does
+  // not expand ~ or $HOME inside a config file (kittrial-5bb.275 rev2, kittrial-5bb.524).
+  const hasPosixCert = Boolean(hasCertificate && certFile);
+  const posixManaged = credentialManagedLines(comments, { certFile, hasCertificate, noproxy, server, windows: false, homeDir: '$h' });
   const quoted = posixManaged.map((line) => (line.startsWith('cacert =')
     ? `"${line.replace(/"/g, '\\"')}"`
     : shQuote(line))).join(' ');
+  const posixHomePrefix = hasPosixCert
+    ? 'h=$(printf \'%s\\n\' "$HOME" | sed \'s/\\\\/\\\\\\\\/g; s/"/\\\\"/g\'); '
+    : '';
   // PowerShell rewrite: managed lines built by the same credentialManagedLines helper, substituting
   // PowerShell's live UserProfile expression (forward slashes inside double quotes, backtick
   // escapes only -- a single-quoted fragment that opens with '/...' never terminates;
@@ -228,7 +234,7 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
     + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_MANAGED_PATTERN + ",''); "
     + 'if ($c -and -not $c.EndsWith("`n")) { $c = $c + "`r`n" } '
     + '[IO.File]::WriteAllText($p, (' + psPrefix + ') + $c) }';
-  const posix = `( umask 077; [ -f ${file.posix} ] || { echo 'Save the header line first, then run this again.'; exit 0; }; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
+  const posix = `( umask 077; [ -f ${file.posix} ] || { echo 'Save the header line first, then run this again.'; exit 0; }; rm -f ${file.posix}.new; ${posixHomePrefix}printf '%s\\n' ${quoted} > ${file.posix}.new && `
     + `grep -vE ${CREDENTIAL_MANAGED_PATTERN} ${file.posix} >> ${file.posix}.new && `
     + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new )`;
   return Object.freeze({ powershell, posix });
@@ -330,9 +336,9 @@ export function testCommands(payload) {
 // `secretValue` is the fresh secret, passed in by the one screen that shows it; every other
 // caller gets the placeholder.
 export function credentialFileLines(server, fingerprint, secretValue = SECRET_PLACEHOLDER,
-  { noproxy = false, certFile = null, hasCertificate = false, windows = false, homeDir = null } = {}) {
+  { noproxy = false, certFile = null, hasCertificate = false, windows = false, macos = false, homeDir = null } = {}) {
   const comments = credentialCommentLines(server, fingerprint);
-  const managed = credentialManagedLines(comments, { certFile, hasCertificate, noproxy, server, windows, homeDir });
+  const managed = credentialManagedLines(comments, { certFile, hasCertificate, noproxy, server, windows, macos, homeDir });
   return [...managed, headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
 }
 
@@ -358,9 +364,12 @@ export function runsFromStored(stored) {
   if (stored && RUNS_IN.includes(stored.runs)) return stored.runs;
   return stored && stored.bridge === false ? 'older' : 'bridge';
 }
-export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false, vscode = true, noproxy = false } = {}) {
+export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false, vscode = true, noproxy = false, certAfterSecret = false } = {}) {
   const posix = osKind(os) === 'posix';
   if (bridge) return ['system', 'role', 'secret', ...(posix ? ['restrict'] : []), 'vscode', 'resume'];
+  if (hasCertificate && certAfterSecret) {
+    return ['system', 'role', 'secret', 'cert-save', 'cert-move', 'rewrite', 'test', 'files', ...(vscode ? ['vscode'] : []), 'resume'];
+  }
   return ['system', 'role', ...(hasCertificate ? ['cert-save', 'cert-move'] : []), 'secret',
     ...(posix && !hasCertificate && !noproxy ? ['restrict'] : []), 'rewrite', 'test', 'files', ...(vscode ? ['vscode'] : []), 'resume'];
 }

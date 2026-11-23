@@ -816,10 +816,24 @@ export async function inviteSetupBlock(ctx, created, secret) {
       fileBlock(setupText.GUIDE_PATH, files[1][1], null, setupText.GUIDE_PATH)));
 }
 
+export const SCREEN_TITLES = Object.freeze({
+  system: 'Your computer',
+  role: 'What this agent does',
+  'cert-save': 'Save the certificate',
+  'cert-move': 'Move the certificate',
+  secret: 'Save your secret',
+  restrict: 'Restrict the file',
+  rewrite: 'Update the credential options',
+  test: 'Test it',
+  files: 'Save the agent’s files',
+  vscode: 'Set up in VS Code',
+  resume: 'Start the agent',
+});
+
 // One line per curl error the person may see when the test fails (kittrial-5bb.275, .328 & .524).
 export const CURL_ERROR_LINES = Object.freeze({
-  2: 'curl exit 2 / cacert does not exist: either <your-name> was left in the credential file (run the command on “Add the certificate path”) or the certificate is still in Downloads without its leading dot (run the command on “Move the certificate”).',
-  77: 'curl exit 77: curl could not read the cacert file — run the command on “Move the certificate”, then run “Add the certificate path” so cacert points to your real user folder.',
+  2: 'curl exit 2 / cacert does not exist: either <your-name> was left in the credential file (run the command on “' + SCREEN_TITLES.rewrite + '”) or the certificate is still in Downloads without its leading dot (run the command on “' + SCREEN_TITLES['cert-move'] + '”).',
+  77: 'curl exit 77: curl could not read the cacert file — run the command on “' + SCREEN_TITLES['cert-move'] + '”, then run “' + SCREEN_TITLES.rewrite + '” so cacert points to your real user folder.',
   60: 'curl exit 60: the certificate is not in this machine’s trust store — save the service’s certificate and keep the cacert line in the credential file.',
   35: 'curl exit 35: the TLS handshake failed (wrong address or a proxy speaking plain HTTP to the https port).',
   26: 'curl exit 26: cannot read the config file — the file name is wrong or Notepad added .txt.',
@@ -914,6 +928,7 @@ function writeWizardStorage(state) {
       screen: state.screen,
       bridge: state.bridge !== false,
       runs: state.runs,
+      routeChosen: state.routeChosen === true,
       os: state.os,
       role: state.role || 'worker',
       noproxy: state.noproxy === true,
@@ -950,20 +965,6 @@ const RUNS_CHOICES = Object.freeze([
   ['no', 'older', 'VS Code with an older Bridge, or none yet'],
   ['none', 'none', 'No Bridge: Claude Code, Codex, a command-line agent'],
 ]);
-
-const SCREEN_TITLES = Object.freeze({
-  system: 'Your computer',
-  role: 'What this agent does',
-  'cert-save': 'Save the certificate',
-  'cert-move': 'Move the certificate',
-  secret: 'Save your secret',
-  restrict: 'Restrict the file',
-  rewrite: 'Update the credential options',
-  test: 'Test it',
-  files: 'Save the agent’s files',
-  vscode: 'Set up in VS Code',
-  resume: 'Start the agent',
-});
 //: The numbered step of the released three-step wizard, mapped to a screen of the new one, so a
 //: wizard left open across the upgrade resumes near where it was.
 function oldStepScreen(step, bridge) {
@@ -1023,7 +1024,7 @@ function secretNotice(justCreated) {
       'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Agents page first.') : null);
 }
 
-function secretLinesBlock(payload, secretValue, os, { noproxy = false, bridge = true } = {}) {
+function secretLinesBlock(payload, secretValue, os, { noproxy = false, bridge = true, certFirst = false } = {}) {
   const meta = PAYLOAD_META.get(payload) || {};
   const address = meta.bridgeServer || payload.server;
   const fingerprint = (meta.certificate && meta.certificate.sha256) || null;
@@ -1031,24 +1032,31 @@ function secretLinesBlock(payload, secretValue, os, { noproxy = false, bridge = 
   const includeCert = Boolean(meta.certificate) && !bridge;
   // Never derive cacert from working_directory (an agent can edit working_directory via
   // PATCH /v1/agents/me): emit the <your-name> placeholder here and direct the person to click
-  // Next for "Add the certificate path", which expands the real profile path on their machine
-  // (and sets mode 600 on POSIX) without touching the secret (kittrial-5bb.524).
+  // Next for "Update the credential options" (preceded by Save/Move the certificate on a new
+  // agent), which expands the real profile path on their machine (and sets mode 600 on POSIX)
+  // without touching the secret (kittrial-5bb.524).
   const lines = setupText.credentialFileLines(address, fingerprint, secretValue, {
     noproxy,
     certFile: includeCert ? payload.certificateFile : null,
     hasCertificate: includeCert,
     windows: !posix,
+    macos: os === 'macos',
     homeDir: null,
   });
   const file = setupText.osSecretFile(payload.secretFile, os);
+  const nextRewriteNotice = certFirst
+    ? (posix
+      ? 'Click Next to walk through “' + SCREEN_TITLES['cert-save'] + '”, “' + SCREEN_TITLES['cert-move'] + '”, and “' + SCREEN_TITLES.rewrite + '” to save the certificate, replace <your-name> with your real $HOME path, and set mode 600 automatically.'
+      : 'Click Next to walk through “' + SCREEN_TITLES['cert-save'] + '”, “' + SCREEN_TITLES['cert-move'] + '”, and “' + SCREEN_TITLES.rewrite + '” to save the certificate and replace <your-name> with your real profile path automatically.')
+    : (posix
+      ? 'Click Next for “' + SCREEN_TITLES.rewrite + '” to replace <your-name> with your real $HOME path and set mode 600 automatically.'
+      : 'Click Next for “' + SCREEN_TITLES.rewrite + '” to replace <your-name> with your real profile path automatically.');
   return h('div', { class: 'stack', 'data-secret-lines': 'true' },
     h('p', { class: 'small' }, `Open ${osWords(os).editor}, paste these lines, and save them as the file below${posix ? '' : ' (Save as type: All files)'}. They are shown only now.`),
     h('div', { class: 'copy-row' }, h('pre', { class: 'json secret', 'data-secret-file-text': 'true' }, lines),
       copyButton('Copy', lines, { ariaLabel: 'Copy the credential file text with the secret', what: 'Credential file text' })),
     commandLine(file, 'file name'),
-    includeCert ? h('p', { class: 'small', 'data-cert-rewrite-next': 'true' }, posix
-      ? 'Click Next for “Add the certificate path” to replace <your-name> with your real $HOME path and set mode 600 automatically.'
-      : 'Click Next for “Add the certificate path” to replace <your-name> with your real profile path automatically.') : null,
+    includeCert ? h('p', { class: 'small', 'data-cert-rewrite-next': 'true' }, nextRewriteNotice) : null,
     more(h('p', { class: 'small muted' }, includeCert
       ? (posix
         ? 'The first lines name this server and its certificate path for curl; the last line is the secret. Keep the file name exactly, with no .txt at the end. Never put the secret in the agent’s folder, a commit or a command line.'
@@ -1104,11 +1112,12 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   const agent = (source && source.agent) || {};
   const saved = readWizardStorage();
   const same = saved && saved.agentId === payload.agentId ? saved : null;
+  const storedRuns = setupText.runsFromStored(same);
   const state = {
     os: (same && same.os) || setupText.detectOs(),
-    runs: setupText.runsFromStored(same),
-    bridge: setupText.runsFromStored(same) === 'bridge',
-    routeKnown: Boolean(same),
+    runs: storedRuns,
+    bridge: storedRuns === 'bridge',
+    routeKnown: Boolean(same && (same.routeChosen === true || storedRuns !== 'bridge')),
     noproxy: Boolean(same && same.noproxy),
     role: (same && setupText.BRIDGE_ROLES.includes(same.role) && same.role) || (agent.role === 'reviewer' ? 'reviewer' : 'worker'),
     coordinatorProject: null,
@@ -1123,7 +1132,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   };
   if (!setupText.OS_CHOICES.some(([v]) => v === state.os)) state.os = 'windows';
   const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
-  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate, noproxy: state.noproxy });
+  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate, noproxy: state.noproxy, certAfterSecret: state.createdHere });
   const needsRouteChoice = () => hasCertificate && Boolean(state.secretValue) && !state.routeKnown;
   if (state.secretValue) {
     // A fresh secret exists only while this dialog is open: open where it is saved (Back reaches the
@@ -1263,29 +1272,40 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
         more(h('p', { class: 'small muted' }, move.note)),
       ];
     },
-    secret: () => [
-      state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,
-      needsRouteChoice()
-        ? h('div', { class: 'stack', 'data-connection-choice': 'true' },
-            h('p', { class: 'small' }, 'How does this agent connect?'),
-            h('div', { class: 'copy-row' },
-              choice('secret-connect', 'bridge', 'Orchestra Bridge', false, () => {
-                state.runs = 'bridge'; state.bridge = true; state.routeKnown = true;
-                checkStatus.hidden = true; checkStatus.textContent = '';
-                persist(); render();
-              }),
-              choice('secret-connect', 'curl', 'curl or another client', false, () => {
-                state.runs = 'none'; state.bridge = false; state.routeKnown = true;
-                checkStatus.hidden = true; checkStatus.textContent = '';
-                persist(); render();
-              })))
-        : (state.secretValue
-          ? secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge })
-          : issueBlock(ctx, agent, payload, wizard)),
-      state.issued ? more(h('p', { class: 'small', 'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ') },
-        'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.')) : null,
-      state.issued ? olderCredentials(ctx, state.issued.agent, state.issued.credential && state.issued.credential.id) : null,
-    ],
+    secret: () => {
+      const secretBlock = () => secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge, certFirst: state.createdHere });
+      const secretBody = h('div', { class: 'stack', 'data-secret-body': 'true' });
+      return [
+        state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,
+        needsRouteChoice()
+          ? h('div', { class: 'stack' },
+              h('div', { class: 'stack', 'data-connection-choice': 'true' },
+                h('p', { class: 'small' }, 'How does this agent connect?'),
+                h('div', { class: 'copy-row' },
+                  ...RUNS_CHOICES.map(([, runs, label]) => choice('secret-connect', runs, label, false, () => {
+                    state.runs = runs;
+                    state.bridge = runs === 'bridge';
+                    state.routeKnown = true;
+                    checkStatus.hidden = true;
+                    checkStatus.textContent = '';
+                    persist();
+                    const list = plan();
+                    const index = list.indexOf(state.screen);
+                    showProgress();
+                    backBtn.hidden = index === 0;
+                    nextBtn.hidden = index === list.length - 1;
+                    doneBtn.className = index === list.length - 1 ? 'primary' : '';
+                    secretBody.replaceChildren(secretBlock());
+                  })))),
+              secretBody)
+          : (state.secretValue
+            ? secretBlock()
+            : issueBlock(ctx, agent, payload, wizard)),
+        state.issued ? more(h('p', { class: 'small', 'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ') },
+          'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.')) : null,
+        state.issued ? olderCredentials(ctx, state.issued.agent, state.issued.credential && state.issued.credential.id) : null,
+      ];
+    },
     restrict: () => [
       h('p', { class: 'small' }, 'Run this in a terminal, so that only you can read the file.'),
       commandLine(setupText.testCommands(payload).posixChmod, 'chmod command'),
@@ -1298,7 +1318,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
         const options = { hasCertificate, noproxy: state.noproxy, server };
         const rewrite = setupText.credentialFileCommand(payload.secretFile, comments, { ...options, certFile: payload.certificateFile });
         const posix = setupText.osKind(state.os) === 'posix';
-        const body = setupText.credentialFileBody(null, payload.certificateFile, { ...options, windows: !posix }).trimEnd();
+        const body = setupText.credentialFileBody(null, payload.certificateFile, { ...options, windows: !posix, macos: state.os === 'macos' }).trimEnd();
         return [
           h('p', { class: 'small' }, `Run this in ${osWords(state.os).shell}. It rewrites the managed options in your credential file for the choices you made.`),
           h('p', { class: 'small', 'data-noproxy-rewrite-notice': 'true' }, setupText.NOPROXY_REWRITE_NOTICE),
@@ -1474,7 +1494,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   // ---- moving between screens ----------------------------------------------------------------
   function persist() {
     touchKeepAlive();
-    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, os: state.os, role: state.role, noproxy: state.noproxy });
+    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, routeChosen: state.routeKnown, os: state.os, role: state.role, noproxy: state.noproxy });
   }
 
   // The badge counts the screens of the chosen path; the heading below it is the screen's one title
@@ -1517,7 +1537,6 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   }
 
   async function next() {
-    if (state.screen === 'system') state.routeKnown = true;
     if (state.screen === 'secret' && needsRouteChoice()) {
       checkStatus.setAttribute('data-check-state', 'failed');
       checkStatus.textContent = 'Choose how this agent connects first.';
