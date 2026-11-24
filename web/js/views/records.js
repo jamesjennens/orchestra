@@ -22,6 +22,21 @@ function textOf(val) {
   return String(val);
 }
 
+function omittedOf(val) {
+  if (!val || typeof val !== 'object') return 0;
+  const n = Number(val.omitted_chars);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+// kittrial-5bb.603: truncation marker built solely from omitted_chars and key, never record text.
+function truncationMarker(val, key) {
+  const omitted = omittedOf(val);
+  if (!omitted) return null;
+  const k = String(key || '');
+  return h('div', { class: 'small muted', 'data-truncated-marker': '1' },
+    `truncated: ${omitted} more characters; capability get ${k}`);
+}
+
 function splitCsv(text) {
   return String(text || '').split(',').map((s) => s.trim()).filter(Boolean);
 }
@@ -207,10 +222,15 @@ export async function page(ctx, { pid }) {
     const dTitle = textOf(draft.title || item.title || rec.title);
     const dStmt = textOf(draft.statement || item.statement || rec.statement);
     const dName = textOf(draft.name || item.name || rec.name);
-    const dSum = textOf(draft.summary || item.summary || rec.summary);
+    const rawCapSum = draft.summary || item.summary || rec.summary;
+    const dSum = textOf(rawCapSum);
     const titleOrSummary = family === 'reference'
       ? (dTitle || dStmt || '—')
-      : (dName ? `${dName} — ${dSum}` : (dSum || '—'));
+      : [
+        dName ? h('span', null, dSum ? `${dName} — ` : dName) : null,
+        dSum ? h('span', { class: 'prose' }, dSum) : (!dName ? '—' : null),
+        truncationMarker(rawCapSum, item.key),
+      ];
     return h('tr', { 'data-waiting-key': item.key, 'data-waiting-family': family },
       h('td', null, h('span', { class: 'badge' }, family)),
       h('td', null, h('a', { class: 'mono', href: safeHref(href) }, item.key)),
@@ -319,7 +339,8 @@ export async function page(ctx, { pid }) {
           const href = `/p/${pid}/capabilities/${encodeURIComponent(item.key)}`;
           const proposerLabel = item.accepted_proposer_name || item.proposed_by_name || item.proposer_name || item.proposed_by || '—';
           const acceptorLabel = item.accepted_by_name || item.acceptor_name || item.accepted_by || '';
-          const sum = textOf(rec.summary || item.summary);
+          const rawSum = rec.summary || item.summary;
+          const sum = textOf(rawSum);
           return h('tr', { 'data-capability-row': item.key },
             h('td', null, h('a', { class: 'mono', href: safeHref(href) }, item.key)),
             h('td', null,
@@ -329,7 +350,8 @@ export async function page(ctx, { pid }) {
             h('td', { class: 'mono small' }, rec.owner || item.owner || '—'),
             h('td', null,
               h('strong', null, textOf(rec.name || item.name) || '—'),
-              sum ? h('div', { class: 'small muted' }, sum) : null),
+              sum ? h('div', { class: 'small muted prose', 'data-capability-summary': item.key }, sum) : null,
+              truncationMarker(rawSum, item.key)),
             h('td', { class: 'small muted' },
               `Proposed by ${proposerLabel}`,
               acceptorLabel ? ` · Accepted by ${acceptorLabel}` : ''));
@@ -963,7 +985,8 @@ export async function capabilityPage(ctx, { pid, key }) {
         h('span', { class: 'badge muted' }, `rev ${shown.revision || 1}`)),
       h('span', { class: 'mono small muted', 'data-record-sha256': shown.sha256 || '' }, shown.sha256 ? `sha256: ${shown.sha256}` : '')),
     h('h3', null, textOf(shown.name) || '—'),
-    h('p', null, textOf(shown.summary) || '—'),
+    h('p', { class: 'prose', 'data-capability-summary': key }, textOf(shown.summary) || '—'),
+    truncationMarker(shown.summary, key),
     h('dl', { class: 'meta-grid' },
       h('dt', null, 'Native anchor'), h('dd', { class: 'mono' }, entry.native_id || entry.task || '—'),
       h('dt', null, 'Owner'), h('dd', { class: 'mono' }, shown.owner || '—'),
@@ -1004,7 +1027,7 @@ export async function capabilityPage(ctx, { pid, key }) {
       h('dt', null, 'Draft sha256'), h('dd', { class: 'mono', 'data-proposed-sha256': proposed.sha256 }, proposed.sha256),
       h('dt', null, 'Proposed by'), h('dd', null, entry.proposed_by_name || entry.proposed_by || '—'),
       h('dt', null, 'Name'), h('dd', null, textOf(proposed.name) || '—'),
-      h('dt', null, 'Summary'), h('dd', null, textOf(proposed.summary) || '—'),
+      h('dt', null, 'Summary'), h('dd', { class: 'prose', 'data-proposed-summary': key }, textOf(proposed.summary) || '—', truncationMarker(proposed.summary, key)),
       h('dt', null, 'Code pointers'), h('dd', { class: 'mono small' }, (proposed.code || []).join(', ') || '—'))) : null;
 
   const reviseError = h('p', { class: 'field-error', hidden: true });

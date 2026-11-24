@@ -217,21 +217,88 @@ class _Parser(argparse.ArgumentParser):
 
 # ---------------------------------------------------------------- text and paths
 
-def clean(value):
-    """Untrusted text as one line: control, format and separator characters become
-    spaces and runs of whitespace collapse."""
-    text = ''.join(' ' if unicodedata.category(ch)[0] in 'CZ' else ch for ch in str(value))
-    return ' '.join(text.split())
+def clean(value, multiline=False):
+    """Untrusted text cleaned of control and format characters (including bidi overrides
+    and zero-width characters such as U+200B and U+200D).
+
+    Default (`multiline=False`) collapses every C/Z character to one line.
+    With `multiline=True` (used only for capability record summaries on `find`/`get`),
+    line feeds are kept after CRLF/CR normalization while C characters are stripped and
+    other separators become spaces.
+    """
+    raw = str(value)
+    if not multiline:
+        text = ''.join(' ' if unicodedata.category(ch)[0] in 'CZ' else ch for ch in raw)
+        return ' '.join(text.split())
+    raw = raw.replace('\r\n', '\n').replace('\r', '\n')
+    out = []
+    for ch in raw:
+        if ch == ' ' or ch == '\n':
+            out.append(ch)
+        elif ch in '\t\v\f' or unicodedata.category(ch)[0] == 'Z':
+            out.append(' ')
+        elif unicodedata.category(ch)[0] != 'C':
+            out.append(ch)
+    return ''.join(out).strip()
 
 
-def excerpt(value, limit):
+def _is_regional_indicator(ch):
+    cp = ord(ch)
+    return 0x1F1E6 <= cp <= 0x1F1FF
+
+
+def _is_cluster_continuation(text, index):
+    """True when text[index] continues the grapheme cluster started before it.
+
+    Covers a practical subset of UAX #29 (combining marks Mn/Mc/Me including
+    variation selectors, emoji skin-tone modifiers U+1F3FB..U+1F3FF, ZWJ glue
+    on raw uncleaned text, CRLF, and regional indicator pairs), not full UAX #29
+    (no Hangul Jamo, Indic conjunct/Virama, or Prepend rules).
+    """
+    if index <= 0 or index >= len(text):
+        return False
+    ch = text[index]
+    prev = text[index - 1]
+    if prev == '\r' and ch == '\n':
+        return True
+    if prev == '\u200d' or ch == '\u200d':
+        return True
+    if unicodedata.category(ch) in ('Mn', 'Mc', 'Me'):
+        return True
+    cp = ord(ch)
+    if 0x1F3FB <= cp <= 0x1F3FF:
+        return True
+    if _is_regional_indicator(ch) and _is_regional_indicator(prev):
+        run = 0
+        pos = index - 1
+        while pos >= 0 and _is_regional_indicator(text[pos]):
+            run += 1
+            pos -= 1
+        return (run % 2) == 1
+    return False
+
+
+def slice_graphemes(text, limit):
+    """Return (prefix, omitted_chars) with len(prefix) <= limit, never splitting a cluster."""
+    if limit <= 0:
+        return '', len(text)
+    if len(text) <= limit:
+        return text, 0
+    end = limit
+    while end > 0 and _is_cluster_continuation(text, end):
+        end -= 1
+    return text[:end], len(text) - end
+
+
+def excerpt(value, limit, multiline=False):
     """An excerpt object (the CLI contract's bounded-text shape), or None."""
     if value is None:
         return None
-    text = clean(value)
+    text = clean(value, multiline=multiline)
     if not text:
         return None
-    return {'text': text[:limit], 'omitted_chars': max(0, len(text) - limit)}
+    kept, omitted = slice_graphemes(text, limit)
+    return {'text': kept, 'omitted_chars': omitted}
 
 
 def words(text):

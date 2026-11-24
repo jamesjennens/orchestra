@@ -913,16 +913,16 @@ def catalog(rows, operators):
     return KIND.catalog(rows, operators, view=entry_view)
 
 
-def _excerpt(text, limit):
+def _excerpt(text, limit, multiline=False):
     from capabilities import excerpt
-    return excerpt(text, limit)
+    return excerpt(text, limit, multiline=multiline)
 
 
 def _record_view(record):
     if record is None:
         return None
     return {'revision': record['revision'], 'name': _excerpt(record['name'], NAME_MAX),
-            'summary': _excerpt(record['summary'], SUMMARY_MAX), 'aliases': record['aliases'],
+            'summary': _excerpt(record['summary'], SUMMARY_MAX, multiline=True), 'aliases': record['aliases'],
             'requirements': record['requirements'], 'anchors': record['anchors'], 'code': record['code'],
             'tests': record['tests'], 'owner': record['owner'], 'tags': record['tags'],
             'acceptance_state': record['acceptance_state'], 'successor': record['successor'],
@@ -1150,7 +1150,7 @@ def find(rows, phrase, operators, limit=5, trust=None):
                 'state': entry['state'],
                 'native_id': entry['native_id'], 'revision': record.get('revision'),
                 'name': _excerpt(record.get('name'), NAME_MAX),
-                'summary': _excerpt(record.get('summary'), 200), 'owner': record.get('owner'),
+                'summary': _excerpt(record.get('summary'), SUMMARY_MAX, multiline=True), 'owner': record.get('owner'),
                 'tags': record.get('tags') or [],
                 'code': record.get('code') or [] if entry['state'] != 'conflicted' else [],
                 'tests': record.get('tests') or [] if entry['state'] != 'conflicted' else [],
@@ -1188,19 +1188,36 @@ VIEW_MAX = 500
 VIEW_SUMMARY = 300
 
 
-def _md(value, limit=None):
-    """Untrusted text as inert one-line Markdown: cleaned as .61 does, bounded, and with
-    every character Markdown or HTML could act on escaped."""
-    from capabilities import clean
-    text = clean('' if value is None else value)
-    if limit is not None and len(text) > limit:
-        text = text[:limit] + '...'
+def _md_escape(text):
     # Some renderers turn a bare URL or e-mail address into a link even in escaped
     # text, so they are defanged the usual way: `://` -> `[:]//`, `www.` -> `www[.]`,
     # `@` -> `[at]`.
     text = re.sub(r'(?i)\bwww\.', lambda match: match.group(0)[:-1] + '[.]', text.replace('://', '[:]//'))
     text = text.replace('@', '[at]')
     return re.sub(r'([\\`*_{}\[\]()#+!|<>~&-])', r'\\\1', text)
+
+
+def _md(value, limit=None):
+    """Untrusted text as inert one-line Markdown: cleaned as .61 does, grapheme-bounded,
+    and with every character Markdown or HTML could act on escaped."""
+    from capabilities import clean, slice_graphemes
+    text = clean('' if value is None else value)
+    if limit is not None and len(text) > limit:
+        kept, _ = slice_graphemes(text, limit)
+        text = kept + '...'
+    return _md_escape(text)
+
+
+def _md_summary(value, limit, key):
+    """One-line inert Markdown summary for CAPABILITIES.md; when bounded, appends an
+    explicit marker built solely from omitted_chars and the validated capability key."""
+    from capabilities import clean, slice_graphemes
+    text = clean('' if value is None else value)
+    kept, omitted = slice_graphemes(text, limit)
+    rendered = _md_escape(kept)
+    if omitted > 0:
+        rendered += ' (truncated: %d more characters; capability get %s)' % (omitted, key)
+    return rendered
 
 
 def capabilities_view(rows, operators=None, verifiers=None, journal=None, banner=''):
@@ -1241,7 +1258,7 @@ def capabilities_view(rows, operators=None, verifiers=None, journal=None, banner
             checked += ' at commit %s: %d pointer(s) reported missing' % (block['drift']['commit'][:12],
                                                                          len(block['drift']['missing']))
         lines.append('## %s: %s\n\n' % (_md(entry['key']), _md(record['name'], NAME_MAX)))
-        lines.append('- Summary: %s\n' % _md(record['summary'], VIEW_SUMMARY))
+        lines.append('- Summary: %s\n' % _md_summary(record['summary'], VIEW_SUMMARY, entry['key']))
         lines.append('- Owner: %s\n' % _md(record['owner']))
         lines.append('- State: accepted, revision %d. Verification: %s\n' % (record['revision'], checked))
         for label, values in (('Requirements', ['%s%s' % (link['key'], ' r%d' % link['revision']

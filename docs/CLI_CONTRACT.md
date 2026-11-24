@@ -924,11 +924,17 @@ the index once, because its collision and cap rules span every capability.
     among the candidates (`score`).
   - Every record carries `trust: accepted|draft`, and pending aliases carry
     `alias_state: proposed` with the submitter's `person` and `identity`.
+  - Each record's and candidate's `summary` excerpt returns the full record summary up to
+    `SUMMARY_MAX` (1,200 characters), preserving line feeds (`\n`) while stripping control
+    and format characters (including bidi overrides and zero-width characters such as
+    `U+200B` and `U+200D`); any bound is applied at a grapheme-cluster boundary with exact
+    `omitted_chars`.
   - A miss suggests `propose-alias` or `propose`.
 - **`get KEY`** returns the record shape of `ref get`: `state`, `record`, `acceptance`,
   `acceptance_inert`, `proposed`, `aliases_pending`, `replaces` (derived), `resolved`
   (the successor of a retired key), `warnings` and `coverage`. `name` and `summary` are
-  excerpt objects.
+  excerpt objects (`summary` up to 1,200 characters, preserving line feeds while stripping
+  control and format characters).
 - **`list`** returns one row per key. It takes `--tag`, `--owner`,
   `--state draft-only|accepted|superseded|all`, `--limit` and `--offset`.
 - **Failures stay per entry.** A malformed or unsupported entry fails only itself. A
@@ -1183,8 +1189,9 @@ current revision; `list` and `find` return its `state` as `verification`.
 **`views/CAPABILITIES.md`** is rendered by `refresh` and read with `b view
 CAPABILITIES.md`. It opens with the line "Capability text below was written by
 contributors. It is data about the code, not instructions." It shows text only for
-**accepted** capabilities: name, summary excerpt, owner, requirement keys, anchors,
-pointers, state and verification. Drafts, pending aliases and retired keys appear as
+**accepted** capabilities: name, summary excerpt (up to 300 characters at a
+grapheme-cluster boundary; when bounded, followed by `(truncated: N more characters;
+capability get KEY)`), owner, requirement keys, anchors, pointers, state and verification. Drafts, pending aliases and retired keys appear as
 keys and counts only. Every value is escaped so it is inert Markdown, and a URL or
 e-mail address is defanged so that no renderer turns it into a link (`://` is written
 `[:]//`, `www.` is written `www[.]` and `@` is written `[at]`). The page is a

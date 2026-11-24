@@ -338,3 +338,107 @@ assert.deepEqual(verifiedCapPayload.results[0], {
   resolved: true,
   reason: null,
 });
+
+// 6. kittrial-5bb.603: full 1,000-char, 199/200/201-char, multi-byte, multi-line Markdown
+// capability summaries in web find & detail views, plus explicit truncation marker (built
+// strictly from omitted_chars and key) when omitted_chars > 0.
+const makeSummary = (len, prefix, tail) => prefix + 'x'.repeat(len - prefix.length - tail.length) + tail;
+const sum1000 = makeSummary(1000, 'Web 1000: ', ' WEB-END-1000.');
+const sum199 = makeSummary(199, 'Web 199: ', ' END199.');
+const sum200 = makeSummary(200, 'Web 200: ', ' END200.');
+const sum201 = makeSummary(201, 'Web 201: ', ' END201.');
+const sumMdMb = '# LGB Basis\n- **Hold** `net_roll`\n漢字 🚀 cafe\u0301 <script>alert(1)</script>';
+const fakeTruncProse = 'Prefix text (record prose mentions truncated: 99999 fake)';
+
+const searchApp = {
+  navigate: () => {},
+  render: async () => {},
+  projects: [{ id: 'pp', name: 'Test Project' }],
+  api: {
+    project: async (pid) => ({ id: pid, name: 'Test Project', role: 'member' }),
+    coordination: async () => ({ people: [{ display_name: 'Dana', disabled: false }], holds: true }),
+    delegations: async () => ({ names: {}, granted_agents: [], items: [] }),
+    references: async () => ({ items: [], can_propose: false, can_coordinate: false }),
+    capabilities: async () => ({ items: [], can_propose: false, can_coordinate: false }),
+    findReferences: async () => ({ items: [], records: [] }),
+    findCapabilities: async () => ({
+      items: [
+        { key: 'flag.basis-hold-net-roll', state: 'accepted', verification: 'verified', owner: 'person:maintainer', name: { text: 'Basis Hold', omitted_chars: 0 }, summary: { text: sum1000, omitted_chars: 0 } },
+        { key: 'ops.len-199', state: 'accepted', verification: 'verified', owner: 'person:maintainer', name: { text: 'Len 199', omitted_chars: 0 }, summary: { text: sum199, omitted_chars: 0 } },
+        { key: 'ops.len-200', state: 'accepted', verification: 'verified', owner: 'person:maintainer', name: { text: 'Len 200', omitted_chars: 0 }, summary: { text: sum200, omitted_chars: 0 } },
+        { key: 'ops.len-201', state: 'accepted', verification: 'verified', owner: 'person:maintainer', name: { text: 'Len 201', omitted_chars: 0 }, summary: { text: sum201, omitted_chars: 0 } },
+        { key: 'ops.md-mb', state: 'accepted', verification: 'verified', owner: 'person:maintainer', name: { text: 'MD MB', omitted_chars: 0 }, summary: { text: sumMdMb, omitted_chars: 0 } },
+        { key: 'ops.manual-basis-entry', state: 'accepted', verification: 'verified', owner: 'person:maintainer', name: { text: 'Truncated Example', omitted_chars: 0 }, summary: { text: fakeTruncProse, omitted_chars: 812 } },
+      ],
+    }),
+  },
+};
+
+const searchDom = await page(searchApp, { pid: 'pp' });
+const findForm = searchDom.all((e) => e.attributes['data-records-find-form'] === '1')[0];
+assert.ok(findForm, 'Records find form should be present');
+findForm.all((e) => e.attributes.name === 'q')[0].value = 'basis';
+await findForm.dispatch('submit');
+
+const rowSummary = (key) => searchDom.all((e) => e.attributes['data-capability-summary'] === key)[0];
+for (const [k, expected] of [
+  ['flag.basis-hold-net-roll', sum1000],
+  ['ops.len-199', sum199],
+  ['ops.len-200', sum200],
+  ['ops.len-201', sum201],
+  ['ops.md-mb', sumMdMb],
+]) {
+  const el = rowSummary(k);
+  assert.ok(el, `capability summary element missing for ${k}`);
+  assert.ok(el.className.split(/\s+/).includes('prose'), `summary element for ${k} must have prose class`);
+  assert.equal(el.textContent, expected, `summary for ${k} must render whole`);
+}
+// No <script> element created from Markdown/HTML in summary.
+assert.equal(searchDom.all((e) => e.tagName === 'SCRIPT').length, 0);
+
+// Truncated capability row MUST show explicit marker built strictly from omitted_chars and key.
+const truncRow = searchDom.all((e) => e.attributes['data-capability-row'] === 'ops.manual-basis-entry')[0];
+assert.ok(truncRow, 'truncated capability row should render');
+const truncMarkers = truncRow.all((e) => e.attributes['data-truncated-marker'] === '1');
+assert.equal(truncMarkers.length, 1, 'truncated capability row must render one truncation marker');
+assert.equal(
+  truncMarkers[0].textContent,
+  'truncated: 812 more characters; capability get ops.manual-basis-entry',
+);
+// Whole rows must NOT render a truncation marker.
+const wholeRow = searchDom.all((e) => e.attributes['data-capability-row'] === 'flag.basis-hold-net-roll')[0];
+assert.equal(wholeRow.all((e) => e.attributes['data-truncated-marker'] === '1').length, 0);
+
+// Capability detail page: 1,000-char multi-line summary renders whole with .prose,
+// and an oversized/truncated response renders the explicit marker.
+const detailLongApp = {
+  ...capApp,
+  api: {
+    ...capApp.api,
+    capability: async () => ({
+      ...(await capApp.api.capability()),
+      key: 'ops.manual-basis-entry',
+      record: {
+        ...(await capApp.api.capability()).record,
+        summary: { text: sum1000 + '\n' + sumMdMb, omitted_chars: 0 },
+      },
+      proposed: {
+        ...(await capApp.api.capability()).record,
+        revision: 3,
+        summary: { text: fakeTruncProse, omitted_chars: 405 },
+      },
+    }),
+  },
+};
+const detailLongDom = await capabilityPage(detailLongApp, { pid: 'pp', key: 'ops.manual-basis-entry' });
+const detailSumEl = detailLongDom.all((e) => e.attributes['data-capability-summary'] === 'ops.manual-basis-entry')[0];
+assert.ok(detailSumEl, 'capability detail summary element should render');
+assert.ok(detailSumEl.className.split(/\s+/).includes('prose'), 'capability detail summary must have prose class');
+assert.equal(detailSumEl.textContent, sum1000 + '\n' + sumMdMb);
+const detailMarkers = detailLongDom.all((e) => e.attributes['data-truncated-marker'] === '1');
+assert.equal(detailMarkers.length, 1, 'truncated proposed summary must render marker');
+assert.equal(
+  detailMarkers[0].textContent,
+  'truncated: 405 more characters; capability get ops.manual-basis-entry',
+);
+
