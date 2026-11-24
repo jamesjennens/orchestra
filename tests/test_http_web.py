@@ -918,6 +918,29 @@ class CanonicalBindingReadCase(EndpointCase):
         self.assertEqual(200, brief.status, brief.data)
         self.assertEqual('alex', brief.data['checkpoint']['author_name'])
 
+    def test_endpoint_brief_read_whole_uses_task_id_not_dict_repr(self):
+        """kittrial-5bb.531 bug 1: HTTP brief read_whole must interpolate task_id,
+        not the task dict repr, when a compact field is cut."""
+        alex, project = self.setup_project()
+        long_desc = 'detail ' * 200
+        created = self.request('POST', '/v1/projects/%s/tasks' % project,
+                               {'title': 'Cut brief title', 'description': long_desc},
+                               token=alex)
+        self.assertEqual(201, created.status, created.data)
+        task_id = created.data['id']
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task_id),
+                             token=alex)
+        self.assertEqual(200, brief.status, brief.data)
+        expected_path = '/v1/projects/%s/tasks/%s' % (project, task_id)
+        self.assertEqual(
+            {'route': 'GET %s' % expected_path,
+             'link': expected_path,
+             'note': 'The complete text: GET %s.' % expected_path},
+            brief.data.get('read_whole'))
+        for value in brief.data['read_whole'].values():
+            self.assertNotIn('{', value)
+            self.assertNotIn('Cut brief title', value)
+
     def test_brief_and_queue_follow_the_canonical_review_chain(self):
         alex, project = self.setup_project()
         task = self.create_task(alex, project, 'canonical task').data['id']

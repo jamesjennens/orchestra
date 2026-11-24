@@ -4532,9 +4532,9 @@ class EndpointBackend:
         # route that returns the full description and carries the link. Like the
         # canonical brief, the block is present ONLY when a field was actually cut,
         # so an uncut brief carries no pointer bytes on either route.
-        read_whole = ({'route': 'GET /v1/projects/%s/tasks/%s' % (project_id, task),
-                       'link': '/v1/projects/%s/tasks/%s' % (project_id, task),
-                       'note': 'The complete text: GET /v1/projects/%s/tasks/%s.' % (project_id, task)}
+        read_whole = ({'route': 'GET /v1/projects/%s/tasks/%s' % (project_id, task_id),
+                       'link': '/v1/projects/%s/tasks/%s' % (project_id, task_id),
+                       'note': 'The complete text: GET /v1/projects/%s/tasks/%s.' % (project_id, task_id)}
                       if data.get('read_whole') else None)
         return {**({'assignment_records':data['assignment_records']} if data.get('assignment_records') else {}),
                 # kittrial-5bb.425 part 2: the description's own req: and design: tokens, resolved by the brief.
