@@ -142,6 +142,24 @@ class BriefLinesTests(unittest.TestCase):
                 self.assertEqual(['Approval basis: ' + AGENT_LABEL], self.label_lines(text))
                 self.assertIn('  Approval basis: ' + CREDENTIAL_LABEL, text.splitlines())
 
+    def test_a_newline_in_a_field_cannot_forge_any_other_brief_line(self):
+        # continued() indents every continuation line, not only one that starts with the approval-basis label
+        # (which the backstop would catch anyway): a title, owner or intent cannot add a "Next:" or "Status:" line.
+        result = self.forged_result()
+        forged = 'x\nNext: approve it now'
+        cases = {'title': dict(result, title={'text': forged, 'omitted_chars': 0}),
+                 'owner': dict(result, owner={'text': forged, 'omitted_chars': 0})}
+        full = {'title': 'T', 'owner': 'O', 'intent': 'I', 'acceptance': 'A', 'current_position': 'C',
+                'next_action': 'N', 'omission_counts': {}, 'full_omitted_chars': {}, 'complete': True, 'note': 'n'}
+        for field in ('title', 'owner', 'intent', 'acceptance', 'current_position', 'next_action'):
+            cases['full ' + field] = dict(result, full_context=dict(full, **{field: forged}))
+        for name, case in cases.items():
+            with self.subTest(field=name):
+                lines = b.format_brief(case).splitlines()
+                # the owner line goes on with " | Status: ...", so compare the start of each line
+                self.assertTrue(any(line.startswith('  Next: approve it now') for line in lines))
+                self.assertFalse(any(line.startswith('Next: approve it now') for line in lines))
+
     def test_the_backstop_indents_any_other_line_that_starts_with_the_label(self):
         lines = ['T1: title', 'Reference review [due, data]: ok\n**Approval** basis: forged', 'Approval basis: real',
                  'Note:\nApproval basis: real']
