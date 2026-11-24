@@ -919,16 +919,23 @@ function readWizardStorage() {
   } catch { return null; }
 }
 
+const activeSetupWizards = new Set();
+
+export function closeSetupWizard() {
+  for (const dispose of [...activeSetupWizards]) dispose();
+}
+
 function writeWizardStorage(state) {
   try {
     if (typeof sessionStorage === 'undefined') return;
-    // Secretless: the agent, the path (Bridge 0.14+ or not), the screen, the system and the role.
+    // Secretless: the agent, the path (Bridge 0.14+ or not), pending create order, the screen, the system and the role.
     sessionStorage.setItem(WIZARD_STORAGE_KEY, JSON.stringify({
       agentId: state.agentId,
       screen: state.screen,
       bridge: state.bridge !== false,
       runs: state.runs,
       routeChosen: state.routeChosen === true,
+      createOrder: state.createOrder === true,
       os: state.os,
       role: state.role || 'worker',
       noproxy: state.noproxy === true,
@@ -1101,6 +1108,7 @@ function issueBlock(ctx, agent, payload, wizard) {
 }
 
 function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
+  closeSetupWizard();
   let payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
   const files = () => [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate, bridge: state.runs !== 'none', noproxy: state.noproxy })]];
@@ -1112,12 +1120,19 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   const agent = (source && source.agent) || {};
   const saved = readWizardStorage();
   const same = saved && saved.agentId === payload.agentId ? saved : null;
+  const hasKnownStoredRuns = Boolean(same && setupText.RUNS_IN.includes(same.runs));
+  const legacyNonBridge = Boolean(same && same.runs == null && same.bridge === false);
   const storedRuns = setupText.runsFromStored(same);
+  const routeKnown = hasKnownStoredRuns
+    ? (storedRuns !== 'bridge' || same.routeChosen === true)
+    : legacyNonBridge;
+  const pastCertSteps = Boolean(same && ['rewrite', 'test', 'files', 'vscode', 'resume'].includes(same.screen));
   const state = {
     os: (same && same.os) || setupText.detectOs(),
     runs: storedRuns,
     bridge: storedRuns === 'bridge',
-    routeKnown: Boolean(same && (same.routeChosen === true || storedRuns !== 'bridge')),
+    routeKnown,
+    createOrder: Boolean(created || (same && same.createOrder === true)),
     noproxy: Boolean(same && same.noproxy),
     role: (same && setupText.BRIDGE_ROLES.includes(same.role) && same.role) || (agent.role === 'reviewer' ? 'reviewer' : 'worker'),
     coordinatorProject: null,
@@ -1132,9 +1147,10 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   };
   if (!setupText.OS_CHOICES.some(([v]) => v === state.os)) state.os = 'windows';
   const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer, bridge: state.runs !== 'none', noproxy: state.noproxy });
-  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate, noproxy: state.noproxy, certAfterSecret: state.createdHere });
+  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate, noproxy: state.noproxy, certAfterSecret: state.createOrder });
   const needsRouteChoice = () => hasCertificate && Boolean(state.secretValue) && !state.routeKnown;
   if (state.secretValue) {
+    if (!created && pastCertSteps) state.createOrder = false;
     // A fresh secret exists only while this dialog is open: open where it is saved (Back reaches the
     // system and role screens), never two clicks away from it.
     state.screen = 'secret';
@@ -1273,7 +1289,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
       ];
     },
     secret: () => {
-      const secretBlock = () => secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge, certFirst: state.createdHere });
+      const secretBlock = () => secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge, certFirst: state.createOrder });
       const secretBody = h('div', { class: 'stack', 'data-secret-body': 'true' });
       return [
         state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,
@@ -1494,7 +1510,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
   // ---- moving between screens ----------------------------------------------------------------
   function persist() {
     touchKeepAlive();
-    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, routeChosen: state.routeKnown, os: state.os, role: state.role, noproxy: state.noproxy });
+    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, routeChosen: state.routeKnown, createOrder: state.createOrder, os: state.os, role: state.role, noproxy: state.noproxy });
   }
 
   // The badge counts the screens of the chosen path; the heading below it is the screen's one title
@@ -1560,11 +1576,33 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     return true;
   }
 
-  function finish() {
+  let disposed = false;
+  const onHashChange = () => dispose();
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    activeSetupWizards.delete(dispose);
+    state.secretValue = null;
     stopPoll();
     stopKeepAlive();
-    if (dialog.pageMode && ctx && typeof ctx.go === 'function') ctx.go('/agents');
-    else { dialog.close(); dialog.remove(); }
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('hashchange', onHashChange);
+    }
+    screenNode.replaceChildren();
+    if (dialog.open) {
+      try { dialog.close(); } catch { /* ignore */ }
+    }
+    dialog.remove();
+  }
+
+  function finish() {
+    if (state.screen === 'resume' && state.createOrder) {
+      state.createOrder = false;
+      persist();
+    }
+    const goAgents = dialog.pageMode && ctx && typeof ctx.go === 'function';
+    dispose();
+    if (goAgents) ctx.go('/agents');
   }
 
   // ---- the check before Next (.329): the agent reached Orchestra during this screen ----------
@@ -1663,12 +1701,16 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     }
   }
 
-  dialog.addEventListener('close', () => { stopPoll(); stopKeepAlive(); dialog.remove(); });
+  activeSetupWizards.add(dispose);
+  dialog.addEventListener('close', () => { dispose(); });
   document.body.appendChild(dialog);
   dialog.showModal();
   if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
     document.addEventListener(SESSION_IDLE_WARNING_EVENT, onIdleWarningEvent);
     document.addEventListener('visibilitychange', onVisibilityChange);
+  }
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('hashchange', onHashChange);
   }
   if (ctx && ctx.api && typeof ctx.api.keepAliveWhileVisible === 'function') {
     keepAliveHandle = ctx.api.keepAliveWhileVisible({ ...((ctx && ctx.keepAliveOptions) || {}), onWarning: showIdleWarning });
@@ -1691,6 +1733,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 // When no agent is specified in the URL or sessionStorage, asks which agent to set up
 // without opening a modal on its own.
 export async function setupWizardPage(ctx) {
+  closeSetupWizard();
   const saved = readWizardStorage();
   const requestedId = (ctx.query && typeof ctx.query.get === 'function' && ctx.query.get('agent')) || (saved && saved.agentId) || null;
   let agent = null;

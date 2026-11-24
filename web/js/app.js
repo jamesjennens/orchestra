@@ -150,6 +150,7 @@ export async function start(root, options = {}) {
   };
 
   function showLogin(message) {
+    agents.closeSetupWizard();
     // Nothing is rendered from the route now, so opening any route (an invite link included) renders again.
     rendered = null;
     place(auth.login(ctx, message));
@@ -160,6 +161,7 @@ export async function start(root, options = {}) {
   function showInvite() {
     const route = currentRoute();
     if (!route.startsWith(INVITE_PREFIX)) return false;
+    agents.closeSetupWizard();
     rendered = route;
     place(invites.invitePage(ctx, route.slice(INVITE_PREFIX.length)));
     return true;
@@ -257,6 +259,7 @@ export async function start(root, options = {}) {
 
   let token = 0;
   async function render() {
+    agents.closeSetupWizard();
     if (showInvite()) return;
     if (!ctx.me) return showLogin();
     const route = currentRoute();

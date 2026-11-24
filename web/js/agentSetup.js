@@ -213,6 +213,7 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
   const quoted = posixManaged.map((line) => (line.startsWith('cacert =')
     ? `"${line.replace(/"/g, '\\"')}"`
     : shQuote(line))).join(' ');
+  const posixHomeGuard = 'nl=$(printf \'\\nx\'); nl=${nl%x}; case "$HOME" in \'\'|[!/]*|*"$nl"*) echo \'HOME must be an absolute path without a newline.\' >&2; exit 1 ;; esac; ';
   const posixHomePrefix = hasPosixCert
     ? 'h=$(printf \'%s\\n\' "$HOME" | sed \'s/\\\\/\\\\\\\\/g; s/"/\\\\"/g\'); '
     : '';
@@ -234,7 +235,7 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
     + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_MANAGED_PATTERN + ",''); "
     + 'if ($c -and -not $c.EndsWith("`n")) { $c = $c + "`r`n" } '
     + '[IO.File]::WriteAllText($p, (' + psPrefix + ') + $c) }';
-  const posix = `( umask 077; [ -f ${file.posix} ] || { echo 'Save the header line first, then run this again.'; exit 0; }; rm -f ${file.posix}.new; ${posixHomePrefix}printf '%s\\n' ${quoted} > ${file.posix}.new && `
+  const posix = `( umask 077; ${posixHomeGuard}[ -f ${file.posix} ] || { echo 'Save the header line first, then run this again.'; exit 0; }; rm -f ${file.posix}.new; ${posixHomePrefix}printf '%s\\n' ${quoted} > ${file.posix}.new && `
     + `grep -vE ${CREDENTIAL_MANAGED_PATTERN} ${file.posix} >> ${file.posix}.new && `
     + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new )`;
   return Object.freeze({ powershell, posix });

@@ -56,9 +56,15 @@ const cleared = [];
 globalThis.setInterval = () => nextInterval++;
 globalThis.clearInterval = (id) => { cleared.push(id); };
 const pickerCalls = [];
+const windowListeners = new Map();
+globalThis.history = { replaceState(_s, _t, url) { if (typeof url === 'string') globalThis.location.hash = url; } };
 globalThis.window = {
   location: globalThis.location,
   isSecureContext: true,
+  scrollTo() {},
+  addEventListener(type, fn) { if (!windowListeners.has(type)) windowListeners.set(type, new Set()); windowListeners.get(type).add(fn); },
+  removeEventListener(type, fn) { if (windowListeners.has(type)) windowListeners.get(type).delete(fn); },
+  dispatchEvent(event) { for (const fn of [...(windowListeners.get(event.type) || [])]) fn(event); return true; },
   showDirectoryPicker: async (opts) => {
     pickerCalls.push(opts);
     const missing = () => { const e = new Error('missing'); e.name = 'NotFoundError'; throw e; };
@@ -1253,20 +1259,25 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       enabled: true, projects: ['p1'], working_directory: '/Users/Shared/agents/kestrel',
       scopes: ['read', 'tasks'], scopes_source: 'stored', credentials: [],
     };
+    const newAgent = { ...cardAgent, id: 'agent_new_524', name: 'Heron', display_name: 'Heron' };
+    let includeNewInList = false;
     const cardOverrides = {
-      agents: async () => ({ items: [cardAgent], total: 1, next_cursor: null }),
+      agents: async () => ({ items: includeNewInList ? [cardAgent, newAgent] : [cardAgent], total: includeNewInList ? 2 : 1, next_cursor: null }),
       accounts: async () => ({ items: [] }),
       agentHistory: async () => ({ items: [] }),
-      agent: async () => cardAgent,
+      agent: async (aid) => (aid === 'agent_new_524' ? newAgent : cardAgent),
       certificate: async () => server.certificate,
-      createAgent: async (body) => ({
-        agent: { ...cardAgent, id: 'agent_new_524', name: body.name || 'Heron' },
-        credential: { id: 'cred_new_524', secret: SECRET, scopes: ['read', 'tasks'] },
-        setup: { config: { agent_id: 'agent_new_524', name: body.name || 'Heron', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } },
-      }),
-      issueAgentCredential: async (_aid, scopes) => ({
+      createAgent: async (body) => {
+        newAgent.name = body.name || 'Heron';
+        return {
+          agent: { ...newAgent },
+          credential: { id: 'cred_new_524', secret: SECRET, scopes: ['read', 'tasks'] },
+          setup: { config: { agent_id: 'agent_new_524', name: newAgent.name, server_url: 'https://127.0.0.1:8765', projects: ['p1'] } },
+        };
+      },
+      issueAgentCredential: async (aid, scopes) => ({
         credential: { id: 'cred_card_1', secret: SECRET, scopes },
-        setup: { config: { agent_id: 'agent_1', name: 'Kestrel', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } },
+        setup: { config: { agent_id: aid || 'agent_1', name: aid === 'agent_new_524' ? newAgent.name : 'Kestrel', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } },
       }),
     };
     const cardApi = new Proxy(api, { get: (target, key) => (key in cardOverrides ? cardOverrides[key] : target[key]) });
@@ -1591,6 +1602,294 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     }
     out.createAgentCurlVisitsCertSaveBeforeRewrite = createFlowOk;
     for (const open of openDialogs()) await open.close();
+
+    // (5f-reopen) MUST-1 (reopen-create-order, field reproduction): create the agent (certificate
+    // present), choose No Bridge, save/copy the secret, close the dialog, then reopen setup for
+    // that agent. It must still run cert-save, then cert-move, before rewrite. Also pin
+    // close-then-reopen at cert-save, and that a later rotation after completing setup on resume
+    // returns to secret -> rewrite.
+    store.clear();
+    localStore.clear();
+    consoleMessages.length = 0;
+    const reopenNewCtx = {
+      ...ctx,
+      api: cardApi,
+      query: { get: (k) => (k === 'agent' ? 'agent_new_524' : null) },
+      go: () => {},
+    };
+    const reopenCreate = await openCreateAgentDialog('Heron');
+    const reopenNone = reopenCreate ? windowsChoice(reopenCreate, 'secret-connect', 'none') : null;
+    let reopenAfterSecretOk = false;
+    let reopenAtCertSaveOk = false;
+    let rotateAfterFinishOk = false;
+    if (reopenCreate && reopenNone) {
+      reopenNone.checked = true;
+      await reopenNone.dispatch('change');
+      await tick();
+      const copiedSecretOk = await clickBothCopyButtonsAndScan(reopenCreate, SECRET);
+      const storedAfterChoice = JSON.parse(store.get(WIZARD_STORAGE_KEY) || '{}');
+      const storedNoSecret = !(store.get(WIZARD_STORAGE_KEY) || '').includes(SECRET);
+      // Close the dialog on the secret screen after saving the secret (field reproduction).
+      await button(reopenCreate, 'wizard-done').dispatch('click');
+      await tick();
+      // Reopen setup for that agent via the card's "Set up folder" button (reopenSetup, created=false, secret=null).
+      includeNewInList = true;
+      const listAfterCreate = await agentsList({ ...ctx, api: cardApi, render() {}, refreshProjects: async () => {} });
+      await new Promise((r) => setTimeout(r, 50));
+      includeNewInList = false;
+      const setupFolderBtn = listAfterCreate.all((e) => e.tagName === 'BUTTON' && e.getAttribute('aria-label') === 'Set up the folder for Heron')[0];
+      if (setupFolderBtn) {
+        await setupFolderBtn.dispatch('click');
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const reopened = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
+      if (reopened) {
+        const reopenedPlan = reopened.wizard.plan();
+        const startScreen = screenOf(reopened);
+        const startNoSecret = secretContainmentOk(SECRET, { expectPre: false });
+        await reopened.wizard.next();
+        const s1 = screenOf(reopened);
+        await reopened.wizard.next();
+        const s2 = screenOf(reopened);
+        await reopened.wizard.next();
+        const s3 = screenOf(reopened);
+        await reopened.wizard.next();
+        const s4 = screenOf(reopened);
+        reopenAfterSecretOk = copiedSecretOk
+          && storedNoSecret
+          && storedAfterChoice.agentId === 'agent_new_524'
+          && storedAfterChoice.createOrder === true
+          && startScreen === 'secret'
+          && startNoSecret
+          && reopenedPlan.indexOf('cert-save') > reopenedPlan.indexOf('secret')
+          && reopenedPlan.indexOf('cert-move') > reopenedPlan.indexOf('cert-save')
+          && reopenedPlan.indexOf('rewrite') > reopenedPlan.indexOf('cert-move')
+          && s1 === 'cert-save'
+          && s2 === 'cert-move'
+          && s3 === 'rewrite'
+          && s4 === 'test';
+        // Close-then-reopen at cert-save:
+        reopened.wizard.show('cert-save');
+        await button(reopened, 'wizard-done').dispatch('click');
+        await tick();
+        await setupWizardPage(reopenNewCtx);
+        await tick();
+        const reopenedAtCert = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
+        if (reopenedAtCert) {
+          const atCertScreen = screenOf(reopenedAtCert);
+          reopenedAtCert.wizard.back();
+          const backFromCert = screenOf(reopenedAtCert);
+          await reopenedAtCert.wizard.next();
+          const forwardCertSave = screenOf(reopenedAtCert);
+          await reopenedAtCert.wizard.next();
+          const forwardCertMove = screenOf(reopenedAtCert);
+          await reopenedAtCert.wizard.next();
+          const forwardRewrite = screenOf(reopenedAtCert);
+          reopenAtCertSaveOk = atCertScreen === 'cert-save'
+            && backFromCert === 'secret'
+            && forwardCertSave === 'cert-save'
+            && forwardCertMove === 'cert-move'
+            && forwardRewrite === 'rewrite';
+          // Finish setup on resume, then verify createOrder clears so a later rotation skips cert-save.
+          reopenedAtCert.wizard.show('resume');
+          await button(reopenedAtCert, 'wizard-done').dispatch('click');
+          await tick();
+          const storedAfterFinish = JSON.parse(store.get(WIZARD_STORAGE_KEY) || '{}');
+          await setupWizardPage(reopenNewCtx);
+          await tick();
+          const postFinish = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
+          rotateAfterFinishOk = storedAfterFinish.createOrder === false
+            && Boolean(postFinish)
+            && postFinish.wizard.plan().indexOf('cert-save') < postFinish.wizard.plan().indexOf('secret');
+        }
+      }
+    }
+    out.createAgentCloseAfterSecretReopenRunsCertBeforeRewrite = reopenAfterSecretOk
+      && reopenAtCertSaveOk
+      && rotateAfterFinishOk;
+    for (const open of openDialogs()) await open.close();
+
+    // (5f-stored) SHOULD-3 (stored-route): routeChosen: true with missing or unknown runs MUST ask
+    // on both card rotation and Add agent; non-boolean routeChosen with Bridge MUST ask; legacy
+    // bridge: false without runs still keeps curl.
+    const badStoredRecords = [
+      { agentId: 'agent_1', screen: 'resume', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_1', screen: 'resume', bridge: true, routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_1', screen: 'resume', runs: 'bogus', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_1', screen: 'resume', runs: 'bogus', bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_1', screen: 'resume', runs: 'bridge', bridge: true, routeChosen: 'true', os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_1', screen: 'resume', runs: 'bridge', bridge: true, routeChosen: 1, os: 'windows', role: 'worker', noproxy: false },
+    ];
+    let badCardAllAsk = true;
+    for (const rec of badStoredRecords) {
+      store.clear();
+      store.set(WIZARD_STORAGE_KEY, JSON.stringify(rec));
+      const w = await openCardSecretDialog();
+      const asks = Boolean(w)
+        && attr(w, 'data-connection-choice', 'true').length === 1
+        && attr(w, 'data-secret-file-text', 'true').length === 0;
+      if (!asks) badCardAllAsk = false;
+      for (const open of openDialogs()) await open.close();
+    }
+    let badCreateAllAsk = true;
+    for (const rec of [
+      { agentId: 'agent_new_524', screen: 'resume', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_new_524', screen: 'resume', runs: 'bogus', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+    ]) {
+      store.clear();
+      store.set(WIZARD_STORAGE_KEY, JSON.stringify(rec));
+      const w = await openCreateAgentDialog('Heron');
+      const asks = Boolean(w)
+        && attr(w, 'data-connection-choice', 'true').length === 1
+        && attr(w, 'data-secret-file-text', 'true').length === 0;
+      if (!asks) badCreateAllAsk = false;
+      for (const open of openDialogs()) await open.close();
+    }
+    // Legacy bridge: false (no runs key) still renders curl without asking.
+    store.clear();
+    store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'resume', bridge: false, os: 'windows', role: 'worker', noproxy: false }));
+    const legacyFalseW = await openCardSecretDialog();
+    const legacyFalseKeepsCurl = Boolean(legacyFalseW)
+      && attr(legacyFalseW, 'data-connection-choice', 'true').length === 0
+      && (attr(legacyFalseW, 'data-secret-file-text', 'true')[0]?.textContent || '').includes('cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"');
+    for (const open of openDialogs()) await open.close();
+    out.storedRouteRequiresKnownRunsValue = badCardAllAsk && badCreateAllAsk && legacyFalseKeepsCurl;
+
+    // (5f-stale) MUST-2 (stale-wizard): opening #/setup or changing hash while a setup wizard is
+    // showing a secret MUST close and remove the previous wizard and its listeners WITHOUT any
+    // harness close-all, leaving at most one wizard and zero secret text in the whole document.
+    store.clear();
+    localStore.clear();
+    consoleMessages.length = 0;
+    const listenerCount = () => (listeners.get('visibilitychange')?.size || 0)
+      + (listeners.get('orchestra:session-idle-warning')?.size || 0)
+      + (windowListeners.get('hashchange')?.size || 0);
+    const baseListeners = listenerCount();
+    // (a) Direct setupWizardPage without harness close-all after card rotation secret is shown:
+    const staleCard = await openCardSecretDialog();
+    const staleNone = staleCard ? windowsChoice(staleCard, 'secret-connect', 'none') : null;
+    if (staleNone) { staleNone.checked = true; await staleNone.dispatch('change'); await tick(); }
+    const cardHadSecretBeforeNav = body.textContent.includes(SECRET);
+    const listenersWithOneWizard = listenerCount();
+    await setupWizardPage(ctx);
+    await tick();
+    const afterDirectSetupDialogs = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+    const directNavOk = cardHadSecretBeforeNav
+      && listenersWithOneWizard > baseListeners
+      && afterDirectSetupDialogs.length === 1
+      && afterDirectSetupDialogs[0] !== staleCard
+      && staleCard.open === false
+      && staleCard.parentNode === null
+      && !body.textContent.includes(SECRET)
+      && secretContainmentOk(SECRET, { expectPre: false })
+      && listenerCount() === listenersWithOneWizard;
+    // (a2) Direct setupWizardPage without harness close-all after Add agent secret is shown:
+    store.clear();
+    const staleCreate = await openCreateAgentDialog('Heron');
+    const staleCreateNone = staleCreate ? windowsChoice(staleCreate, 'secret-connect', 'none') : null;
+    if (staleCreateNone) { staleCreateNone.checked = true; await staleCreateNone.dispatch('change'); await tick(); }
+    const createHadSecretBeforeNav = body.textContent.includes(SECRET);
+    await setupWizardPage(reopenNewCtx);
+    await tick();
+    const afterCreateSetupDialogs = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+    const directCreateNavOk = createHadSecretBeforeNav
+      && afterCreateSetupDialogs.length === 1
+      && afterCreateSetupDialogs[0] !== staleCreate
+      && staleCreate.open === false
+      && staleCreate.parentNode === null
+      && !body.textContent.includes(SECRET)
+      && secretContainmentOk(SECRET, { expectPre: false })
+      && listenerCount() === listenersWithOneWizard;
+    // (a3) Opening a second setupDialog directly while one is already open replaces the earlier one:
+    const prevSetupWizard = afterCreateSetupDialogs[0];
+    const secondDirectWizard = await openCardSecretDialog();
+    const afterSecondDirect = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+    const directReplaceOk = Boolean(secondDirectWizard)
+      && afterSecondDirect.length === 1
+      && afterSecondDirect[0] === secondDirectWizard
+      && prevSetupWizard.open === false
+      && prevSetupWizard.parentNode === null
+      && listenerCount() === listenersWithOneWizard;
+    for (const open of openDialogs()) await open.close();
+    const listenersBackToBase = listenerCount() === baseListeners;
+
+    // (b) Real app.js router hashchange from #/agents (with secret showing) -> #/setup -> #/:
+    const appMod = await import(new URL('../app.js', agentsUrl).href);
+    const appRoot = document.createElement('div');
+    body.appendChild(appRoot);
+    const savedHash = location.hash;
+    let routerNavOk = false;
+    try {
+      location.hash = '#/agents';
+      const appTransport = async (method, path) => {
+        const clean = path.split('?')[0];
+        if (clean === '/v1/sessions/current') return { status: 200, data: { user: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: true }, csrf_token: 'tok' } };
+        if (clean === '/v1/projects') return { status: 200, data: { items: [{ id: 'p1', name: 'Alpha', role: 'owner', usable: true, archived: false }] } };
+        if (clean === '/v1/agents' && method === 'GET') return { status: 200, data: { items: [cardAgent], total: 1, next_cursor: null } };
+        if (clean === '/v1/agents/agent_1' && method === 'GET') return { status: 200, data: cardAgent };
+        if (clean === '/v1/agents/agent_1/history') return { status: 200, data: { items: [] } };
+        if (clean === '/v1/agents/agent_1/credentials' && method === 'POST') return { status: 200, data: { credential: { id: 'cred_r5', secret: SECRET, scopes: ['read', 'tasks'] }, setup: { config: { agent_id: 'agent_1', name: 'Kestrel', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } } } };
+        if (clean === '/v1/certificate') return { status: 200, data: server.certificate };
+        if (clean === '/v1/accounts') return { status: 200, data: { items: [] } };
+        if (clean === '/v1/work' || clean === '/v1/tasks') return { status: 200, data: { items: [], next_cursor: null } };
+        return { status: 200, data: { items: [] } };
+      };
+      const origQForApp = Element.prototype.querySelector;
+      const origQAForApp = Element.prototype.querySelectorAll;
+      Element.prototype.querySelector = function (sel) {
+        if (sel === 'h1') return this.all((e) => e.tagName === 'H1')[0] || null;
+        if (sel === '[data-account-error]') return this.all((e) => e.getAttribute('data-account-error') !== null)[0] || null;
+        return origQForApp.call(this, sel);
+      };
+      await appMod.start(appRoot, { transport: appTransport, storage: localStore });
+      await new Promise((r) => setTimeout(r, 50));
+      const appBaseListeners = listenerCount();
+      // Open wizard with secret showing on #/agents:
+      store.clear();
+      const scopeFormApp = appRoot.all((e) => e.tagName === 'FORM' && e.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Save and issue a new secret').length > 0)[0];
+      if (scopeFormApp) {
+        const sub = scopeFormApp.dispatch('submit');
+        await tick();
+        const conf = openDialogs().at(-1);
+        await conf.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
+        await sub; await new Promise((r) => setTimeout(r, 50));
+      }
+      const wBeforeHash = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1);
+      const rNone = wBeforeHash ? windowsChoice(wBeforeHash, 'secret-connect', 'none') : null;
+      if (rNone) { rNone.checked = true; await rNone.dispatch('change'); await tick(); }
+      const secretShownBeforeHash = Boolean(wBeforeHash) && body.textContent.includes(SECRET);
+      const appListenersWithOneWizard = listenerCount();
+      // Navigate via hashchange to #/setup WITHOUT closing any dialogs:
+      location.hash = '#/setup';
+      window.dispatchEvent({ type: 'hashchange' });
+      await new Promise((r) => setTimeout(r, 60));
+      const wizardsAtSetup = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+      const oneWizardNoSecretAtSetup = wizardsAtSetup.length === 1
+        && wizardsAtSetup[0] !== wBeforeHash
+        && wBeforeHash.open === false
+        && wBeforeHash.parentNode === null
+        && !body.textContent.includes(SECRET)
+        && secretContainmentOk(SECRET, { expectPre: false })
+        && listenerCount() === appListenersWithOneWizard;
+      // Navigate via hashchange away from #/setup to #/:
+      location.hash = '#/';
+      window.dispatchEvent({ type: 'hashchange' });
+      await new Promise((r) => setTimeout(r, 60));
+      const wizardsAtHome = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+      routerNavOk = secretShownBeforeHash
+        && appListenersWithOneWizard > appBaseListeners
+        && oneWizardNoSecretAtSetup
+        && wizardsAtHome.length === 0
+        && listenerCount() === appBaseListeners
+        && !body.textContent.includes(SECRET);
+      Element.prototype.querySelector = origQForApp;
+      Element.prototype.querySelectorAll = origQAForApp;
+    } finally {
+      location.hash = savedHash;
+      for (const open of openDialogs()) await open.close();
+      appRoot.remove();
+    }
+    out.navigationClosesStaleWizardAndRemovesSecret = directNavOk && directCreateNavOk && directReplaceOk && listenersBackToBase && routerNavOk;
 
     // (5g) F11 behaviour pin: fresh rotation on a server WITHOUT a certificate shows secret lines
     // directly and never asks the connection question.

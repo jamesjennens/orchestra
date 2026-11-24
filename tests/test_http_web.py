@@ -1754,9 +1754,10 @@ class AgentSetupDialogCase(unittest.TestCase):
         # (the first line only opens the dialog on the screen that shows a fresh secret)
         self.assertEqual(['const needsRouteChoice = () => hasCertificate && Boolean(state.secretValue) && !state.routeKnown;',
                           'if (state.secretValue) {', 'state.secretValue = value;',
-                          'const secretBlock = () => secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge, certFirst: state.createdHere });',
+                          'const secretBlock = () => secretLinesBlock(payload, state.secretValue, state.os, { noproxy: state.noproxy, bridge: state.bridge, certFirst: state.createOrder });',
                           'state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,',
-                          ': (state.secretValue'],
+                          ': (state.secretValue',
+                          'state.secretValue = null;'],
                          [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
                           and not line.strip().startswith('secretValue:')])
         # The definition, the dialog's one call, and the invite page's (kittrial-5bb.578), which shows the
@@ -2486,6 +2487,9 @@ console.log(JSON.stringify({
             'cardNewSecretOtherAgentStoredStillAsks',
             'storedDefaultBridgeNeverSuppressesQuestion',
             'createAgentCurlVisitsCertSaveBeforeRewrite',
+            'createAgentCloseAfterSecretReopenRunsCertBeforeRewrite',
+            'storedRouteRequiresKnownRunsValue',
+            'navigationClosesStaleWizardAndRemovesSecret',
             'cardNewSecretWithoutCertificateSkipsQuestion',
             'certificateCurlLinesPathSafetyPinned',
         }, set(observed))
@@ -2577,17 +2581,31 @@ console.log(JSON.stringify(out));
                     rewritten = cred.read_text(encoding='utf-8')
                     self.assertEqual(rewritten, data[key]['posixLines'])
                     self.assertEqual(0o600, cred.stat().st_mode & 0o777)
-                    # N1: POSIX $HOME containing space, backslash, and double quote escapes cleanly
-                    # in both sh and bash so curl -K parses the cacert line without breaking quotes.
+                    # N1 & r5 home-check: POSIX $HOME containing space, backslash, double quote, or
+                    # leading-hyphen basename escapes cleanly across sh, bash, and dash; embedded
+                    # newline, trailing newline, and relative HOME (e.g. -home) are refused before
+                    # touching any file and leave the existing credential file untouched with no .new.
                     tricky_home = Path(tmp) / 'a\\b"c d'
                     tricky_home.mkdir(exist_ok=True)
                     tricky_cred = tricky_home / '.orchestra-agent-kestrel.curlrc'
                     expected_escaped = str(tricky_home).replace('\\', '\\\\').replace('"', '\\"')
-                    for shell_name in ('sh', 'bash'):
+                    abs_dash_home = Path(tmp) / '-home'
+                    abs_dash_home.mkdir(exist_ok=True)
+                    abs_dash_cred = abs_dash_home / '.orchestra-agent-kestrel.curlrc'
+                    embed_nl_home = Path(tmp) / 'a\nb'
+                    embed_nl_home.mkdir(exist_ok=True)
+                    trail_nl_home = Path(tmp) / 'a\n'
+                    trail_nl_home.mkdir(exist_ok=True)
+                    bad_home_cases = [
+                        ('embedded-newline', str(embed_nl_home), embed_nl_home),
+                        ('trailing-newline', str(trail_nl_home), trail_nl_home),
+                        ('relative-dash', '-home', abs_dash_home),
+                    ]
+                    for shell_name in ('sh', 'bash', 'dash'):
                         shell_bin = shutil.which(shell_name)
                         if not shell_bin:
                             continue
-                        tricky_cred.write_text(f'header = "Authorization: ******"\n', encoding='utf-8')
+                        tricky_cred.write_text('header = "Authorization: ******"\n', encoding='utf-8')
                         subprocess.check_output(
                             [shell_bin, '-c', data[key]['posixCmd']],
                             env=dict(os.environ, HOME=str(tricky_home)),
@@ -2596,6 +2614,35 @@ console.log(JSON.stringify(out));
                         tricky_text = tricky_cred.read_text(encoding='utf-8')
                         self.assertIn(f'cacert = "{expected_escaped}/.orchestra-agent-kestrel.crt"\n', tricky_text)
                         self.assertEqual(0o600, tricky_cred.stat().st_mode & 0o777)
+
+                        abs_dash_cred.write_text('header = "Authorization: ******"\n', encoding='utf-8')
+                        subprocess.check_output(
+                            [shell_bin, '-c', data[key]['posixCmd']],
+                            env=dict(os.environ, HOME=str(abs_dash_home)),
+                            text=True,
+                        )
+                        self.assertIn(f'cacert = "{abs_dash_home}/.orchestra-agent-kestrel.crt"\n', abs_dash_cred.read_text(encoding='utf-8'))
+                        self.assertEqual(0o600, abs_dash_cred.stat().st_mode & 0o777)
+
+                        for label, bad_home, bad_dir in bad_home_cases:
+                            sentinel = f'header = "Authorization: KEEP-{label}"\n'
+                            bad_cred = bad_dir / '.orchestra-agent-kestrel.curlrc'
+                            bad_new = bad_dir / '.orchestra-agent-kestrel.curlrc.new'
+                            bad_new.unlink(missing_ok=True)
+                            bad_cred.write_text(sentinel, encoding='utf-8')
+                            proc = subprocess.Popen(
+                                [shell_bin, '-c', data[key]['posixCmd']],
+                                env=dict(os.environ, HOME=bad_home),
+                                cwd=str(tmp),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
+                            out_s, err_s = proc.communicate(timeout=30)
+                            self.assertNotEqual(0, proc.returncode, f'{shell_name} {label} unexpectedly succeeded: out={out_s!r} err={err_s!r}')
+                            self.assertIn('HOME must be an absolute path without a newline.', err_s, f'{shell_name} {label} missing clear message')
+                            self.assertEqual(sentinel, bad_cred.read_text(encoding='utf-8'), f'{shell_name} {label} modified existing file')
+                            self.assertFalse(bad_new.exists(), f'{shell_name} {label} left stray .new file')
                 # Windows: verify managed lines match the PowerShell prefix byte-for-byte, and
                 # on Windows execute the real PowerShell rewrite and compare lines byte-for-byte.
                 win_lines = data[key]['winLines'].splitlines()
