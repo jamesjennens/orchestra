@@ -1968,18 +1968,43 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       let onAgentGetStarted = null;
       let delayCertGet = null;
       let onCertGetStarted = null;
-      const appTransport = async (method, path) => {
+      let delayAgentsList = null;
+      let onAgentsListStarted = null;
+      let delayCreatePost = null;
+      let onCreatePostStarted = null;
+      let delayIssuePost = null;
+      let onIssuePostStarted = null;
+      let createAgentCalls = 0;
+      let issueCredentialCalls = 0;
+      const appTransport = async (method, path, bodyData) => {
         const clean = path.split('?')[0];
         if (clean === '/v1/sessions/current') return { status: 200, data: { user: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: true }, csrf_token: 'tok' } };
         if (clean === '/v1/projects') return { status: 200, data: { items: [{ id: 'p1', name: 'Alpha', role: 'owner', usable: true, archived: false }] } };
-        if (clean === '/v1/agents' && method === 'GET') return { status: 200, data: { items: [cardAgent], total: 1, next_cursor: null } };
+        if (clean === '/v1/agents' && method === 'GET') {
+          if (onAgentsListStarted) { const fn = onAgentsListStarted; onAgentsListStarted = null; fn(); }
+          if (delayAgentsList) await delayAgentsList;
+          return { status: 200, data: { items: [cardAgent], total: 1, next_cursor: null } };
+        }
+        if (clean === '/v1/agents' && method === 'POST') {
+          createAgentCalls += 1;
+          if (onCreatePostStarted) { const fn = onCreatePostStarted; onCreatePostStarted = null; fn(); }
+          if (delayCreatePost) await delayCreatePost;
+          const createdName = (bodyData && bodyData.name) || 'Osprey';
+          const createdAgent = { ...cardAgent, id: 'agent_2', name: createdName, display_name: createdName };
+          return { status: 201, data: { agent: createdAgent, credential: { id: 'cred_new', secret: SECRET, scopes: ['read', 'tasks'] }, setup: { config: { agent_id: 'agent_2', name: createdName, server_url: 'https://127.0.0.1:8765', projects: ['p1'] } } } };
+        }
         if (clean === '/v1/agents/agent_1' && method === 'GET') {
           if (onAgentGetStarted) { const fn = onAgentGetStarted; onAgentGetStarted = null; fn(); }
           if (delayAgentGet) await delayAgentGet;
           return { status: 200, data: cardAgent };
         }
         if (clean === '/v1/agents/agent_1/history') return { status: 200, data: { items: [] } };
-        if (clean === '/v1/agents/agent_1/credentials' && method === 'POST') return { status: 200, data: { credential: { id: 'cred_r5', secret: SECRET, scopes: ['read', 'tasks'] }, setup: { config: { agent_id: 'agent_1', name: 'Kestrel', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } } } };
+        if (clean === '/v1/agents/agent_1/credentials' && method === 'POST') {
+          issueCredentialCalls += 1;
+          if (onIssuePostStarted) { const fn = onIssuePostStarted; onIssuePostStarted = null; fn(); }
+          if (delayIssuePost) await delayIssuePost;
+          return { status: 200, data: { credential: { id: 'cred_r5', secret: SECRET, scopes: ['read', 'tasks'] }, setup: { config: { agent_id: 'agent_1', name: 'Kestrel', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } } } };
+        }
         if (clean === '/v1/service/certificate') {
           if (onCertGetStarted) { const fn = onCertGetStarted; onCertGetStarted = null; fn(); }
           if (delayCertGet) await delayCertGet;
@@ -2113,6 +2138,199 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
           && !body.textContent.includes(SECRET);
       }
       routeOwnsDialogOk = fastBackOk && chooserFastOk;
+
+      // (e) r7 MUST (write-after-leaving + pins): leaving during Add agent list read or while
+      // Add agent / card rotation confirmation is open must end on Projects with 0 open dialogs
+      // total, 0 create/issue calls, baseline listeners, and no secret. Leaving while an already
+      // started create/issue write is in flight must not show a wizard or drop the secret
+      // silently: it stays on Projects with 0 open dialogs, 0 secret in DOM, baseline listeners,
+      // and a secretless crit toast explaining recovery.
+      const clearToasts = () => {
+        for (const layer of body.all((e) => e.className === 'toasts')) layer.remove();
+      };
+      const goTo = async (hash) => {
+        location.hash = hash;
+        window.dispatchEvent({ type: 'hashchange' });
+        await new Promise((r) => setTimeout(r, 60));
+      };
+      const addAgentForm = () => appRoot.all((e) => e.tagName === 'FORM' && e.querySelector('#a-name'))[0];
+      const rotationForm = () => appRoot.all((e) => e.tagName === 'FORM' && e.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Save and issue a new secret').length > 0)[0];
+      const clearAnyOpenDialogs = async () => {
+        for (const open of openDialogs()) {
+          const cancelBtn = open.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Cancel')[0];
+          if (cancelBtn) await cancelBtn.dispatch('click');
+          else await open.close();
+        }
+        await new Promise((r) => setTimeout(r, 30));
+      };
+
+      // (e1) Add agent with duplicate name, leaving during held GET /v1/agents list read:
+      await goTo('#/agents');
+      createAgentCalls = 0;
+      let releaseListDup = null;
+      const listDupStarted = new Promise((resolve) => { onAgentsListStarted = resolve; });
+      delayAgentsList = new Promise((resolve) => { releaseListDup = resolve; });
+      const fDupList = addAgentForm();
+      fDupList.querySelector('#a-name').value = 'Kestrel';
+      const subDupList = fDupList.dispatch('submit');
+      await listDupStarted;
+      await goTo('#/projects');
+      delayAgentsList = null;
+      if (releaseListDup) releaseListDup();
+      await new Promise((r) => setTimeout(r, 60));
+      const dupListDialogs = openDialogs();
+      out.leaveAddAgentDuplicateDuringListReadCancelsCleanly = (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
+        && dupListDialogs.length === 0
+        && createAgentCalls === 0
+        && listenerCount() === appBaseListeners
+        && !body.textContent.includes(SECRET)
+        && secretContainmentOk(SECRET, { expectPre: false });
+      await clearAnyOpenDialogs();
+      await subDupList.catch(() => {});
+
+      // (e2) Add agent with unique name, leaving during held GET /v1/agents list read:
+      await goTo('#/agents');
+      createAgentCalls = 0;
+      let releaseListUniq = null;
+      const listUniqStarted = new Promise((resolve) => { onAgentsListStarted = resolve; });
+      delayAgentsList = new Promise((resolve) => { releaseListUniq = resolve; });
+      const fUniqList = addAgentForm();
+      fUniqList.querySelector('#a-name').value = 'Osprey';
+      const subUniqList = fUniqList.dispatch('submit');
+      await listUniqStarted;
+      await goTo('#/projects');
+      delayAgentsList = null;
+      if (releaseListUniq) releaseListUniq();
+      await new Promise((r) => setTimeout(r, 60));
+      const uniqListDialogs = openDialogs();
+      out.leaveAddAgentUniqueDuringListReadCancelsCleanly = (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
+        && uniqListDialogs.length === 0
+        && createAgentCalls === 0
+        && listenerCount() === appBaseListeners
+        && !body.textContent.includes(SECRET)
+        && secretContainmentOk(SECRET, { expectPre: false });
+      await clearAnyOpenDialogs();
+      await subUniqList.catch(() => {});
+
+      // (e3) Add agent leaving while 'An agent already has this name' confirmDialog is open:
+      await goTo('#/agents');
+      createAgentCalls = 0;
+      const fDupConf = addAgentForm();
+      fDupConf.querySelector('#a-name').value = 'Kestrel';
+      const subDupConf = fDupConf.dispatch('submit');
+      await new Promise((r) => setTimeout(r, 40));
+      const dupConfirmShown = openDialogs().length === 1 && openDialogs()[0].textContent.includes('An agent already has this name');
+      await goTo('#/projects');
+      await new Promise((r) => setTimeout(r, 40));
+      const dupConfDialogs = openDialogs();
+      out.leaveAddAgentDuplicateConfirmCancelsCleanly = dupConfirmShown
+        && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
+        && dupConfDialogs.length === 0
+        && createAgentCalls === 0
+        && listenerCount() === appBaseListeners
+        && !body.textContent.includes(SECRET)
+        && secretContainmentOk(SECRET, { expectPre: false });
+      await clearAnyOpenDialogs();
+      await subDupConf.catch(() => {});
+
+      // (e4) Card rotation leaving while 'Set what it may do and issue a new secret?' confirmDialog is open:
+      await goTo('#/agents');
+      issueCredentialCalls = 0;
+      const fRotConf = rotationForm();
+      const subRotConf = fRotConf.dispatch('submit');
+      await new Promise((r) => setTimeout(r, 40));
+      const rotConfirmShown = openDialogs().length === 1 && openDialogs()[0].textContent.includes('Set what it may do and issue a new secret?');
+      await goTo('#/projects');
+      await new Promise((r) => setTimeout(r, 40));
+      const rotConfDialogs = openDialogs();
+      out.leaveCardRotationConfirmCancelsCleanly = rotConfirmShown
+        && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
+        && rotConfDialogs.length === 0
+        && issueCredentialCalls === 0
+        && listenerCount() === appBaseListeners
+        && !body.textContent.includes(SECRET)
+        && secretContainmentOk(SECRET, { expectPre: false });
+      await clearAnyOpenDialogs();
+      await subRotConf.catch(() => {});
+
+      // (e5) In-flight card rotation write finishes after leaving #/agents -> #/projects
+      // (both while POST /credentials is held AND while follow-up GET /service/certificate is held):
+      // must NOT open a dialog or expose the secret, and MUST raise a secretless crit toast.
+      const checkRotFlight = async (holdPost) => {
+        await goTo('#/agents');
+        clearToasts();
+        issueCredentialCalls = 0;
+        let release = null;
+        const started = new Promise((resolve) => {
+          if (holdPost) onIssuePostStarted = resolve;
+          else onCertGetStarted = resolve;
+        });
+        if (holdPost) delayIssuePost = new Promise((resolve) => { release = resolve; });
+        else delayCertGet = new Promise((resolve) => { release = resolve; });
+        const fRotFlight = rotationForm();
+        const subRotFlight = fRotFlight.dispatch('submit');
+        await new Promise((r) => setTimeout(r, 30));
+        const rotFlightConfirm = openDialogs().at(-1);
+        await rotFlightConfirm.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Issue new secret')[0].dispatch('click');
+        await started;
+        await goTo('#/projects');
+        delayIssuePost = null;
+        delayCertGet = null;
+        if (release) release();
+        await subRotFlight;
+        await new Promise((r) => setTimeout(r, 40));
+        const toasts = body.all((e) => e.className === 'toast' || e.className === 'toast crit');
+        const crit = toasts.filter((e) => e.className === 'toast crit').map((e) => e.textContent);
+        const plain = toasts.filter((e) => e.className === 'toast').map((e) => e.textContent);
+        return issueCredentialCalls === 1
+          && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
+          && openDialogs().length === 0
+          && listenerCount() === appBaseListeners
+          && !body.textContent.includes(SECRET)
+          && secretContainmentOk(SECRET, { expectPre: false })
+          && plain.length === 0
+          && crit.some((t) => t.includes('Kestrel') && t.includes('My agents') && t.includes('revoke') && !t.includes(SECRET));
+      };
+      out.inFlightCardRotationAfterLeaveNotifiesWithoutSecret = (await checkRotFlight(true)) && (await checkRotFlight(false));
+
+      // (e6) In-flight Add agent write finishes after leaving #/agents -> #/projects
+      // (both while POST /agents is held AND while follow-up GET /service/certificate is held):
+      // must NOT open a dialog or expose the secret, and MUST raise a secretless crit toast.
+      const checkCreateFlight = async (holdPost) => {
+        await goTo('#/agents');
+        clearToasts();
+        createAgentCalls = 0;
+        let release = null;
+        const started = new Promise((resolve) => {
+          if (holdPost) onCreatePostStarted = resolve;
+          else onCertGetStarted = resolve;
+        });
+        if (holdPost) delayCreatePost = new Promise((resolve) => { release = resolve; });
+        else delayCertGet = new Promise((resolve) => { release = resolve; });
+        const fCreateFlight = addAgentForm();
+        fCreateFlight.querySelector('#a-name').value = 'Osprey';
+        const subCreateFlight = fCreateFlight.dispatch('submit');
+        await started;
+        await goTo('#/projects');
+        delayCreatePost = null;
+        delayCertGet = null;
+        if (release) release();
+        await subCreateFlight;
+        await new Promise((r) => setTimeout(r, 40));
+        const toasts = body.all((e) => e.className === 'toast' || e.className === 'toast crit');
+        const crit = toasts.filter((e) => e.className === 'toast crit').map((e) => e.textContent);
+        const plain = toasts.filter((e) => e.className === 'toast').map((e) => e.textContent);
+        return createAgentCalls === 1
+          && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
+          && openDialogs().length === 0
+          && listenerCount() === appBaseListeners
+          && !body.textContent.includes(SECRET)
+          && secretContainmentOk(SECRET, { expectPre: false })
+          && plain.length === 0
+          && crit.some((t) => t.includes('Osprey') && t.includes('My agents') && t.includes('issue a new secret') && !t.includes(SECRET));
+      };
+      out.inFlightAddAgentAfterLeaveNotifiesWithoutSecret = (await checkCreateFlight(true)) && (await checkCreateFlight(false));
+      clearToasts();
 
       Element.prototype.querySelector = origQForApp;
       Element.prototype.querySelectorAll = origQAForApp;

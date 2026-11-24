@@ -262,12 +262,12 @@ export async function start(root, options = {}) {
   }
 
   async function render() {
-    agents.closeSetupWizard();
     if (showInvite()) return;
     if (!ctx.me) return showLogin();
     const route = currentRoute();
     rendered = route;
     const mine = ++token;
+    agents.closeSetupWizard();
     const main = buildShell(route);
     place(...(ctx.options.banner ? [ctx.options.banner(ctx), shell] : [shell]));
     // A route may carry a query, e.g. /p/{pid}/reviews?proposal=<key>: the path selects

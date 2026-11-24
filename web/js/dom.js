@@ -114,16 +114,44 @@ export function toast(message, kind) {
 }
 
 // In-page confirmation (never window.confirm): resolves true only on explicit confirm.
-export function confirmDialog({ title, body, confirmLabel = 'Confirm', danger = false }) {
+// When an owning route is given, leaving that route closes the dialog and resolves false.
+export function confirmDialog({ title, body, confirmLabel = 'Confirm', danger = false, owner = null }) {
   return new Promise((resolve) => {
+    if (owner && typeof owner.isCurrent === 'function' && !owner.isCurrent()) {
+      resolve(false);
+      return;
+    }
     const dialog = h('dialog', { 'aria-labelledby': 'confirm-title' });
-    const done = (value) => { dialog.close(); dialog.remove(); resolve(value); };
+    let closed = false;
+    let unsubLeave = null;
+    const cancelIfLeft = () => {
+      if (owner && typeof owner.isCurrent === 'function' && !owner.isCurrent()) done(false);
+    };
+    const done = (value) => {
+      if (closed) return;
+      closed = true;
+      if (unsubLeave) { unsubLeave(); unsubLeave = null; }
+      if (owner && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('hashchange', cancelIfLeft);
+      }
+      if (dialog.open) {
+        try { dialog.close(); } catch { /* ignore */ }
+      }
+      dialog.remove();
+      resolve(value);
+    };
     dialog.append(
       h('div', { class: 'dialog-body' }, h('h2', { id: 'confirm-title' }, title), h('p', null, body)),
       h('div', { class: 'dialog-foot' },
         h('button', { type: 'button', onclick: () => done(false) }, 'Cancel'),
         h('button', { type: 'button', class: danger ? 'danger solid' : 'primary', onclick: () => done(true) }, confirmLabel)));
     dialog.addEventListener('cancel', (event) => { event.preventDefault(); done(false); });
+    if (owner && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('hashchange', cancelIfLeft);
+    }
+    if (owner && typeof owner.onLeave === 'function') {
+      unsubLeave = owner.onLeave(cancelIfLeft);
+    }
     document.body.appendChild(dialog);
     dialog.showModal();
   });

@@ -565,12 +565,21 @@ export async function list(ctx) {
       if (!chosen.length) return;
       const owner = routeOwner(ctx);
       if (!(await confirmDialog({ title: 'Set what it may do and issue a new secret?',
-        body: inferredWarning + `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret' }))) return;
+        body: inferredWarning + `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret', owner }))) return;
+      if (!owner.isCurrent()) return;
       let result;
-      try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: 'New secret issued' }); } catch { return; }
+      try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: null }); } catch { return; }
+      if (!owner.isCurrent()) {
+        notifyLeftBeforeSecret(ctx, 'rotation', agent.display_name || agent.name);
+        return;
+      }
       const fresh = await ctx.api.agent(agent.id).catch(() => agent);
       const certificate = await agentCertificate(ctx);
-      if (!owner.isCurrent()) return;
+      if (!owner.isCurrent()) {
+        notifyLeftBeforeSecret(ctx, 'rotation', fresh.display_name || fresh.name);
+        return;
+      }
+      toast('New secret issued');
       setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret, certificate,
         issued: result && result.credential ? { credential: result.credential, agent } : null });
       load();
@@ -625,21 +634,32 @@ export async function list(ctx) {
         poolNote = 'among every agent name that account uses';
       }
     } catch { pool = loaded.items; }
+    if (!owner.isCurrent()) return;
     const dup = duplicateNamed(pool, name);
     if (dup) {
-      const warned = await confirmDialog({ title: 'An agent already has this name', body: duplicateWarning(dup) + ` (checked ${poolNote}).`, confirmLabel: 'Create anyway' });
-      if (!warned) return;
+      const warned = await confirmDialog({ title: 'An agent already has this name', body: duplicateWarning(dup) + ` (checked ${poolNote}).`, confirmLabel: 'Create anyway', owner });
+      if (!warned || !owner.isCurrent()) return;
     }
+    if (!owner.isCurrent()) return;
     // A name whose secret file would clash with another of your agents (409), or an
     // invalid name (422), is explained next to the name field in the server's words.
     const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen, ...(ownerField ? { owner: v['a-owner'] } : {}) }), {
-      success: 'Agent added',
+      success: null,
       onError: (e) => { if (e.status === 409 || e.status === 422) { setFieldError(form, 'a-name', e.message); return true; } return false; },
     }).catch(() => null);
     if (!created) return;
     form.reset();
+    const createdName = (created.agent && (created.agent.display_name || created.agent.name)) || name;
+    if (!owner.isCurrent()) {
+      notifyLeftBeforeSecret(ctx, 'create', createdName);
+      return;
+    }
     const certificate = await agentCertificate(ctx);
-    if (!owner.isCurrent()) return;
+    if (!owner.isCurrent()) {
+      notifyLeftBeforeSecret(ctx, 'create', createdName);
+      return;
+    }
+    toast('Agent added');
     setupDialog(ctx, created, { secret: created.credential && created.credential.secret, certificate, created: true });
     load();
   });
@@ -910,6 +930,8 @@ function olderCredentials(ctx, agent, newId) {
   return wrap;
 }
 
+const activeRouteLeaveCallbacks = new Set();
+
 function currentRouteKey() {
   try { return (location.hash || '').replace(/^#/, ''); } catch { return ''; }
 }
@@ -922,7 +944,23 @@ function routeOwner(ctx) {
       if (view !== null && ctx.currentView() !== view) return false;
       return currentRouteKey() === route;
     },
+    onLeave(fn) {
+      activeRouteLeaveCallbacks.add(fn);
+      return () => activeRouteLeaveCallbacks.delete(fn);
+    },
   };
+}
+
+// When an already-started credential write finishes after leaving My agents, never mount the
+// secret over another page and never drop it silently: tell the signed-in person how to recover.
+function notifyLeftBeforeSecret(ctx, kind, name) {
+  if (!ctx || !ctx.me || currentRouteKey().startsWith('/invite/')) return;
+  const label = name || 'your agent';
+  if (kind === 'rotation') {
+    toast(`New secret issued for ${label}, but you left My agents before it was shown. Return to My agents to issue another secret and revoke the unused credential.`, 'crit');
+    return;
+  }
+  toast(`Agent ${label} was created, but you left My agents before its secret was shown. Return to My agents to open setup and issue a new secret.`, 'crit');
 }
 
 // Reopens the setup dialog from the card, from the agent's CURRENT secretless record.
@@ -947,6 +985,7 @@ const activeSetupWizards = new Set();
 
 export function closeSetupWizard() {
   for (const dispose of [...activeSetupWizards]) dispose();
+  for (const notify of [...activeRouteLeaveCallbacks]) notify();
 }
 
 function writeWizardStorage(state) {

@@ -2495,6 +2495,12 @@ console.log(JSON.stringify({
             'malformedStoredRouteStaysUnansweredOnSecondOpen',
             'navigationClosesStaleWizardAndRemovesSecret',
             'routeOwnsDialogBothAsyncAndChooserOrders',
+            'leaveAddAgentDuplicateDuringListReadCancelsCleanly',
+            'leaveAddAgentUniqueDuringListReadCancelsCleanly',
+            'leaveAddAgentDuplicateConfirmCancelsCleanly',
+            'leaveCardRotationConfirmCancelsCleanly',
+            'inFlightCardRotationAfterLeaveNotifiesWithoutSecret',
+            'inFlightAddAgentAfterLeaveNotifiesWithoutSecret',
             'cardNewSecretWithoutCertificateSkipsQuestion',
             'certificateCurlLinesPathSafetyPinned',
         }, set(observed))
