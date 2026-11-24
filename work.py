@@ -215,7 +215,8 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
                  '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
                  '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset',
-                 '--recent', '--last', '--kind', '--role', '--silent-hours', '--days'}
+                 '--recent', '--last', '--kind', '--role', '--silent-hours', '--days',
+                 '--until', '--reason', '--episode'}
 
 #: At most this many request ids are named per work item (a review record holds at most 20 items).
 PENDING_REQUEST_IDS_MAX = 20
@@ -544,7 +545,7 @@ def help_payload(action='work'):
                    '[--since-checkpoint | --since-my-checkpoint] [--kind comment|event] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
         'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | checkpoint TASK --directions [--offset N] [--limit N]',
-        'waiting': 'waiting [--on-me | --all | --role ROLE] [--silent-hours N] [--limit N] [--offset N] [--json] | waiting --metrics [--days N] [--json]',
+        'waiting': 'waiting [--on-me | --all | --role ROLE] [--silent-hours N] [--limit N] [--offset N] [--json] | waiting --metrics [--days N] [--json] | waiting snooze TASK --until ISO8601 --reason TEXT [--episode ID] [--json]',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),

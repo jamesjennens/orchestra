@@ -1031,9 +1031,11 @@ def wait_activity_marker(data,row):
     computed from the read's own full snapshot, so brief and the queue rows cannot
     disagree.
     """
+    from reserved_comments import is_wait_meta_comment
     owner=row.get('assignee')
     entries=[entry for entry in data.get('entries') or []
-             if isinstance(entry,dict) and not same_activity_actor(entry.get('author'),owner)]
+             if isinstance(entry,dict) and not same_activity_actor(entry.get('author'),owner)
+             and not is_wait_meta_comment(entry.get('body'))]
     newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
     return activity_marker(newest,fields_digest(row))
 

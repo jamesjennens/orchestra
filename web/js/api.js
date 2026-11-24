@@ -606,6 +606,10 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     // The lane board (kittrial-5bb.263): one server read of who holds what, who is free and
     // the three flags. `idle_minutes` is this page's argument, `limit`/`cursor` page it.
     lanes: (pid, params) => call('GET', `/v1/projects/${pid}/lanes`, { params }),
+    // kittrial-5bb.598 Slice 2: open waits, silent lanes, transparent snooze, and daily metrics.
+    waiting: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/waiting`, { params }),
+    waitingMetrics: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/waiting/metrics`, { params }),
+    snoozeWait: (pid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/waiting/snooze`, body),
     // kittrial-5bb.513: ask that a fixed message reach one stalled lane, or list the requests.
     nudgeLane: (pid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/nudges`, body),
     nudges: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/nudges`, { params }),

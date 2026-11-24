@@ -254,6 +254,13 @@ DESIGN_INDEX_PREFIX = 'Kind: design-index-v1\n'
 # kittrial-5bb.418 part 2. A `trace --verify` report on a design document (design_documents). Written
 # only by `ref verify` (unverified) or `admin.py design-verify` (trusted); reserved in every version.
 DESIGN_VERIFICATION_PREFIX = 'Kind: design-verification-v1\n'
+# kittrial-5bb.598 Slice 2. Transparent, episode-keyed wait snooze written only by POST
+# /v1/projects/{pid}/waiting/snooze (wait_snooze.py) and honoured only with its host journal entry
+# in ``<project>/.wait-snoozes/``. Excluded from lane wake markers (SHOULD-5), not hidden from history.
+WAIT_SNOOZE_PREFIX = 'Kind: wait-snooze-v1\n'
+# kittrial-5bb.598 Slice 3. Server-side wait escalation notice written only by wait-sweep; reserved
+# here and excluded from lane wake markers (SHOULD-5).
+WAIT_ESCALATION_PREFIX = 'Kind: wait-escalation-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -307,6 +314,10 @@ RESERVED = (
      'ref propose|revise of a design.<scope> entry with its document (the server writes the index)'),
     (DESIGN_VERIFICATION_PREFIX, 'design document verification',
      'trace --verify --record (ref verify) or admin.py design-verify on the coordination host'),
+    (WAIT_SNOOZE_PREFIX, 'wait snooze record',
+     'the waiting snooze route (POST /v1/projects/PID/waiting/snooze)'),
+    (WAIT_ESCALATION_PREFIX, 'wait escalation record',
+     'admin.py wait-sweep on the coordination host'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -975,7 +986,15 @@ RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
 # by reserved_match ONLY. They are deliberately NOT in RECORD_COMMENT_FAMILIES: that list also hides
 # matching comments from history (is_record_comment), and real delegation and attestation records
 # must stay visible as comments.
-RESERVED_LOOKALIKE_FAMILIES = ('Kind: delegation-', 'Kind: decision-attest-')
+RESERVED_LOOKALIKE_FAMILIES = ('Kind: delegation-', 'Kind: decision-attest-',
+                               'Kind: wait-snooze-', 'Kind: wait-escalation-')
+
+
+def is_wait_meta_comment(text):
+    """True for wait-snooze and wait-escalation records (excluded from lane wake markers, SHOULD-5)."""
+    return isinstance(text, str) and (
+        text.startswith(WAIT_SNOOZE_PREFIX) or text.startswith(WAIT_ESCALATION_PREFIX)
+    )
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
 SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3), ('capability-entry', 2)})

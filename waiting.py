@@ -781,7 +781,7 @@ def comment_pointers(rows, caller):
     """
     from briefing import same_activity_actor
     from lane_state import is_record as is_lane_state_record
-    from reserved_comments import is_record_comment
+    from reserved_comments import is_record_comment, is_wait_meta_comment
     found = []
     for row in rows or []:
         if not isinstance(row, dict) or row.get('issue_type') == 'event':
@@ -790,7 +790,7 @@ def comment_pointers(rows, caller):
             if not isinstance(comment, dict) or comment.get('id') is None:
                 continue
             text = comment.get('text')
-            if is_record_comment(text) or is_lane_state_record(text):
+            if is_record_comment(text) or is_lane_state_record(text) or is_wait_meta_comment(text):
                 continue
             author = comment.get('author') or ''
             if caller and same_activity_actor(author, caller):

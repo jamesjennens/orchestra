@@ -13,6 +13,7 @@ import { historyPanel } from '../agentHistory.js';
 import { switchesPanel } from './switches.js';
 import { invitePanel } from './invites.js';
 import { coveragePanel } from './trace.js';
+import { waitTimesPanel } from './waiting.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -719,10 +720,24 @@ export async function overview(ctx, { pid }) {
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'tasks-heading' }, 'Tasks'), toolbar),
     host);
 
+  const oe = project.overdue_escalations;
+  const overdueBanner = (oe && (oe.overdue_count || oe.silent_count || oe.project_visible_count))
+    ? h('div', { class: 'banner warn', 'data-banner': 'overdue-escalations' },
+      [
+        oe.overdue_count ? `${oe.overdue_count} overdue wait(s)` : null,
+        oe.unreached_count ? `${oe.unreached_count} owner NOT reached` : null,
+        oe.silent_count ? `${oe.silent_count} silent lane(s)` : null,
+        oe.project_visible_count ? `${oe.project_visible_count} project-wide (+24h)` : null,
+      ].filter(Boolean).join(' · '),
+      ' · ',
+      h('a', { href: ctx.href(`/p/${pid}/waiting`) }, 'Open Waiting'))
+    : null;
+
   return h('div', { class: 'stack' },
     head,
     archivedBanner(project),
     unusableBanner(project),
+    overdueBanner,
     setupLine,
     // Slice 3 (kittrial-5bb.416): the task list first; the merge slot, guidance and
     // onboarding fold into one closed Coordinator tools details; the lanes board
@@ -740,6 +755,7 @@ export async function overview(ctx, { pid }) {
       h('summary', null, 'Coordinator tools ',
         h('span', { class: 'fold-hint' }, 'merge slot · guidance · onboarding')),
       h('div', { class: 'fold-body tools' }, mergeSlotPanel(ctx, project), guidancePanel(ctx, project))),
+    waitTimesPanel(ctx, pid),
     strip);
 }
 

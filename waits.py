@@ -1228,7 +1228,7 @@ def _review_for_row(row, task, evidence, revert_map, revert_problems, operators,
 
 def compute_waits(rows, *, now=None, project=None, registry=None, operators=None,
                   authority_state=None, journal=None, silent_hours=DEFAULT_SILENT_HOURS,
-                  lane_owners=None, ledger=None, evidence=None, revert_map=None,
+                  lane_owners=None, ledger=None, snoozes=None, evidence=None, revert_map=None,
                   revert_problems=None, identity_names=None, include_closed_episodes=False):
     """Pure wait + silent-lane computation over one cached export.
 
@@ -1238,6 +1238,7 @@ def compute_waits(rows, *, now=None, project=None, registry=None, operators=None
         now = datetime.now(timezone.utc)
     project_id = project or (Path(journal).name if journal is not None else '')
     from lanes import registry_names
+    import wait_snooze
     names = dict(registry_names(registry))
     if isinstance(identity_names, dict):
         names.update({k: v for k, v in identity_names.items() if isinstance(k, str) and isinstance(v, str)})
@@ -1247,6 +1248,9 @@ def compute_waits(rows, *, now=None, project=None, registry=None, operators=None
         lane_owners = cfg.get('lane_owners') if isinstance(cfg.get('lane_owners'), dict) else {}
     if ledger is None:
         ledger = load_frozen_ledger(journal)
+    if snoozes is None:
+        snoozes = wait_snooze.load_snoozes(journal)
+    snooze_map = snoozes if isinstance(snoozes, dict) else {}
 
     if evidence is None:
         from lifecycle import integration_evidence
@@ -1294,6 +1298,11 @@ def compute_waits(rows, *, now=None, project=None, registry=None, operators=None
         )
         all_episodes.extend(task_eps)
         if open_waits:
+            for item in open_waits:
+                act_sn, sn_cnt = wait_snooze.active_snooze(snooze_map.get(item['episode_id'], ()), now=now)
+                item['snoozed'] = act_sn is not None
+                item['snooze_count'] = sn_cnt
+                item['snooze'] = act_sn
             by_task[task] = open_waits
             waits_list.extend(open_waits)
         elif not closed:
@@ -1304,6 +1313,7 @@ def compute_waits(rows, *, now=None, project=None, registry=None, operators=None
                 eid = _episode_id(project_id, task, 'silent', holder, last_iso)
                 ledger_rec = ledger.get(eid) or {}
                 stage = ledger_rec.get('stage') or 'overdue'
+                act_sn, sn_cnt = wait_snooze.active_snooze(snooze_map.get(eid, ()), now=now)
                 silent_list.append({
                     'kind': 'silent-lane',
                     'silent': True,
@@ -1326,6 +1336,9 @@ def compute_waits(rows, *, now=None, project=None, registry=None, operators=None
                     'overdue_seconds': max(0, age_sec - int(silent_threshold.total_seconds())),
                     'escalation_stage': stage,
                     'escalation_notified_at': ledger_rec.get('notified_at'),
+                    'snoozed': act_sn is not None,
+                    'snooze_count': sn_cnt,
+                    'snooze': act_sn,
                 })
 
     # Oldest first by started_at ascending (unparseable/None first so fail-visible), tie-break task, episode_id.
@@ -1610,8 +1623,8 @@ def parse_args(args):
 
 
 def read(rows, actor, registry, args, now=None, operators=None, journal=None,
-         scope='all', project=None, authority_state=None, identity_names=None):
-    """Bounded ``waiting`` read view (CLI + future HTTP reuse). Plain reads never write."""
+         scope='all', project=None, authority_state=None, identity_names=None, snoozes=None):
+    """Bounded ``waiting`` read view (CLI + HTTP reuse). Plain reads never write."""
     parsed = parse_args(args)
     if now is None:
         now = datetime.now(timezone.utc)
@@ -1625,28 +1638,37 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None,
     computed = compute_waits(
         rows, now=now, project=project, registry=registry, operators=operators,
         authority_state=authority_state, journal=journal, silent_hours=parsed.silent_hours,
-        identity_names=identity_names,
+        identity_names=identity_names, snoozes=snoozes,
     )
     resolver = computed['resolver']
     waits_list = computed['waits']
     silent_list = computed['silent']
     from briefing import same_activity_actor
 
+    roles = resolver.caller_roles(actor) if (scope == 'own' or parsed.on_me) else frozenset()
+
     if scope == 'own':
-        # Non-coordinator bound key narrows to waits authored by or addressed to this actor,
-        # and silent rows for this actor only.
+        # Non-coordinator bound key narrows to waits authored by or addressed to this actor
+        # (or live roles held by this actor, or owned agents), and silent rows for this actor
+        # (or owned agents) only.
         waits_list = [
             w for w in waits_list
             if same_activity_actor(w['actor'], actor)
+            or resolver.caller_owns_lane(actor, w['actor'])
+            or (w['waiting_on'] in roles)
             or (w['waiting_on'] and same_activity_actor(w['waiting_on'], actor))
         ]
-        silent_list = [s for s in silent_list if same_activity_actor(s['actor'], actor)]
+        silent_list = [
+            s for s in silent_list
+            if same_activity_actor(s['actor'], actor)
+            or resolver.caller_owns_lane(actor, s['actor'])
+        ]
 
     if parsed.on_me:
-        roles = resolver.caller_roles(actor)
         waits_list = [
             w for w in waits_list
             if w['waiting_on'] in roles
+            or (w['waiting_on'] == 'user' and resolver.caller_owns_lane(actor, w['actor']))
             or (w['waiting_on'] and same_activity_actor(w['waiting_on'], actor))
         ]
         is_coord = 'coordinator' in roles
@@ -1664,6 +1686,15 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None,
 
     total_waits = len(waits_list)
     overdue_count = sum(1 for w in waits_list if w['overdue'])
+    snoozed_count = sum(1 for w in waits_list if w.get('snoozed')) + sum(1 for s in silent_list if s.get('snoozed'))
+    unreached_count = (
+        sum(1 for w in waits_list if w.get('escalation_stage') == 'owner-not-reached')
+        + sum(1 for s in silent_list if s.get('escalation_stage') == 'owner-not-reached')
+    )
+    project_visible_count = (
+        sum(1 for w in waits_list if w.get('escalation_stage') == 'project-visible')
+        + sum(1 for s in silent_list if s.get('escalation_stage') == 'project-visible')
+    )
     page_waits = waits_list[parsed.offset:parsed.offset + parsed.limit]
     next_offset = (
         parsed.offset + parsed.limit
@@ -1680,6 +1711,9 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None,
         'silent_hours': parsed.silent_hours,
         'total': total_waits,
         'overdue_count': overdue_count,
+        'unreached_count': unreached_count,
+        'project_visible_count': project_visible_count,
+        'snoozed_count': snoozed_count,
         'silent_count': len(silent_list),
         'items': page_waits,
         'silent': silent_list,

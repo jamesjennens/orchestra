@@ -1835,7 +1835,8 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
                  '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
                  '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset',
-                 '--recent', '--last', '--kind', '--role', '--silent-hours', '--days'}
+                 '--recent', '--last', '--kind', '--role', '--silent-hours', '--days',
+                 '--until', '--reason', '--episode'}
 
 
 def help_requested(args):
@@ -1861,7 +1862,7 @@ _COMMAND_HELP_USAGE = {
                   'checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | '
                   'checkpoint TASK --directions [--offset N] [--limit N]',
     'docs': 'docs [NAME] | docs --status',
-    'waiting': 'waiting [--on-me | --all | --role ROLE] [--silent-hours N] [--limit N] [--offset N] [--json] | waiting --metrics [--days N] [--json]',
+    'waiting': 'waiting [--on-me | --all | --role ROLE] [--silent-hours N] [--limit N] [--offset N] [--json] | waiting --metrics [--days N] [--json] | waiting snooze TASK --until ISO8601 --reason TEXT [--episode ID] [--json]',
 }
 
 

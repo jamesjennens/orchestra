@@ -72,7 +72,8 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'server_address.py',  # kittrial-5bb.360: library-only; imported by office_service, http_auth, http_service
            'wake_log.py',  # kittrial-5bb.397: library-only (no __main__ block); imported by work, lanes and http_service
            'sessions.py', 'task_assignment.py', 'version.py', 'waiting.py',
-           'waits.py',  # kittrial-5bb.598 Slice 1: library-only (no __main__ block); imported by lanes/work
+           'wait_snooze.py',
+    'waits.py',  # kittrial-5bb.598 Slice 1: library-only (no __main__ block); imported by lanes/work
            'web_guidance.py', 'web_lifecycle.py', 'web_lifecycle_marks.py', 'web_merge_slot.py',
            'web_release.py',  # kittrial-5bb.378: library-only (no __main__ block); imported by endpoint
            'work.py', 'work_summary.py')

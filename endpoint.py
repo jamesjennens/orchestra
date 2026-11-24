@@ -1032,7 +1032,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: may name it.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file','room-decision','delegation','decision-attest','web-switches')
+                      'task-file','room-decision','delegation','decision-attest','web-switches','wait-snooze')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1285,8 +1285,8 @@ READ_ONLY_ACTIONS={
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
     # and nothing is written, so it takes the project lock SHARED like the work read itself.
     'wait':_read_only_always,
-    # kittrial-5bb.598 Slice 1: server-computed open waits, silent lanes, and daily metrics (read-only).
-    'waiting':_read_only_always,
+    # kittrial-5bb.598 Slice 1/2: waiting reads take SHARED lock; waiting snooze takes EXCLUSIVE lock.
+    'waiting':lambda args,operation:not (isinstance(args,list) and bool(args) and args[0]=='snooze'),
     'bd':lambda args,operation:not is_mutating_invocation(args),
     # The integration check (kittrial-5bb.374) is a read with no identity: it must never
     # take the project lock exclusively or write.
@@ -1593,7 +1593,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
     # Host notes repeat registry ownership at the private service before any read/effect.
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation','decision-attest'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation','decision-attest','wait-snooze'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1665,7 +1665,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         if frame is None or authority_config is not None:
             raise ValueError('%s is a framed request: use the client\'s files command over SSH'%action)
         return framed_files(root,path,actor,request,frame)
-    if action in ('handoff','review','work','wait','waiting'):
+    if action in ('handoff','review','work','wait','waiting') and not (action=='waiting' and isinstance(request.get('args'),list) and request.get('args')[:1]==['snooze']):
         from work import execute as work_execute
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -3301,6 +3301,104 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                                      require_authority=True,runner=runner,identity_check=attest_authority)
             except decision_attest.AttestRefusal as error:
                 return refused(error)
+    if action=='wait-snooze' or (action=='waiting' and isinstance(request.get('args'),list) and request.get('args')[:1]==['snooze']):
+        # Transparent, episode-keyed wait snooze written under the exclusive project lock
+        # (kittrial-5bb.598 Slice 2): writes Kind: wait-snooze-v1 + <project>/.wait-snoozes/.
+        # Serves both HTTP service (`wait-snooze`) and SSH CLI (`waiting snooze TASK ...`)
+        # through ONE canonical `wait_snooze.apply` path.
+        from datetime import datetime, timezone
+        import wait_snooze
+        import waits as waits_mod
+        from http_authority import CAP_COORDINATE, read_state
+        from read_cache import cached_export_rows
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        from lifecycle import host_snapshot
+        from sessions import read_registry
+        is_cli_snooze = (action == 'waiting')
+        run_warnings=[]
+        def snooze_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(snooze_run, project=path)
+        def refused(error):
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','snooze_status':error.status}
+        if is_cli_snooze:
+            try:
+                body=wait_snooze.parse_cli_snooze_args(request.get('args',[]))
+            except wait_snooze.SnoozeRefusal as error:
+                return refused(error)
+        else:
+            body=request.get('payload')
+            if not isinstance(body,dict):
+                return refused(wait_snooze.SnoozeRefusal(422,'Snooze request must be a JSON object. Nothing was written.'))
+        authority=request.get('authority') if isinstance(request.get('authority'),dict) else {}
+        def snooze_authority():
+            if authority_config is not None or not is_cli_snooze:
+                if not verified_web_authority(request,authority_config,CAP_COORDINATE,name):
+                    raise wait_snooze.SnoozeRefusal(403,'Verified coordinate authority required in this project. Nothing was written.')
+            else:
+                import sessions
+                ops=configured_operators(root)
+                owners_arg=(lambda: sessions.owners(path)) if key_principal is not None else None
+                if lanes_scope_for(actor,ops,key_principal,owners_arg) != 'all':
+                    raise wait_snooze.SnoozeRefusal(403,'Coordinator or operator authority required to snooze a wait. Nothing was written.')
+        def snooze_effect():
+            try:
+                now=datetime.now(timezone.utc)
+                rows=cached_export_rows(root, path, runner)
+                rows=record_json.classify(rows, runner, sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+                rows=host_snapshot(rows, run=runner, project=path)
+                state=read_state(authority_config.store) if authority_config is not None else None
+                operators=configured_operators(root)
+                reg=read_registry(path)
+                computed=waits_mod.compute_waits(
+                    rows, now=now, project=name, registry=reg, operators=operators,
+                    authority_state=state, journal=path,
+                )
+                req_body=dict(body)
+                target_task=req_body.get('task')
+                target_ep=req_body.get('episode_id')
+                candidates=[w for w in computed['waits']+computed['silent'] if w.get('task')==target_task]
+                if is_cli_snooze and not target_ep:
+                    if len(candidates)==1:
+                        found=candidates[0]
+                        req_body['episode_id']=found['episode_id']
+                    elif len(candidates)>1:
+                        raise wait_snooze.SnoozeRefusal(422,'Multiple open waits exist on %s; pass --episode ID. Nothing was written.'%target_task)
+                    else:
+                        found=None
+                        req_body['episode_id']='missing-episode-id'
+                else:
+                    found=next((w for w in candidates if w.get('episode_id')==target_ep), None)
+                user_id=authority.get('user_id') if isinstance(authority,dict) else None
+                is_human_owner=False
+                if isinstance(authority,dict) and authority.get('via')=='session' and not authority.get('credential_id') and isinstance(state,dict):
+                    members=(state.get('memberships') or {}).get(name) or {}
+                    user_rec=(state.get('users') or {}).get(user_id) or {}
+                    if members.get(user_id)=='owner' or user_rec.get('superuser'):
+                        is_human_owner=True
+                def write_comment(tid, text):
+                    out=runner(['comments','add',tid,text,'--json'])
+                    return wait_snooze.parse_comment_add_id(out)
+                result=wait_snooze.apply(
+                    req_body, actor=actor, actor_display=request.get('actor_display') or actor,
+                    caller_user_id=user_id, wait_record=found, now=now, journal=path,
+                    resolver=computed['resolver'], authority_state=state, project=name,
+                    is_human_project_owner=is_human_owner, write_comment=write_comment,
+                )
+            except wait_snooze.SnoozeRefusal as error:
+                return refused(error)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
+        with held_coordination_lock(path):
+            try:
+                res=guarded_write(root,request,journal_path(path),snooze_effect,authority_config=authority_config,
+                                  require_authority=not is_cli_snooze,runner=runner,identity_check=snooze_authority)
+            except wait_snooze.SnoozeRefusal as error:
+                return refused(error)
+            if isinstance(res,dict) and res.get('returncode')==2 and 'snooze_status' not in res and isinstance(res.get('records_status'),int):
+                res=dict(res,snooze_status=res['records_status'])
+            return res
     if action=='assignee-followon':
         # The web route's recorded hand-back (kittrial-5bb.343). It runs through the same
         # live-authority boundary every canonical web write uses, and then calls the SAME

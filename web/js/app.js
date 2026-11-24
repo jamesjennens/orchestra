@@ -21,6 +21,7 @@ import * as releases from './views/releases.js';
 import * as designs from './views/designs.js';
 import * as trace from './views/trace.js';
 import * as invites from './views/invites.js';
+import * as waitingView from './views/waiting.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
@@ -28,6 +29,7 @@ const VIEWS = {
   project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, people: project.people, projectAgents: project.projectAgents, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, program: program.page, how: how.page,
   newTask: task.create, task: task.detail,
   lanes: project.lanesPage,
+  waiting: waitingView.waitingPage,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
   records: records.page, referenceRecord: records.referencePage, capabilityRecord: records.capabilityPage,
   designPage: designs.page, tracePage: trace.page,
@@ -176,6 +178,7 @@ export async function start(root, options = {}) {
       ctx.features.records && ['decisions', 'Decisions'],
       ['rooms', 'Rooms'],
       ['lanes', 'Lanes'],
+      ['waiting', 'Waiting'],
       // kittrial-5bb.453: only on a project with an accepted program.area side (the server's cached flag).
       program.showsProgram(proj) && ['program', 'Program'],
       ['feedback', 'Orchestra feedback'],

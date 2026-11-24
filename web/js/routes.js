@@ -20,6 +20,7 @@ export const ROUTE_PATTERNS = [
   ['rooms', '/p/{pid}/rooms'],
   ['room', '/p/{pid}/rooms/{rid}'],
   ['lanes', '/p/{pid}/lanes'],
+  ['waiting', '/p/{pid}/waiting'],
   ['people', '/p/{pid}/people'],
   ['projectAgents', '/p/{pid}/agents'],
   ['settings', '/p/{pid}/settings'],
@@ -83,7 +84,7 @@ const LIST_OF_RECORD = { room: ['rooms', 'room'], requirement: ['requirements', 
   record: ['records', 'record'], referenceRecord: ['records', 'record'], capabilityRecord: ['records', 'record'] };
 // The name of each section, for the toast when the page the person left does not show it in the rail.
 export const SECTION_LABELS = { reviews: 'Reviews', releases: 'Releases', requirements: 'Requirements', records: 'Records',
-  decisions: 'Decisions', rooms: 'Rooms', lanes: 'Lanes', program: 'Program', feedback: 'Orchestra feedback',
+  decisions: 'Decisions', rooms: 'Rooms', lanes: 'Lanes', waiting: 'Waiting', program: 'Program', feedback: 'Orchestra feedback',
   people: 'People', agents: 'Agents', settings: 'Settings', setup: 'Set up', how: 'How work is found', handover: 'Handover', notes: 'Notes' };
 
 // Where the project switcher sends the current page. A project page keeps its section when the target project

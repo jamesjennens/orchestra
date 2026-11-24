@@ -2,6 +2,7 @@ import { h, time, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag, waitsOnReader } from '../ui.js';
 import { agentCard, attentionOf } from './agents.js';
 import { myContributionsPanel } from './proposals.js';
+import { waitingOnYouPanel } from './waiting.js';
 
 function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
   if (!rows.length) return empty(emptyTitle, emptyBody);
@@ -53,8 +54,17 @@ function approverIn(ctx, data) {
 // covers) the count is not the whole, so the page shows no number (the banner says why).
 function workKey(ctx, data, incomplete, revisions, assigned) {
   if (incomplete) return null;
-  const n = revisions.concat(data.to_review, assigned)
-    .reduce((ids, t) => (waitsOnReader(ctx, t, approverIn(ctx, data)) ? ids.add(t.project_id + '/' + t.id) : ids), new Set()).size;
+  const ids = revisions.concat(data.to_review, assigned)
+    .reduce((set, t) => (waitsOnReader(ctx, t, approverIn(ctx, data)) ? set.add(t.project_id + '/' + t.id) : set), new Set());
+  const waiting = data.waiting_on_you;
+  if (waiting && typeof waiting === 'object') {
+    for (const w of (waiting.items || []).concat(waiting.silent || [])) {
+      if (w && (w.project || w.project_id) && (w.task || w.id)) {
+        ids.add((w.project || w.project_id) + '/' + (w.task || w.id));
+      }
+    }
+  }
+  const n = ids.size;
   return { num: n, label: n === 1 ? 'waits on you' : 'wait on you', source: 'my-work:distinct-next-step-is-yours' };
 }
 
@@ -100,6 +110,7 @@ export async function home(ctx) {
     pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.`,
       key: workKey(ctx, data, incomplete, revisions, assigned), actions: workNext(ctx, data, revisions, assigned) }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,
+    waitingOnYouPanel(ctx, data.waiting_on_you),
     agentPromptPanel(ctx, data),
     contributions,
     agentsPanel,

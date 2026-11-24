@@ -2155,10 +2155,13 @@ class InProcessBackend:
         is its own entry and never moves the marker.
         """
         from briefing import activity_marker, fields_digest, same_activity_actor
+        from reserved_comments import is_wait_meta_comment
         events = [(index, event) for index, event in enumerate(self.state.get('events') or [])
                   if isinstance(event, dict) and event.get('task') == task['id']]
         others = [(index, event) for index, event in events
-                  if not same_activity_actor(event.get('actor'),task.get('assignee'))]
+                  if not same_activity_actor(event.get('actor'),task.get('assignee'))
+                  and event.get('action') != 'wait-snooze'
+                  and not is_wait_meta_comment(event.get('detail'))]
         newest = max(others, key=lambda pair: (pair[1].get('time') or '', pair[0])) if others else None
         entry = None
         if newest is not None:
@@ -2258,6 +2261,120 @@ class InProcessBackend:
                           operators=operators, journal=None, scope=scope,
                           project=project_id, authority_state=self.service.state,
                           extra_live_sessions=extra_live_sessions)
+
+    def _memory_wait_inputs(self, project_id):
+        from sessions import read_registry
+        rows = [dict(task, issue_type=task.get('issue_type') or 'task',
+                     labels=task.get('labels') or [], dependencies=task.get('dependencies') or [],
+                     comments=list(task.get('comments') or []))
+                for task in self._project_rows(project_id)]
+        registry = getattr(self, 'session_registry', None)
+        pdir = None
+        root = getattr(self, 'root', None)
+        if root is not None:
+            cand = Path(root) / 'projects' / project_id
+            if cand.is_dir():
+                pdir = cand
+        if not isinstance(registry, dict):
+            registry = {'schema_version': 1, 'records': {}}
+            if pdir is not None:
+                try:
+                    registry = read_registry(pdir)
+                except Exception:
+                    registry = {'schema_version': 1, 'records': {}}
+        operators = None
+        coord_fn = getattr(self, 'host_coordination', None)
+        if callable(coord_fn):
+            try:
+                coord = coord_fn(project_id)
+                if isinstance(coord, dict) and isinstance(coord.get('operators'), list):
+                    operators = list(coord['operators'])
+            except Exception:
+                pass
+        return rows, registry, operators, pdir
+
+    def _memory_snoozes(self, project_id, pdir=None):
+        import wait_snooze
+        combined = {}
+        if pdir is not None:
+            for eid, items in wait_snooze.load_snoozes(pdir).items():
+                combined.setdefault(eid, []).extend(items)
+        mem = (self.state.get('wait_snoozes') or {}).get(project_id) or {}
+        for eid, items in mem.items():
+            combined.setdefault(eid, []).extend(items)
+        return combined
+
+    def waiting_read(self, project_id, principal, args, actor, scope='own'):
+        """One page of open waits, silent lanes, or daily metrics from waits.py (kittrial-5bb.598 Slice 2)."""
+        from datetime import datetime, timezone
+        import waits as waits_mod
+        rows, registry, operators, pdir = self._memory_wait_inputs(project_id)
+        now = datetime.fromtimestamp(self.service._now(), tz=timezone.utc)
+        snoozes = self._memory_snoozes(project_id, pdir=pdir)
+        return waits_mod.read(
+            rows, actor, registry, list(args), now=now, operators=operators,
+            journal=pdir, scope=scope, project=project_id,
+            authority_state=self.service.state, snoozes=snoozes,
+        )
+
+    def waiting_snooze(self, project_id, principal, body, actor, actor_display=None):
+        """Record one transparent, episode-keyed wait snooze in MemoryBackend (kittrial-5bb.598 Slice 2)."""
+        from datetime import datetime, timezone
+        import wait_snooze
+        import waits as waits_mod
+        with self.service.store.lock:
+            rows, registry, operators, pdir = self._memory_wait_inputs(project_id)
+            now = datetime.fromtimestamp(self.service._now(), tz=timezone.utc)
+            snoozes = self._memory_snoozes(project_id, pdir=pdir)
+            computed = waits_mod.compute_waits(
+                rows, now=now, project=project_id, registry=registry, operators=operators,
+                authority_state=self.service.state, journal=pdir, snoozes=snoozes,
+            )
+            target_task = body.get('task') if isinstance(body, dict) else None
+            target_ep = body.get('episode_id') if isinstance(body, dict) else None
+            found = next((w for w in computed['waits'] + computed['silent']
+                          if w.get('task') == target_task and w.get('episode_id') == target_ep), None)
+            members = (self.service.state.get('memberships') or {}).get(project_id) or {}
+            is_human_owner = bool(
+                principal is not None and principal.via == 'session'
+                and (members.get(principal.user_id) == 'owner' or principal.superuser)
+            )
+            def write_comment(tid, text):
+                task_row = self.state.get('tasks', {}).get(tid)
+                if not isinstance(task_row, dict):
+                    return None
+                cid = 'c-snooze-%d' % (len(task_row.get('comments') or []) + 1)
+                stamp = now_iso(self.service._now())
+                task_row.setdefault('comments', []).append({
+                    'id': cid, 'issue_id': tid, 'author': actor, 'text': text, 'created_at': stamp,
+                })
+                return cid
+            try:
+                result = wait_snooze.apply(
+                    body, actor=actor, actor_display=actor_display or actor,
+                    caller_user_id=principal.user_id if principal is not None else None,
+                    wait_record=found, now=now, journal=pdir,
+                    existing_entries=snoozes.get(target_ep, ()),
+                    resolver=computed['resolver'], authority_state=self.service.state,
+                    project=project_id, is_human_project_owner=is_human_owner,
+                    write_comment=write_comment,
+                )
+            except wait_snooze.SnoozeRefusal as exc:
+                code = {403: 'forbidden', 404: 'not_found', 409: 'conflict', 422: 'invalid'}.get(exc.status, 'invalid')
+                raise HttpError(exc.status, code, str(exc)) from None
+            if pdir is None:
+                self.state.setdefault('wait_snoozes', {}).setdefault(project_id, {}).setdefault(
+                    result['payload']['episode_id'], []
+                ).append(result['payload'])
+            return {
+                'task': result['payload']['task'],
+                'episode_id': result['payload']['episode_id'],
+                'comment_id': result['comment_id'],
+                'snooze': result['snooze'],
+                'snooze_count': result['snooze_count'],
+                'waited_on_party': result['waited_on_party'],
+                'suppresses_owner_notice': result['suppresses_owner_notice'],
+            }
 
     def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """The disposable model's queue and board at one locked state."""
@@ -3894,6 +4011,42 @@ class EndpointBackend:
         if not isinstance(payload, dict):
             raise uncertain('The canonical lanes read returned an unexpected shape')
         return payload
+
+    def waiting_read(self, project_id, principal, args, actor, scope):
+        """One page of open waits, silent lanes, or daily metrics through the endpoint's ``waiting`` action."""
+        authority = (authority_request(principal, project_id, CAP_READ, now=self.service._expiry_now())
+                     if principal is not None else None)
+        reply = self._endpoint('waiting', project_id, actor, list(args),
+                               authority=authority,
+                               require_authority=principal is not None, extra={'lanes_scope': scope})
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical waiting read returned an unexpected shape')
+        return payload
+
+    def waiting_snooze(self, project_id, principal, body, actor, actor_display=None):
+        """Record one wait snooze under the endpoint's exclusive project lock (``wait-snooze`` action)."""
+        authority = authority_request(principal, project_id, CAP_COORDINATE, now=self.service._expiry_now())
+        reply = self._endpoint('wait-snooze', project_id, actor, [],
+                               authority=authority, require_authority=True,
+                               extra={'payload': dict(body), 'actor_display': actor_display or actor})
+        snooze_status = (reply.get('snooze_status') or reply.get('records_status')) if isinstance(reply, dict) else None
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and snooze_status in (403, 404, 409, 422):
+            status = int(snooze_status)
+            code = {403: 'forbidden', 404: 'not_found', 409: 'conflict', 422: 'invalid'}.get(status, 'invalid')
+            raise HttpError(status, code, (reply.get('stderr') or 'Snooze refused').strip())
+        payload = self._checked(reply, reading=False)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical wait-snooze write returned an unexpected shape')
+        return {
+            'task': (payload.get('payload') or {}).get('task'),
+            'episode_id': (payload.get('payload') or {}).get('episode_id'),
+            'comment_id': payload.get('comment_id'),
+            'snooze': payload.get('snooze'),
+            'snooze_count': payload.get('snooze_count'),
+            'waited_on_party': payload.get('waited_on_party'),
+            'suppresses_owner_notice': payload.get('suppresses_owner_notice'),
+        }
 
     def wake_project_dir(self, project_id):
         """The project directory the empty-wake host log lives under (kittrial-5bb.397).
@@ -9714,7 +9867,39 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['can_set_agent_approval'] = self._may_set_agent_approval(ctx)
         result['auto_nudge'] = self.service.auto_nudge(ctx.params['pid'])
         result['can_set_auto_nudge'] = self._may_set_agent_approval(ctx)
+        result['overdue_escalations'] = self._project_overdue_summary(ctx, ctx.params['pid'])
         return 200, result
+
+    def _project_overdue_summary(self, ctx, project_id):
+        """Open-task overdue & silent wait counts for GET /v1/projects/{pid} (kittrial-5bb.598 Slice 2).
+
+        Never computes historical metrics; falls back cleanly to zeroes when a stub backend
+        does not expose ``waiting_read`` or the project directory is unavailable.
+        """
+        empty = {
+            'total': 0, 'overdue_count': 0, 'unreached_count': 0,
+            'project_visible_count': 0, 'silent_count': 0, 'snoozed_count': 0,
+        }
+        if not hasattr(self.backend, 'waiting_read'):
+            return empty
+        try:
+            scope, _basis, _role = self._lanes_scope(ctx.principal, project_id)
+            read = self.backend.waiting_read(
+                project_id, ctx.principal, ['--all', '--limit', '1'],
+                self._lanes_actor(ctx.principal), scope,
+            )
+        except HttpError:
+            return empty
+        if not isinstance(read, dict):
+            return empty
+        return {
+            'total': int(read.get('total') or 0),
+            'overdue_count': int(read.get('overdue_count') or 0),
+            'unreached_count': int(read.get('unreached_count') or 0),
+            'project_visible_count': int(read.get('project_visible_count') or 0),
+            'silent_count': int(read.get('silent_count') or 0),
+            'snoozed_count': int(read.get('snoozed_count') or 0),
+        }
 
     def _may_set_agent_approval(self, ctx):
         if ctx.principal is None or ctx.principal.via == 'credential':
@@ -15877,6 +16062,190 @@ class ApiHandler(BaseHTTPRequestHandler):
                          for row in body.get('items') or []]
         return 200, body
 
+    @staticmethod
+    def _waiting_int_query(raw, name, low, high, default):
+        if raw is None:
+            return default
+        if not re.fullmatch(r'[0-9]+', raw):
+            raise HttpError(400, 'invalid_request',
+                            '%s must be a whole number, %d to %d' % (name, low, high))
+        value = int(raw)
+        if not low <= value <= high:
+            raise HttpError(400, 'invalid_request',
+                            '%s must be between %d and %d' % (name, low, high))
+        return value
+
+    def _waiting_display_names(self, payload, project_id):
+        """Attach server-resolved display names to waiting/metrics payloads (display only, zero task text)."""
+        from lane_state import ROLES
+        import waits as waits_mod
+        if not isinstance(payload, dict):
+            return
+        wanted = []
+        for bucket_key in ('items', 'silent'):
+            for row in payload.get(bucket_key) or []:
+                if not isinstance(row, dict):
+                    continue
+                if isinstance(row.get('actor'), str):
+                    wanted.append(row['actor'])
+                wo = row.get('waiting_on')
+                if isinstance(wo, str) and wo and wo not in ROLES:
+                    wanted.append(wo)
+                sn = row.get('snooze')
+                if isinstance(sn, dict) and isinstance(sn.get('actor'), str):
+                    wanted.append(sn['actor'])
+        for row in payload.get('by_target') or []:
+            if isinstance(row, dict):
+                wo = row.get('waiting_on')
+                if isinstance(wo, str) and wo and wo not in ROLES:
+                    wanted.append(wo)
+        for row in payload.get('by_actor') or []:
+            if isinstance(row, dict) and isinstance(row.get('actor'), str):
+                wanted.append(row['actor'])
+        role_members = {}
+        if payload.get('by_target'):
+            with self.service.store.lock:
+                state_snap = self.service.state
+                for role_name in ROLES:
+                    if role_name == 'coordinator':
+                        mids = sorted(waits_mod._http_project_role_members(state_snap, project_id, ('owner', 'coordinator')))
+                    elif role_name == 'reviewer':
+                        mids = sorted(waits_mod._http_project_role_members(state_snap, project_id, ('owner', 'coordinator', 'reviewer')))
+                    else:
+                        mids = sorted(waits_mod._http_project_role_members(state_snap, project_id, ('owner',)))
+                    role_members[role_name] = mids
+                    wanted.extend(mids)
+        try:
+            names = self._actor_names(wanted, project_id) if wanted else {}
+        except Exception:
+            names = {}
+        for bucket_key in ('items', 'silent'):
+            for row in payload.get(bucket_key) or []:
+                if not isinstance(row, dict):
+                    continue
+                actor = row.get('actor')
+                row['display_name'] = (names.get(actor, row.get('lane') or actor)
+                                       if isinstance(actor, str) else row.get('lane'))
+                wo = row.get('waiting_on')
+                if isinstance(wo, str) and wo:
+                    row['waiting_on_name'] = wo if wo in ROLES else names.get(wo, wo)
+                sn = row.get('snooze')
+                if isinstance(sn, dict) and isinstance(sn.get('actor'), str):
+                    sn['actor_display'] = names.get(sn['actor'], sn.get('actor_display') or sn['actor'])
+        for row in payload.get('by_target') or []:
+            if not isinstance(row, dict):
+                continue
+            wo = row.get('waiting_on')
+            if isinstance(wo, str) and wo:
+                row['waiting_on_name'] = wo if wo in ROLES else names.get(wo, wo)
+                if wo in ROLES and (row.get('open_now') or {}).get('open_count', 0) > 0:
+                    row['resolved_members'] = [
+                        {'id': mid, 'name': names.get(mid, mid)}
+                        for mid in role_members.get(wo, ())
+                    ]
+        for row in payload.get('by_actor') or []:
+            if isinstance(row, dict) and isinstance(row.get('actor'), str):
+                row['actor_name'] = names.get(row['actor'], row.get('actor_name') or row['actor'])
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/waiting')
+    def project_waiting(self, ctx):
+        """Open waits and silent lanes for this project (kittrial-5bb.598 Slice 2, §2.2).
+
+        Readable by any project member (``CAP_READ``); non-members are refused by ``_project``
+        before anything is read. Never computes historical metrics on this default route (SHOULD-9).
+        """
+        from waits import DEFAULT_SILENT_HOURS, SILENT_HOURS_MIN, SILENT_HOURS_MAX
+        self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('filter', 'role', 'silent_hours'))
+        limit, state = self._page(ctx, ctx.query)
+        flt = ctx.query.get('filter') or 'all'
+        if flt not in ('all', 'on-me'):
+            raise HttpError(400, 'invalid_request', "filter must be 'all' or 'on-me'")
+        role = ctx.query.get('role')
+        if role is not None:
+            if not role.strip():
+                raise HttpError(400, 'invalid_request', 'role must be non-empty')
+            if flt == 'on-me':
+                raise HttpError(400, 'invalid_request', "Use either filter=on-me or role, not both")
+            role = role.strip()
+        silent_hours = self._waiting_int_query(
+            ctx.query.get('silent_hours'), 'silent_hours',
+            SILENT_HOURS_MIN, SILENT_HOURS_MAX, DEFAULT_SILENT_HOURS,
+        )
+        scope, basis, scope_role = self._lanes_scope(ctx.principal, ctx.params['pid'])
+        cli_args = (['--on-me'] if flt == 'on-me' else (['--role', role] if role else ['--all'])) + [
+            '--silent-hours', str(silent_hours), '--limit', str(limit), '--offset', str(state['o']),
+        ]
+        read = self.backend.waiting_read(
+            ctx.params['pid'], ctx.principal, cli_args,
+            self._lanes_actor(ctx.principal), scope,
+        )
+        body = dict(read)
+        body['scope_basis'] = basis
+        body['scope_role'] = scope_role
+        self._waiting_display_names(body, ctx.params['pid'])
+        continuation = body.get('next_offset')
+        body['next_cursor'] = (
+            make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
+                        key=self.service.cursor_key())
+            if type(continuation) is int and continuation > state['o'] else None
+        )
+        try:
+            self.service.check_authority(ctx.principal, ctx.params['pid'], CAP_COORDINATE)
+            body['can_snooze'] = True
+        except HttpError:
+            body['can_snooze'] = False
+        return 200, body
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/waiting/snooze')
+    def project_waiting_snooze(self, ctx):
+        """Record one transparent, end-timed, episode-keyed wait snooze (kittrial-5bb.598 Slice 2, §2.3).
+
+        Requires live ``CAP_COORDINATE`` in this project. Refuses missing/past/>7d ``until`` (422),
+        empty/multiline ``reason`` (422), unknown wait/episode (404), and a 3rd renewal (409 unless
+        issued by a non-waited-on human project owner). Waited-on-party snooze sets
+        ``suppresses_owner_notice=False``.
+        """
+        pid = ctx.params['pid']
+        self._project(ctx, CAP_COORDINATE)
+        payload = dict(ctx.payload or {})
+        task_label = payload.get('task') if isinstance(payload.get('task'), str) else '?'
+        actor = self._lanes_actor(ctx.principal)
+        actor_display = ctx.principal.display_name or actor
+
+        def write():
+            result = self.backend.waiting_snooze(
+                pid, ctx.principal, payload, actor, actor_display=actor_display,
+            )
+            return result, result
+
+        return self._mutate(
+            ctx, 'waiting.snooze', pid, write, capability=CAP_COORDINATE,
+            status=201, serialize=False,
+            reason='task %s' % task_label[:80],
+        )
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/waiting/metrics')
+    def project_waiting_metrics(self, ctx):
+        """Read-time daily wait metrics for this project (kittrial-5bb.598 Slice 2, §6, SHOULD-6/7/9).
+
+        Authorized by ``CAP_READ``: returns counts, durations, and display names only — zero task text.
+        """
+        from waits import DEFAULT_METRICS_DAYS, METRICS_DAYS_MIN, METRICS_DAYS_MAX
+        self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('days',))
+        days = self._waiting_int_query(
+            ctx.query.get('days'), 'days',
+            METRICS_DAYS_MIN, METRICS_DAYS_MAX, DEFAULT_METRICS_DAYS,
+        )
+        read = self.backend.waiting_read(
+            ctx.params['pid'], ctx.principal, ['--metrics', '--days', str(days)],
+            self._lanes_actor(ctx.principal), 'all',
+        )
+        body = dict(read)
+        self._waiting_display_names(body, ctx.params['pid'])
+        return 200, body
+
     #: The one body a nudge request takes (kittrial-5bb.413). ``operation_id`` is the retry key of
     #: the design when the caller sends no ``Idempotency-Key`` header.
     NUDGE_FIELDS = ('lane', 'message', 'reason', 'note', 'acknowledge_declared_wait', 'operation_id')
@@ -16190,6 +16559,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if not p.get('archived') and principal.user_id in (p.get('members') or [])]
         truncated = len(projects) > ME_WORK_MAX_PROJECTS
         assigned, to_review, unavailable, classified = [], [], [], []
+        waiting_items, waiting_silent = [], []
+        waiting_totals = {'total': 0, 'overdue_count': 0, 'unreached_count': 0,
+                          'snoozed_count': 0, 'silent_lanes_count': 0}
         generated_at = now_iso(self.service._now())
         now = agent_prompts.parse_time(generated_at)
         blocked = self._agent_blocked_tasks()
@@ -16205,6 +16577,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                 continue
             truncated = truncated or not read.get('complete')
             reads.append((project, capabilities, read))
+            if hasattr(self.backend, 'waiting_read'):
+                def _load_waiting(pid=project['id']):
+                    wait_scope, _basis, _role = self._lanes_scope(principal, pid)
+                    try:
+                        wread = self.backend.waiting_read(
+                            pid, principal, ['--on-me', '--limit', str(MAX_PAGE)],
+                            actor, wait_scope,
+                        )
+                    except HttpError:
+                        return None
+                    if not isinstance(wread, dict):
+                        return None
+                    wbody = dict(wread)
+                    self._waiting_display_names(wbody, pid)
+                    return wbody
+                wbody = self._cached_read('waiting-on-me', project['id'], _load_waiting, shared=True)
+                if isinstance(wbody, dict):
+                    waiting_totals['total'] += int(wbody.get('total') or 0)
+                    waiting_totals['overdue_count'] += int(wbody.get('overdue_count') or 0)
+                    waiting_totals['unreached_count'] += int(wbody.get('unreached_count') or 0)
+                    waiting_totals['snoozed_count'] += int(wbody.get('snoozed_count') or 0)
+                    waiting_totals['silent_lanes_count'] += int(wbody.get('silent_count') or 0)
+                    for wrow in wbody.get('items') or []:
+                        if isinstance(wrow, dict):
+                            waiting_items.append(dict(wrow, project=project['id'], project_name=project['name']))
+                    for srow in wbody.get('silent') or []:
+                        if isinstance(srow, dict):
+                            waiting_silent.append(dict(srow, project=project['id'], project_name=project['name']))
         details = self._me_work_details(reads, actor)
         settings = {}                      # each project's agent-approval setting, read at most once a request
         for project, capabilities, read in reads:
@@ -16274,10 +16674,22 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._agent_prompt_projects(agent, principal, classified, settings),
             generated_at, server)
             for agent in agents if agent.get('owner') == principal.user_id]
+        waiting_items.sort(key=lambda w: (w.get('started_at') or '', w.get('project') or '', w.get('task') or '', w.get('episode_id') or ''))
+        waiting_silent.sort(key=lambda s: (s.get('started_at') or '', s.get('project') or '', s.get('task') or '', s.get('episode_id') or ''))
+        waiting_on_you = {
+            'total': waiting_totals['total'],
+            'overdue_count': waiting_totals['overdue_count'],
+            'unreached_count': waiting_totals['unreached_count'],
+            'snoozed_count': waiting_totals['snoozed_count'],
+            'silent_lanes_count': waiting_totals['silent_lanes_count'],
+            'items': waiting_items[:MAX_PAGE],
+            'silent': waiting_silent[:MAX_PAGE],
+        }
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
                      'to_review': self._task_views(to_review[:MAX_PAGE]),
                      'to_review_note': (self.ME_WORK_PARTY_NOTE
                                         if self.service.approval_by_another_party else None),
+                     'waiting_on_you': waiting_on_you,
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}
