@@ -1835,7 +1835,7 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
                  '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
                  '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset',
-                 '--recent', '--last', '--kind'}
+                 '--recent', '--last', '--kind', '--role', '--silent-hours', '--days'}
 
 
 def help_requested(args):

@@ -7,6 +7,7 @@ compares a hard-coded date against the real wall clock.
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -16,7 +17,6 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import briefing as b
-import endpoint
 import lane_state
 import lanes
 import review_workflow as rw
@@ -837,9 +837,14 @@ class WaitRoleAndMetricTests(unittest.TestCase):
                                 operators=[COORD], project=PROJECT)
         self.assertEqual([s['task'] for s in view_coord['silent']], ['t-sil-hidden'])
 
-    def test_work_execute_forwards_lanes_scope_validates_args_early_and_uses_shared_lock(self):
-        """MUST-2 (M11) + M15 + NOTE 6: work.execute forwards lanes_scope, parses args pre-export, shared lock."""
+    @unittest.skipIf(os.name == 'nt', 'endpoint requires POSIX fcntl')
+    def test_endpoint_marks_waiting_read_only_for_shared_lock(self):
+        """MUST-2 (M15): endpoint classifies waiting under READ_ONLY_ACTIONS (shared lock)."""
+        import endpoint
         self.assertIn('waiting', endpoint.READ_ONLY_ACTIONS)
+
+    def test_work_execute_forwards_lanes_scope_validates_args_early(self):
+        """MUST-2 (M11) + NOTE 6: work.execute forwards lanes_scope and parses args pre-export."""
         t0 = BASE_NOW - timedelta(hours=6)
         r_wa = make_task('t-ex-wa', LANE_A, created_at=t0)
         add_checkpoint(r_wa, 'cp1', t0)
@@ -915,6 +920,20 @@ class WaitRoleAndMetricTests(unittest.TestCase):
         self.assertIsNone(h_by_task['t-m16']['state'])
         self.assertNotIn('waiting_too_long', h_by_task['t-m16']['flags'])
         self.assertNotIn('expect_by_passed', h_by_task['t-m16']['flags'])
+
+        # Wait with no declared expect_by: waits.py applies the 4 h default (overdue=True),
+        # while lanes.read keeps expect_by=None so idle_minutes stays the sole board threshold.
+        r_no_eb = make_task('t-no-eb', LANE_A, created_at=t_b)
+        add_checkpoint(r_no_eb, 'cp1', t_b)
+        add_lane_state(r_no_eb, 'ls1', 'cp1', t_b, state='waiting-on-coordinator', waiting_on='coordinator')
+        w_no = waits.compute_waits([r_no_eb], now=BASE_NOW, project=PROJECT, registry=default_reg(), operators=[COORD])
+        self.assertTrue(w_no['waits'][0]['expect_by_defaulted'])
+        self.assertTrue(w_no['waits'][0]['overdue'])
+        b_wide = lanes.read([r_no_eb], COORD, default_reg(), ['--idle-minutes', '10080'],
+                            now=BASE_NOW, operators=[COORD], project=PROJECT)
+        h_no = next(h for lane in b_wide['items'] for h in lane['held'] if h['task'] == 't-no-eb')
+        self.assertIsNone(h_no['expect_by'])
+        self.assertEqual(h_no['flags'], [])
 
     def test_verdict_after_recheckpoint_keeps_origin_started_at_and_single_metric(self):
         """SHOULD-4 (M17): _find_checkpoint_verdict respects its before bound across re-checkpoints."""
