@@ -94,6 +94,7 @@ export async function start(root, options = {}) {
   // is no longer current, or while another page's navigation is pending, writes nothing, so a late timer of a
   // page already left (the search box's 250 ms) never puts its filters on the next page.
   ctx.currentView = () => token;
+  ctx.isInvitePage = () => typeof rendered === 'string' && rendered.startsWith(INVITE_PREFIX);
   ctx.setQuery = (params, view) => {
     if (view !== token || !rendered) return;
     const path = rendered.split('?')[0];

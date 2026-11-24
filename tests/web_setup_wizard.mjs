@@ -80,7 +80,7 @@ const { createApi } = await import(apiUrl);
 const { setupWizardPage, WIZARD_STORAGE_KEY, clearWizardStorage, list: agentsList, SCREEN_TITLES, CURL_ERROR_LINES } = await import(agentsUrl);
 const setupText = await import(new URL('../agentSetup.js', agentsUrl).href);
 const { SESSION_IDLE_WARNING_EVENT } = await import(apiUrl);
-const { toast } = await import(domUrl);
+const { toast, confirmDialog } = await import(domUrl);
 
 const SECRET = 'orc_TESTSECRET_348_value';
 const server = {
@@ -2021,7 +2021,7 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
         if (sel === '[data-account-error]') return this.all((e) => e.getAttribute('data-account-error') !== null)[0] || null;
         return origQForApp.call(this, sel);
       };
-      await appMod.start(appRoot, { transport: appTransport, storage: localStore });
+      const appCtx = await appMod.start(appRoot, { transport: appTransport, storage: localStore });
       await new Promise((r) => setTimeout(r, 50));
       const appBaseListeners = listenerCount();
       // Open wizard with secret showing on #/agents:
@@ -2253,12 +2253,21 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       await clearAnyOpenDialogs();
       await subRotConf.catch(() => {});
 
+      const storageSecretAbsent = () => secretContainmentOk(SECRET, { expectPre: false })
+        && !JSON.stringify([...localStore.entries()]).includes(SECRET);
+      const EXPECTED_PROJECTS_ROTATION_NOTICE = 'New secret issued for Kestrel, but you left My agents before it was shown. Return to My agents to issue another secret and revoke the unused credential.';
+      const EXPECTED_PROJECTS_CREATE_NOTICE = 'Agent Osprey was created, but you left My agents before its secret was shown. Return to My agents to open setup and issue a new secret.';
+      const EXPECTED_SIGNIN_ROTATION_NOTICE = "A new secret was issued before your session ended. Sign in, issue another from the agent's card and revoke the unused credential.";
+      const EXPECTED_SIGNIN_CREATE_NOTICE = 'An agent was created before your session ended. Sign in, open its card in My agents and issue a new secret.';
+      const ME_USER = { id: 'u1', username: 'olive', display_name: 'Olive', superuser: true };
+
       // (e5) In-flight card rotation write finishes after leaving #/agents -> #/projects
       // (both while POST /credentials is held AND while follow-up GET /service/certificate is held):
-      // must NOT open a dialog or expose the secret, and MUST raise a secretless crit toast.
+      // must NOT open a dialog or expose the secret, and MUST raise the exact secretless crit toast.
       const checkRotFlight = async (holdPost) => {
         await goTo('#/agents');
         clearToasts();
+        createAgentCalls = 0;
         issueCredentialCalls = 0;
         let release = null;
         const started = new Promise((resolve) => {
@@ -2283,23 +2292,27 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
         const crit = toasts.filter((e) => e.className === 'toast crit').map((e) => e.textContent);
         const plain = toasts.filter((e) => e.className === 'toast').map((e) => e.textContent);
         return issueCredentialCalls === 1
+          && createAgentCalls === 0
           && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
           && openDialogs().length === 0
           && listenerCount() === appBaseListeners
           && !body.textContent.includes(SECRET)
-          && secretContainmentOk(SECRET, { expectPre: false })
+          && storageSecretAbsent()
           && plain.length === 0
-          && crit.some((t) => t.includes('Kestrel') && t.includes('My agents') && t.includes('revoke') && !t.includes(SECRET));
+          && crit.length === 1
+          && crit[0] === EXPECTED_PROJECTS_ROTATION_NOTICE
+          && !crit[0].includes(SECRET);
       };
       out.inFlightCardRotationAfterLeaveNotifiesWithoutSecret = (await checkRotFlight(true)) && (await checkRotFlight(false));
 
       // (e6) In-flight Add agent write finishes after leaving #/agents -> #/projects
       // (both while POST /agents is held AND while follow-up GET /service/certificate is held):
-      // must NOT open a dialog or expose the secret, and MUST raise a secretless crit toast.
+      // must NOT open a dialog or expose the secret, and MUST raise the exact secretless crit toast.
       const checkCreateFlight = async (holdPost) => {
         await goTo('#/agents');
         clearToasts();
         createAgentCalls = 0;
+        issueCredentialCalls = 0;
         let release = null;
         const started = new Promise((resolve) => {
           if (holdPost) onCreatePostStarted = resolve;
@@ -2321,16 +2334,208 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
         const crit = toasts.filter((e) => e.className === 'toast crit').map((e) => e.textContent);
         const plain = toasts.filter((e) => e.className === 'toast').map((e) => e.textContent);
         return createAgentCalls === 1
+          && issueCredentialCalls === 0
           && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Projects'
           && openDialogs().length === 0
           && listenerCount() === appBaseListeners
           && !body.textContent.includes(SECRET)
-          && secretContainmentOk(SECRET, { expectPre: false })
+          && storageSecretAbsent()
           && plain.length === 0
-          && crit.some((t) => t.includes('Osprey') && t.includes('My agents') && t.includes('issue a new secret') && !t.includes(SECRET));
+          && crit.length === 1
+          && crit[0] === EXPECTED_PROJECTS_CREATE_NOTICE
+          && !crit[0].includes(SECRET);
       };
       out.inFlightAddAgentAfterLeaveNotifiesWithoutSecret = (await checkCreateFlight(true)) && (await checkCreateFlight(false));
+
+      // (e7) r8 MUST (signed-out-notice + pins): session loss mid-write (POST held or certificate
+      // read held) for both Add agent and card rotation MUST leave Sign in with exactly one
+      // anonymous critical recovery notice, zero dialogs, one write, and no secret in DOM/storage.
+      const checkCreateSessionLost = async (holdPost) => {
+        await goTo('#/agents');
+        clearToasts();
+        createAgentCalls = 0;
+        issueCredentialCalls = 0;
+        let release = null;
+        const started = new Promise((resolve) => {
+          if (holdPost) onCreatePostStarted = resolve;
+          else onCertGetStarted = resolve;
+        });
+        if (holdPost) delayCreatePost = new Promise((resolve) => { release = resolve; });
+        else delayCertGet = new Promise((resolve) => { release = resolve; });
+        const fCreateLost = addAgentForm();
+        fCreateLost.querySelector('#a-name').value = 'Osprey';
+        const subCreateLost = fCreateLost.dispatch('submit');
+        await started;
+        appCtx.sessionLost();
+        delayCreatePost = null;
+        delayCertGet = null;
+        if (release) release();
+        await subCreateLost;
+        await new Promise((r) => setTimeout(r, 40));
+        const toasts = body.all((e) => e.className === 'toast' || e.className === 'toast crit');
+        const crit = toasts.filter((e) => e.className === 'toast crit').map((e) => e.textContent);
+        const plain = toasts.filter((e) => e.className === 'toast').map((e) => e.textContent);
+        const ok = createAgentCalls === 1
+          && issueCredentialCalls === 0
+          && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Sign in'
+          && openDialogs().length === 0
+          && listenerCount() === appBaseListeners
+          && !body.textContent.includes(SECRET)
+          && storageSecretAbsent()
+          && plain.length === 0
+          && crit.length === 1
+          && crit[0] === EXPECTED_SIGNIN_CREATE_NOTICE
+          && !crit[0].includes('Osprey')
+          && !crit[0].includes(SECRET);
+        clearToasts();
+        await appCtx.signedIn(ME_USER);
+        await new Promise((r) => setTimeout(r, 60));
+        return ok;
+      };
+      const checkRotSessionLost = async (holdPost) => {
+        await goTo('#/agents');
+        clearToasts();
+        createAgentCalls = 0;
+        issueCredentialCalls = 0;
+        let release = null;
+        const started = new Promise((resolve) => {
+          if (holdPost) onIssuePostStarted = resolve;
+          else onCertGetStarted = resolve;
+        });
+        if (holdPost) delayIssuePost = new Promise((resolve) => { release = resolve; });
+        else delayCertGet = new Promise((resolve) => { release = resolve; });
+        const fRotLost = rotationForm();
+        const subRotLost = fRotLost.dispatch('submit');
+        await new Promise((r) => setTimeout(r, 30));
+        const rotLostConfirm = openDialogs().at(-1);
+        await rotLostConfirm.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Issue new secret')[0].dispatch('click');
+        await started;
+        appCtx.sessionLost();
+        delayIssuePost = null;
+        delayCertGet = null;
+        if (release) release();
+        await subRotLost;
+        await new Promise((r) => setTimeout(r, 40));
+        const toasts = body.all((e) => e.className === 'toast' || e.className === 'toast crit');
+        const crit = toasts.filter((e) => e.className === 'toast crit').map((e) => e.textContent);
+        const plain = toasts.filter((e) => e.className === 'toast').map((e) => e.textContent);
+        const ok = issueCredentialCalls === 1
+          && createAgentCalls === 0
+          && (appRoot.querySelector('h1')?.textContent || '').trim() === 'Sign in'
+          && openDialogs().length === 0
+          && listenerCount() === appBaseListeners
+          && !body.textContent.includes(SECRET)
+          && storageSecretAbsent()
+          && plain.length === 0
+          && crit.length === 1
+          && crit[0] === EXPECTED_SIGNIN_ROTATION_NOTICE
+          && !crit[0].includes('Kestrel')
+          && !crit[0].includes(SECRET);
+        clearToasts();
+        await appCtx.signedIn(ME_USER);
+        await new Promise((r) => setTimeout(r, 60));
+        return ok;
+      };
+      out.inFlightCreatePostSessionLostNotifiesSignIn = await checkCreateSessionLost(true);
+      out.inFlightCreateCertSessionLostNotifiesSignIn = await checkCreateSessionLost(false);
+      out.inFlightRotationPostSessionLostNotifiesSignIn = await checkRotSessionLost(true);
+      out.inFlightRotationCertSessionLostNotifiesSignIn = await checkRotSessionLost(false);
+
+      // Invite route stays excluded from late write notices (both signed-in and signed-out).
+      {
+        await goTo('#/agents');
+        clearToasts();
+        createAgentCalls = 0;
+        let release = null;
+        const started = new Promise((resolve) => { onCreatePostStarted = resolve; });
+        delayCreatePost = new Promise((resolve) => { release = resolve; });
+        const fInv = addAgentForm();
+        fInv.querySelector('#a-name').value = 'Osprey';
+        const subInv = fInv.dispatch('submit');
+        await started;
+        await goTo('#/invite/tok-r8');
+        delayCreatePost = null;
+        if (release) release();
+        await subInv;
+        await new Promise((r) => setTimeout(r, 40));
+        const toasts = body.all((e) => e.className === 'toast' || e.className === 'toast crit');
+        out.inFlightInviteRouteStaysExcluded = createAgentCalls === 1
+          && openDialogs().length === 0
+          && toasts.length === 0
+          && !body.textContent.includes(SECRET)
+          && storageSecretAbsent();
+        await goTo('#/agents');
+      }
       clearToasts();
+
+      // (e8) r8 MUST (pins): direct confirmDialog unit checks for (1) already-stale owner at
+      // entry (resolves false at once without mounting or registering listeners) and (2) repeated
+      // dismissal across leave/hashchange/Escape/Cancel (resolves once and removes once).
+      {
+        const baseL = listenerCount();
+        let mounted = 0;
+        let onLeaveRegistered = false;
+        const origAppend = body.appendChild.bind(body);
+        body.appendChild = (node) => { if (node && node.tagName === 'DIALOG') mounted += 1; return origAppend(node); };
+        let staleResult;
+        try {
+          const pStale = confirmDialog({
+            title: 'Stale confirm?',
+            body: 'Already left before opening.',
+            owner: { isCurrent: () => false, onLeave: () => { onLeaveRegistered = true; return () => {}; } },
+          });
+          staleResult = await Promise.race([pStale, new Promise((r) => setTimeout(() => r('TIMED_OUT'), 50))]);
+        } finally {
+          body.appendChild = origAppend;
+        }
+        out.confirmDialogStaleOwnerResolvesFalseWithoutMounting = staleResult === false
+          && mounted === 0
+          && !onLeaveRegistered
+          && openDialogs().length === 0
+          && listenerCount() === baseL;
+        await clearAnyOpenDialogs();
+      }
+      {
+        const baseL = listenerCount();
+        let current = true;
+        let leaveCb = null;
+        let unsubCalls = 0;
+        const pRace = confirmDialog({
+          title: 'Repeated dismissal?',
+          body: 'Leave, hashchange, Escape and Cancel race.',
+          owner: {
+            isCurrent: () => current,
+            onLeave: (fn) => { leaveCb = fn; return () => { unsubCalls += 1; }; },
+          },
+        });
+        let resolveCount = 0;
+        let resolvedValue = null;
+        pRace.then((v) => { resolveCount += 1; resolvedValue = v; });
+        const dlg = openDialogs().at(-1);
+        let removeCalls = 0;
+        let closeCalls = 0;
+        const origRemove = dlg.remove.bind(dlg);
+        const origClose = dlg.close.bind(dlg);
+        dlg.remove = (...args) => { removeCalls += 1; return origRemove(...args); };
+        dlg.close = (...args) => { closeCalls += 1; return origClose(...args); };
+        const cancelBtn = dlg.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Cancel')[0];
+        current = false;
+        if (leaveCb) leaveCb();
+        window.dispatchEvent({ type: 'hashchange' });
+        await dlg.dispatch('cancel');
+        if (cancelBtn) await cancelBtn.dispatch('click');
+        if (leaveCb) leaveCb();
+        await pRace;
+        await tick();
+        out.confirmDialogRepeatedDismissalResolvesAndRemovesOnce = resolvedValue === false
+          && resolveCount === 1
+          && removeCalls === 1
+          && closeCalls === 1
+          && unsubCalls === 1
+          && openDialogs().length === 0
+          && listenerCount() === baseL;
+        await clearAnyOpenDialogs();
+      }
 
       Element.prototype.querySelector = origQForApp;
       Element.prototype.querySelectorAll = origQAForApp;

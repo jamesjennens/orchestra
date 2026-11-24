@@ -952,9 +952,19 @@ function routeOwner(ctx) {
 }
 
 // When an already-started credential write finishes after leaving My agents, never mount the
-// secret over another page and never drop it silently: tell the signed-in person how to recover.
+// secret over another page and never drop it silently: tell the person how to recover.
+// On Sign in (no active session), show an anonymous notice with no agent name or secret;
+// invite routes stay excluded.
 function notifyLeftBeforeSecret(ctx, kind, name) {
-  if (!ctx || !ctx.me || currentRouteKey().startsWith('/invite/')) return;
+  if (!ctx || (typeof ctx.isInvitePage === 'function' && ctx.isInvitePage()) || currentRouteKey().startsWith('/invite/')) return;
+  if (!ctx.me) {
+    if (kind === 'rotation') {
+      toast("A new secret was issued before your session ended. Sign in, issue another from the agent's card and revoke the unused credential.", 'crit');
+      return;
+    }
+    toast('An agent was created before your session ended. Sign in, open its card in My agents and issue a new secret.', 'crit');
+    return;
+  }
   const label = name || 'your agent';
   if (kind === 'rotation') {
     toast(`New secret issued for ${label}, but you left My agents before it was shown. Return to My agents to issue another secret and revoke the unused credential.`, 'crit');

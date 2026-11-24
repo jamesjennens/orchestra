@@ -2501,6 +2501,13 @@ console.log(JSON.stringify({
             'leaveCardRotationConfirmCancelsCleanly',
             'inFlightCardRotationAfterLeaveNotifiesWithoutSecret',
             'inFlightAddAgentAfterLeaveNotifiesWithoutSecret',
+            'inFlightCreatePostSessionLostNotifiesSignIn',
+            'inFlightCreateCertSessionLostNotifiesSignIn',
+            'inFlightRotationPostSessionLostNotifiesSignIn',
+            'inFlightRotationCertSessionLostNotifiesSignIn',
+            'inFlightInviteRouteStaysExcluded',
+            'confirmDialogStaleOwnerResolvesFalseWithoutMounting',
+            'confirmDialogRepeatedDismissalResolvesAndRemovesOnce',
             'cardNewSecretWithoutCertificateSkipsQuestion',
             'certificateCurlLinesPathSafetyPinned',
         }, set(observed))
