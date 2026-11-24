@@ -1735,7 +1735,7 @@ CONTRIBUTOR_COMMANDS = (
     ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
     ('guidance get|ack', 'the worker guidance in force, and the acknowledgement of a version'),
     ('onboard', 'what a new worker is told about this project'),
-    ('docs NAME', 'a kit document; read `docs start` and `docs worker-guide` first'),
+    ('docs [NAME] [--json]', 'a kit document (plain text by default, or JSON envelope with --json; --status is JSON); read `docs start` and `docs worker-guide` first'),
     ('feedback add|list|correct', 'Orchestra feedback - about Orchestra itself, not about the project'),
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
@@ -1859,7 +1859,7 @@ _COMMAND_HELP_USAGE = {
     'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | '
                   'checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | '
                   'checkpoint TASK --directions [--offset N] [--limit N]',
-    'docs': 'docs [NAME] | docs --status',
+    'docs': 'docs [NAME] [--json] | docs --status [--json]',
 }
 
 

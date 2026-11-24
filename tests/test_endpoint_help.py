@@ -106,6 +106,16 @@ class ContributorHelpTests(unittest.TestCase):
         self.assertEqual(client.nearest_contributor_command('workerguide'), 'docs worker-guide')
         self.assertIsNone(client.nearest_contributor_command('zzzzzzzz'))
 
+    def test_docs_help_advertises_text_default_and_json_envelope(self):
+        """kittrial-5bb.531 bug 5: docs help advertises plain text default and --json."""
+        text = client.contributor_command_help('docs')
+        self.assertIn('usage: docs [NAME] [--json] | docs --status [--json]', text)
+        self.assertIn('plain text by default', text)
+        self.assertIn('--json', text)
+        docs_entry = next(item for item in client.CONTRIBUTOR_COMMANDS if item[0].split()[0] == 'docs')
+        self.assertIn('--json', docs_entry[0])
+        self.assertIn('plain text by default', docs_entry[1])
+
 
 @unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 class EndpointRefusalTests(unittest.TestCase):

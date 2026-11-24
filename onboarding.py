@@ -298,6 +298,13 @@ def read_kit_document(kit, name):
     return read_document(kit, DOCUMENTS[name], KIT_DOCUMENT_LIMIT, kit_document=name)
 
 
+def _document_output_info(name):
+    """Default output mode and media type for a catalogued document."""
+    if name != 'project' and DOCUMENTS.get(name, '').endswith('.json'):
+        return 'json', 'application/json'
+    return 'text', 'text/markdown'
+
+
 def catalog_status(kit, project_path=None):
     """Every catalogued name as served (with its size) or refused (with its sentence).
 
@@ -323,7 +330,9 @@ def catalog_status(kit, project_path=None):
             else:
                 read_kit_document(kit, name)
                 size = (Path(kit) / DOCUMENTS[name]).stat().st_size
-            rows.append({'name': name, 'served': True, 'bytes': size})
+            mode, media_type = _document_output_info(name)
+            rows.append({'name': name, 'served': True, 'bytes': size,
+                         'default_output_mode': mode, 'media_type': media_type})
         except ValueError as error:
             rows.append({'name': name, 'served': False, 'refused': str(error)})
         except OSError as error:
@@ -412,14 +421,45 @@ def execute(kit, project_path, project, actor, action, args, endpoint=None):
     catalog = '\n'.join(['  docs --status  (every name as served, with its size, or as refused with its sentence)']
                        + ['  docs '+key for key in ['project', *DOCUMENTS]])
     if action == 'docs':
-        if not args:return 'Installed onboarding documents (use your existing client prefix):\n'+catalog+'\n'
-        if args == ['--status']:
+        if any(token in ('-h', '--help') for token in args):
+            return ('usage: docs [NAME] [--json] | docs --status [--json]\n\n'
+                    'a kit document (plain text by default, or JSON envelope with --json; --status is JSON); '
+                    'read `docs start` and `docs worker-guide` first\n\n'
+                    'options:\n'
+                    '  --json      return the document or catalog as a JSON envelope\n'
+                    '  --status    report every catalogued document with served status, size, '
+                    'default_output_mode and media_type (JSON)\n'
+                    '  -h, --help  show this help message and exit\n')
+        json_count = args.count('--json')
+        if json_count > 1:
+            raise ValueError('Unknown document; run docs for the fixed catalog')
+        json_flag = json_count == 1
+        rest = [token for token in args if token != '--json']
+        if not rest:
+            if not json_flag:
+                return 'Installed onboarding documents (use your existing client prefix):\n'+catalog+'\n'
+            import json
+            docs_rows = []
+            for key in ['project', *DOCUMENTS]:
+                mode, media_type = _document_output_info(key)
+                docs_rows.append({'name': key, 'default_output_mode': mode, 'media_type': media_type})
+            return json.dumps({'schema_version': 1, 'output_mode': 'json',
+                               'documents': docs_rows}, ensure_ascii=False, indent=2) + '\n'
+        if rest == ['--status']:
             import json
             return json.dumps({'documents': catalog_status(kit, project_path)}, ensure_ascii=False, indent=2) + '\n'
-        if len(args) != 1 or args[0] not in {'project', *DOCUMENTS}:
+        if len(rest) != 1 or rest[0] not in {'project', *DOCUMENTS}:
             raise ValueError('Unknown document; run docs for the fixed catalog')
-        if args[0] == 'project':return read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
-        return read_kit_document(kit, args[0])
+        name = rest[0]
+        text = (read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
+                if name == 'project' else read_kit_document(kit, name))
+        if not json_flag:
+            return text
+        import json
+        mode, media_type = _document_output_info(name)
+        return json.dumps({'schema_version': 1, 'name': name, 'output_mode': mode,
+                           'media_type': media_type, 'bytes': len(text.encode('utf-8')),
+                           'text': text}, ensure_ascii=False, indent=2) + '\n'
     if action != 'onboard' or args:raise ValueError('Use onboard without arguments')
     # Read both before constructing output: never return a plausible but incomplete start.
     entry = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)

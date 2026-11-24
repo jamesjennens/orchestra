@@ -331,6 +331,76 @@ class BoundTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             onboarding.read_document(self.kit, onboarding.DOCUMENTS['workflow'])
 
+    def test_docs_json_envelope_status_output_mode_and_help(self):
+        """kittrial-5bb.531 bug 5: docs keeps plain text by default, adds --json
+        envelopes, reports default_output_mode/media_type in --status, and
+        answers --help/-h cleanly."""
+        md_text = '# CLI contract\n'
+        json_text = '{"schema_version": 1}\n'
+        (self.kit / onboarding.DOCUMENTS['cli-contract']).write_text(md_text, encoding='utf-8')
+        (self.kit / onboarding.DOCUMENTS['contribution-template']).write_text(json_text, encoding='utf-8')
+
+        # Default stays plain text.
+        self.assertEqual(self.docs('cli-contract'), md_text)
+
+        # --json works in either position and reports output_mode/media_type.
+        for args in (['cli-contract', '--json'], ['--json', 'cli-contract']):
+            with self.subTest(args=args):
+                envelope = json.loads(onboarding.execute(
+                    self.kit, self.project, 'example', 'worker', 'docs', args))
+                self.assertEqual(envelope, {
+                    'schema_version': 1,
+                    'name': 'cli-contract',
+                    'output_mode': 'text',
+                    'media_type': 'text/markdown',
+                    'bytes': len(md_text.encode('utf-8')),
+                    'text': md_text,
+                })
+
+        tpl_env = json.loads(onboarding.execute(
+            self.kit, self.project, 'example', 'worker', 'docs', ['contribution-template', '--json']))
+        self.assertEqual(tpl_env['output_mode'], 'json')
+        self.assertEqual(tpl_env['media_type'], 'application/json')
+        self.assertEqual(tpl_env['text'], json_text)
+
+        proj_env = json.loads(onboarding.execute(
+            self.kit, self.project, 'example', 'worker', 'docs', ['project', '--json']))
+        self.assertEqual(proj_env['name'], 'project')
+        self.assertEqual(proj_env['output_mode'], 'text')
+        self.assertEqual(proj_env['media_type'], 'text/markdown')
+
+        catalog = json.loads(onboarding.execute(
+            self.kit, self.project, 'example', 'worker', 'docs', ['--json']))
+        self.assertEqual(catalog['schema_version'], 1)
+        self.assertEqual(catalog['output_mode'], 'json')
+        by_name = {row['name']: row for row in catalog['documents']}
+        self.assertEqual(by_name['cli-contract'], {
+            'name': 'cli-contract', 'default_output_mode': 'text', 'media_type': 'text/markdown'})
+        self.assertEqual(by_name['contribution-template'], {
+            'name': 'contribution-template', 'default_output_mode': 'json', 'media_type': 'application/json'})
+
+        for status_args in (['--status'], ['--status', '--json'], ['--json', '--status']):
+            with self.subTest(status_args=status_args):
+                status = json.loads(onboarding.execute(
+                    self.kit, self.project, 'example', 'worker', 'docs', status_args))
+                status_by_name = {row['name']: row for row in status['documents']}
+                self.assertEqual(status_by_name['cli-contract']['default_output_mode'], 'text')
+                self.assertEqual(status_by_name['cli-contract']['media_type'], 'text/markdown')
+                self.assertEqual(status_by_name['contribution-template']['default_output_mode'], 'json')
+                self.assertEqual(status_by_name['contribution-template']['media_type'], 'application/json')
+
+        for help_args in (['--help'], ['-h'], ['cli-contract', '--help']):
+            with self.subTest(help_args=help_args):
+                helped = onboarding.execute(
+                    self.kit, self.project, 'example', 'worker', 'docs', help_args)
+                self.assertIn('usage: docs [NAME] [--json] | docs --status [--json]', helped)
+                self.assertIn('plain text by default', helped)
+                self.assertIn('--json', helped)
+
+        for bad_args in (['cli-contract', '--json', '--json'], ['--bogus'], ['cli-contract', 'start']):
+            with self.subTest(bad_args=bad_args), self.assertRaises(ValueError):
+                onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', bad_args)
+
 
 @unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 class EndpointTests(unittest.TestCase):
@@ -363,6 +433,16 @@ class EndpointTests(unittest.TestCase):
     def test_the_project_text_and_the_catalogue_are_answered(self):
         self.assertEqual(self.ask('project')['stdout'], 'Start with the README.\n')
         self.assertIn('  docs cli-contract', self.ask()['stdout'])
+        answer = self.ask('cli-contract', '--json')
+        self.assertEqual((answer['returncode'], answer['stderr']), (0, ''), answer['stderr'])
+        envelope = json.loads(answer['stdout'])
+        self.assertEqual(envelope['name'], 'cli-contract')
+        self.assertEqual(envelope['output_mode'], 'text')
+        self.assertEqual(envelope['media_type'], 'text/markdown')
+        self.assertEqual(envelope['text'], (KIT / onboarding.DOCUMENTS['cli-contract']).read_text(encoding='utf-8-sig'))
+        helped = self.ask('--help')
+        self.assertEqual((helped['returncode'], helped['stderr']), (0, ''), helped['stderr'])
+        self.assertIn('usage: docs [NAME] [--json] | docs --status [--json]', helped['stdout'])
 
 
 if __name__ == '__main__':

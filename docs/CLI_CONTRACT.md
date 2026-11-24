@@ -52,7 +52,9 @@ Every request is one JSON object on stdin; every response is one JSON object on 
 ```
 
 - `stdout` is the command result. For structured commands it is JSON text (often
-  pretty-printed); for document/help commands it is text.
+  pretty-printed); for document/help commands (`docs`, `docs NAME`, `onboard`) it is
+  plain text by default (`docs --json` and `docs NAME --json` return a JSON envelope;
+  `docs --status` is always JSON).
 - `stderr` carries native warnings, progress notes and errors. It is **never** mixed
   into `stdout`.
 - The client writes `stdout` to its own stdout and `stderr` to its own stderr, and
@@ -2098,11 +2100,18 @@ write the record: the `Kind: decision-attest-v1` prefix is reserved and is honou
 
 ## `docs` and `onboard`: the installed documents
 
-`docs` lists the catalogued documents and serves one whole; `docs --status` reports every
-catalogued document as served with its size or refused with its sentence; whoever may call
-`docs` may call it, and the web route does not offer it. `onboard` serves the start document
-and the project entry point together. A document that cannot be read is refused without
-printing a host path, and the sentence names the document.
+`docs` lists the catalogued documents and serves one whole as plain text by default
+(Markdown for `.md` documents and `project`; JSON text for `.json` templates). Passing
+`--json` in any position returns a structured JSON envelope:
+- `docs NAME --json` returns `{"schema_version": 1, "name": NAME, "output_mode": "text"|"json", "media_type": "text/markdown"|"application/json", "bytes": N, "text": "..."}`.
+- `docs --json` returns `{"schema_version": 1, "output_mode": "json", "documents": [{"name": ..., "default_output_mode": ..., "media_type": ...}, ...]}`.
+- `docs --status` (also accepting `--json`) reports every catalogued document as served
+  with its size, `default_output_mode` and `media_type`, or refused with its sentence;
+  whoever may call `docs` may call it, and the web route does not offer it.
+- `docs --help` (and `-h`) prints the usage and output-mode summary.
+`onboard` serves the start document and the project entry point together as plain text.
+A document that cannot be read is refused without printing a host path, and the sentence
+names the document.
 
 ## A revision with review items still open (kittrial-5bb.431)
 
