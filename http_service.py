@@ -12560,7 +12560,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
         refuse_unknown_fields(payload, ('text',), 'A task comment')
         text = payload.get('text')
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str):
+            raise invalid('text must be a string')
+        if not text.strip():
             raise invalid('A task comment must be nonempty text of at most 65536 UTF-8 bytes')
         try:
             text_bytes = len(text.encode('utf-8'))

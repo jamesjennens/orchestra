@@ -74,6 +74,23 @@ class CommentTests(AgentHarness):
         self.assertEqual(201,retry.status,retry.data)
         self.assertEqual(1,len(self.backend.state['tasks'][tid]['comments']))
 
+    def test_non_string_text_refused_with_type_message(self):
+        """kittrial-5bb.531 bug 3: non-string or missing text reports a type error,
+        while empty, blank, or oversize strings keep the length/nonempty message."""
+        token, pid, tid = self.fixture()
+        for body in ({'text': {'body': 'hi'}}, {'text': 42}, {'text': ['a']},
+                     {'text': True}, {'text': None}, {}):
+            res = self.post(token, pid, tid, body)
+            self.assertEqual(422, res.status, (body, res.data))
+            self.assertEqual('text must be a string', res.data['error']['message'], (body, res.data))
+        for text in ('', '   ', 'é' * 32769):
+            res = self.post(token, pid, tid, {'text': text})
+            self.assertEqual(422, res.status, (text, res.data))
+            self.assertEqual(
+                'A task comment must be nonempty text of at most 65536 UTF-8 bytes',
+                res.data['error']['message'], (text, res.data))
+        self.assertFalse(self.backend.state['tasks'][tid].get('comments'))
+
     def test_membership_revoked_replay_refuses_and_foreign_never_writes(self):
         token,pid,tid=self.fixture()
         uid=self.create_account(token,'contributor','password-contributor-1')
