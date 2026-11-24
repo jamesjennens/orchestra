@@ -444,10 +444,12 @@ def _classify_checkpoint(payload, paired_ls):
     - ``'idle'``: idle checkpoint (preserves any prior open wait episode, Change 3)
     - ``'clear'``: Case C3 — no paired lane-state, no wait open_items, no role in next_action (ends episode)
     """
-    from lane_state import FAULT_STATE, WAITING_STATES
+    from lane_state import FAULT_STATE, WAITING_ON_STATES
     if paired_ls is not None:
         st = paired_ls.get('state')
-        if st in WAITING_STATES:
+        # kittrial-5bb.588 r5: waiting-on-own-job waits on nobody else, so it is no episode here: like
+        # 'working' it ends an open checkpoint wait, and lanes.held_task dates it by lane_state's own-job rule.
+        if st in WAITING_ON_STATES:
             return 'wait', {
                 'source': 'lane-state-v1',
                 'inferred': False,
@@ -979,7 +981,7 @@ def _task_episodes_and_waits(row, project, now, resolver, review=None, ledger=No
     # Fallback when no holder task-checkpoint-v1 chain exists yet, but the holder wrote a valid
     # lane-state-v1 paired with a holder-authored comment on this task (lane_state.newest parity).
     if not has_holder_chain and paired_ls_map:
-        from lane_state import WAITING_STATES
+        from lane_state import WAITING_ON_STATES
         from briefing import qualifying_other_comments, snapshot as briefing_snapshot
         usable = []
         for cid, (rec_comment, ls_payload) in paired_ls_map.items():
@@ -992,7 +994,7 @@ def _task_episodes_and_waits(row, project, now, resolver, review=None, ledger=No
         if usable:
             usable.sort(key=lambda item: (item[0], item[1]))
             _stamp, cid, anchor, ls_payload = usable[-1]
-            if ls_payload.get('state') in WAITING_STATES:
+            if ls_payload.get('state') in WAITING_ON_STATES:   # not own-job (kittrial-5bb.588 r5)
                 ci_time = _parse_moment(anchor.get('created_at'))
                 eff_eb, eb_flags = _compute_expect_by(ci_time, ls_payload.get('expect_by'))
                 eid = _episode_id(project, task, 'checkpoint', cid)

@@ -172,6 +172,7 @@ def lane_rows(page):
             continue
         held = [{'task': entry.get('task'), 'title': entry.get('title'), 'state': entry.get('state'),
                  'waiting_on': entry.get('waiting_on'), 'expect_by': entry.get('expect_by'),
+                 **({'job': str(entry['job'])[:120]} if entry.get('state') == 'waiting-on-own-job' and entry.get('job') else {}),
                  'flags': list(entry.get('flags') or [])}
                 for entry in (lane.get('held') or [])[:LANE_ROWS_MAX] if isinstance(entry, dict)]
         rows.append({'lane': lane.get('lane'), 'actor': lane.get('actor'), 'idle': bool(lane.get('idle')),

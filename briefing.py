@@ -1017,6 +1017,22 @@ def same_activity_actor(author, owner):
     """
     return actor_holds(author, owner) or actor_holds(owner, author)
 
+_NUMERIC_COMMENT=re.compile(r'(.*-c)([0-9]{1,18})\Z')
+
+def entry_order_key(entry):
+    """The order of two entries when "newest" is asked (kittrial-5bb.588 T2).
+
+    By time first. Within one second, by the tracker's own sequence: a numeric comment id
+    (``TASK-c9``, ``TASK-c10``) compares as a number, so the tenth comment of a second is
+    newer than the ninth. Any other id (the endpoint's time-ordered ids, events) compares
+    as text, exactly as before. The snapshot's own sort is NOT changed: it feeds the
+    activity cursor, and changing it would make every saved cursor stale.
+    """
+    entry_id=str(entry['entry_id'])
+    found=_NUMERIC_COMMENT.match(entry_id)
+    return (parse_moment(entry['timestamp']),found.group(1) if found else entry_id,
+            int(found.group(2)) if found else -1,entry_id)
+
 def wait_activity_marker(data,row):
     """The stable marker a worker's wait fingerprints (kittrial-5bb.369).
 
@@ -1034,7 +1050,7 @@ def wait_activity_marker(data,row):
     owner=row.get('assignee')
     entries=[entry for entry in data.get('entries') or []
              if isinstance(entry,dict) and not same_activity_actor(entry.get('author'),owner)]
-    newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
+    newest=max(entries,key=entry_order_key) if entries else None
     return activity_marker(newest,fields_digest(row))
 
 def comment_author_allowed(author, operators=None, owners=None, authority=None, project=None):
@@ -1162,6 +1178,140 @@ def assignee_comment_pending(row, state=None, response=None, full=None, authorit
     except (ValueError, TypeError, KeyError, StopIteration):
         return False
 
+
+def own_baseline(state,row):
+    """The checkpoint state measured from the LANE'S OWN newest checkpoint (kittrial-5bb.588 T1).
+
+    The newer-activity fields answer "what is new since YOUR checkpoint". The chain's newest
+    record need not be the lane's: a coordinator or a reviewer may record a checkpoint on a
+    task they do not hold. Measured from that one, a comment the coordinator wrote after the
+    lane's own checkpoint read as already incorporated, and the lane woke to "nothing new".
+    So the baseline is the newest checkpoint written by the assignee (parent and sub-label
+    are the same actor, :func:`same_activity_actor`); a later checkpoint by anyone else is
+    itself new activity. With no assignee, or no checkpoint of the assignee's own, the
+    state is returned unchanged (the newest by anyone, as before). The returned view keeps
+    the chain up to that record only, so its retained provenance is that record's.
+    """
+    owner=row.get('assignee')
+    history=state.get('history') or []
+    if not owner or state.get('current') is None or not history:return state
+    comments={str(c.get('id')):c for c in row.get('comments') or [] if isinstance(c,dict)}
+    mine=[index for index,(cid,_payload) in enumerate(history)
+          if same_activity_actor((comments.get(str(cid)) or {}).get('author'),owner)]
+    if not mine or mine[-1]==len(history)-1 or str(history[mine[-1]][0]) not in comments:return state
+    index=mine[-1];cid,payload=history[index];kept=history[:index+1]
+    ids={str(chain_id) for chain_id,_ in kept}
+    provenance={key:value for key,value in (state.get('provenance') or {}).items() if str(key) in ids}
+    return dict(state,current=(payload,comments[str(cid)]),history=kept,provenance=provenance)
+
+def later_checkpoints_by_others(row,checkpoint_comment):
+    """Checkpoint comments by actors other than the assignee, after ``checkpoint_comment``."""
+    comments=row.get('comments') or []
+    position=next(index for index,comment in enumerate(comments)
+                  if str(comment.get('id'))==str(checkpoint_comment.get('id')))
+    return [comment for comment in comments[position+1:]
+            if str(comment.get('text') or '').startswith(PREFIX)
+            and not same_activity_actor(comment.get('author'),row.get('assignee'))]
+
+#: The one sentence a wake prints when the lane has no checkpoint on the task.
+WAKE_NO_CHECKPOINT='You have no checkpoint on this task yet.'
+
+def wake_summary(row,checkpoint_comment,fields,data=None):
+    """One sentence saying what is new, built in ONE place (kittrial-5bb.588 T4).
+
+    Every reader (the agent, the Bridge, ``tools/wake``) prints this instead of composing
+    its own "no new activity" from the fields. It is made from the same fields the row
+    carries, so it cannot disagree with them: the count by others since the lane's own
+    checkpoint, the newest other-party entry (author and time) when it is newer than that
+    checkpoint, and any later checkpoint by someone else. Authors are actor ids, cut at 96.
+    It is a reader's field and is never fingerprinted (waiting.normalize_item).
+    """
+    if checkpoint_comment is None:return WAKE_NO_CHECKPOINT
+    owner=row.get('assignee')
+    entries=[entry for entry in (data or {}).get('entries') or []
+             if isinstance(entry,dict) and not same_activity_actor(entry.get('author'),owner)]
+    newest=max(entries,key=entry_order_key) if entries else None
+    try:
+        after=newest is not None and checkpoint_comment.get('created_at') and \
+            parse_moment(newest['timestamp'])>=parse_moment(checkpoint_comment['created_at'])
+    except (ValueError,TypeError,KeyError):
+        after=False
+    try:
+        later=later_checkpoints_by_others(row,checkpoint_comment)
+    except StopIteration:
+        later=[]
+    last=later[-1] if later else None
+    return wake_summary_text(checkpoint_comment.get('created_at'),fields.get('newer_activity_by_others'),
+                             (newest.get('author'),newest.get('timestamp')) if after else None,
+                             (last.get('author'),last.get('created_at')) if last else None,
+                             fields.get('newer_activity_coverage'),
+                             task_changed_unexplained(fields))
+
+#: kittrial-5bb.588 r2 (S1): said when the checkpoint's cursor is stale and no entry explains it.
+WAKE_TASK_CHANGED='the task itself changed after it (a field, its status, assignee, labels or dependencies)'
+
+def task_changed_unexplained(fields):
+    """True when the checkpoint is stale and no entry, by others or the lane, explains it (r2, S1).
+
+    The cursor hashes the task's own state (title, description, acceptance, design, notes, status,
+    assignee, labels, dependencies) with the entries, so a stale cursor with no new entry means that
+    state changed. The checkpoint records no per-field digest (its key set is closed), so WHICH
+    field cannot be told; the sentence says the task changed rather than "nothing new".
+    """
+    return (fields.get('newer_activity_coverage') not in (None,'current')
+            and not fields.get('newer_activity_by_others') and not fields.get('newer_activity_own'))
+
+def wake_summary_text(checkpoint_at,others,newest=None,later_checkpoint=None,coverage=None,task_changed=False):
+    """The sentence itself, from plain values, so every backend builds it the same way.
+
+    ``newest`` and ``later_checkpoint`` are ``(author, time)`` or None. Authors are actor
+    ids; each is cut at 96 characters. ``task_changed`` (:func:`task_changed_unexplained`)
+    adds that the task itself changed: an edit of the title, description or acceptance moves
+    the wait fingerprint, so the sentence must not say only "nothing new".
+    """
+    at=checkpoint_at or 'an unknown time'
+    if not others:
+        return 'Nothing new by others since your checkpoint at %s%s.'%(at,'; '+WAKE_TASK_CHANGED if task_changed else '')
+    parts=['%d new %s by others since your checkpoint at %s'%(others,'entry' if others==1 else 'entries',at)]
+    if newest:
+        parts.append('newest by %s at %s'%(str(newest[0] or 'an unknown actor')[:96],newest[1] or 'an unknown time'))
+    if later_checkpoint:
+        parts.append('%s recorded a checkpoint at %s'%(str(later_checkpoint[0] or 'an unknown actor')[:96],
+                                                       later_checkpoint[1] or 'an unknown time'))
+    if coverage in ('timestamp','unknown'):
+        parts.append('coverage is %s, so the count may be incomplete'%coverage.upper())
+    return '; '.join(parts)+'.'
+
+def wrote_since(row,checkpoint_comment,who,in_role=None):
+    """Whether ``who`` wrote on THIS task after ``checkpoint_comment`` (kittrial-5bb.588).
+
+    ``who`` is an actor id or a role (lane_state.ROLES). An actor id matches its parent and
+    sub-labels (:func:`same_activity_actor`); a role is answered by ``in_role(author, role)``,
+    which the caller supplies from live authority (a role without one is refused). The
+    lane's own comments (the assignee's, parent or sub-label) never count, and neither does
+    the lane-state record written with that checkpoint. Order is the task's native comment
+    order after the checkpoint. A checkpoint comment that is not on this row is refused: a
+    comment on another task can never count. .585 (a checkpoint-to-coordinator answered)
+    and .598 (overdue waits) build on this.
+    """
+    from lane_state import ROLES
+    if who in ROLES and in_role is None:
+        raise ValueError('wrote_since: a role (%s) needs in_role to resolve its holders'%who)
+    comments=row.get('comments') or []
+    position=next((index for index,comment in enumerate(comments)
+                   if str(comment.get('id'))==str(checkpoint_comment.get('id'))),None)
+    if position is None:
+        raise ValueError('wrote_since: the checkpoint comment is not on task %s'%row.get('id'))
+    owner=row.get('assignee');checkpoint_id=str(checkpoint_comment.get('id'))
+    for comment in comments[position+1:]:
+        author=comment.get('author')
+        if not author or same_activity_actor(author,owner):continue
+        if lane_state_record(comment,checkpoint_id,checkpoint_comment.get('author')):continue
+        if who in ROLES:
+            if in_role(author,who):return True
+        elif same_activity_actor(author,who):
+            return True
+    return False
 
 def newer_comment_by_other(row,checkpoint_comment):
     """The released ``newer_activity`` boolean, in ONE place (kittrial-5bb.354).
@@ -1520,7 +1670,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     # can be missed.
     marker=None
     if coverage!='unknown' and (others or marker_fields is not None):
-        newest=max(others,key=lambda e:(parse_moment(e['timestamp']),e['entry_id'])) if others else None
+        newest=max(others,key=entry_order_key) if others else None
         marker=(activity_marker(newest,marker_fields) if marker_fields is not None
                 else newest['entry_id']+':'+content_hash(newest)[:MARKER_DIGEST])
     refs=[{'entry_id':e['entry_id'],'kind':e['kind'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
@@ -1694,22 +1844,26 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             ids=', '.join(i['entry_id'] for i in dir_out['items'][:NEWER_MAX])
             ids+=(f' (+{dir_out["omitted"]} more)' if dir_out['omitted'] else '')
             next_action='OUTSTANDING DIRECTIONS ('+str(dir_out['total'])+'): '+ids+' — resolve or supersede with evidence. '+next_action
+    # kittrial-5bb.588 T1: newer activity is measured from the lane's OWN newest checkpoint;
+    # the brief's position (open items, next action) stays the chain's newest record.
+    bstate=own_baseline(state,issue) if p is not None else state
+    bp,bc=bstate['current'] if p is not None else (None,None)
     if p is not None:
-        excluded=excluding_checkpoint(data,c['id'],c.get('author'))
+        excluded=excluding_checkpoint(data,bc['id'],bc.get('author'))
         excluded_cursor=activity_cursor(excluded)
-        stale=not cursor_matches(p['activity_cursor'],excluded,compatible=excluded_cursor)
+        stale=not cursor_matches(bp['activity_cursor'],excluded,compatible=excluded_cursor)
         if stale:
             # kittrial-5bb.293 item 2: a title/description/acceptance change is newer
             # activity too. The checkpoint's cursor carries the field lengths it saw;
             # the live snapshot carries the current ones.
             try:
-                recorded=untoken(p['activity_cursor'])
+                recorded=untoken(bp['activity_cursor'])
             except ValueError:
                 recorded=None
             recorded_fields=(recorded or {}).get('fields') if isinstance(recorded,dict) else None
             current_sizes={k:len(str(issue.get(k) or '')) for k in ('title','description','acceptance_criteria')}
             changes=field_changes_since(recorded_fields, current_sizes)
-            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes,marker_fields=fields_digest(issue))
+            newer=newer_activity_summary(excluded,retained_provenance(bstate),bc.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes,marker_fields=fields_digest(issue))
             if not recorded_fields and not changes and not newer.get('entries'):
                 # An older cursor carries no lengths and no entry explains the stale
                 # flag: the change is in the task fields (state_sha256). Report that
@@ -1735,8 +1889,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     activity=None
     if p is not None:
         try:
-            activity=activity_fields(issue,c,retained_provenance(state),fields_digest(issue),newer if stale else None,
+            activity=activity_fields(issue,bc,retained_provenance(bstate),fields_digest(issue),newer if stale else None,
                                      dir_out['total'],data=data)
+            activity['wake_summary']=wake_summary(issue,bc,activity,data)
         except StopIteration:
             activity=None
     # Which of title, description and acceptance changed: only the tracker's version
@@ -1758,10 +1913,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             if history_text is False:
                 changed_fields,fields_note=[],field_versions.TOO_LARGE_NOTE
             else:
-                changed_fields,fields_note=field_versions.changes(history_text,issue,c.get('created_at'))
+                changed_fields,fields_note=field_versions.changes(history_text,issue,bc.get('created_at'))
     section=changes_since_checkpoint(
-        excluded if p is not None else data, retained_provenance(state) if p is not None else None,
-        {'comment_id':c['id'],'author':c.get('author'),'timestamp':c.get('created_at')} if p is not None else None,
+        excluded if p is not None else data, retained_provenance(bstate) if p is not None else None,
+        {'comment_id':bc['id'],'author':bc.get('author'),'timestamp':bc.get('created_at')} if p is not None else None,
         context[0],fields=changed_fields,current=p is not None and not stale,fields_note=fields_note)
     # The project the checkpoint was taken in, when it is not this one (kittrial-5bb.136):
     # after restore-new under another name an unchanged task reads current, which is true
@@ -1822,8 +1977,16 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from task_assignment import notices as assignment_notices
     notice_block=assignment_notices(issue,project,actor)
     notice_records=assignment_notices(issue,project,None,limit=20)
+    from lane_state import newest as newest_lane_state
+    declared_lane=newest_lane_state(issue.get('comments'),task)
+    # kittrial-5bb.588 r2 (S2): only the record written WITH the checkpoint shown carries its local
+    # fact; a newer checkpoint without a lane-state record shows none, never an older one's.
+    fact=declared_lane[1].get('local_fact') if (declared_lane is not None and p is not None
+        and str(declared_lane[2].get('id'))==str(c['id'])
+        and isinstance(declared_lane[1].get('local_fact'),dict)) else None
     result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(owner_raw or 'unassigned',96),**({'owner_name':clip(owner_name,96),'assigned_to':clip(assigned_to,200)} if owner_name and owner_name!=owner_raw else {}),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
+                **({'local_fact':fact} if fact else {}),
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
             # kittrial-5bb.354: only with a checkpoint, so a task without one keeps the
@@ -1979,6 +2142,11 @@ PROVENANCE_OFF=('checkpoint_provenance_writes is off (the installation default).
                 'An operator enables the installation switch only after the rollback target can read these fields.')
 SERVER_DERIVED='carried and direction_owner are server-derived; omit them from the request'
 
+def utc_now():
+    """The native writer's clock (kittrial-5bb.588 r4): one place, so a test can set it."""
+    from datetime import datetime as _dt, timezone as _tz
+    return _dt.now(_tz.utc)
+
 def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False,now=None):
     # The declared wait state travels BESIDE the checkpoint in the same payload file
     # (kittrial-5bb.263; docs/LANE_BOARD_DESIGN.md section 1). `lane_state` is popped out
@@ -1992,14 +2160,18 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False,now=No
     issue=task_row(rows,task)
     problems=checkpoint_problems(p,task)
     if lane is not None:
-        from lane_state import problems as lane_state_problems
-        # The write-time clock for `not_before` (kittrial-5bb.509): only when the record
-        # carries one, and injectable so no test reads the real clock.
+        from lane_state import native_history,own_job_write_began,problems as lane_state_problems
+        # The write-time clock, for `not_before` (kittrial-5bb.509) and for the own-job
+        # `expect_by` cap (kittrial-5bb.588 r4): read for EVERY lane record, so `client.py
+        # checkpoint` (which passes no clock) is held to both. Injectable through `now`, and
+        # `utc_now` is the one place the real clock is read.
         moment_now=now
-        if moment_now is None and isinstance(lane,dict) and 'not_before' in lane:
-            from datetime import datetime as _dt, timezone as _tz
-            moment_now=_dt.now(_tz.utc)
-        problems=problems+lane_state_problems(lane,task,now=moment_now)
+        if moment_now is None and isinstance(lane,dict):
+            moment_now=utc_now()
+        began=None
+        if moment_now is not None:
+            began=own_job_write_began(native_history(issue.get('comments'),task),actor,moment_now)
+        problems=problems+lane_state_problems(lane,task,now=moment_now,began=began)
         # Only the task's holder sets a wake time (kittrial-5bb.509 review): the record is
         # the lane's own, so a coordinator asks the holder in a comment instead.
         if isinstance(lane,dict) and 'not_before' in lane and actor!=issue.get('assignee'):
@@ -2211,7 +2383,8 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
     stamp=checkpoint.get('timestamp')
     if current:coverage,entries,fresh,unverified='current',[],[],0
     else:coverage,entries,fresh,_changed,unverified=newer_selection(data,prov,stamp)
-    newest=sorted(entries,key=lambda e:(parse_moment(e['timestamp']),e['entry_id']),reverse=True)
+    # kittrial-5bb.588 r2 (N3): within a second, the tracker's own sequence (c10 after c9).
+    newest=sorted(entries,key=entry_order_key,reverse=True)
     shown=[];spent=0
     for entry in newest[:SECTION_ENTRIES_MAX]:
         body=clip(plain_text(entry.get('body')),SECTION_BODY_CHARS)
@@ -2282,7 +2455,7 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
            'wait_newer_activity_marker':None,
            'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None,
-           'lane_not_before':None}
+           'lane_not_before':None,'wake_summary':None}
     try:
         if state is None:state=checkpoint_state(row)
         elif not state['provenance']:
@@ -2299,7 +2472,10 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
         # newer-activity fields so every reader of a work row sees the same timer.
         not_before=lane_not_before(row,str(row.get('id') or ''))
         if not has_checkpoint:
-            return dict(empty,wait_newer_activity_marker=wait_marker,lane_not_before=not_before)
+            return dict(empty,wait_newer_activity_marker=wait_marker,lane_not_before=not_before,
+                        wake_summary=WAKE_NO_CHECKPOINT)
+        # kittrial-5bb.588 T1: "newer" is measured from the lane's OWN newest checkpoint.
+        state=own_baseline(state,row)
         p,c=state['current']
         data=excluding_checkpoint(full,c['id'],c.get('author'))
         dispositions=chain_dispositions(state['history'])
@@ -2317,6 +2493,7 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
                                data=full)
         fields['wait_newer_activity_marker']=wait_marker
         fields['lane_not_before']=not_before
+        fields['wake_summary']=wake_summary(row,c,fields,full)
         return fields
     except (ValueError,TypeError,KeyError,StopIteration):return empty
 
@@ -2666,6 +2843,9 @@ def format_changes(section,activity):
             activity.get('newer_activity'),activity.get('newer_activity_marker'),activity.get('newer_activity_fields'),
             activity.get('newer_activity_by_others'),
             activity.get('newer_activity_own'),activity.get('newer_activity_coverage'),activity.get('unresolved_directions')))
+        if activity.get('wake_summary'):
+            # kittrial-5bb.588 T4: print the service's sentence; never compose "no new activity".
+            lines.append('What is new: %s'%activity['wake_summary'])
     if not section['total'] and not section['fields']:
         return lines+['Changes since your checkpoint: none (coverage %s).'%section['coverage']
                       +(' '+section['fields_note'] if section.get('fields_note') else '')]
@@ -2839,10 +3019,14 @@ def help_limits(action):
             'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
             'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
             'lane_state.waiting_on':'<= 96 characters (a role or an actor id)',
-            'lane_state.expect_by':'ISO-8601 with an offset; a past value is accepted and flagged',
+            'lane_state.expect_by':'ISO-8601 with an offset; a past value is accepted and flagged; with waiting-on-own-job '
+                                  'at most 24 hours after the wait began',
             'lane_state.not_before':'ISO-8601 with seconds and an offset, strictly future, <= 14 days ahead '
                                     '(the holder only; a later record without it clears it)',
             'lane_state.reason':'<= 300 characters (needs-investigation only)',
+            'lane_state.job':'<= 120 characters, one line (waiting-on-own-job only, required there)',
+            'lane_state.local_fact.what':'<= 160 characters, one line',
+            'lane_state.local_fact.detail':'<= 300 characters (optional)',
             'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)})
     return limits
 
@@ -2918,9 +3102,19 @@ def help_notes(action):
             'id, reason, evidence).',
             'An optional sibling key lane_state (kittrial-5bb.263) writes one Kind: lane-state-v1 record beside '
             'this checkpoint in the same act. Its fields are schema_version (1), task, state (one of working, '
-            'waiting-on-coordinator, waiting-on-review, waiting-on-user, idle, needs-investigation), waiting_on (a role coordinator/'
-            'reviewer/user or an actor id; required with a waiting state and refused without one) and expect_by '
-            '(optional ISO-8601 with an offset; a past value is accepted). Do not send checkpoint: the writer '
+            'waiting-on-coordinator, waiting-on-review, waiting-on-user, waiting-on-own-job, idle, needs-investigation), '
+            'waiting_on (a role coordinator/reviewer/user or an actor id; required with waiting-on-coordinator, '
+            'waiting-on-review and waiting-on-user and refused with every other state) and expect_by '
+            '(optional ISO-8601 with an offset; a past value is accepted). State waiting-on-own-job '
+            '(kittrial-5bb.588) is for waiting on YOUR OWN job (a test run, a replay, a build): it requires job '
+            '(one line, <= 120 characters, shown escaped), refuses waiting_on, allows expect_by (at most 24 hours after the wait began: a repost does not restart '
+            'it, and another state ends the wait) and not_before, '
+            'is not a question for the coordinator, and with no expect_by counts as overdue 4 hours after the '
+            'state began; every other state refuses job. Any state may also carry local_fact (kittrial-5bb.588; '
+            '{kind, what, at, detail}: kind one of job-finished, job-failed, job-partial, time-reached, file-seen; '
+            'what one line <= 160 characters; at ISO-8601 with seconds and an offset; detail optional <= 300 '
+            'characters; no other keys), your own statement of what you saw locally: it rides in this lane_state '
+            'record, never in the checkpoint, and changes no review or lifecycle fact. Do not send checkpoint: the writer '
             'sets it to the comment id this checkpoint just published, which is what makes the record name the '
             'task\'s newest checkpoint at write time. It is NOT a checkpoint field: the checkpoint object '
             'above is unchanged and its field set stays closed, and lane_state is popped out before the checkpoint '

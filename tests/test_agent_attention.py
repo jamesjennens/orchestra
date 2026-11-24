@@ -658,6 +658,8 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # The holder's declared wake time (kittrial-5bb.509) is carried by the same
             # row family; this older page omits it, so it honestly reads None.
             'lane_not_before': None,
+            # The one wake sentence (kittrial-5bb.588 T4): this older page omits it, so None.
+            'wake_summary': None,
             'newer_activity_by_others': None,
             'newer_activity_own': None, 'newer_activity_coverage': None,
             'unresolved_directions': None})
@@ -748,7 +750,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
                                        'open_items', 'pending_change_requests', 'pending_review_items',
                                        'redelivered',
                                        'review_state', 'status', 'title', 'unresolved_directions',
-                                       'wait_newer_activity_marker'])
+                                       'wait_newer_activity_marker', 'wake_summary'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):

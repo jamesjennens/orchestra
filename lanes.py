@@ -22,6 +22,8 @@ act; ``next_actor`` is that same decision's caller-neutral role.
 import argparse
 from datetime import datetime, timezone
 
+from lane_state import OWN_JOB_DEFAULT_EXPECT, OWN_JOB_EXPECT_MAX_AHEAD, OWN_JOB_STATE, WAITING_ON_STATES
+
 DEFAULT_IDLE_MINUTES = 15
 IDLE_MINUTES_MIN, IDLE_MINUTES_MAX = 1, 10080          # one minute .. seven days
 LANES_LIMIT_MIN, LANES_LIMIT_MAX = 1, 100
@@ -273,6 +275,20 @@ def inferred_wait(checkpoint_payload):
     return None
 
 
+def local_fact(payload):
+    """The newest lane-state record's ``local_fact`` (kittrial-5bb.588) as the board shows it: the worker's own
+    statement of what it saw locally, clipped to its limits. A fact is NOT a state: it moves no flag or move."""
+    from lane_state import LOCAL_FACT_DETAIL_LIMIT, LOCAL_FACT_WHAT_LIMIT
+    fact = payload.get('local_fact') if isinstance(payload, dict) else None
+    if not isinstance(fact, dict):
+        return None
+    shown = {'kind': str(fact.get('kind'))[:24], 'what': str(fact.get('what'))[:LOCAL_FACT_WHAT_LIMIT],
+             'at': str(fact.get('at'))[:40]}
+    if isinstance(fact.get('detail'), str):
+        shown['detail'] = fact['detail'][:LOCAL_FACT_DETAIL_LIMIT]
+    return shown
+
+
 def holder_last_write(row, actor):
     """The timestamp text of the holder's newest comment on the task, or the task's own write time."""
     stamps = [comment.get('created_at') for comment in row.get('comments') or []
@@ -352,7 +368,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     found = declared_state(row, task)
     checkpoint = newest_checkpoint(row)
     declared = found is not None
-    wait_state = waiting_on = expect_by = None
+    wait_state = waiting_on = expect_by = job = None
     not_before = not_before_due = None
     checkpoint_id = None
     since = None
@@ -363,6 +379,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         wait_state = payload.get('state')
         waiting_on = payload.get('waiting_on')
         expect_by = payload.get('expect_by')
+        job = payload.get('job') if wait_state == OWN_JOB_STATE else None
         # A wake time is the HOLDER's own (kittrial-5bb.509): the writer refuses anybody
         # else's, and the reader takes it only from the lane's own record, so a record by
         # anybody else declares a state but never a timer for this lane. A value that does
@@ -389,9 +406,16 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     )
     active_wait = open_waits[0] if open_waits else None
     inferred_flag = False
+    # kittrial-5bb.588 r5: a declared waiting-on-own-job record is the lane's OWN move, so waits.py opens no
+    # episode for it (it ends a checkpoint wait as 'working' does). Its times come from lane_state alone: the
+    # start of the own-job run, the 4 h default and the 24 h cap the writer also enforces. A wait waits.py
+    # still reports for the task (a delivery, an approval, a named review request) is another party's move and
+    # governs the row, exactly as it does for a declared 'working' record.
+    own_job = declared and wait_state == OWN_JOB_STATE and active_wait is None
     if active_wait is not None:
         wait_state = active_wait.get('state') or wait_state
         waiting_on = active_wait.get('waiting_on')
+        job = None
         inferred_flag = bool(active_wait.get('inferred'))
         declared = not inferred_flag
         if active_wait.get('origin_checkpoint'):
@@ -403,21 +427,54 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         # was defaulted (no declared expect_by), keep expect_by=None on the lanes board so
         # idle_minutes stays the sole threshold and wait --coordinator sees no extra wakes.
         expect_by = None if active_wait.get('expect_by_defaulted') else active_wait.get('expect_by')
-    elif wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user'):
+    elif own_job:
+        # kittrial-5bb.588 r2 (S4): an own-job wait is dated from the start of its episode, so
+        # re-posting it slides neither the 4 h default nor the declared wait's "since".
+        from lane_state import own_job_episode_start
+        began_with = own_job_episode_start(row.get('comments') or [], task)
+        if began_with is not None:
+            since = began_with.get('created_at')
+    elif wait_state in WAITING_ON_STATES:
         # Wait was answered by a qualifying verdict or dropped by a newer holder checkpoint:
         # clear stale waiting flags (kittrial-5bb.598 §1.1 gaps 1-2).
         wait_state = waiting_on = expect_by = None
         declared = False
     age = seconds_since(since, now)
-    expect_moment = moment(expect_by) if isinstance(expect_by, str) else None
+    expect_effective = expect_by
+    if own_job and not expect_by:
+        # kittrial-5bb.588: a wait on the lane's OWN job with no expect_by is overdue this long
+        # after the state began, so the existing expect_by_passed / lane-quiet path fires; nothing new.
+        began = moment(since) if isinstance(since, str) else None
+        if began is not None:
+            expect_effective = (began + OWN_JOB_DEFAULT_EXPECT).isoformat().replace('+00:00', 'Z')
+    expect_moment = moment(expect_effective) if isinstance(expect_effective, str) else None
+    if own_job and expect_by and expect_moment is not None:
+        # kittrial-5bb.588 r3 (expect-by-cap): the writer refuses an own-job expect_by more than a day ahead; one that
+        # reached a record anyway (a raw comment) ends the quiet time a day after the episode began, and the board
+        # shows the clamped value as expect_by_effective.
+        began = moment(since) if isinstance(since, str) else None
+        if began is None:
+            # r4 (should 2): with no readable start there is nothing to clamp from, so the wait is not quiet
+            # at all (not clamped against now, which would slide with every read): the lane reads idle as any
+            # undeclared wait does, and expect_by_effective is null.
+            expect_moment = None
+            expect_effective = None
+        elif expect_moment - began > OWN_JOB_EXPECT_MAX_AHEAD:
+            expect_moment = began + OWN_JOB_EXPECT_MAX_AHEAD
+            expect_effective = expect_moment.isoformat().replace('+00:00', 'Z')
     idle_seconds = holder_idle_seconds(row, actor, now)
     flags = []
-    if active_wait is not None and wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user') \
+    # The own-job wait ages by its (effective) expect_by, not by the idle threshold: a long
+    # test run is not "quiet" after fifteen minutes.
+    if active_wait is not None and wait_state in WAITING_ON_STATES \
             and age is not None and age > threshold:
         flags.append('waiting_too_long')
-    if active_wait is not None and expect_moment is not None and expect_moment <= now:
+    if (active_wait is not None or own_job) and expect_moment is not None and expect_moment <= now:
         flags.append('expect_by_passed')
-    if move == 'you' and idle_seconds is not None and idle_seconds > threshold:
+    # kittrial-5bb.588 r2 (m1): a declared own-job wait is not idle before its effective expect_by;
+    # after it, your_move_idle and expect_by_passed both fire, through the existing lane-quiet path.
+    own_job_quiet = own_job and expect_moment is not None and expect_moment >= now
+    if move == 'you' and idle_seconds is not None and idle_seconds > threshold and not own_job_quiet:
         flags.append('your_move_idle')
     return {
         'task': task,
@@ -430,6 +487,9 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         'state': wait_state,
         'waiting_on': waiting_on,
         'expect_by': expect_by,
+        'job': job,
+        'local_fact': local_fact(payload if declared else None),
+        'expect_by_effective': expect_effective if wait_state == OWN_JOB_STATE else None,
         'not_before': not_before,
         'not_before_due': not_before_due,
         'timer_due': False,

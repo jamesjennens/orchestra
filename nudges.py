@@ -14,6 +14,8 @@ Library only: it has no ``__main__`` block.
 import re
 import secrets
 
+from lane_state import WAITING_STATES
+
 SCHEMA = 'lane-nudge-v1'
 
 #: The closed message set (design section 2). Only the key is ever stored or sent; the text belongs
@@ -66,7 +68,9 @@ AUTO_GAP_SECONDS = 6 * HOUR
 AUTO_DAY_SECONDS = 24 * HOUR
 AUTO_DAY_LIMIT = 2
 
-WAIT_STATES = ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user')
+#: Every declared wait (kittrial-5bb.588: includes waiting-on-own-job). An own-job wait counts only until
+#: its (effective) expect_by passes, which the lane board flags as expect_by_passed.
+WAIT_STATES = WAITING_STATES
 LANE_LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 CONTROL = re.compile(r'[\x00-\x1f\x7f]')
 
@@ -105,6 +109,20 @@ def parse_request(payload):
             'acknowledge_declared_wait': acknowledged}
 
 
+def counts_as_wait(entry):
+    """A held entry that is a DECLARED wait now: an own-job wait stops counting once its expect_by passed.
+
+    kittrial-5bb.588 r4 (should 2): an own-job wait counts only while it has a readable effective
+    ``expect_by``. With an unreadable episode start the board has no bound (``expect_by_effective`` is
+    null), and such a wait does not count, so it never keeps a lane quiet.
+    """
+    if not entry.get('declared') or entry.get('state') not in WAIT_STATES:
+        return False
+    if entry.get('state') != 'waiting-on-own-job':
+        return True
+    return isinstance(entry.get('expect_by_effective'), str) and 'expect_by_passed' not in (entry.get('flags') or [])
+
+
 def declared_wait(row):
     """The lane's own declared wait on a lanes-board row, or ``None``.
 
@@ -114,7 +132,7 @@ def declared_wait(row):
     """
     found = []
     for entry in (row.get('held') if isinstance(row, dict) else None) or []:
-        if isinstance(entry, dict) and entry.get('declared') and entry.get('state') in WAIT_STATES:
+        if isinstance(entry, dict) and counts_as_wait(entry):
             found.append(entry)
     if not found:
         return None
@@ -126,7 +144,11 @@ def declared_wait(row):
 
 
 def waiting_sentence(snapshot):
-    return DECLARED_WAIT % (snapshot.get('waiting_on') or snapshot['state'], snapshot.get('since') or 'an unknown time')
+    # kittrial-5bb.588 r2 (N1): an own-job wait has no waiting_on; it is "its own job", not
+    # "waiting on waiting-on-own-job".
+    party = snapshot.get('waiting_on') or ('its own job' if snapshot.get('state') == 'waiting-on-own-job'
+                                           else snapshot['state'])
+    return DECLARED_WAIT % (party, snapshot.get('since') or 'an unknown time')
 
 
 def new_record(project_id, fields, requested_by, snapshot, now, iso,
@@ -390,7 +412,7 @@ def eligible_auto_nudge_entry(row, threshold_seconds, records, lane, now):
             continue
         if entry.get('whose_move') != 'you':
             continue
-        if entry.get('declared') and entry.get('state') in WAIT_STATES:
+        if counts_as_wait(entry):
             continue
         idle = entry.get('holder_last_write_seconds')
         if not isinstance(idle, int) or idle <= auto_threshold:
