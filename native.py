@@ -39,6 +39,7 @@ outside this boundary and returns native output unchanged.
 """
 import hashlib
 import json
+import os
 import re
 import subprocess
 
@@ -99,8 +100,34 @@ def argv(root, path, actor, command, scoped=True):
     return [*prefix, *command]
 
 
+def bd_env(env):
+    """Return a copy of ``env`` for a ``bd`` subprocess with ``beads.role`` set.
+
+    Beads 1.2.2 warns on stderr (GH#2950) when ``beads.role`` is unset in git
+    config. Setting ``beads.role=maintainer`` via ``GIT_CONFIG_COUNT`` narrowly
+    on ``bd`` invocations suppresses the warning without changing
+    ``admin.environment`` for other subprocesses, preserves any existing
+    ``GIT_CONFIG_*`` entries, and leaves a preconfigured ``beads.role`` alone.
+    """
+    copy = dict(env) if env is not None else dict(os.environ)
+    raw_count = copy.get('GIT_CONFIG_COUNT', '')
+    try:
+        count = int(raw_count) if raw_count != '' else 0
+    except (TypeError, ValueError):
+        count = 0
+    if count < 0:
+        count = 0
+    for idx in range(count):
+        if (copy.get('GIT_CONFIG_KEY_%d' % idx) or '').lower() == 'beads.role':
+            return copy
+    copy['GIT_CONFIG_KEY_%d' % count] = 'beads.role'
+    copy['GIT_CONFIG_VALUE_%d' % count] = 'maintainer'
+    copy['GIT_CONFIG_COUNT'] = str(count + 1)
+    return copy
+
+
 def run(command, env, timeout=TIMEOUT):
-    return subprocess.run(command, env=env, capture_output=True, text=True,
+    return subprocess.run(command, env=bd_env(env), capture_output=True, text=True,
                           encoding='utf-8', timeout=timeout)
 
 
@@ -120,7 +147,7 @@ def run_bounded(command, env, max_bytes, timeout=TIMEOUT):
     too and raises ``subprocess.TimeoutExpired``, as :func:`run` does.
     """
     import threading
-    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(command, env=bd_env(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     errors = []
 
     def drain():

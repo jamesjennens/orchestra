@@ -1262,7 +1262,7 @@ def _emit(code,stdout,stderr,out):
             with open(out,'w',encoding='utf-8',newline='') as capture:
                 capture.write(stdout)
         sys.stderr.write(stderr);return code
-    sys.stdout.write(stdout);sys.stderr.write(stderr);return code
+    sys.stdout.write(stdout);sys.stdout.flush();sys.stderr.write(stderr);return code
 
 def _wait_client_prefix(config_path,project,actor):
     """How this caller invokes the client, as the prefix of the printed ``next_command``.
@@ -1429,7 +1429,7 @@ def _capability(args,out):
             with open(out,'w',encoding='utf-8',newline='') as capture:
                 capture.write(stdout)
         sys.stderr.write(stderr);return code
-    sys.stdout.write(stdout);sys.stderr.write(stderr);return code
+    sys.stdout.write(stdout);sys.stdout.flush();sys.stderr.write(stderr);return code
 
 def _capability_lookup(args,config,project,actor,out):
     """`capability lookup` with --config/--project: the local .61 lookup plus the
@@ -2007,7 +2007,7 @@ def _files_command(args, config, project, actor):
     if a.verb == 'list':
         answer, _ = _frame_exchange(config, header)
         if answer['returncode'] != 0:return _files_refusal(answer)
-        sys.stdout.write(answer['stdout']);sys.stderr.write(answer.get('stderr') or '')
+        sys.stdout.write(answer['stdout']);sys.stdout.flush();sys.stderr.write(answer.get('stderr') or '')
         return 0
     if a.verb == 'put':
         status = os.stat(a.path)
@@ -2026,7 +2026,7 @@ def _files_command(args, config, project, actor):
             source.seek(0)
             answer, _ = _frame_exchange(config, header, body=(source, size))
         if answer['returncode'] != 0:return _files_refusal(answer)
-        sys.stdout.write(answer['stdout']);sys.stderr.write(answer.get('stderr') or '')
+        sys.stdout.write(answer['stdout']);sys.stdout.flush();sys.stderr.write(answer.get('stderr') or '')
         return 0
     return _files_get(a, config, header)
 
@@ -2218,7 +2218,7 @@ def main():
             with open(a.out,'w',encoding='utf-8',newline='') as capture:
                 capture.write(output)
         sys.stderr.write(result['stderr']);return result['returncode']
-    sys.stdout.write(output);sys.stderr.write(result['stderr']);return result['returncode']
+    sys.stdout.write(output);sys.stdout.flush();sys.stderr.write(result['stderr']);return result['returncode']
 
 if __name__=='__main__':
     # Keep redirected document/template output UTF-8 on Windows as well as POSIX.

@@ -1085,5 +1085,123 @@ class RevisionContractDocumentationTests(unittest.TestCase):
         self.assertIn('`~/x` becomes', text)
 
 
+class StreamOrderingAndBdEnvTests(unittest.TestCase):
+    """kittrial-5bb.531 bug 4: narrow beads.role env for bd only, and stdout
+    flushed before stderr across every client.py stdout+stderr emission site."""
+
+    def test_bd_env_sets_beads_role_narrowly_without_changing_admin_environment(self):
+        import admin
+        base = {'PATH': '/usr/bin'}
+        scoped = native.bd_env(base)
+        self.assertNotIn('GIT_CONFIG_COUNT', base)
+        self.assertEqual(scoped['GIT_CONFIG_COUNT'], '1')
+        self.assertEqual(scoped['GIT_CONFIG_KEY_0'], 'beads.role')
+        self.assertEqual(scoped['GIT_CONFIG_VALUE_0'], 'maintainer')
+
+        existing = {
+            'GIT_CONFIG_COUNT': '1',
+            'GIT_CONFIG_KEY_0': 'user.name',
+            'GIT_CONFIG_VALUE_0': 'alice',
+        }
+        appended = native.bd_env(existing)
+        self.assertEqual(appended['GIT_CONFIG_COUNT'], '2')
+        self.assertEqual(appended['GIT_CONFIG_KEY_0'], 'user.name')
+        self.assertEqual(appended['GIT_CONFIG_VALUE_0'], 'alice')
+        self.assertEqual(appended['GIT_CONFIG_KEY_1'], 'beads.role')
+        self.assertEqual(appended['GIT_CONFIG_VALUE_1'], 'maintainer')
+
+        preset = {
+            'GIT_CONFIG_COUNT': '1',
+            'GIT_CONFIG_KEY_0': 'beads.role',
+            'GIT_CONFIG_VALUE_0': 'contributor',
+        }
+        kept = native.bd_env(preset)
+        self.assertEqual(kept['GIT_CONFIG_COUNT'], '1')
+        self.assertEqual(kept['GIT_CONFIG_VALUE_0'], 'contributor')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'deployment.private.json').write_text(
+                json.dumps({'port': 13307, 'unit': 'u', 'password': 'pw', 'schema': 1}),
+                encoding='utf-8',
+            )
+            env = admin.environment(root)
+            self.assertNotIn('GIT_CONFIG_COUNT', env)
+            self.assertNotIn('GIT_CONFIG_KEY_0', env)
+
+    def test_client_flushes_stdout_before_stderr_under_merged_pipe(self):
+        """Under a block-buffered stdout pipe merged with line-buffered stderr (2>&1),
+        every stdout+stderr emission site in client.py must flush stdout before
+        writing stderr so JSON always precedes any warning."""
+        script = r'''
+import json, os, sys, tempfile, types
+from pathlib import Path
+from unittest import mock
+
+kit = Path(sys.argv[1])
+mode = sys.argv[2]
+sys.path.insert(0, str(kit))
+import client
+
+out_json = '{"ok": true}\n'
+warn = 'warning: beads.role not configured\n'
+
+if mode == 'emit':
+    raise SystemExit(client._emit(0, out_json, warn, None))
+elif mode == 'capability':
+    fake_mod = types.SimpleNamespace(run=lambda args: (0, out_json, warn))
+    with mock.patch.object(client, '_capabilities_module', return_value=fake_mod):
+        raise SystemExit(client._capability(['list'], None))
+elif mode == 'files-list':
+    with mock.patch.object(client, '_frame_exchange',
+                           return_value=({'returncode': 0, 'stdout': out_json, 'stderr': warn}, b'')):
+        raise SystemExit(client._files_command(['list', 'demo-1'], {'host': 'x'}, 'demo', 'alice'))
+elif mode == 'files-put':
+    with tempfile.NamedTemporaryFile('wb', delete=False) as tf:
+        tf.write(b'hello')
+        path = tf.name
+    try:
+        with mock.patch.object(client, '_frame_exchange',
+                               return_value=({'returncode': 0, 'stdout': out_json, 'stderr': warn}, b'')):
+            raise SystemExit(client._files_command(['put', 'demo-1', path, '--direction', 'to-worker'],
+                                                   {'host': 'x'}, 'demo', 'alice'))
+    finally:
+        os.unlink(path)
+elif mode == 'main':
+    with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.json', delete=False) as cfg:
+        json.dump({'host': 'example', 'user': 'u'}, cfg)
+        cfg_path = cfg.name
+    try:
+        sys.argv = ['client.py', '--config', cfg_path, '--project', 'demo',
+                    '--actor', 'alice', 'ref', 'list']
+        with mock.patch.object(client, 'request',
+                               return_value={'returncode': 0, 'stdout': out_json, 'stderr': warn}):
+            raise SystemExit(client.main())
+    finally:
+        os.unlink(cfg_path)
+else:
+    raise SystemExit(99)
+'''
+        for mode in ('emit', 'capability', 'files-list', 'files-put', 'main'):
+            with self.subTest(mode=mode):
+                import os
+                env = dict(os.environ)
+                env.pop('PYTHONUNBUFFERED', None)
+                proc = subprocess.run(
+                    [sys.executable, '-c', script, str(KIT), mode],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding='utf-8',
+                    env=env,
+                    timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout)
+                self.assertEqual(
+                    proc.stdout,
+                    '{"ok": true}\nwarning: beads.role not configured\n',
+                )
+
+
 if __name__ == '__main__':
     unittest.main()

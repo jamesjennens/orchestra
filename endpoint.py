@@ -205,7 +205,7 @@ def _native_labels(root,path,actor,task):
     the returned rows are matched against the token and an unresolved or
     ambiguous read raises rather than reporting "no labels".
     """
-    p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
+    p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',task,'--json'],env=native.bd_env(environment(root)),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the current labels of %s before the label write, so the reserved-label guard cannot verify it: %s'%(task,(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
     except (ValueError, RecursionError):raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
@@ -225,7 +225,7 @@ def _native_labels(root,path,actor,task):
 
 def _native_comments(root,path,actor,task):
     """The comments of one canonical issue, for the record-anchor check."""
-    p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'comments',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
+    p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'comments',task,'--json'],env=native.bd_env(environment(root)),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the comments of %s before the label write, so the record-anchor guard cannot verify it; refusing.'%(task,))
     try:rows=json.loads(p.stdout)
     except (ValueError, RecursionError):raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
@@ -279,7 +279,7 @@ def _native_anchor_rows(root,path,actor,tokens):
     as `_native_labels` does for one token.
     """
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,
-                      'show',*tokens,'--json','--include-comments'],env=environment(root),
+                      'show',*tokens,'--json','--include-comments'],env=native.bd_env(environment(root)),
                      capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read %s before the status write, so the record-anchor guard cannot verify it: %s'%(', '.join(tokens),(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
@@ -407,7 +407,7 @@ def _guard_open_dependency_on_claim(root,path,actor,row):
     if not deps:return
     # Fail CLOSED: read the other ends in ONE native read; a missing one is open.
     completed=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,
-                             'show',*ids,'--json'],env=environment(root),
+                             'show',*ids,'--json'],env=native.bd_env(environment(root)),
                             capture_output=True,text=True,encoding='utf-8',timeout=60)
     try:
         others=json.loads(completed.stdout or '[]')
@@ -564,7 +564,7 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     items ``rc0`` and ``absence-pins``).
     """
     try:
-        p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
+        p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=native.bd_env(environment(root)),capture_output=True,text=True,encoding='utf-8',timeout=60)
     except subprocess.TimeoutExpired:
         return None,'the read of the tasks timed out'
     said=(p.stderr or '').strip()
@@ -3483,7 +3483,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
     if action=='refresh':
         with (path/'.refresh.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=native.bd_env(environment(root)),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             rows=record_json.loads_rows(p.stdout)
             from reserved_comments import RECORD_ANCHOR_LABELS
@@ -3612,7 +3612,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             if denied is not None:return denied
             _guard_reserved_labels(root,path,args,actor,attachments=attachments)
             def bd_dispatch(argv):
-                p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+                p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=native.bd_env(environment(root)),capture_output=True,text=True,encoding='utf-8',timeout=120)
                 # When bd itself says no, before it writes, that is a refusal and not an outcome
                 # nobody knows (kittrial-5bb.185): the identity is released and the caller is told
                 # bd's sentence. Only what bd_refusals recognises; anything else is handed on as it came.

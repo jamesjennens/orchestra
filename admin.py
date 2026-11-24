@@ -2394,9 +2394,10 @@ def project_dir(root,name):
     return path
 
 def run_bd(root,name,args):
+    import native
     path=project_dir(root,name)
     location=[] if args and args[0]=='init' else ['--directory',path]
-    return checked([root/'bin/bd',*location,'--sandbox',*args],env=environment(root),cwd=path).stdout
+    return checked([root/'bin/bd',*location,'--sandbox',*args],env=native.bd_env(environment(root)),cwd=path).stdout
 
 def read_regular_text(path,limit=None,raw=False,validate=None,prefix=None):
     """Read a regular file through the shared nonblocking, no-follow primitive."""
@@ -3025,7 +3026,8 @@ def install(root,port,unit):
     checked([root/'bin/dolt','config','--global','--add','metrics.disabled','true'],env=env)
     checked([root/'bin/dolt','config','--global','--add','user.name','Beads team service'],env=env)
     checked([root/'bin/dolt','config','--global','--add','user.email','beads@localhost'],env=env)
-    checked([root/'bin/bd','metrics','off'],env=env)
+    import native
+    checked([root/'bin/bd','metrics','off'],env=native.bd_env(env))
     server={'log_level':'warning','behavior':{'autocommit':True,'auto_gc_behavior':{'enable':False}},
             'listener':{'host':'127.0.0.1','port':port,'socket':str(root/'mysql.sock')},
             'data_dir':str(root/'data'),'cfg_dir':str(root/'data/.doltcfg'),'metrics':{'port':-1}}

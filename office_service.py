@@ -462,8 +462,9 @@ def _verify_bd_starts(root):
     build and install time is kittrial-5bb.161's separate change.
     """
     path = root/'bin/bd'
+    import native
     try:
-        admin.checked([path, '--version'], env=admin.environment(root))
+        admin.checked([path, '--version'], env=native.bd_env(admin.environment(root)))
     except (OSError, subprocess.CalledProcessError) as error:
         detail = (getattr(error, 'stderr', '') or str(error)).strip()
         raise RuntimeError('%s cannot start: %s' % (path, detail or error)) from None
@@ -504,7 +505,8 @@ def prepare(root, db_port):
     admin.checked([root/'bin/dolt', 'config', '--global', '--add', 'metrics.disabled', 'true'], env=env)
     admin.checked([root/'bin/dolt', 'config', '--global', '--add', 'user.name', 'Orchestra service'], env=env)
     admin.checked([root/'bin/dolt', 'config', '--global', '--add', 'user.email', 'orchestra@localhost'], env=env)
-    admin.checked([root/'bin/bd', 'metrics', 'off'], env=env)
+    import native
+    admin.checked([root/'bin/bd', 'metrics', 'off'], env=native.bd_env(env))
 
 
 def listener(settings, port):
