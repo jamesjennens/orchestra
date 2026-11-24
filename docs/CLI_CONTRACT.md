@@ -925,10 +925,15 @@ the index once, because its collision and cap rules span every capability.
   - Every record carries `trust: accepted|draft`, and pending aliases carry
     `alias_state: proposed` with the submitter's `person` and `identity`.
   - Each record's and candidate's `summary` excerpt returns the full record summary up to
-    `SUMMARY_MAX` (1,200 characters), preserving line feeds (`\n`) while stripping control
-    and format characters (including bidi overrides and zero-width characters such as
-    `U+200B` and `U+200D`); any bound is applied at a grapheme-cluster boundary with exact
-    `omitted_chars`.
+    `SUMMARY_MAX` (1,200 characters), normalizing `\r\n` and lone `\r` to `\n` and
+    preserving line feeds (`\n`) while stripping control and format characters (including
+    bidi overrides and zero-width characters such as `U+200B` and `U+200D`); any bound is
+    applied at a grapheme-cluster boundary with exact `omitted_chars`.
+  - Default `excerpt()` calls and `views/CAPABILITIES.md` cuts also move to the previous
+    grapheme boundary whenever a cut would fall inside a character cluster (combining
+    marks, emoji modifiers, regional-indicator flags, variation selectors), so names,
+    aliases, and phrases can come back a few characters shorter than before while plain
+    text is byte-identical.
   - A miss suggests `propose-alias` or `propose`.
 - **`get KEY`** returns the record shape of `ref get`: `state`, `record`, `acceptance`,
   `acceptance_inert`, `proposed`, `aliases_pending`, `replaces` (derived), `resolved`

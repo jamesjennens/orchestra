@@ -221,6 +221,42 @@ class CapabilityLookupTruncationUnitAndCliTests(CapabilityCase):
         self.assertEqual(kept, 'x' * 5)
         self.assertEqual(omitted, len(raw_zwj) - 5)
 
+    def test_lone_cr_normalized_to_lf_on_multiline_path(self):
+        # Kills reviewer mutant O3 (removing CR normalisation at capabilities.py:233).
+        self.assertEqual(capabilities.clean('x\ry', multiline=True), 'x\ny')
+        self.assertEqual(capabilities.excerpt('x\ry', 50, multiline=True), {'text': 'x\ny', 'omitted_chars': 0})
+        self._propose_and_accept(
+            'ops.lone-cr-summary',
+            'Lone CR summary',
+            'line one\rline two\r\nline three',
+            op_id='cap-lone-cr',
+        )
+        expected = 'line one\nline two\nline three'
+        for summary_obj in (
+            self.read('find', 'ops.lone-cr-summary')['records'][0]['summary'],
+            self.read('get', 'ops.lone-cr-summary')['record']['summary'],
+        ):
+            self.assertEqual(summary_obj, {'text': expected, 'omitted_chars': 0})
+
+    def test_regional_indicator_flag_pair_parity_limits_2_3_4(self):
+        # Kills reviewer mutant O2 (returning True instead of (run % 2) == 1 at capabilities.py:277).
+        us = '\U0001f1fa\U0001f1f8'
+        gb = '\U0001f1ec\U0001f1e7'
+        fr = '\U0001f1eb\U0001f1f7'
+        three_flags = us + gb + fr
+        for limit, expected_text, expected_omitted in (
+            (2, us, 4),
+            (3, us, 4),
+            (4, us + gb, 2),
+        ):
+            kept, omitted = capabilities.slice_graphemes(three_flags, limit)
+            self.assertEqual((kept, omitted), (expected_text, expected_omitted), 'limit=%d' % limit)
+            self.assertEqual(
+                capabilities.excerpt(three_flags, limit),
+                {'text': expected_text, 'omitted_chars': expected_omitted},
+                'excerpt limit=%d' % limit,
+            )
+
     def test_newlines_markdown_and_bidi_control_stripping_in_summary(self):
         # Condition 2: multiline=True on find & get summary only; bidi U+202E, U+2066-2069,
         # U+200B, U+200D, and ESC still stripped on multiline path; default clean() stays one-line.
