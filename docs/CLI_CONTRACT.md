@@ -2427,6 +2427,8 @@ request ID instead of creating a duplicate.
 - The request ID is the route's durable operation identity from the Idempotency-Key, so an exact retry
   returns the same child. The route reads the parent first, so a parent that is absent, in another
   project or a record anchor, and a project the caller may not read, all answer one 404 "Task not found".
+- A successful 201 reply returns `{"id": CHILD_ID, "reconciled": BOOL, "task": {"id": CHILD_ID, "parent": PARENT_ID}}`,
+  carrying the nested `task` identity alongside the existing flat `id` (without echoing unverified request fields).
 - Every other rule is the endpoint's own, unchanged: the type list (task, bug, feature, chore, decision;
   no epic), the merge slot taking no child, the description bound, a decision's required headings (`##
   Decision`, `## Rationale`, `## Alternatives Considered`, named in the refusal), and assignee names.

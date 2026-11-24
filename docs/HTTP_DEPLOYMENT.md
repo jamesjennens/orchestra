@@ -2187,6 +2187,8 @@ a child task or a decision under `{task}` through the host's own `coordinate cre
 - The body takes `title`, `description`, `type` (task, bug, feature, chore or decision; no epic), and
   optionally `assignee` and `priority` (0-4). Any other field is 422. The Idempotency-Key is required.
   An exact retry returns the same child.
+- A successful 201 reply returns `{"id": CHILD_ID, "reconciled": BOOL, "task": {"id": CHILD_ID, "parent": PARENT_ID}}`,
+  carrying the nested `task` identity alongside the existing flat `id` (without echoing unverified request fields).
 - A decision without its required headings is refused (422) with create-child's sentence naming them.
 - The in-process backend answers 501. The task page shows an "Add a child task" form when the project
   read says `can_coordinate`.

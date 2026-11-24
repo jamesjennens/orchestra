@@ -363,7 +363,10 @@ export async function detail(ctx, { pid, tid }) {
       h('ul', { class: 'panel-body open-items' }, brief.depends_on.map((d) => h('li', null, h('a', { href: ctx.href(`/p/${pid}/t/${d.id}`) }, d.title), ' ', statusChip(d.status))))) : null,
     taskFilesPanel(ctx, { pid, tid, task: t, project }),
     // kittrial-5bb.434: a coordinator adds a child task or a decision here (null for everybody else).
-    childForm(ctx, project, t, (made) => { if (made && made.id) ctx.go(`/p/${pid}/t/${made.id}`); else reload(); }),
+    childForm(ctx, project, t, (made) => {
+      const nextId = made && ((made.task && made.task.id) || made.id);
+      if (nextId) ctx.go(`/p/${pid}/t/${nextId}`); else reload();
+    }),
     (ownerToolsFold =h('details', { class: 'fold' }, h('summary', null, 'Owner tools'),
       h('div', { class: 'fold-body' },
         brief.lifecycle ? h('div', { id: 'lifecycle-facts' }, lifecyclePanel(ctx, project, t)) : null,

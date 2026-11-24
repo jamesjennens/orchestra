@@ -55,6 +55,7 @@ class _GapsMixin(records._RecordsScenarioMixin):
         made = self.child(coordinator, parent, body, 'child-1')
         self.assertEqual(made.status, 201, made.data)
         child = made.data['id']
+        self.assertEqual(made.data.get('task'), {'id': child, 'parent': parent})
         self.assertNotEqual(child, parent)
         shown = harness.request('GET', f'/v1/projects/{self.pid}/tasks/{child}', token=coordinator)
         self.assertEqual(shown.status, 200, shown.data)
@@ -64,11 +65,13 @@ class _GapsMixin(records._RecordsScenarioMixin):
         again = self.child(coordinator, parent, body, 'child-1')
         self.assertIn(again.status, (200, 201), again.data)
         self.assertEqual(again.data['id'], child)
+        self.assertEqual(again.data.get('task'), {'id': child, 'parent': parent})
         self.assertEqual(self.children_of(parent), [child])
         # A coordinator-grant agent may; a decision is a child type.
         by_agent = self.child(people['coord1_agent']['token'], parent,
                               {'title': 'Agent child', 'description': 'x', 'type': 'bug'}, 'child-agent')
         self.assertEqual(by_agent.status, 201, by_agent.data)
+        self.assertEqual(by_agent.data.get('task'), {'id': by_agent.data['id'], 'parent': parent})
         # Without CAP_COORDINATE: a contributor, a viewer and a worker agent without the grant get 403.
         for name in ('contrib', 'viewer', 'coord2_agent', 'contrib_records_agent'):
             refused = self.child(people[name]['token'], parent, body, 'child-refused-' + name)

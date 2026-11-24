@@ -12457,7 +12457,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             result = self.backend.invoke('tasks.create-child', ctx.principal, ctx.params['pid'], payload,
                                          ctx.idempotency_key, target=ctx.route_target,
                                          authorize=ctx.authorize, capability=CAP_COORDINATE)
-            return result, result
+            if not isinstance(result, dict) or not result.get('id'):
+                raise UncertainOutcome()
+            public = dict(result)
+            # Additive (kittrial-5bb.531): include nested task identity alongside the existing flat id
+            # without inventing or echoing unverified request fields.
+            public['task'] = {'id': result['id'], 'parent': ctx.params['tid']}
+            return public, public
         try:
             return self._mutate(ctx, 'tasks.create-child', ctx.params['pid'], create, status=201,
                                 capability=CAP_COORDINATE, serialize=False, canonical=True,
