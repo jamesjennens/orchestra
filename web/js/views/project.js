@@ -373,7 +373,7 @@ export function lanesPanel(ctx, project) {
       localFactLine(entry.local_fact),
       h('div', { class: 'small muted' },
         'In that state ', ageText(entry.state_age_seconds),
-        entry.expect_by ? [' · expected ', time(entry.expect_by)] : null,
+        (entry.expect_by_effective || entry.expect_by) ? [' · expected ', time(entry.expect_by_effective || entry.expect_by)] : null,
         // The holder's own wake time (kittrial-5bb.509): the SERVER says whether it has
         // come due (not_before_due); this page never reads a clock of its own.
         entry.not_before ? (entry.not_before_due
@@ -383,7 +383,7 @@ export function lanesPanel(ctx, project) {
       // A late wait says so in words: the Late chip plus the plain sentence it
       // explains (mock-up lanes.html:60 'Late / expected today 20:00, 2 hours ago').
       late ? h('div', { class: 'small' }, h('span', { class: 'chip warn', 'data-flag': 'late' }, 'Late'), ' ',
-        'expected ', entry.expect_by ? time(entry.expect_by) : h('span', { class: 'muted' }, 'no date was given'),
+        'expected ', (entry.expect_by_effective || entry.expect_by) ? time(entry.expect_by_effective || entry.expect_by) : h('span', { class: 'muted' }, 'no date was given'),
         entry.state_age_seconds != null ? [', waited ', ageText(entry.state_age_seconds)] : null) : null,
       // A row the read could not declare is GUESSED from the checkpoint text, and says so.
       entry.inferred ? h('div', { class: 'small', 'data-inferred': 'true' },
