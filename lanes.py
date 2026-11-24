@@ -409,7 +409,13 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         # reached a record anyway (a raw comment) ends the quiet time a day after the episode began, and the board
         # shows the clamped value as expect_by_effective.
         began = moment(since) if isinstance(since, str) else None
-        if began is not None and expect_moment - began > OWN_JOB_EXPECT_MAX_AHEAD:
+        if began is None:
+            # r4 (should 2): with no readable start there is nothing to clamp from, so the wait is not quiet
+            # at all (not clamped against now, which would slide with every read): the lane reads idle as any
+            # undeclared wait does, and expect_by_effective is null.
+            expect_moment = None
+            expect_effective = None
+        elif expect_moment - began > OWN_JOB_EXPECT_MAX_AHEAD:
             expect_moment = began + OWN_JOB_EXPECT_MAX_AHEAD
             expect_effective = expect_moment.isoformat().replace('+00:00', 'Z')
     idle_seconds = holder_idle_seconds(row, actor, now)

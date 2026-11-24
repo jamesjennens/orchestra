@@ -110,10 +110,17 @@ def parse_request(payload):
 
 
 def counts_as_wait(entry):
-    """A held entry that is a DECLARED wait now: an own-job wait stops counting once its expect_by passed."""
+    """A held entry that is a DECLARED wait now: an own-job wait stops counting once its expect_by passed.
+
+    kittrial-5bb.588 r4 (should 2): an own-job wait counts only while it has a readable effective
+    ``expect_by``. With an unreadable episode start the board has no bound (``expect_by_effective`` is
+    null), and such a wait does not count, so it never keeps a lane quiet.
+    """
     if not entry.get('declared') or entry.get('state') not in WAIT_STATES:
         return False
-    return not (entry.get('state') == 'waiting-on-own-job' and 'expect_by_passed' in (entry.get('flags') or []))
+    if entry.get('state') != 'waiting-on-own-job':
+        return True
+    return isinstance(entry.get('expect_by_effective'), str) and 'expect_by_passed' not in (entry.get('flags') or [])
 
 
 def declared_wait(row):

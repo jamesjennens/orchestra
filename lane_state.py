@@ -243,7 +243,7 @@ def _reason_problems(value):
     return []
 
 
-def problems(payload, task, checkpoint=None, now=None):
+def problems(payload, task, checkpoint=None, now=None, began=None):
     """Every problem with one lane-state payload, in order, so one refusal names them all.
 
     ``checkpoint`` is the comment id of the checkpoint this record is written with. When
@@ -256,6 +256,10 @@ def problems(payload, task, checkpoint=None, now=None):
     ``newest`` with it -- checks ``not_before`` structurally only, so a record whose wake
     time has passed stays usable; the writer passes a clock and the future-and-bounded
     rules apply. Tests inject ``now``; only the writers supply the real clock.
+
+    ``began`` (kittrial-5bb.588 r4) is when the own-job wait this record continues began
+    (:func:`own_job_write_began`); the 24-hour cap on its ``expect_by`` is measured from
+    it, the instant the board clamps from. ``None`` measures from ``now``.
     """
     if not isinstance(payload, dict):
         return ['Invalid lane state: expected a JSON object']
@@ -340,12 +344,15 @@ def problems(payload, task, checkpoint=None, now=None):
         except ValueError as error:
             found.append('Invalid lane state: ' + str(error))
         else:
-            if now is not None and payload.get('state') == OWN_JOB_STATE \
-                    and expected - now > OWN_JOB_EXPECT_MAX_AHEAD:
-                found.append('Invalid lane state: expect_by of a %s wait is more than %d hours ahead; your own '
-                             'job is expected back within %d hours, and you can declare the wait again then'
-                             % (OWN_JOB_STATE, OWN_JOB_EXPECT_MAX_AHEAD.total_seconds() // 3600,
-                                OWN_JOB_EXPECT_MAX_AHEAD.total_seconds() // 3600))
+            start = began if began is not None else now
+            if start is not None and payload.get('state') == OWN_JOB_STATE \
+                    and expected - start > OWN_JOB_EXPECT_MAX_AHEAD:
+                hours = int(OWN_JOB_EXPECT_MAX_AHEAD.total_seconds() // 3600)
+                found.append('Invalid lane state: expect_by of a %s wait is more than %d hours ahead of the '
+                             "wait's start: it must be within %d hours after this wait began (%s). A repost does "
+                             'not restart the wait; to wait longer, end it with another state (for example '
+                             'working) and declare a new wait'
+                             % (OWN_JOB_STATE, hours, hours, start.isoformat().replace('+00:00', 'Z')))
     if 'not_before' in payload:
         try:
             moment = parse_moment(payload['not_before'], 'not_before')
@@ -366,9 +373,9 @@ def problems(payload, task, checkpoint=None, now=None):
     return found
 
 
-def validate(payload, task, checkpoint=None, now=None):
+def validate(payload, task, checkpoint=None, now=None, began=None):
     """Return ``payload`` when it is a valid lane-state record for ``task``, else raise."""
-    found = problems(payload, task, checkpoint, now=now)
+    found = problems(payload, task, checkpoint, now=now, began=began)
     if found:
         raise ValueError('; '.join(found))
     return payload
@@ -437,16 +444,57 @@ def own_job_episode_start(comments, task):
     usable, comments = _usable(comments, task)
     if not usable or usable[-1][3].get('state') != OWN_JOB_STATE:
         return None
-    # r3 (note 1): a repost under a sub-label of the same actor (A/sub1) is the same author, by the claim
-    # namespace rule every activity comparison uses (briefing.same_activity_actor).
-    from briefing import same_activity_actor
+    # r3 (note 1): a repost under a sub-label of the same actor (A/sub1) is the same author; r4 (note 1): so is
+    # a sibling sub-label (A/sub1, then A/sub2). See same_episode_actor.
     author = usable[-1][2].get('author')
     first = usable[-1]
     for row in reversed(usable[:-1]):
-        if row[3].get('state') != OWN_JOB_STATE or not same_activity_actor(row[2].get('author'), author):
+        if row[3].get('state') != OWN_JOB_STATE or not same_episode_actor(row[2].get('author'), author):
             break
         first = row
     return next(item for item in comments if str(item.get('id')) == first[3]['checkpoint'])
+
+
+def same_episode_actor(first, second):
+    """Whether two record authors are one actor for an own-job episode (kittrial-5bb.588 r3 note 1, r4 note 1).
+
+    The claim namespace rule every activity comparison uses (``briefing.same_activity_actor``: a parent
+    and its sub-label), and also two sub-labels of one root (``A/sub1`` and ``A/sub2``). That is the safe
+    direction: treating siblings as one actor keeps the episode's first start, so the clock never restarts
+    early. A shared prefix without the slash (``A`` and ``Ax``) is still another actor.
+    """
+    from briefing import same_activity_actor
+    if same_activity_actor(first, second):
+        return True
+    if not isinstance(first, str) or not isinstance(second, str) or '/' not in first or '/' not in second:
+        return False
+    return first.split('/', 1)[0] == second.split('/', 1)[0] != ''
+
+
+def own_job_write_began(history, actor, now):
+    """When the own-job wait that a new record by ``actor`` continues began (kittrial-5bb.588 r4, should 1).
+
+    ``history`` is the task's usable lane records, oldest first, as ``(author, state, checkpoint_created_at)``.
+    A new own-job record continues the newest unbroken run of own-job records by the same actor, so the run's
+    first record dates it; otherwise it starts a new wait, at ``now``. A start that cannot be read gives
+    ``now``: the board then treats the wait as not quiet (lanes.py), so the record is never quiet for long.
+    """
+    began = now
+    for author, state, created_at in reversed(list(history or ())):
+        if state != OWN_JOB_STATE or not same_episode_actor(author, actor):
+            break
+        try:
+            began = parse_moment(created_at)
+        except (TypeError, ValueError):
+            return now
+    return began
+
+
+def native_history(comments, task):
+    """The ``history`` of :func:`own_job_write_began` from a task's native comments."""
+    usable, comments = _usable(comments, task)
+    created = {str(item.get('id')): item.get('created_at') for item in comments}
+    return [(row[2].get('author'), row[3].get('state'), created.get(row[3].get('checkpoint'))) for row in usable]
 
 
 def _usable(comments, task):

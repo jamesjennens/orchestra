@@ -2126,6 +2126,11 @@ PROVENANCE_OFF=('checkpoint_provenance_writes is off (the installation default).
                 'An operator enables the installation switch only after the rollback target can read these fields.')
 SERVER_DERIVED='carried and direction_owner are server-derived; omit them from the request'
 
+def utc_now():
+    """The native writer's clock (kittrial-5bb.588 r4): one place, so a test can set it."""
+    from datetime import datetime as _dt, timezone as _tz
+    return _dt.now(_tz.utc)
+
 def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False,now=None):
     # The declared wait state travels BESIDE the checkpoint in the same payload file
     # (kittrial-5bb.263; docs/LANE_BOARD_DESIGN.md section 1). `lane_state` is popped out
@@ -2139,14 +2144,18 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False,now=No
     issue=task_row(rows,task)
     problems=checkpoint_problems(p,task)
     if lane is not None:
-        from lane_state import problems as lane_state_problems
-        # The write-time clock for `not_before` (kittrial-5bb.509): only when the record
-        # carries one, and injectable so no test reads the real clock.
+        from lane_state import native_history,own_job_write_began,problems as lane_state_problems
+        # The write-time clock, for `not_before` (kittrial-5bb.509) and for the own-job
+        # `expect_by` cap (kittrial-5bb.588 r4): read for EVERY lane record, so `client.py
+        # checkpoint` (which passes no clock) is held to both. Injectable through `now`, and
+        # `utc_now` is the one place the real clock is read.
         moment_now=now
-        if moment_now is None and isinstance(lane,dict) and 'not_before' in lane:
-            from datetime import datetime as _dt, timezone as _tz
-            moment_now=_dt.now(_tz.utc)
-        problems=problems+lane_state_problems(lane,task,now=moment_now)
+        if moment_now is None and isinstance(lane,dict):
+            moment_now=utc_now()
+        began=None
+        if moment_now is not None:
+            began=own_job_write_began(native_history(issue.get('comments'),task),actor,moment_now)
+        problems=problems+lane_state_problems(lane,task,now=moment_now,began=began)
         # Only the task's holder sets a wake time (kittrial-5bb.509 review): the record is
         # the lane's own, so a coordinator asks the holder in a comment instead.
         if isinstance(lane,dict) and 'not_before' in lane and actor!=issue.get('assignee'):
@@ -2994,7 +3003,8 @@ def help_limits(action):
             'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
             'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
             'lane_state.waiting_on':'<= 96 characters (a role or an actor id)',
-            'lane_state.expect_by':'ISO-8601 with an offset; a past value is accepted and flagged',
+            'lane_state.expect_by':'ISO-8601 with an offset; a past value is accepted and flagged; with waiting-on-own-job '
+                                  'at most 24 hours after the wait began',
             'lane_state.not_before':'ISO-8601 with seconds and an offset, strictly future, <= 14 days ahead '
                                     '(the holder only; a later record without it clears it)',
             'lane_state.reason':'<= 300 characters (needs-investigation only)',
@@ -3081,7 +3091,8 @@ def help_notes(action):
             'waiting-on-review and waiting-on-user and refused with every other state) and expect_by '
             '(optional ISO-8601 with an offset; a past value is accepted). State waiting-on-own-job '
             '(kittrial-5bb.588) is for waiting on YOUR OWN job (a test run, a replay, a build): it requires job '
-            '(one line, <= 120 characters, shown escaped), refuses waiting_on, allows expect_by and not_before, '
+            '(one line, <= 120 characters, shown escaped), refuses waiting_on, allows expect_by (at most 24 hours after the wait began: a repost does not restart '
+            'it, and another state ends the wait) and not_before, '
             'is not a question for the coordinator, and with no expect_by counts as overdue 4 hours after the '
             'state began; every other state refuses job. Any state may also carry local_fact (kittrial-5bb.588; '
             '{kind, what, at, detail}: kind one of job-finished, job-failed, job-partial, time-reached, file-seen; '

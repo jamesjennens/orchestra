@@ -1193,8 +1193,13 @@ class InProcessBackend:
                 # is read as one), and a wake time is the HOLDER's only: the same two
                 # rules the native checkpoint writer (briefing.save_checkpoint) enforces.
                 from datetime import datetime as _dt, timezone as _tz
-                lane_state.validate(declared, task['id'],
-                                    now=_dt.fromtimestamp(self.service._now(), _tz.utc))
+                moment = _dt.fromtimestamp(self.service._now(), _tz.utc)
+                # kittrial-5bb.588 r4 (should 1): the own-job cap is measured from the start of the
+                # wait this record continues, as the native writer and the board measure it.
+                history = [(item.get('actor'), item['lane_state'].get('state'), item.get('created_at'))
+                           for item in checkpoints if isinstance(item.get('lane_state'), dict)]
+                lane_state.validate(declared, task['id'], now=moment,
+                                    began=lane_state.own_job_write_began(history, record['actor'], moment))
             except ValueError as error:
                 raise invalid(str(error)) from None
             if (isinstance(declared, dict) and 'not_before' in declared
