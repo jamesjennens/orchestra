@@ -5,19 +5,24 @@ plus review-598r2b.md Conditions 1, 2, and 6. Every test passes an explicit ``no
 compares a hard-coded date against the real wall clock.
 """
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import briefing as b
+import endpoint
 import lane_state
 import lanes
 import review_workflow as rw
+import sessions
 import waits
+import work
 from requirements import canonical_bytes
 
 PROJECT = 'kittrial'
@@ -40,7 +45,7 @@ def iso(dt):
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
-def make_registry(entries, owners=None, sessions=None):
+def make_registry(entries, owners=None, runs=None):
     records = {}
     for name, act in entries:
         rid = str(uuid.uuid5(uuid.NAMESPACE_URL, name + '|' + act))
@@ -49,8 +54,8 @@ def make_registry(entries, owners=None, sessions=None):
     reg = {'schema_version': 1, 'records': records}
     if owners is not None:
         reg['owners'] = dict(owners)
-    if sessions is not None:
-        reg['sessions'] = dict(sessions)
+    if runs is not None:
+        reg['runs'] = dict(runs)
     return reg
 
 
@@ -206,10 +211,15 @@ class WaitAnswerTests(unittest.TestCase):
             'under review',
             'CI started',
             'Coordinator: received r2; for .511: VERIFIED earlier',
+            'Coordinator:received r2; for .511: VERIFIED earlier',
+            'Coordinator received r2; for .511: VERIFIED earlier',
+            'Coordinator, 2026-11-23 00:52Z received r2 - for .511: VERIFIED',
+            'Coordinator, received: REVISE requested by Fable earlier',
             'Coordinator: received r1; see .511 VERIFIED',
             'Kittrial coordinator, 2026-11-23 05:16Z: Slice 0 received (f4f8d602). Not a verdict yet.',
             'Coordinator: VERIFICATION pending',
             'Coordinator: APPROVEDX not a token',
+            'Coordinator: APPROVE_LATER',
         ]
         # Verdicts (must close the wait)
         verdicts = [
@@ -217,7 +227,8 @@ class WaitAnswerTests(unittest.TestCase):
             'VERIFIED',
             'VERIFIED WITH CONDITIONS. Build Slice 0.',
             'Coordinator, 2026-11-22 22:35Z: **VERIFIED** plan',
-            'Coordinator, 2026-11-23 (00:52Z): REQUEST CHANGES on Slice 0',
+            'Coordinator, 2026-11-23T00:52:05Z: APPROVED',
+            'Coordinator (2026-11-23 00:52Z): REQUEST CHANGES on Slice 0',
             'PM: ANSWER — use option B',
             'REVISE, design round 3, delta only.',
             'Reviewer: APPROVED',
@@ -640,6 +651,56 @@ class SilentLaneTests(unittest.TestCase):
             self.assertTrue(fell_back)
             self.assertEqual(mapped, frozenset([COORD]))
 
+    def test_silent_lane_exact_boundary_at_n_hours(self):
+        """M6 pin: silent triggers at >= N hours (exact boundary included, 1s short excluded)."""
+        row_exact = make_task('t-exact', LANE_A, created_at=BASE_NOW - timedelta(hours=6))
+        row_exact['comments'].append(make_comment('c1', 'working', LANE_A, BASE_NOW - timedelta(hours=4)))
+        row_short = make_task('t-short', LANE_B, created_at=BASE_NOW - timedelta(hours=6))
+        row_short['comments'].append(make_comment('c2', 'working', LANE_B, BASE_NOW - timedelta(hours=4) + timedelta(seconds=1)))
+        res = waits.compute_waits([row_exact, row_short], now=BASE_NOW, project=PROJECT,
+                                  registry=default_reg(), operators=[COORD], silent_hours=4)
+        self.assertEqual([s['task'] for s in res['silent']], ['t-exact'])
+        self.assertEqual(res['silent'][0]['overdue_seconds'], 0)
+
+    def test_real_registry_run_last_heartbeat_resets_silent_clock_for_same_task_only(self):
+        """SHOULD-3: silent clock reads validated registry['runs'][*]['last_heartbeat'] for this task."""
+        t0 = BASE_NOW - timedelta(hours=6)
+        run_id_a = str(uuid.uuid5(uuid.NAMESPACE_URL, 'run-a'))
+        run_id_b = str(uuid.uuid5(uuid.NAMESPACE_URL, 'run-b'))
+        reg = make_registry(
+            [('agy-neon', LANE_A), ('agy-argon', LANE_B), ('coord', COORD)],
+            owners={LANE_A: 'lane:agyneon', LANE_B: 'lane:agyargon', COORD: 'person:coord'},
+            runs={
+                run_id_a: {
+                    'run_id': run_id_a,
+                    'actor': LANE_A,
+                    'task': 't-active-run',
+                    'status': 'running',
+                    'started_at': iso(t0),
+                    'last_heartbeat': iso(BASE_NOW - timedelta(minutes=30)),
+                    'ended_at': None,
+                    'events': {},
+                },
+                run_id_b: {
+                    'run_id': run_id_b,
+                    'actor': LANE_B,
+                    'task': 't-other-task',
+                    'status': 'running',
+                    'started_at': iso(t0),
+                    'last_heartbeat': iso(BASE_NOW - timedelta(minutes=10)),
+                    'ended_at': None,
+                    'events': {},
+                },
+            },
+        )
+        # Must pass the real session registry validator (never a synthetic 'sessions' key).
+        sessions.validate(reg)
+        row_active = make_task('t-active-run', LANE_A, created_at=t0)
+        row_other_task = make_task('t-silent-task', LANE_B, created_at=t0)
+        res = waits.compute_waits([row_active, row_other_task], now=BASE_NOW, project=PROJECT,
+                                  registry=reg, operators=[COORD])
+        self.assertEqual([s['task'] for s in res['silent']], ['t-silent-task'])
+
 
 class WaitRoleAndMetricTests(unittest.TestCase):
     """Tests #11, #33, read-only guarantee (S6), CLI parsing, and scope isolation."""
@@ -721,6 +782,204 @@ class WaitRoleAndMetricTests(unittest.TestCase):
             own_view = waits.read([row, row_b], LANE_A, default_reg(), ['--all'], now=BASE_NOW,
                                   operators=[COORD], journal=jdir, scope='own', project=PROJECT)
             self.assertEqual([w['task'] for w in own_view['items']], ['t-ro'])
+
+    def test_scope_own_filters_silent_rows_and_metrics(self):
+        """MUST-2 (M9) + SHOULD-1: scope='own' narrows waits, silent lanes, and --metrics."""
+        t0 = BASE_NOW - timedelta(hours=6)
+        r_wait_a = make_task('t-wa', LANE_A, created_at=t0)
+        add_checkpoint(r_wait_a, 'cp1', t0)
+        add_lane_state(r_wait_a, 'ls1', 'cp1', t0, state='waiting-on-coordinator', waiting_on='coordinator')
+        r_sil_a = make_task('t-sa', LANE_A, created_at=t0)
+        r_ans_a = make_task('t-aa', LANE_A, created_at=t0)
+        add_checkpoint(r_ans_a, 'cp1', t0)
+        add_lane_state(r_ans_a, 'ls1', 'cp1', t0, state='waiting-on-coordinator', waiting_on='coordinator')
+        r_ans_a['comments'].append(make_comment('va', 'VERIFIED', COORD, t0 + timedelta(hours=1)))
+        r_ans_a['comments'].append(make_comment('fa', 'resumed work', LANE_A, BASE_NOW - timedelta(minutes=30)))
+
+        r_wait_b = make_task('t-wb', LANE_B, created_at=t0)
+        add_checkpoint(r_wait_b, 'cp1', t0)
+        add_lane_state(r_wait_b, 'ls1', 'cp1', t0, state='waiting-on-user', waiting_on='user')
+        r_sil_b = make_task('t-sb', LANE_B, created_at=t0)
+        r_ans_b = make_task('t-ab', LANE_B, created_at=t0)
+        add_checkpoint(r_ans_b, 'cp1', t0)
+        add_lane_state(r_ans_b, 'ls1', 'cp1', t0, state='waiting-on-review', waiting_on=REVIEWER)
+        r_ans_b['comments'].append(make_comment('vb', 'APPROVED', REVIEWER, t0 + timedelta(hours=2)))
+        r_ans_b['comments'].append(make_comment('fb', 'resumed work', LANE_B, BASE_NOW - timedelta(minutes=30)))
+
+        rows = [r_wait_a, r_sil_a, r_ans_a, r_wait_b, r_sil_b, r_ans_b]
+        own = waits.read(rows, LANE_A, default_reg(), ['--all'], now=BASE_NOW,
+                         operators=[COORD], scope='own', project=PROJECT)
+        self.assertEqual([w['task'] for w in own['items']], ['t-wa'])
+        self.assertEqual([s['task'] for s in own['silent']], ['t-sa'])
+        self.assertEqual(own['silent_count'], 1)
+
+        m_own = waits.read(rows, LANE_A, default_reg(), ['--metrics', '--days=7'], now=BASE_NOW,
+                           operators=[COORD], scope='own', project=PROJECT)
+        self.assertEqual(m_own['scope'], 'own')
+        self.assertEqual({x['waiting_on'] for x in m_own['by_target']}, {'coordinator'})
+        self.assertEqual({x['actor'] for x in m_own['by_actor']}, {COORD})
+
+        m_all = waits.read(rows, COORD, default_reg(), ['--metrics', '--days=7'], now=BASE_NOW,
+                           operators=[COORD], scope='all', project=PROJECT)
+        self.assertEqual(m_all['scope'], 'all')
+        self.assertEqual({x['waiting_on'] for x in m_all['by_target']}, {'coordinator', 'user', REVIEWER})
+        self.assertEqual({x['actor'] for x in m_all['by_actor']}, {COORD, REVIEWER})
+
+    def test_on_me_hides_silent_rows_from_non_coordinator_non_owner(self):
+        """MUST-2 (M12): --on-me never shows another lane's silent row to a non-coordinator non-owner."""
+        t0 = BASE_NOW - timedelta(hours=6)
+        row_sil = make_task('t-sil-hidden', LANE_A, created_at=t0)
+        view_other = waits.read([row_sil], OTHER, default_reg(), ['--on-me'], now=BASE_NOW,
+                                operators=[COORD], project=PROJECT)
+        self.assertEqual(view_other['silent'], [])
+        self.assertEqual(view_other['silent_count'], 0)
+        view_coord = waits.read([row_sil], COORD, default_reg(), ['--on-me'], now=BASE_NOW,
+                                operators=[COORD], project=PROJECT)
+        self.assertEqual([s['task'] for s in view_coord['silent']], ['t-sil-hidden'])
+
+    def test_work_execute_forwards_lanes_scope_validates_args_early_and_uses_shared_lock(self):
+        """MUST-2 (M11) + M15 + NOTE 6: work.execute forwards lanes_scope, parses args pre-export, shared lock."""
+        self.assertIn('waiting', endpoint.READ_ONLY_ACTIONS)
+        t0 = BASE_NOW - timedelta(hours=6)
+        r_wa = make_task('t-ex-wa', LANE_A, created_at=t0)
+        add_checkpoint(r_wa, 'cp1', t0)
+        add_lane_state(r_wa, 'ls1', 'cp1', t0, state='waiting-on-coordinator', waiting_on='coordinator')
+        r_sa = make_task('t-ex-sa', LANE_A, created_at=t0)
+        r_wb = make_task('t-ex-wb', LANE_B, created_at=t0)
+        add_checkpoint(r_wb, 'cp1', t0)
+        add_lane_state(r_wb, 'ls1', 'cp1', t0, state='waiting-on-coordinator', waiting_on='coordinator')
+        r_sb = make_task('t-ex-sb', LANE_B, created_at=t0)
+        rows = [r_wa, r_sa, r_wb, r_sb]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jdir = Path(tmp) / 'projects' / PROJECT
+            jdir.mkdir(parents=True)
+            with mock.patch('read_cache.cached_export_rows', return_value=rows) as mock_exp, \
+                 mock.patch('record_json.classify', side_effect=lambda rs, *a, **kw: rs), \
+                 mock.patch('lifecycle.host_snapshot', side_effect=lambda rs, *a, **kw: rs), \
+                 mock.patch('sessions.read_registry', return_value=default_reg()):
+                with self.assertRaises(ValueError):
+                    work.execute(jdir, LANE_A, 'waiting', ['--bogus-flag'], {}, lambda a: '',
+                                 operators=[COORD], lanes_scope='own')
+                mock_exp.assert_not_called()
+
+                res_own = work.execute(jdir, LANE_A, 'waiting', ['--all'], {}, lambda a: '',
+                                       operators=[COORD], lanes_scope='own')
+                self.assertEqual(res_own['scope'], 'own')
+                self.assertEqual([w['task'] for w in res_own['items']], ['t-ex-wa'])
+                self.assertEqual([s['task'] for s in res_own['silent']], ['t-ex-sa'])
+
+                res_all = work.execute(jdir, COORD, 'waiting', ['--all'], {}, lambda a: '',
+                                       operators=[COORD], lanes_scope='all')
+                self.assertEqual({w['task'] for w in res_all['items']}, {'t-ex-wa', 't-ex-wb'})
+                self.assertEqual({s['task'] for s in res_all['silent']}, {'t-ex-sa', 't-ex-sb'})
+
+    def test_lanes_board_agrees_with_waits_on_clamped_and_unextended_expect_by_and_clears_verdict(self):
+        """SHOULD-2 (P3, P3b) + M16: lanes.read shares effective expect_by, overdue, and verdict clearing."""
+        # P3: far-future expect_by clamped to +72h; now is +80h -> overdue in BOTH waits and lanes.
+        t_start = BASE_NOW - timedelta(hours=80)
+        r_clamp = make_task('t-p3', LANE_A, created_at=t_start)
+        add_checkpoint(r_clamp, 'cp1', t_start)
+        add_lane_state(r_clamp, 'ls1', 'cp1', t_start, state='waiting-on-coordinator',
+                       waiting_on='coordinator', expect_by='2027-06-01T00:00:00Z')
+
+        # P3b: re-checkpoint tries to push expect_by +14h later -> ignored in BOTH waits and lanes.
+        t_b = BASE_NOW - timedelta(hours=10)
+        r_ext = make_task('t-p3b', LANE_B, created_at=t_b)
+        add_checkpoint(r_ext, 'cp1', t_b)
+        add_lane_state(r_ext, 'ls1', 'cp1', t_b, state='waiting-on-coordinator',
+                       waiting_on='coordinator', expect_by=iso(t_b + timedelta(hours=4)))
+        add_checkpoint(r_ext, 'cp2', t_b + timedelta(hours=2), previous='cp1')
+        add_lane_state(r_ext, 'ls2', 'cp2', t_b + timedelta(hours=2), state='waiting-on-coordinator',
+                       waiting_on='coordinator', expect_by=iso(t_b + timedelta(hours=18)))
+
+        # M16: answered wait clears stale waiting flags on lanes.read too.
+        r_ans = make_task('t-m16', OTHER, created_at=t_b)
+        add_checkpoint(r_ans, 'cp1', t_b)
+        add_lane_state(r_ans, 'ls1', 'cp1', t_b, state='waiting-on-coordinator',
+                       waiting_on='coordinator', expect_by=iso(t_b + timedelta(hours=1)))
+        r_ans['comments'].append(make_comment('v1', 'Kittrial coordinator, 2026-11-23 03:00Z: VERIFIED',
+                                              COORD, t_b + timedelta(hours=2)))
+
+        rows = [r_clamp, r_ext, r_ans]
+        w_view = waits.compute_waits(rows, now=BASE_NOW, project=PROJECT, registry=default_reg(), operators=[COORD])
+        w_by_task = {w['task']: w for w in w_view['waits']}
+        board = lanes.read(rows, COORD, default_reg(), [], now=BASE_NOW, operators=[COORD], project=PROJECT)
+        h_by_task = {h['task']: h for lane in board['items'] for h in lane['held']}
+
+        for tid in ('t-p3', 't-p3b'):
+            self.assertEqual(h_by_task[tid]['expect_by'], w_by_task[tid]['expect_by'])
+            self.assertTrue(w_by_task[tid]['overdue'])
+            self.assertIn('expect_by_passed', h_by_task[tid]['flags'])
+
+        self.assertIsNone(h_by_task['t-m16']['state'])
+        self.assertNotIn('waiting_too_long', h_by_task['t-m16']['flags'])
+        self.assertNotIn('expect_by_passed', h_by_task['t-m16']['flags'])
+
+    def test_verdict_after_recheckpoint_keeps_origin_started_at_and_single_metric(self):
+        """SHOULD-4 (M17): _find_checkpoint_verdict respects its before bound across re-checkpoints."""
+        t0 = BASE_NOW - timedelta(hours=20)
+        row = make_task('t-m17', LANE_A, created_at=t0)
+        add_checkpoint(row, 'cp1', t0)
+        add_lane_state(row, 'ls1', 'cp1', t0, state='waiting-on-coordinator', waiting_on='coordinator')
+        add_checkpoint(row, 'cp2', t0 + timedelta(hours=10), previous='cp1')
+        add_lane_state(row, 'ls2', 'cp2', t0 + timedelta(hours=10), state='waiting-on-coordinator', waiting_on='coordinator')
+        row['comments'].append(make_comment('v1', 'Coordinator: VERIFIED', COORD, t0 + timedelta(hours=15)))
+
+        res = waits.compute_waits([row], now=BASE_NOW, project=PROJECT, registry=default_reg(), operators=[COORD])
+        self.assertEqual(res['waits'], [])
+        answered = [e for e in res['episodes'] if e['outcome'] == 'answered']
+        self.assertEqual(len(answered), 1)
+        self.assertEqual(answered[0]['origin_checkpoint'], 'cp1')
+        self.assertEqual(answered[0]['started_at'], t0)
+
+        m = waits.compute_daily_metrics([row], now=BASE_NOW, days=7, project=PROJECT,
+                                        registry=default_reg(), operators=[COORD])
+        coord_row = next(x for x in m['by_target'] if x['waiting_on'] == 'coordinator')
+        self.assertEqual(coord_row['answered']['count'], 1)
+        self.assertEqual(coord_row['answered']['median_seconds'], 15 * 3600)
+
+    def test_read_leaves_entire_journal_tree_byte_identical_and_refuses_symlinks(self):
+        """SHOULD-4 (M13) + NOTE 5: journal tree is byte-identical after read; symlinks ignored."""
+        def snapshot_tree(root):
+            snap = []
+            for p in sorted(root.rglob('*')):
+                rel = p.relative_to(root).as_posix()
+                if p.is_symlink():
+                    snap.append((rel, 'symlink', None))
+                elif p.is_dir():
+                    snap.append((rel, 'dir', None))
+                else:
+                    snap.append((rel, 'file', hashlib.sha256(p.read_bytes()).hexdigest()))
+            return snap
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jdir = Path(tmp) / PROJECT
+            jdir.mkdir()
+            (jdir / waits.ESCALATION_CONFIG_FILE).write_text(
+                json.dumps({'lane_owners': {'lane:agyneon': 'person:james'}}), encoding='utf-8'
+            )
+            t0 = BASE_NOW - timedelta(hours=5)
+            row = make_task('t-snap', LANE_A, created_at=t0)
+            add_checkpoint(row, 'cp1', t0)
+            add_lane_state(row, 'ls1', 'cp1', t0, state='waiting-on-coordinator', waiting_on='coordinator')
+
+            before = snapshot_tree(jdir)
+            waits.read([row], COORD, default_reg(), ['--all'], now=BASE_NOW, operators=[COORD], journal=jdir, project=PROJECT)
+            waits.read([row], COORD, default_reg(), ['--metrics', '--days=7'], now=BASE_NOW, operators=[COORD], journal=jdir, project=PROJECT)
+            self.assertEqual(before, snapshot_tree(jdir))
+
+            # Symlink refusal in load_frozen_ledger (skipped only if platform forbids symlinks).
+            led_dir = jdir / waits.ESCALATION_LEDGER_DIR
+            led_dir.mkdir()
+            outside = Path(tmp) / 'outside.json'
+            outside.write_text(json.dumps({'episode_id': 'ep-sym', 'answered_at': iso(BASE_NOW)}), encoding='utf-8')
+            link = led_dir / 'ep-sym.json'
+            try:
+                link.symlink_to(outside)
+            except OSError:
+                return
+            self.assertEqual(waits.load_frozen_ledger(jdir), {})
 
 
 if __name__ == '__main__':

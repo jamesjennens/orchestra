@@ -1486,6 +1486,9 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         if action == 'work' and args[:1] == ['summary']:
             from work_summary import parse_args as summary_args
             summary_ids = summary_args(args[1:])
+        if action == 'waiting':
+            from waits import parse_args as waits_parse_args
+            waits_parse_args(args)
         # kittrial-5bb.339: the export rows come from the generation-keyed cache when
         # the tracker has not committed since they were parsed (a write IS visible to
         # the next read: every write commits, so the key moves and the cache misses).

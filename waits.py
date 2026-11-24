@@ -12,7 +12,7 @@ Explicit differences between ``whose_move`` (``briefing.assignee_comment_pending
 2. Verdict vs acknowledgement: ``assignee_comment_pending`` accepts any non-reserved
    comment so acknowledgements/clarifications still flag ``whose_move``; ``waits.py``
    requires a qualifying verdict (``is_verdict_body``) to close a wait episode.
-3. Response consumption (``briefing.py:1142-1145``): ``assignee_comment_pending`` consumes
+3. Response consumption (``briefing.py:1158-1161``): ``assignee_comment_pending`` consumes
    entries up to the holder's ``last_response``; ``waits.py`` evaluates verdicts per
    checkpoint episode without ``last_response`` consumption.
 4. Newest-own-checkpoint vs episode walk: ``assignee_comment_pending`` inspects only the
@@ -61,15 +61,18 @@ VERDICT_TOKENS = (
     'ANSWER',
 )
 
-# Case-insensitive header anchored on the first ': ' (colons followed by a non-space,
-# such as '00:52Z', are allowed inside the header, but the header can never skip past
-# an earlier ': ' into a mid-body verdict mention).
+# Case-insensitive header anchored strictly on the header's own colon:
+# either '<opt-prefix> <role>:' or '<opt-prefix> <role>[,| (]<UTC-timestamp-Z>[)]:'.
+# Mid-sentence colons after prose (e.g. 'Coordinator received r2; for .511: VERIFIED')
+# or comma-prose ('Coordinator, received: REVISE') never match.
 _VERDICT_HEADER_RE = re.compile(
-    r'^(?:(?:[A-Za-z0-9_-]+\s+)?(?:coordinator|pm|reviewer|owner)(?:[^:\n]|:(?!\s)){0,60}:\s*)',
+    r'^(?:[A-Za-z0-9_-]+\s+)?(?:coordinator|pm|reviewer|owner)'
+    r'(?:(?:\s*,\s*|\s*\(\s*|\s+)(?:(?:\d{4}-)?\d{2}-\d{2}[T ])?\d{2}:\d{2}(?::\d{2})?Z\)?)?'
+    r':\s*',
     re.IGNORECASE,
 )
 _VERDICT_BODY_RE = re.compile(
-    r'^[*_\s]*(?:' + '|'.join(re.escape(tok) for tok in VERDICT_TOKENS) + r')(?![A-Za-z])'
+    r'^[*_\s]*(?:' + '|'.join(re.escape(tok) for tok in VERDICT_TOKENS) + r')(?![A-Za-z0-9_])'
 )
 _ROLE_RE = re.compile(r'\b(coordinator|reviewer|user)\b', re.IGNORECASE)
 _REVIEW_VERDICT_OPS = frozenset(('approve', 'request-changes', 'decline'))
@@ -86,6 +89,8 @@ _NON_ANSWER_PREFIXES = (
 
 ESCALATION_CONFIG_FILE = '.escalation-config.json'
 ESCALATION_LEDGER_DIR = '.wait-escalations'
+MAX_LEDGER_FILES = 10000
+MAX_LEDGER_BYTES = 65536
 
 
 def _iso_utc(dt):
@@ -130,7 +135,9 @@ def is_verdict_body(text):
     """True when ``text`` is a structured review verdict or a lead-keyword verdict comment.
 
     Plain acknowledgements ('received', 'under review', 'CI started') and mid-body mentions
-    ('Coordinator: received r2; for .511: VERIFIED earlier') return False.
+    ('Coordinator: received r2; for .511: VERIFIED earlier' or colon-less variants) return
+    False. Matches ``kittrial-waits.py`` parity: a lead verdict naming another task id
+    (e.g. 'Coordinator: VERIFIED for kittrial-5bb.511') still counts as a verdict.
     """
     if not isinstance(text, str):
         return False
@@ -152,13 +159,15 @@ def is_verdict_body(text):
 
 
 def load_escalation_config(journal):
-    """Read optional ``<project>/.escalation-config.json`` (read-only). Returns dict."""
+    """Read optional ``<project>/.escalation-config.json`` (read-only, refuses symlinks). Returns dict."""
     if journal is None:
         return {}
     path = Path(journal) / ESCALATION_CONFIG_FILE
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return {}
     try:
+        if path.stat().st_size > MAX_LEDGER_BYTES:
+            return {}
         data = record_json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return {}
@@ -166,21 +175,27 @@ def load_escalation_config(journal):
 
 
 def load_frozen_ledger(journal):
-    """Read optional frozen answers from ``<project>/.wait-escalations/`` (read-only, never writes)."""
+    """Read optional frozen answers from ``<project>/.wait-escalations/`` (read-only, bounded, refuses symlinks)."""
     if journal is None:
         return {}
     root = Path(journal) / ESCALATION_LEDGER_DIR
-    if not root.is_dir():
+    if root.is_symlink() or not root.is_dir():
         return {}
     out = {}
     try:
         entries = sorted(root.iterdir())
     except OSError:
         return {}
+    count = 0
     for item in entries:
-        if not item.is_file() or item.suffix != '.json':
+        if item.is_symlink() or not item.is_file() or item.suffix != '.json':
             continue
+        count += 1
+        if count > MAX_LEDGER_FILES:
+            break
         try:
+            if item.stat().st_size > MAX_LEDGER_BYTES:
+                continue
             data = record_json.loads(item.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             continue
@@ -663,11 +678,13 @@ def holder_activity_timestamp(row, assignee, registry=None, project=None):
 
     Max over:
     1. Holder's own comments on the task (plain comments, checkpoints, lane-state, deliveries/responses),
-    2. Optional ``last_commit_at`` recorded on the lane's session in ``registry``,
+    2. Holder's session run activity for this task in ``registry['runs']`` (``last_heartbeat``,
+       ``started_at``, ``ended_at``, matching ``sessions.py:117`` and ``lanes.py:229-233``),
     3. Fallback ONLY when neither (1) nor (2) exists: newest ``Kind: task-assignment-v1``
        notice naming ``assignee``, else ``row['created_at']``.
     """
     from briefing import same_activity_actor
+    task_id = str(row.get('id') or '')
     best = None
     for comment in row.get('comments') or []:
         if not isinstance(comment, dict):
@@ -678,20 +695,23 @@ def holder_activity_timestamp(row, assignee, registry=None, project=None):
         if dt is not None and (best is None or dt > best):
             best = dt
     if isinstance(registry, dict):
-        for entry in (registry.get('sessions') or {}).values():
-            if not isinstance(entry, dict):
+        for run in (registry.get('runs') or {}).values():
+            if not isinstance(run, dict):
                 continue
-            if not same_activity_actor(entry.get('actor'), assignee):
+            if not same_activity_actor(run.get('actor'), assignee):
                 continue
-            dt = _parse_moment(entry.get('last_commit_at'))
-            if dt is not None and (best is None or dt > best):
-                best = dt
+            run_task = run.get('task')
+            if run_task and task_id and str(run_task) != task_id:
+                continue
+            for field in ('last_heartbeat', 'started_at', 'ended_at'):
+                dt = _parse_moment(run.get(field))
+                if dt is not None and (best is None or dt > best):
+                    best = dt
     if best is not None:
         return best
     # Fallback 3: newest task-assignment-v1 naming assignee, else row['created_at'] (NEVER updated_at).
     from task_assignment import parse_comment as parse_assignment
     proj = project or ''
-    task_id = str(row.get('id') or '')
     assign_best = None
     for comment in row.get('comments') or []:
         if not isinstance(comment, dict):
@@ -890,6 +910,7 @@ def _task_episodes_and_waits(row, project, now, resolver, review=None, ledger=No
                     ep = {
                         'episode_id': eid,
                         'task': task,
+                        'actor': holder,
                         'source': info['source'],
                         'state': info['state'],
                         'inferred': info['inferred'],
@@ -978,6 +999,7 @@ def _task_episodes_and_waits(row, project, now, resolver, review=None, ledger=No
                 ep = {
                     'episode_id': eid,
                     'task': task,
+                    'actor': holder,
                     'source': 'lane-state-v1',
                     'state': ls_payload.get('state'),
                     'inferred': False,
@@ -1049,6 +1071,7 @@ def _task_episodes_and_waits(row, project, now, resolver, review=None, ledger=No
             deliv_ep = {
                 'episode_id': eid,
                 'task': task,
+                'actor': holder,
                 'source': 'delivery-awaiting-review',
                 'state': 'waiting-on-review',
                 'inferred': False,
@@ -1093,6 +1116,7 @@ def _task_episodes_and_waits(row, project, now, resolver, review=None, ledger=No
             deliv_ep = {
                 'episode_id': eid,
                 'task': task,
+                'actor': holder,
                 'source': 'delivery-awaiting-integration',
                 'state': 'waiting-on-coordinator',
                 'inferred': False,
@@ -1147,6 +1171,7 @@ def _task_episodes_and_waits(row, project, now, resolver, review=None, ledger=No
         req_ep = {
             'episode_id': eid,
             'task': task,
+            'actor': holder,
             'source': 'review-request',
             'state': 'waiting-on-review',
             'inferred': False,
@@ -1345,13 +1370,16 @@ def _median_seconds(values):
 
 def compute_daily_metrics(rows, *, now=None, days=DEFAULT_METRICS_DAYS, project=None,
                           registry=None, operators=None, authority_state=None,
-                          journal=None, lane_owners=None, ledger=None, identity_names=None):
+                          journal=None, lane_owners=None, ledger=None, identity_names=None,
+                          scope='all', actor=None):
     """Read-time wait metrics per UTC day (Section 6, SHOULD-6/7/9).
 
     Invoked ONLY by ``waiting --metrics`` and ``GET /v1/projects/{pid}/waiting/metrics``.
     Scans all tasks including closed tasks. Four outcome buckets: ``answered``,
     ``closed_unanswered``, ``superseded``, and ``open_now``; grouped by both
     ``by_target`` (``waiting_on``) and ``by_actor`` (``answered_by``).
+    When ``scope == 'own'``, narrows episodes to waits authored by, addressed to, or
+    answered by ``actor`` so bound contributor keys never see other lanes' metrics.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -1364,6 +1392,7 @@ def compute_daily_metrics(rows, *, now=None, days=DEFAULT_METRICS_DAYS, project=
     day_set = set(day_keys)
 
     from lanes import registry_names
+    from briefing import same_activity_actor
     names = dict(registry_names(registry))
     if isinstance(identity_names, dict):
         names.update({k: v for k, v in identity_names.items() if isinstance(k, str) and isinstance(v, str)})
@@ -1385,7 +1414,16 @@ def compute_daily_metrics(rows, *, now=None, days=DEFAULT_METRICS_DAYS, project=
             by_target_raw[key] = b
         return b
 
-    for ep in computed['episodes']:
+    episodes = computed['episodes']
+    if scope == 'own':
+        episodes = [
+            ep for ep in episodes
+            if (actor and same_activity_actor(ep.get('actor'), actor))
+            or (actor and ep.get('waiting_on') and same_activity_actor(ep.get('waiting_on'), actor))
+            or (actor and ep.get('answered_by') and same_activity_actor(ep.get('answered_by'), actor))
+        ]
+
+    for ep in episodes:
         started = ep.get('started_at')
         if started is None:
             continue
@@ -1458,6 +1496,7 @@ def compute_daily_metrics(rows, *, now=None, days=DEFAULT_METRICS_DAYS, project=
 
     return {
         'schema_version': 1,
+        'scope': scope,
         'days': days,
         'computed_at': _iso_utc(now_utc),
         'by_target': by_target,
@@ -1580,7 +1619,7 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None,
         return compute_daily_metrics(
             rows, now=now, days=parsed.days, project=project, registry=registry,
             operators=operators, authority_state=authority_state, journal=journal,
-            identity_names=identity_names,
+            identity_names=identity_names, scope=scope, actor=actor,
         )
 
     computed = compute_waits(

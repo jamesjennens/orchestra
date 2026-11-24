@@ -118,7 +118,8 @@ class RowTests(unittest.TestCase):
         self.assertEqual(entry['work_state'], 'none')
         self.assertEqual(entry['state'], 'waiting-on-coordinator')
         self.assertEqual(entry['waiting_on'], 'coordinator')
-        self.assertEqual(entry['expect_by'], '2026-09-20T00:00:00+00:00')
+        # 2026-09-20T00:00:00+00:00 is >72 h after cp1 (2026-09-15T09:30:00Z), so waits.py clamps to 72 h.
+        self.assertEqual(entry['expect_by'], '2026-09-18T09:30:00Z')
         self.assertEqual(entry['checkpoint'], 'cp1')
         self.assertTrue(entry['declared'])
         self.assertFalse(entry['inferred'])

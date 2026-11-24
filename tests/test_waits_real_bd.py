@@ -92,6 +92,15 @@ class RealBdWaitingTests(unittest.TestCase):
         # Plain read never writes .wait-escalations/.
         self.assertFalse((self.project / waits.ESCALATION_LEDGER_DIR).exists())
 
+        # Contributor scope='own' hides another lane's wait over real bd (MUST-2 / M11).
+        other_view = work.execute(
+            self.project, 'lane-2', 'waiting', ['--all'],
+            {}, self.writer('lane-2'), operators=['coord-1'], lanes_scope='own',
+        )
+        self.assertEqual(other_view['scope'], 'own')
+        self.assertNotIn(task_id, [w['task'] for w in other_view['items']])
+        self.assertNotIn(task_id, [s['task'] for s in other_view['silent']])
+
         # Coordinator posts a plain acknowledgement -> wait stays open!
         ack = self.bd('comments', 'add', task_id, 'Coordinator: received r1; for .511: VERIFIED earlier',
                       '--author', 'coord-1', actor='coord-1')

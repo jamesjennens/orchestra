@@ -306,7 +306,13 @@ def holder_idle_seconds(row, actor, now):
 
 def held_task(row, task, actor, now, threshold, review=None, error=None, comment_authority=None,
               operators=None, owners=None, authority_state=None, project=None, journal=None):
-    """One held task's row: the shared review facts plus the server-computed wait state."""
+    """One held task's row: the shared review facts plus the server-computed wait state.
+
+    When an active wait is present, ``declared`` means "not inferred" (covers explicit
+    ``lane-state-v1`` records and Source 3 delivery/review-request waits, vs ``inferred``
+    for prose-only checkpoints), and ``expect_by`` / ``expect_by_passed`` come from the
+    canonical wait episode in ``waits.py`` (4 h default, 72 h cap, never extended).
+    """
     from lane_state import parse_moment
     import waits as waits_mod
     if error is not None:
@@ -390,10 +396,9 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
             checkpoint_id = active_wait['origin_checkpoint']
         if active_wait.get('started_at'):
             since = active_wait['started_at']
-        # Preserve raw declared expect_by string when present on the matching declared record;
-        # keep None when no explicit expect_by was declared (so existing lanes views stay unchanged).
-        if not (found is not None and found[1].get('expect_by') is not None):
-            expect_by = None
+        # Take effective expect_by (4h default, 72h cap, never extended) from waits.py
+        # so the lanes board and waiting CLI share one implementation (kittrial-5bb.598).
+        expect_by = active_wait.get('expect_by')
     elif wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user'):
         # Wait was answered by a qualifying verdict or dropped by a newer holder checkpoint:
         # clear stale waiting flags (kittrial-5bb.598 §1.1 gaps 1-2).
@@ -406,7 +411,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     if active_wait is not None and wait_state in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user') \
             and age is not None and age > threshold:
         flags.append('waiting_too_long')
-    if active_wait is not None and expect_moment is not None and expect_moment < now:
+    if active_wait is not None and (bool(active_wait.get('overdue')) or (expect_moment is not None and expect_moment < now)):
         flags.append('expect_by_passed')
     if move == 'you' and idle_seconds is not None and idle_seconds > threshold:
         flags.append('your_move_idle')
