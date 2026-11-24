@@ -1709,14 +1709,103 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       && rotateAfterFinishOk;
     for (const open of openDialogs()) await open.close();
 
-    // (5f-stored) SHOULD-3 (stored-route): routeChosen: true with missing or unknown runs MUST ask
-    // on both card rotation and Add agent; non-boolean routeChosen with Bridge MUST ask; legacy
-    // bridge: false without runs still keeps curl.
+    // (5f-rot-order) Coordinator ruling on rotation-order: create a new non-Bridge agent, leave at
+    // cert-move, then issue a new secret from the card -> Next MUST still reach cert-save (before
+    // rewrite), whereas rotating after reaching rewrite goes straight to rewrite.
+    store.clear();
+    const rotNewW = await openCreateAgentDialog('Heron');
+    let cardRotBeforeCertOk = false;
+    let cardRotAfterRewriteOk = false;
+    if (rotNewW) {
+      const rNoBridge = windowsChoice(rotNewW, 'secret-connect', 'none');
+      if (rNoBridge) { rNoBridge.checked = true; await rNoBridge.dispatch('change'); await tick(); }
+      await rotNewW.wizard.next(); // cert-save
+      const atCertSave = screenOf(rotNewW) === 'cert-save';
+      await rotNewW.wizard.next(); // cert-move
+      const atCertMove = screenOf(rotNewW) === 'cert-move';
+      await rotNewW.close();
+      await tick();
+      // Issue a new secret from the card for this same newly created agent (agent_new_524):
+      const rotCardAgent = {
+        id: 'agent_new_524',
+        name: 'Heron',
+        display_name: 'Heron',
+        owner: 'u1',
+        role: 'worker',
+        enabled: true,
+        scopes: ['read', 'tasks'],
+        scopes_source: 'stored',
+        credentials: [{ id: 'cred_new_524', label: 'initial', created_at: '2026-11-21T00:00:00Z', scopes: ['read', 'tasks'] }],
+        projects: [],
+        attention: { state: 'idle', summary: 'Idle', counts: {} },
+      };
+      const rotCardCtx = {
+        me: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: false },
+        projects: [{ id: 'p1', name: 'Alpha', role: 'owner', usable: true, archived: false }],
+        href: (p) => '#' + p,
+        go: () => {},
+        api: {
+          ...api,
+          agents: async () => ({ items: [rotCardAgent], total: 1, next_cursor: null }),
+          agent: async () => rotCardAgent,
+          agentHistory: async () => ({ items: [] }),
+          certificate: async () => server.certificate,
+          issueAgentCredential: async () => ({
+            credential: { id: 'cred_new_524_rot', secret: SECRET, scopes: ['read', 'tasks'] },
+            setup: { config: { agent_id: 'agent_new_524', name: 'Heron', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } },
+          }),
+        },
+      };
+      const openRotCardIssue = async () => {
+        const p = await agentsList(rotCardCtx);
+        body.appendChild(p);
+        await tick(); await tick(); await tick();
+        const sForm = p.all((e) => e.tagName === 'FORM' && e.all((b) => b.tagName === 'BUTTON' && b.textContent === 'Save and issue a new secret').length > 0)[0];
+        if (sForm) {
+          const sub = sForm.dispatch('submit');
+          await tick();
+          const conf = openDialogs().at(-1);
+          await conf.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
+          await sub; await tick(); await tick();
+        }
+        p.remove();
+        return openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true').at(-1) || null;
+      };
+      const rotAfterCertMove = await openRotCardIssue();
+      if (rotAfterCertMove) {
+        const startsAtSecret = screenOf(rotAfterCertMove) === 'secret';
+        await rotAfterCertMove.wizard.next();
+        const nextIsCertSave = screenOf(rotAfterCertMove) === 'cert-save';
+        await rotAfterCertMove.wizard.next();
+        const nextIsCertMove = screenOf(rotAfterCertMove) === 'cert-move';
+        await rotAfterCertMove.wizard.next();
+        const nextIsRewrite = screenOf(rotAfterCertMove) === 'rewrite';
+        cardRotBeforeCertOk = atCertSave && atCertMove && startsAtSecret && nextIsCertSave && nextIsCertMove && nextIsRewrite;
+        // Close on rewrite, then rotate again -> Next must now go straight to rewrite.
+        await rotAfterCertMove.close();
+        await tick();
+        const rotAfterRewrite = await openRotCardIssue();
+        if (rotAfterRewrite) {
+          const startsSecret2 = screenOf(rotAfterRewrite) === 'secret';
+          await rotAfterRewrite.wizard.next();
+          cardRotAfterRewriteOk = startsSecret2 && screenOf(rotAfterRewrite) === 'rewrite';
+          await rotAfterRewrite.close();
+        }
+      }
+    }
+    out.cardRotationBeforeCertCompleteKeepsCertSave = cardRotBeforeCertOk && cardRotAfterRewriteOk;
+    for (const open of openDialogs()) await open.close();
+
+    // (5f-stored) SHOULD-3 (stored-route) & r6 MUST (malformed-route): routeChosen: true with
+    // missing or unknown runs MUST ask on both card rotation and Add agent; malformed runs ('' or
+    // unknown) with bridge: false MUST NOT persist a fallback runs value across Back/Next/close so
+    // the second open still asks; genuine legacy bridge: false (missing or null runs) still keeps curl.
     const badStoredRecords = [
       { agentId: 'agent_1', screen: 'resume', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
       { agentId: 'agent_1', screen: 'resume', bridge: true, routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
       { agentId: 'agent_1', screen: 'resume', runs: 'bogus', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
       { agentId: 'agent_1', screen: 'resume', runs: 'bogus', bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_1', screen: 'resume', runs: '', bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
       { agentId: 'agent_1', screen: 'resume', runs: 'bridge', bridge: true, routeChosen: 'true', os: 'windows', role: 'worker', noproxy: false },
       { agentId: 'agent_1', screen: 'resume', runs: 'bridge', bridge: true, routeChosen: 1, os: 'windows', role: 'worker', noproxy: false },
     ];
@@ -1735,6 +1824,8 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     for (const rec of [
       { agentId: 'agent_new_524', screen: 'resume', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
       { agentId: 'agent_new_524', screen: 'resume', runs: 'bogus', routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_new_524', screen: 'resume', runs: '', bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_new_524', screen: 'resume', runs: 'bogus', bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false },
     ]) {
       store.clear();
       store.set(WIZARD_STORAGE_KEY, JSON.stringify(rec));
@@ -1745,15 +1836,66 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       if (!asks) badCreateAllAsk = false;
       for (const open of openDialogs()) await open.close();
     }
-    // Legacy bridge: false (no runs key) still renders curl without asking.
-    store.clear();
-    store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'resume', bridge: false, os: 'windows', role: 'worker', noproxy: false }));
-    const legacyFalseW = await openCardSecretDialog();
-    const legacyFalseKeepsCurl = Boolean(legacyFalseW)
-      && attr(legacyFalseW, 'data-connection-choice', 'true').length === 0
-      && (attr(legacyFalseW, 'data-secret-file-text', 'true')[0]?.textContent || '').includes('cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"');
-    for (const open of openDialogs()) await open.close();
+    // Second-open pin for malformed runs ('' and 'bogus') with bridge: false on BOTH rotate and create:
+    let malformedSecondOpenAllAsk = true;
+    for (const badRuns of ['', 'bogus']) {
+      // Rotate: open -> Back -> Next -> Back -> close -> reopen MUST still ask without persisting fallback runs.
+      store.clear();
+      store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'resume', runs: badRuns, bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false }));
+      const w1 = await openCardSecretDialog();
+      const firstAsks = Boolean(w1) && attr(w1, 'data-connection-choice', 'true').length === 1 && attr(w1, 'data-secret-file-text', 'true').length === 0;
+      if (w1) {
+        w1.wizard.back();
+        await w1.wizard.next();
+        w1.wizard.back();
+        await w1.close();
+      }
+      const savedMid = JSON.parse(store.get(WIZARD_STORAGE_KEY) || '{}');
+      const midClean = savedMid.routeChosen === false && savedMid.runs == null && savedMid.bridge !== false;
+      const w2 = await openCardSecretDialog();
+      const secondAsks = Boolean(w2) && attr(w2, 'data-connection-choice', 'true').length === 1 && attr(w2, 'data-secret-file-text', 'true').length === 0;
+      for (const open of openDialogs()) await open.close();
+      // Create: open -> Back -> Next -> Back -> close -> reopen MUST still ask.
+      store.clear();
+      store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_new_524', screen: 'resume', runs: badRuns, bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false }));
+      const c1 = await openCreateAgentDialog('Heron');
+      const cFirstAsks = Boolean(c1) && attr(c1, 'data-connection-choice', 'true').length === 1 && attr(c1, 'data-secret-file-text', 'true').length === 0;
+      if (c1) {
+        c1.wizard.back();
+        await c1.wizard.next();
+        c1.wizard.back();
+        await c1.close();
+      }
+      const cSavedMid = JSON.parse(store.get(WIZARD_STORAGE_KEY) || '{}');
+      const cMidClean = cSavedMid.routeChosen === false && cSavedMid.runs == null && cSavedMid.bridge !== false;
+      const c2 = await openCreateAgentDialog('Heron');
+      const cSecondAsks = Boolean(c2) && attr(c2, 'data-connection-choice', 'true').length === 1 && attr(c2, 'data-secret-file-text', 'true').length === 0;
+      for (const open of openDialogs()) await open.close();
+      if (!(firstAsks && midClean && secondAsks && cFirstAsks && cMidClean && cSecondAsks)) malformedSecondOpenAllAsk = false;
+    }
+    // Genuine legacy bridge: false (missing runs OR explicit null runs) still renders curl without asking.
+    let legacyFalseKeepsCurl = true;
+    for (const legacyRec of [
+      { agentId: 'agent_1', screen: 'resume', bridge: false, os: 'windows', role: 'worker', noproxy: false },
+      { agentId: 'agent_1', screen: 'resume', runs: null, bridge: false, os: 'windows', role: 'worker', noproxy: false },
+    ]) {
+      store.clear();
+      store.set(WIZARD_STORAGE_KEY, JSON.stringify(legacyRec));
+      const legacyFalseW = await openCardSecretDialog();
+      const ok = Boolean(legacyFalseW)
+        && attr(legacyFalseW, 'data-connection-choice', 'true').length === 0
+        && (attr(legacyFalseW, 'data-secret-file-text', 'true')[0]?.textContent || '').includes('cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"');
+      if (!ok) legacyFalseKeepsCurl = false;
+      for (const open of openDialogs()) await open.close();
+    }
+    // Direct runsFromStored pin: malformed runs ('' / 'bogus') with bridge: false never falls back
+    // to 'older', while genuine legacy records (missing or null runs with bridge: false) still do.
+    const runsFromStoredOk = setupText.runsFromStored({ runs: '', bridge: false }) === 'bridge'
+      && setupText.runsFromStored({ runs: 'bogus', bridge: false }) === 'bridge'
+      && setupText.runsFromStored({ bridge: false }) === 'older'
+      && setupText.runsFromStored({ runs: null, bridge: false }) === 'older';
     out.storedRouteRequiresKnownRunsValue = badCardAllAsk && badCreateAllAsk && legacyFalseKeepsCurl;
+    out.malformedStoredRouteStaysUnansweredOnSecondOpen = malformedSecondOpenAllAsk && legacyFalseKeepsCurl && runsFromStoredOk;
 
     // (5f-stale) MUST-2 (stale-wizard): opening #/setup or changing hash while a setup wizard is
     // showing a secret MUST close and remove the previous wizard and its listeners WITHOUT any
@@ -1819,17 +1961,30 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
     body.appendChild(appRoot);
     const savedHash = location.hash;
     let routerNavOk = false;
+    let routeOwnsDialogOk = false;
     try {
       location.hash = '#/agents';
+      let delayAgentGet = null;
+      let onAgentGetStarted = null;
+      let delayCertGet = null;
+      let onCertGetStarted = null;
       const appTransport = async (method, path) => {
         const clean = path.split('?')[0];
         if (clean === '/v1/sessions/current') return { status: 200, data: { user: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: true }, csrf_token: 'tok' } };
         if (clean === '/v1/projects') return { status: 200, data: { items: [{ id: 'p1', name: 'Alpha', role: 'owner', usable: true, archived: false }] } };
         if (clean === '/v1/agents' && method === 'GET') return { status: 200, data: { items: [cardAgent], total: 1, next_cursor: null } };
-        if (clean === '/v1/agents/agent_1' && method === 'GET') return { status: 200, data: cardAgent };
+        if (clean === '/v1/agents/agent_1' && method === 'GET') {
+          if (onAgentGetStarted) { const fn = onAgentGetStarted; onAgentGetStarted = null; fn(); }
+          if (delayAgentGet) await delayAgentGet;
+          return { status: 200, data: cardAgent };
+        }
         if (clean === '/v1/agents/agent_1/history') return { status: 200, data: { items: [] } };
         if (clean === '/v1/agents/agent_1/credentials' && method === 'POST') return { status: 200, data: { credential: { id: 'cred_r5', secret: SECRET, scopes: ['read', 'tasks'] }, setup: { config: { agent_id: 'agent_1', name: 'Kestrel', server_url: 'https://127.0.0.1:8765', projects: ['p1'] } } } };
-        if (clean === '/v1/certificate') return { status: 200, data: server.certificate };
+        if (clean === '/v1/service/certificate') {
+          if (onCertGetStarted) { const fn = onCertGetStarted; onCertGetStarted = null; fn(); }
+          if (delayCertGet) await delayCertGet;
+          return { status: 200, data: server.certificate };
+        }
         if (clean === '/v1/accounts') return { status: 200, data: { items: [] } };
         if (clean === '/v1/work' || clean === '/v1/tasks') return { status: 200, data: { items: [], next_cursor: null } };
         return { status: 200, data: { items: [] } };
@@ -1882,6 +2037,83 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
         && wizardsAtHome.length === 0
         && listenerCount() === appBaseListeners
         && !body.textContent.includes(SECRET);
+
+      // (c) r6 MUST (route-owns-dialog) Order 1: setup -> agents fast while GET /v1/agents/agent_1
+      // is still in flight MUST end on "My agents" with 0 wizards, baseline listeners, and no secret.
+      store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'role', runs: 'none', bridge: false, routeChosen: true, os: 'windows', role: 'worker', noproxy: false }));
+      let releaseSlowAgent = null;
+      const agentStarted = new Promise((resolve) => { onAgentGetStarted = resolve; });
+      delayAgentGet = new Promise((resolve) => { releaseSlowAgent = resolve; });
+      location.hash = '#/setup';
+      window.dispatchEvent({ type: 'hashchange' });
+      await agentStarted;
+      location.hash = '#/agents';
+      window.dispatchEvent({ type: 'hashchange' });
+      await new Promise((r) => setTimeout(r, 50));
+      delayAgentGet = null;
+      if (releaseSlowAgent) releaseSlowAgent();
+      await new Promise((r) => setTimeout(r, 60));
+      const headingAfterFastBack = (appRoot.querySelector('h1')?.textContent || '').trim();
+      const wizardsAfterFastBack = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+      let releaseSlowCert = null;
+      const certStarted = new Promise((resolve) => { onCertGetStarted = resolve; });
+      delayCertGet = new Promise((resolve) => { releaseSlowCert = resolve; });
+      location.hash = '#/setup';
+      window.dispatchEvent({ type: 'hashchange' });
+      await certStarted;
+      location.hash = '#/agents';
+      window.dispatchEvent({ type: 'hashchange' });
+      await new Promise((r) => setTimeout(r, 50));
+      delayCertGet = null;
+      if (releaseSlowCert) releaseSlowCert();
+      await new Promise((r) => setTimeout(r, 60));
+      const headingAfterSlowCertBack = (appRoot.querySelector('h1')?.textContent || '').trim();
+      const wizardsAfterSlowCertBack = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+      const fastBackOk = headingAfterFastBack === 'My agents'
+        && wizardsAfterFastBack.length === 0
+        && headingAfterSlowCertBack === 'My agents'
+        && wizardsAfterSlowCertBack.length === 0
+        && listenerCount() === appBaseListeners
+        && !body.textContent.includes(SECRET)
+        && secretContainmentOk(SECRET, { expectPre: false });
+
+      // (d) r6 MUST (route-owns-dialog) Order 2: chooser click calls ctx.go('/setup?agent=agent_1')
+      // with a fast answer, wizard opens, then queued hashchange arrives -> wizard MUST stay open
+      // on "Set up Kestrel" with 1 wizard, single-wizard listener count, and no secret; leaving to
+      // #/agents then closes it cleanly back to baseline listeners.
+      store.clear();
+      location.hash = '#/setup';
+      window.dispatchEvent({ type: 'hashchange' });
+      await new Promise((r) => setTimeout(r, 60));
+      const chooserBtn = appRoot.all((e) => e.tagName === 'BUTTON' && (e.textContent || '').includes('Set up Kestrel'))[0];
+      let chooserFastOk = false;
+      if (chooserBtn) {
+        await chooserBtn.dispatch('click');
+        await new Promise((r) => setTimeout(r, 60));
+        // Dispatch the queued browser hashchange for that same route:
+        window.dispatchEvent({ type: 'hashchange' });
+        await new Promise((r) => setTimeout(r, 60));
+        const headingChooser = (appRoot.querySelector('h1')?.textContent || '').trim();
+        const wizardsChooser = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+        const staysOpen = headingChooser === 'Set up Kestrel'
+          && wizardsChooser.length === 1
+          && listenerCount() === appListenersWithOneWizard
+          && !body.textContent.includes(SECRET)
+          && secretContainmentOk(SECRET, { expectPre: false });
+        // Now leave #/setup?agent=agent_1 for #/agents -> wizard closes cleanly:
+        location.hash = '#/agents';
+        window.dispatchEvent({ type: 'hashchange' });
+        await new Promise((r) => setTimeout(r, 60));
+        const headingLeft = (appRoot.querySelector('h1')?.textContent || '').trim();
+        const wizardsLeft = openDialogs().filter((x) => x.getAttribute('data-setup-wizard') === 'true');
+        chooserFastOk = staysOpen
+          && headingLeft === 'My agents'
+          && wizardsLeft.length === 0
+          && listenerCount() === appBaseListeners
+          && !body.textContent.includes(SECRET);
+      }
+      routeOwnsDialogOk = fastBackOk && chooserFastOk;
+
       Element.prototype.querySelector = origQForApp;
       Element.prototype.querySelectorAll = origQAForApp;
     } finally {
@@ -1890,6 +2122,7 @@ out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).
       appRoot.remove();
     }
     out.navigationClosesStaleWizardAndRemovesSecret = directNavOk && directCreateNavOk && directReplaceOk && listenersBackToBase && routerNavOk;
+    out.routeOwnsDialogBothAsyncAndChooserOrders = routeOwnsDialogOk;
 
     // (5g) F11 behaviour pin: fresh rotation on a server WITHOUT a certificate shows secret lines
     // directly and never asks the connection question.

@@ -363,7 +363,7 @@ export const RUNS_IN = Object.freeze(['bridge', 'older', 'none']);
 // An older stored wizard state has only the boolean `bridge`.
 export function runsFromStored(stored) {
   if (stored && RUNS_IN.includes(stored.runs)) return stored.runs;
-  return stored && stored.bridge === false ? 'older' : 'bridge';
+  return stored && stored.runs == null && stored.bridge === false ? 'older' : 'bridge';
 }
 export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false, vscode = true, noproxy = false, certAfterSecret = false } = {}) {
   const posix = osKind(os) === 'posix';

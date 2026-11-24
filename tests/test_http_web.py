@@ -1788,7 +1788,9 @@ class AgentSetupDialogCase(unittest.TestCase):
         reopen = self.function_body(code, 'reopenSetup')
         # Built from the agent's current secretless record, with no secret at all.
         self.assertIn('ctx.api.agent(agentId)', reopen)
-        self.assertIn('setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) })', reopen)
+        self.assertIn('const certificate = await agentCertificate(ctx);', reopen)
+        self.assertIn('if (!owner.isCurrent()) return;', reopen)
+        self.assertIn('setupDialog(ctx, { agent }, { secret: null, certificate })', reopen)
         self.assertIsNone(re.search(r'credential|\.secret\b', reopen))
         # Losing the secret means issuing a NEW credential; only its fresh secret is shown, on the
         # "Save your secret" screen, at once (kittrial-5bb.348).
@@ -2488,8 +2490,11 @@ console.log(JSON.stringify({
             'storedDefaultBridgeNeverSuppressesQuestion',
             'createAgentCurlVisitsCertSaveBeforeRewrite',
             'createAgentCloseAfterSecretReopenRunsCertBeforeRewrite',
+            'cardRotationBeforeCertCompleteKeepsCertSave',
             'storedRouteRequiresKnownRunsValue',
+            'malformedStoredRouteStaysUnansweredOnSecondOpen',
             'navigationClosesStaleWizardAndRemovesSecret',
+            'routeOwnsDialogBothAsyncAndChooserOrders',
             'cardNewSecretWithoutCertificateSkipsQuestion',
             'certificateCurlLinesPathSafetyPinned',
         }, set(observed))

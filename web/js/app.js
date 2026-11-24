@@ -149,7 +149,10 @@ export async function start(root, options = {}) {
     showLogin('Your session has ended. Sign in again to continue.');
   };
 
+  let token = 0;
+
   function showLogin(message) {
+    token += 1;
     agents.closeSetupWizard();
     // Nothing is rendered from the route now, so opening any route (an invite link included) renders again.
     rendered = null;
@@ -161,6 +164,7 @@ export async function start(root, options = {}) {
   function showInvite() {
     const route = currentRoute();
     if (!route.startsWith(INVITE_PREFIX)) return false;
+    token += 1;
     agents.closeSetupWizard();
     rendered = route;
     place(invites.invitePage(ctx, route.slice(INVITE_PREFIX.length)));
@@ -257,7 +261,6 @@ export async function start(root, options = {}) {
     return main;
   }
 
-  let token = 0;
   async function render() {
     agents.closeSetupWizard();
     if (showInvite()) return;

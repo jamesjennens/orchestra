@@ -563,12 +563,15 @@ export async function list(ctx) {
       problem.hidden = chosen.length > 0;
       problem.textContent = chosen.length ? '' : 'Tick at least one.';
       if (!chosen.length) return;
+      const owner = routeOwner(ctx);
       if (!(await confirmDialog({ title: 'Set what it may do and issue a new secret?',
         body: inferredWarning + `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret' }))) return;
       let result;
       try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: 'New secret issued' }); } catch { return; }
       const fresh = await ctx.api.agent(agent.id).catch(() => agent);
-      setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret, certificate: await agentCertificate(ctx),
+      const certificate = await agentCertificate(ctx);
+      if (!owner.isCurrent()) return;
+      setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret, certificate,
         issued: result && result.credential ? { credential: result.credential, agent } : null });
       load();
     });
@@ -607,6 +610,7 @@ export async function list(ctx) {
     const name = v['a-name'].trim();
     if (name.length < 2) return setFieldError(form, 'a-name', 'Give the agent a name of at least 2 characters.');
     setFieldError(form, 'a-name', '');
+    const owner = routeOwner(ctx);
     const chosen = [...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value);
     // The duplicate-name check sees every name the new agent's account already uses
     // (kittrial-5bb.561 r2): the new agent's owner is the chosen account for a superuser,
@@ -634,7 +638,9 @@ export async function list(ctx) {
     }).catch(() => null);
     if (!created) return;
     form.reset();
-    setupDialog(ctx, created, { secret: created.credential && created.credential.secret, certificate: await agentCertificate(ctx), created: true });
+    const certificate = await agentCertificate(ctx);
+    if (!owner.isCurrent()) return;
+    setupDialog(ctx, created, { secret: created.credential && created.credential.secret, certificate, created: true });
     load();
   });
 
@@ -904,11 +910,29 @@ function olderCredentials(ctx, agent, newId) {
   return wrap;
 }
 
+function currentRouteKey() {
+  try { return (location.hash || '').replace(/^#/, ''); } catch { return ''; }
+}
+
+function routeOwner(ctx) {
+  const view = ctx && typeof ctx.currentView === 'function' ? ctx.currentView() : null;
+  const route = currentRouteKey();
+  return {
+    isCurrent() {
+      if (view !== null && ctx.currentView() !== view) return false;
+      return currentRouteKey() === route;
+    },
+  };
+}
+
 // Reopens the setup dialog from the card, from the agent's CURRENT secretless record.
 async function reopenSetup(ctx, agentId, button) {
+  const owner = routeOwner(ctx);
   let agent;
   try { agent = await act(button, () => ctx.api.agent(agentId)); } catch { return; }
-  setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) });
+  const certificate = await agentCertificate(ctx);
+  if (!owner.isCurrent()) return;
+  setupDialog(ctx, { agent }, { secret: null, certificate });
 }
 
 function readWizardStorage() {
@@ -928,13 +952,14 @@ export function closeSetupWizard() {
 function writeWizardStorage(state) {
   try {
     if (typeof sessionStorage === 'undefined') return;
+    const chosen = state.routeChosen === true;
     // Secretless: the agent, the path (Bridge 0.14+ or not), pending create order, the screen, the system and the role.
     sessionStorage.setItem(WIZARD_STORAGE_KEY, JSON.stringify({
       agentId: state.agentId,
       screen: state.screen,
-      bridge: state.bridge !== false,
-      runs: state.runs,
-      routeChosen: state.routeChosen === true,
+      bridge: chosen ? state.bridge !== false : true,
+      runs: chosen ? state.runs : null,
+      routeChosen: chosen,
       createOrder: state.createOrder === true,
       os: state.os,
       role: state.role || 'worker',
@@ -1576,8 +1601,11 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
     return true;
   }
 
+  const owner = routeOwner(ctx);
   let disposed = false;
-  const onHashChange = () => dispose();
+  const onHashChange = () => {
+    if (!owner.isCurrent()) dispose();
+  };
   function dispose() {
     if (disposed) return;
     disposed = true;
@@ -1734,18 +1762,21 @@ function setupDialog(ctx, source, { secret = null, certificate = null, created =
 // without opening a modal on its own.
 export async function setupWizardPage(ctx) {
   closeSetupWizard();
+  const owner = routeOwner(ctx);
   const saved = readWizardStorage();
   const requestedId = (ctx.query && typeof ctx.query.get === 'function' && ctx.query.get('agent')) || (saved && saved.agentId) || null;
   let agent = null;
   if (requestedId) {
     try { agent = await ctx.api.agent(requestedId); } catch { agent = null; }
   }
+  if (!owner.isCurrent()) return h('div', { class: 'stack' });
   if (!agent) {
     let items = [];
     try {
       const listed = ctx.api && typeof ctx.api.agents === 'function' ? await ctx.api.agents({ limit: 20 }) : null;
       items = (listed && listed.items) || [];
     } catch { items = []; }
+    if (!owner.isCurrent()) return h('div', { class: 'stack' });
     if (items.length) {
       return h('div', { class: 'stack', 'data-view': 'agent-setup-chooser', 'data-agent-chooser': 'true' },
         pageHead({ title: 'Set up an agent', lede: 'Choose which agent to set up.' }),
@@ -1771,6 +1802,7 @@ export async function setupWizardPage(ctx) {
         h('div', { class: 'panel-body' }, h('a', { class: 'btn primary', href: ctx.href('/agents') }, 'Go to My agents'))));
   }
   const certificate = await agentCertificate(ctx);
+  if (!owner.isCurrent()) return h('div', { class: 'stack' });
   // The dialog itself resumes the stored screen for this agent (kittrial-5bb.348).
   setupDialog(ctx, { agent }, { secret: null, certificate });
   return h('div', { class: 'stack', 'data-view': 'agent-setup-wizard' },
