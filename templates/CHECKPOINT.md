@@ -95,8 +95,9 @@ not send `checkpoint`: the writer sets that to the comment id it publishes.
 The required fields are `schema_version` (1), `task` and `state`. `state` is one of
 `working`, `waiting-on-coordinator`, `waiting-on-review`, `waiting-on-user`, `waiting-on-own-job` or `idle`.
 The three `waiting-on-coordinator|review|user` states also require `waiting_on` (a role
-`coordinator`/`reviewer`/`user`, or an actor id, at most 96 characters; refused with any other
-state). `waiting-on-own-job` is for waiting on your OWN job (a test run, a replay, a build): it
+`coordinator`/`reviewer`/`user`, or an actor id, at most 96 characters; refused without one, and
+refused with a non-waiting state such as `working` or `idle`, or with `waiting-on-own-job`).
+`waiting-on-own-job` is for waiting on your OWN job (a test run, a replay, a build): it
 requires `job` (one line, at most 120 characters), refuses `waiting_on`, allows `expect_by` and
 `not_before`, is not a question for the coordinator, and with no `expect_by` counts as overdue
 4 hours after it began; its `expect_by` may be at most 24 hours ahead (kittrial-5bb.588 r3). Every other state refuses `job`. `expect_by` is an optional
