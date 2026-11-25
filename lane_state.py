@@ -35,16 +35,26 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
+from field_limits import check_text
+
 import record_json
 from requirements import canonical_bytes
 from reserved_comments import LANE_STATE_PREFIX as PREFIX, _reserved_prefix_view
 
 SCHEMA_VERSION = 1
-#: The declared states. The four ``waiting-*`` values are the waiting states: a
-#: ``waiting_on`` is required with one and refused with any other.
-STATES = ('working', 'waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user', 'idle',
-          'needs-investigation')
+#: The declared states. The four ``waiting-*`` values are the waiting states
+#: (:data:`WAITING_STATES`). Three of them wait on someone else (:data:`WAITING_ON_STATES`):
+#: ``waiting_on`` is required with those and refused with any other state.
+#: ``waiting-on-own-job`` (kittrial-5bb.588) waits on the worker's OWN job (a test run, a
+#: build): it requires ``job`` instead, refuses ``waiting_on``, and is never a question for
+#: the coordinator.
+OWN_JOB_STATE = 'waiting-on-own-job'
+STATES = ('working', 'waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user', OWN_JOB_STATE,
+          'idle', 'needs-investigation')
+#: Every state that is a wait (nudges, lane aging and the board count all four).
 WAITING_STATES = tuple(state for state in STATES if state.startswith('waiting-'))
+#: The waits that name somebody else: these, and only these, need ``waiting_on``.
+WAITING_ON_STATES = tuple(state for state in WAITING_STATES if state != OWN_JOB_STATE)
 #: The roles ``waiting_on`` may name instead of an actor id. The flag keys off the role;
 #: an actor id is shown beside it and is never converted into a role by guessing.
 ROLES = ('coordinator', 'reviewer', 'user')
@@ -60,15 +70,36 @@ ACTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 #: (fault_clear.py). The reason is untrusted text: bounded here, escaped when shown.
 FAULT_STATE = 'needs-investigation'
 REASON_LIMIT = 300
+#: ``job`` (kittrial-5bb.588): one printable line naming the worker's own job, untrusted
+#: text like ``reason``: bounded here, escaped when shown.
+JOB_LIMIT = 120
+#: With no ``expect_by`` a ``waiting-on-own-job`` is overdue this long after the state began.
+OWN_JOB_DEFAULT_EXPECT = timedelta(hours=4)
+#: kittrial-5bb.588 r3 (expect-by-cap): an own-job ``expect_by`` is at most this far after the record is written,
+#: as ``not_before`` is bounded, so a lane that died mid-wait is flagged within a day. A later value is refused at
+#: write; one that reached a record anyway is clamped on the board to this long after the episode began.
+OWN_JOB_EXPECT_MAX_AHEAD = timedelta(hours=24)
 TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
+
+#: ``local_fact`` (kittrial-5bb.588): what the worker saw LOCALLY (its job finished, a time reached, a file
+#: appeared). It rides in the lane-state record, never in the checkpoint object, so an older kit that does not know
+#: it refuses only this record (the board shows no declared state) and the checkpoint chain stays readable. It is
+#: only the worker's statement: it changes no review state and no lifecycle fact. Allowed with ANY state. Closed object.
+LOCAL_FACT_KINDS = ('job-finished', 'job-failed', 'job-partial', 'time-reached', 'file-seen')
+LOCAL_FACT_KEYS = ('kind', 'what', 'at', 'detail')
+LOCAL_FACT_WHAT_LIMIT = 160
+LOCAL_FACT_DETAIL_LIMIT = 300
+LOCAL_FACT_AT = re.compile(
+    r'\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:[Zz]|[+-]\d{2}:?\d{2})\Z')
 
 REQUIRED_FIELDS = ('schema_version', 'task', 'state')
 #: ``checkpoint`` is NOT sent in the request: the writer sets it to the comment id it
 #: publishes, which is the only way the record can be guaranteed to name the task's
 #: newest checkpoint at write time. ``waiting_on`` and ``expect_by`` are optional by
-#: rule. ``reason`` and ``about_task`` belong to ``needs-investigation`` only. The written
-#: record's field set is exactly these nine.
-OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by', 'not_before', 'reason', 'about_task')
+#: rule. ``reason`` and ``about_task`` belong to ``needs-investigation`` only, ``job`` to
+#: ``waiting-on-own-job`` only, ``local_fact`` allows any state. The written record's field set is exactly
+#: these eleven (``job`` and ``local_fact`` are absent from older records; schema_version stays 1).
+OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by', 'not_before', 'reason', 'about_task', 'job', 'local_fact')
 FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
 #: A ``not_before`` may be set at most this far ahead (kittrial-5bb.509): a wake time is
@@ -126,6 +157,81 @@ def display_reason(value):
     return shown[:REASON_LIMIT]
 
 
+def display_job(value):
+    """A job line made safe to show: clipped, every non-printable character written as an escape."""
+    text = str(value if value is not None else '')[:JOB_LIMIT]
+    shown = ''.join(ch if ch.isprintable() else ch.encode('unicode_escape').decode('ascii') for ch in text)
+    return shown[:JOB_LIMIT]
+
+
+def _job_problems(value):
+    if not isinstance(value, str) or not value.strip():
+        return ['Invalid lane state: job must be one line of text naming your own job']
+    if len(value) > JOB_LIMIT:
+        return ['Invalid lane state: job is longer than %d characters' % JOB_LIMIT]
+    if not value.isprintable():
+        return ['Invalid lane state: job must be one line without newlines, control or direction characters']
+    return []
+
+
+def local_fact_problems(value):
+    """Every problem with a ``local_fact`` object, as lane-state sentences."""
+    if not isinstance(value, dict):
+        return ['Invalid lane state: local_fact must be an object with kind, what and at (and optionally detail)']
+    found = []
+    unknown = sorted(str(key)[:40] for key in set(value) - set(LOCAL_FACT_KEYS))
+    missing = [key for key in ('kind', 'what', 'at') if key not in value]
+    if unknown:
+        found.append('Invalid lane state: local_fact unknown fields: ' + ', '.join(unknown[:10]))
+    if missing:
+        found.append('Invalid lane state: local_fact missing fields: ' + ', '.join(missing))
+    if 'kind' in value:
+        try:
+            known = value['kind'] in LOCAL_FACT_KINDS
+        except TypeError:
+            known = False
+        if not known:
+            found.append('Invalid lane state: local_fact.kind must be one of ' + ', '.join(LOCAL_FACT_KINDS))
+    for key, limit in (('what', LOCAL_FACT_WHAT_LIMIT), ('detail', LOCAL_FACT_DETAIL_LIMIT)):
+        if key not in value:
+            continue
+        try:
+            check_text(value[key], 'local_fact.' + key, limit)
+            # kittrial-5bb.588 r2 (m2): both texts are one printable line. str.isprintable refuses
+            # every control (C0 with newline and tab, DEL, C1), format characters (bidi overrides
+            # and isolates) and line/paragraph separators.
+            if not value[key].isprintable():
+                raise ValueError('local_fact.%s must be one line without newlines, control or direction '
+                                 'characters' % key)
+        except ValueError as error:
+            found.append(str(error))
+    if 'at' in value:
+        moment = value['at']
+        if not isinstance(moment, str) or not LOCAL_FACT_AT.fullmatch(moment.strip()):
+            found.append('Invalid lane state: local_fact.at must be ISO-8601 with seconds and an offset, such as '
+                         '2026-11-05T17:30:00Z')
+        else:
+            try:
+                parse_moment(moment.strip(), 'local_fact.at')
+            except ValueError:
+                found.append('Invalid lane state: local_fact.at is not a real time')
+    return found
+
+
+def display_local_fact(value):
+    """The one line a surface shows for a stored local_fact: ``Observed locally: <what> (<kind>) at <at>``.
+
+    Untrusted text: clipped to its limit and every non-printable character written as an escape."""
+    if not isinstance(value, dict):
+        return None
+
+    def safe(item, limit):
+        shown = str(item if item is not None else '')[:limit]
+        return ''.join(ch if ch.isprintable() else ch.encode('unicode_escape').decode('ascii') for ch in shown)
+    return 'Observed locally: %s (%s) at %s' % (safe(value.get('what'), LOCAL_FACT_WHAT_LIMIT),
+                                                 safe(value.get('kind'), 24), safe(value.get('at'), 40))
+
+
 def _reason_problems(value):
     if not isinstance(value, str) or not value.strip():
         return ['Invalid lane state: reason must be one line of text saying what needs investigating']
@@ -137,7 +243,7 @@ def _reason_problems(value):
     return []
 
 
-def problems(payload, task, checkpoint=None, now=None):
+def problems(payload, task, checkpoint=None, now=None, began=None):
     """Every problem with one lane-state payload, in order, so one refusal names them all.
 
     ``checkpoint`` is the comment id of the checkpoint this record is written with. When
@@ -150,6 +256,10 @@ def problems(payload, task, checkpoint=None, now=None):
     ``newest`` with it -- checks ``not_before`` structurally only, so a record whose wake
     time has passed stays usable; the writer passes a clock and the future-and-bounded
     rules apply. Tests inject ``now``; only the writers supply the real clock.
+
+    ``began`` (kittrial-5bb.588 r4) is when the own-job wait this record continues began
+    (:func:`own_job_write_began`); the 24-hour cap on its ``expect_by`` is measured from
+    it, the instant the board clamps from. ``None`` measures from ``now``.
     """
     if not isinstance(payload, dict):
         return ['Invalid lane state: expected a JSON object']
@@ -187,7 +297,20 @@ def problems(payload, task, checkpoint=None, now=None):
         found.append('Invalid lane state: checkpoint is missing; the writer sets it to the checkpoint it '
                      'publishes')
     waiting_on = payload.get('waiting_on')
-    if isinstance(state, str) and state.startswith('waiting-'):
+    if state == OWN_JOB_STATE:
+        if waiting_on is not None:
+            found.append('Invalid lane state: waiting_on is refused when state is %r; you wait on your own '
+                         'job, so name it in job' % state)
+        if 'job' not in payload:
+            found.append('Invalid lane state: job is required when state is %r' % state)
+        else:
+            found.extend(_job_problems(payload['job']))
+    elif 'job' in payload:
+        found.append('Invalid lane state: job is refused when state is %r; it belongs to %r'
+                     % (state, OWN_JOB_STATE))
+    if state == OWN_JOB_STATE:
+        pass
+    elif isinstance(state, str) and state in WAITING_ON_STATES:
         if waiting_on is None:
             found.append('Invalid lane state: waiting_on is required when state is %r' % state)
         else:
@@ -213,11 +336,23 @@ def problems(payload, task, checkpoint=None, now=None):
             if name in payload:
                 found.append('Invalid lane state: %s is refused when state is %r; it belongs to %r'
                              % (name, state, FAULT_STATE))
+    if 'local_fact' in payload:
+        found.extend(local_fact_problems(payload['local_fact']))
     if 'expect_by' in payload:
         try:
-            parse_moment(payload['expect_by'])
+            expected = parse_moment(payload['expect_by'])
         except ValueError as error:
             found.append('Invalid lane state: ' + str(error))
+        else:
+            start = began if began is not None else now
+            if start is not None and payload.get('state') == OWN_JOB_STATE \
+                    and expected - start > OWN_JOB_EXPECT_MAX_AHEAD:
+                hours = int(OWN_JOB_EXPECT_MAX_AHEAD.total_seconds() // 3600)
+                found.append('Invalid lane state: expect_by of a %s wait is more than %d hours ahead of the '
+                             "wait's start: it must be within %d hours after this wait began (%s). A repost does "
+                             'not restart the wait; to wait longer, end it with another state (for example '
+                             'working) and declare a new wait'
+                             % (OWN_JOB_STATE, hours, hours, start.isoformat().replace('+00:00', 'Z')))
     if 'not_before' in payload:
         try:
             moment = parse_moment(payload['not_before'], 'not_before')
@@ -238,9 +373,9 @@ def problems(payload, task, checkpoint=None, now=None):
     return found
 
 
-def validate(payload, task, checkpoint=None, now=None):
+def validate(payload, task, checkpoint=None, now=None, began=None):
     """Return ``payload`` when it is a valid lane-state record for ``task``, else raise."""
-    found = problems(payload, task, checkpoint, now=now)
+    found = problems(payload, task, checkpoint, now=now, began=began)
     if found:
         raise ValueError('; '.join(found))
     return payload
@@ -290,6 +425,80 @@ def newest(comments, task):
     raised, and so are needs-investigation records: a fault is its own channel (fault_clear)
     and is never the task's declared wait state; ``None`` means the task carries no usable record (an older checkpoint).
     """
+    usable, comments = _usable(comments, task)
+    if not usable:
+        return None
+    _, _, comment, payload = usable[-1]
+    checkpoint = next(item for item in comments if str(item.get('id')) == payload['checkpoint'])
+    return comment, payload, checkpoint
+
+
+def own_job_episode_start(comments, task):
+    """The checkpoint comment that began the newest record's own-job EPISODE (kittrial-5bb.588 r2, S4).
+
+    An episode is the unbroken run of ``waiting-on-own-job`` records by one author on this task, read
+    newest first. Re-posting the wait (a retrying wrapper, a re-checkpoint) does not restart its clock;
+    a record of any other state, or by another author, ends the run. This is the rule .598 states for
+    every wait, applied here to own-job only. ``None`` when the newest usable record is not an own-job wait.
+    """
+    usable, comments = _usable(comments, task)
+    if not usable or usable[-1][3].get('state') != OWN_JOB_STATE:
+        return None
+    # r3 (note 1): a repost under a sub-label of the same actor (A/sub1) is the same author; r4 (note 1): so is
+    # a sibling sub-label (A/sub1, then A/sub2). See same_episode_actor.
+    author = usable[-1][2].get('author')
+    first = usable[-1]
+    for row in reversed(usable[:-1]):
+        if row[3].get('state') != OWN_JOB_STATE or not same_episode_actor(row[2].get('author'), author):
+            break
+        first = row
+    return next(item for item in comments if str(item.get('id')) == first[3]['checkpoint'])
+
+
+def same_episode_actor(first, second):
+    """Whether two record authors are one actor for an own-job episode (kittrial-5bb.588 r3 note 1, r4 note 1).
+
+    The claim namespace rule every activity comparison uses (``briefing.same_activity_actor``: a parent
+    and its sub-label), and also two sub-labels of one root (``A/sub1`` and ``A/sub2``). That is the safe
+    direction: treating siblings as one actor keeps the episode's first start, so the clock never restarts
+    early. A shared prefix without the slash (``A`` and ``Ax``) is still another actor.
+    """
+    from briefing import same_activity_actor
+    if same_activity_actor(first, second):
+        return True
+    if not isinstance(first, str) or not isinstance(second, str) or '/' not in first or '/' not in second:
+        return False
+    return first.split('/', 1)[0] == second.split('/', 1)[0] != ''
+
+
+def own_job_write_began(history, actor, now):
+    """When the own-job wait that a new record by ``actor`` continues began (kittrial-5bb.588 r4, should 1).
+
+    ``history`` is the task's usable lane records, oldest first, as ``(author, state, checkpoint_created_at)``.
+    A new own-job record continues the newest unbroken run of own-job records by the same actor, so the run's
+    first record dates it; otherwise it starts a new wait, at ``now``. A start that cannot be read gives
+    ``now``: the board then treats the wait as not quiet (lanes.py), so the record is never quiet for long.
+    """
+    began = now
+    for author, state, created_at in reversed(list(history or ())):
+        if state != OWN_JOB_STATE or not same_episode_actor(author, actor):
+            break
+        try:
+            began = parse_moment(created_at)
+        except (TypeError, ValueError):
+            return now
+    return began
+
+
+def native_history(comments, task):
+    """The ``history`` of :func:`own_job_write_began` from a task's native comments."""
+    usable, comments = _usable(comments, task)
+    created = {str(item.get('id')): item.get('created_at') for item in comments}
+    return [(row[2].get('author'), row[3].get('state'), created.get(row[3].get('checkpoint'))) for row in usable]
+
+
+def _usable(comments, task):
+    """``(records, comments)``: the usable records as ``(stamp, index, comment, payload)``, oldest first."""
     comments = [comment for comment in (comments or []) if isinstance(comment, dict)]
     ids = {str(comment.get('id')) for comment in comments if comment.get('id') is not None}
     usable = []
@@ -305,12 +514,8 @@ def newest(comments, task):
         if payload.get('state') == FAULT_STATE:
             continue
         usable.append((_stamp(comment), index, comment, payload))
-    if not usable:
-        return None
     usable.sort(key=lambda row: (row[0], row[1]))
-    _, _, comment, payload = usable[-1]
-    checkpoint = next(item for item in comments if str(item.get('id')) == payload['checkpoint'])
-    return comment, payload, checkpoint
+    return usable, comments
 
 
 def record(payload, task, checkpoint, now=None):

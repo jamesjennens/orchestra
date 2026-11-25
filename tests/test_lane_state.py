@@ -54,14 +54,14 @@ class ValidationTests(unittest.TestCase):
                 lane_state.validate(dict(schema_version=1, task=TASK, state=state), TASK)
 
     def test_each_waiting_state_accepts_a_role_or_an_actor_id(self):
-        for state in lane_state.WAITING_STATES:
+        for state in lane_state.WAITING_ON_STATES:
             for waiting_on in ('coordinator', 'reviewer', 'user', 'session-1234abcd-0000-0000-0000-000000000000',
                                'alice/session'):
                 with self.subTest(state=state, waiting_on=waiting_on):
                     lane_state.validate(dict(schema_version=1, task=TASK, state=state, waiting_on=waiting_on), TASK)
 
     def test_a_waiting_state_requires_waiting_on_and_a_non_waiting_state_refuses_it(self):
-        for state in lane_state.WAITING_STATES:
+        for state in lane_state.WAITING_ON_STATES:
             with self.subTest(state=state):
                 with self.assertRaisesRegex(ValueError, 'waiting_on is required'):
                     lane_state.validate(dict(schema_version=1, task=TASK, state=state), TASK)

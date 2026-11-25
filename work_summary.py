@@ -94,11 +94,15 @@ def item(row):
             if not isinstance(body, str) or not body.strip() or is_record_comment(body) or reserved_match(body) is not None:
                 continue
             cid = comment_identity(comment)
-            candidate = (parse_moment(comment.get('created_at')), cid, comment)
-            if latest is None or candidate[:2] > latest[:2]:
+            moment = parse_moment(comment.get('created_at'))
+            # kittrial-5bb.588 r2 (N3): within a second, a numeric id compares as a number
+            # (the tenth comment of a second is newer than the ninth), as briefing.entry_order_key.
+            order = (moment, (0, int(cid), '') if cid.isascii() and cid.isdigit() and len(cid) <= 18 else (1, 0, cid))
+            candidate = (moment, cid, comment, order)
+            if latest is None or order > latest[3]:
                 latest = candidate
         if latest is not None:
-            moment, cid, comment = latest
+            moment, cid, comment, _order = latest
             author, omitted = clipped(comment.get('author'), AUTHOR_MAX)
             answer['last_post'] = dict(comment_id=cid, timestamp=utc_text(moment),
                                        author=author, author_omitted_chars=omitted)

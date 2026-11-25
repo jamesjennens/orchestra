@@ -239,7 +239,8 @@ def normalize_item(item):
     # digest (kittrial-5bb.367) is carried the same way: the marker already moves on
     # a field edit, so fingerprinting the digest too would be redundant.
     for name in ('newer_activity_by_others', 'newer_activity_own',
-                 'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions'):
+                 'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions',
+                 'wake_summary'):
         if row.get(name) is None:
             value = item.get(name)
             if value is None and isinstance(attention, dict):

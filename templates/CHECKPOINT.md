@@ -34,6 +34,9 @@ The checkpoint validator and `checkpoint --help` read their numbers from
 | resolved evidence | 240 characters |
 | whole checkpoint | 80000 canonical bytes (80 KB) |
 | lane_state.waiting_on | 96 characters |
+| lane_state.job | 120 characters (waiting-on-own-job only) |
+| lane_state.local_fact.what | 160 characters |
+| lane_state.local_fact.detail | 300 characters |
 
 A refusal names the field, the length it had and the limit, for example
 `summary: 1001 characters, the limit is 1000`. An item refusal also names the path and
@@ -90,10 +93,15 @@ out before the checkpoint is validated. Do not put it inside the checkpoint obje
 not send `checkpoint`: the writer sets that to the comment id it publishes.
 
 The required fields are `schema_version` (1), `task` and `state`. `state` is one of
-`working`, `waiting-on-coordinator`, `waiting-on-review`, `waiting-on-user` or `idle`.
-A waiting state also requires `waiting_on` (a role `coordinator`/`reviewer`/`user`, or an
-actor id, at most 96 characters; refused without one, and refused with a non-waiting state
-such as `working` or `idle`). `expect_by` is an optional
+`working`, `waiting-on-coordinator`, `waiting-on-review`, `waiting-on-user`, `waiting-on-own-job` or `idle`.
+The three `waiting-on-coordinator|review|user` states also require `waiting_on` (a role
+`coordinator`/`reviewer`/`user`, or an actor id, at most 96 characters; refused without one, and
+refused with a non-waiting state such as `working` or `idle`, or with `waiting-on-own-job`).
+`waiting-on-own-job` is for waiting on your OWN job (a test run, a replay, a build): it
+requires `job` (one line, at most 120 characters), refuses `waiting_on`, allows `expect_by` and
+`not_before`, is not a question for the coordinator, and with no `expect_by` counts as overdue
+4 hours after it began; its `expect_by` may be at most 24 hours after the wait began, and a repost does not restart that
+(kittrial-5bb.588 r3, r4). Every other state refuses `job`. `expect_by` is an optional
 ISO-8601 time with an offset; a past value is accepted and flagged, and only an
 unparseable one is refused. `not_before` (kittrial-5bb.509) is an optional full ISO-8601
 time with seconds and an offset, strictly in the future and at most 14 days ahead, set
@@ -103,6 +111,17 @@ wait wakes the lane at it, and a later record without it clears it.
 ```json
 {"schema_version": 1, "task": "example-task", "state": "working"}
 ```
+
+## local_fact (an optional key of lane_state)
+
+`local_fact` records what you saw locally (kittrial-5bb.588). It is a key of the `lane_state` object, not of the
+checkpoint, so an older kit that does not know it refuses only the lane-state record and the checkpoint chain stays
+readable. It is allowed with any state: `{"kind": ..., "what": ..., "at": ..., "detail": ...}`. `kind` is one of
+`job-finished`, `job-failed`, `job-partial`, `time-reached` or `file-seen`; `what` is one line, at most 160
+characters; `at` is ISO-8601 with seconds and an offset; `detail` is optional, at most 300 characters; no other
+keys. It is only your statement: it changes no review state and no lifecycle fact, and it is shown as
+`Observed locally: <what> (<kind>) at <at>`. A checkpoint whose only change is a lane_state carrying a new
+`local_fact` is accepted.
 
 ## Payload
 

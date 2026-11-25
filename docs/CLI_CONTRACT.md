@@ -262,6 +262,22 @@ blocking instead of returning it twice. Without `--since` the client uses the fi
 it remembers in its small local state file; `--fresh` ignores it and asks for the whole
 baseline again.
 
+Three local-only options wake the wait from this machine, checked between polls with no extra
+server request; the first of them, the server's answer or `--timeout` to fire wins. A local
+wake prints the normal wait JSON with the caller's own fingerprint, `timed_out: false`, exit 0,
+and a top-level `local_wake: {kind, what, at}`:
+
+- `--recheck-in DURATION` (`30s`, `30m`, `2h`, `1d`; more than zero, at most 14 days): `kind` is `time-reached`.
+- `--until-file PATH` (at most 1024 characters; only `os.path.exists` is called): `kind` is `file-seen`, `what` the escaped path.
+- `--until-exit PID`: `kind` is `process-exited`; the process is only checked (`kill(pid, 0)` on POSIX, `OpenProcess` plus a zero-wait on Windows), never signalled.
+  Limits of that check: on POSIX a process this account may not signal (PID 1, another user's),
+  an exited child not yet reaped (a zombie) and a reused PID all read as alive; so wait only on
+  your own job's PID, and pair `--until-exit` with `--recheck-in` or a `--timeout`.
+
+When the server's answer is a timeout, the local conditions are checked once more before the
+wait returns, so `--timeout 0` with a file that already exists wakes (`file-seen`); a server
+event still comes first.
+
 A waiting agent should not invent its next wait. With `--idle-since TIME` (an ISO-8601
 instant with an offset: when the caller's current idle spell began) and a bounded
 `--timeout`, the result of every timeout with the fingerprint unchanged carries:
@@ -301,6 +317,9 @@ directly. The caller's own delivery or review response takes the row out of its 
 the write's answer prints the post-write fingerprint to pass as `--since`. The caller's
 own claim or status change (for example `--status blocked` or `--status in_progress`)
 changes the worker fingerprint and wakes its wait once; this behavior is unchanged.
+Each item also carries `wake_summary` (kittrial-5bb.588): one sentence saying what is new
+since the lane's own checkpoint, built by the service. Print it rather than composing your
+own; it is never fingerprinted, so a change of wording alone never wakes a wait.
 Parent and sub-label authors (`agent` and `agent/sub0`) count as the same actor for
 activity markers and own/other counts; a different prefix actor such as `agent2` does
 not. The

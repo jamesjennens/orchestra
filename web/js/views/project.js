@@ -174,7 +174,7 @@ export const NUDGE_REASONS = [
   ['other', 'Other'],
 ];
 export const NUDGE_NOTE_MAX = 200;
-export const NUDGE_WAIT_STATES = ['waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user'];
+export const NUDGE_WAIT_STATES = ['waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user', 'waiting-on-own-job'];
 export const NO_CARRIER_SENTENCE = 'No supervisor is running for this lane\u2019s owner, so a nudge cannot be delivered.';
 
 const NUDGE_DETAIL_WORDS = {
@@ -198,11 +198,44 @@ export function hasCarrier(lane) {
   return Boolean(lane && lane.carrier_seen === true);
 }
 
+// kittrial-5bb.588: "waiting on own job: <job>, since <t>, expected by <t>". The job and the fact are the
+// worker's untrusted text: clipped to their limits and control/direction characters written as escapes here
+// too, and only ever placed as text nodes (h() sets text, never markup).
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g;
+function safeText(value, limit) {
+  return String(value == null ? '' : value).slice(0, limit)
+    .replace(UNSAFE_CHARS, (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'));
+}
+export function ownJobParts(entry, fmt) {
+  const expected = entry.expect_by_effective || entry.expect_by;
+  return ['waiting on own job: ', safeText(entry.job, 120),
+    entry.state_since ? [', since ', fmt(entry.state_since)] : null,
+    expected ? [', expected by ', fmt(expected)] : null];
+}
+export function ownJobLabelText(entry) {
+  return ownJobParts(entry, String).flat(Infinity).filter((part) => part !== null).join('');
+}
+function ownJobLabel(entry) {
+  return ownJobParts(entry, time);
+}
+
+// kittrial-5bb.588: what the worker saw locally, in its own words. Never a state: it moves no flag.
+export function localFactText(fact) {
+  if (!fact || typeof fact !== 'object') return null;
+  return `Observed locally: ${safeText(fact.what, 160)} (${safeText(fact.kind, 24)}) at ${safeText(fact.at, 40)}`;
+}
+function localFactLine(fact) {
+  const text = localFactText(fact);
+  return text ? h('div', { class: 'small muted', 'data-local-fact': 'true' }, text) : null;
+}
+
 // The lane's own declared wait on a lanes row, matching nudges.declared_wait (nudges.py:101-118):
 // only a declared waiting-on-* state counts (never an inferred/guessed wait or working).
 export function declaredWait(lane) {
   const found = ((lane && lane.held) || []).filter((entry) =>
-    entry && entry.declared === true && NUDGE_WAIT_STATES.includes(entry.state));
+    entry && entry.declared === true && NUDGE_WAIT_STATES.includes(entry.state)
+    // kittrial-5bb.588: an own-job wait stops counting once its (effective) expect_by passed, as nudges.counts_as_wait.
+    && !(entry.state === 'waiting-on-own-job' && (entry.flags || []).includes('expect_by_passed')));
   if (!found.length) return null;
   found.sort((a, b) => {
     const sa = String(a.state_since || ''), sb = String(b.state_since || '');
@@ -296,6 +329,7 @@ export function lanesPanel(ctx, project) {
     'waiting-on-coordinator': 'Waiting for the coordinator',
     'waiting-on-review': 'Waiting for a review',
     'waiting-on-user': 'Waiting for you: an answer',
+    'waiting-on-own-job': 'Waiting on its own job',
     'idle': 'Free',
     'needs-investigation': 'Needs investigation',
   };
@@ -329,12 +363,17 @@ export function lanesPanel(ctx, project) {
       // move sentence, the expect-by in local time, and the server's ages as spans.
       // Waiting for / Late (kittrial-5bb.416 r3): the mock-up's Late chip plus the
       // plain sentence it explains (expect-by in local time, how long waited).
-      h('div', { class: 'small' }, laneStateWords(entry),
+      entry.state === 'waiting-on-own-job'
+        // kittrial-5bb.588: the coordinator-facing label; the job text is the worker's, set as text only.
+        ? h('div', { class: 'small', 'data-own-job': 'true' }, ownJobLabel(entry))
+        : null,
+      entry.state === 'waiting-on-own-job' ? null : h('div', { class: 'small' }, laneStateWords(entry),
         waited ? [' · waiting for ', h('span', { class: 'who-acts' }, waited)] : null,
         entry.next ? [' — ', entry.next] : null),
+      localFactLine(entry.local_fact),
       h('div', { class: 'small muted' },
         'In that state ', ageText(entry.state_age_seconds),
-        entry.expect_by ? [' · expected ', time(entry.expect_by)] : null,
+        (entry.expect_by_effective || entry.expect_by) ? [' · expected ', time(entry.expect_by_effective || entry.expect_by)] : null,
         // The holder's own wake time (kittrial-5bb.509): the SERVER says whether it has
         // come due (not_before_due); this page never reads a clock of its own.
         entry.not_before ? (entry.not_before_due
@@ -344,7 +383,7 @@ export function lanesPanel(ctx, project) {
       // A late wait says so in words: the Late chip plus the plain sentence it
       // explains (mock-up lanes.html:60 'Late / expected today 20:00, 2 hours ago').
       late ? h('div', { class: 'small' }, h('span', { class: 'chip warn', 'data-flag': 'late' }, 'Late'), ' ',
-        'expected ', entry.expect_by ? time(entry.expect_by) : h('span', { class: 'muted' }, 'no date was given'),
+        'expected ', (entry.expect_by_effective || entry.expect_by) ? time(entry.expect_by_effective || entry.expect_by) : h('span', { class: 'muted' }, 'no date was given'),
         entry.state_age_seconds != null ? [', waited ', ageText(entry.state_age_seconds)] : null) : null,
       // A row the read could not declare is GUESSED from the checkpoint text, and says so.
       entry.inferred ? h('div', { class: 'small', 'data-inferred': 'true' },

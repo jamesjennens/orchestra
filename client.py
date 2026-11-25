@@ -615,7 +615,8 @@ class _InlineWait:
             if isinstance(contribution, dict) and contribution.get('id') is not None:
                 row['contribution_id'] = _InlineWait._scalar(contribution.get('id'))
         for name in ('newer_activity_by_others', 'newer_activity_own',
-                     'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions'):
+                     'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions',
+                     'wake_summary'):
             if row.get(name) is None:
                 value = item.get(name)
                 if value is None and isinstance(attention, dict):
@@ -1298,10 +1299,103 @@ def _wait_parser(add_help=False):
     parser.add_argument('--give-up-after', type=float,
                         default=_InlineWait.DEFAULT_GIVE_UP_AFTER, dest='give_up_after')
     parser.add_argument('--json', action='store_true')
+    # Local-only wake options (kittrial-5bb.588): checked on this machine between polls, they
+    # never reach the server and add no request. _wait_command strips them before the shared wait
+    # parser sees the arguments; they are declared here so --help lists them.
+    parser.add_argument('--recheck-in', dest='recheck_in', metavar='DURATION',
+                        help='return after DURATION (30s, 30m, 2h, 1d; at most 14d) as a local wake')
+    parser.add_argument('--until-file', dest='until_file', metavar='PATH',
+                        help='return when PATH exists (os.path.exists only; at most 1024 characters)')
+    parser.add_argument('--until-exit', dest='until_exit', metavar='PID',
+                        help='return when process PID no longer exists (checked, never signalled)')
     return parser
 
 
-def _wait_command(args,config,project,actor,out,config_path=None):
+#: Local wake options of ``wait`` (kittrial-5bb.588).
+LOCAL_RECHECK_MAX_SECONDS = 14 * 86400
+LOCAL_PATH_MAX = 1024
+LOCAL_SLICE_SECONDS = 1.0
+_LOCAL_UNITS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+
+
+def _local_duration(text):
+    match = re.fullmatch(r'([0-9]{1,9})([smhd])', text or '')
+    seconds = int(match.group(1)) * _LOCAL_UNITS[match.group(2)] if match else 0
+    if not match or seconds <= 0 or seconds > LOCAL_RECHECK_MAX_SECONDS:
+        raise ValueError('Invalid wait: --recheck-in takes a duration such as 30s, 30m, 2h or 1d, '
+                         'more than zero and at most 14 days')
+    return seconds
+
+
+def _escape_path(text):
+    """``text`` with every non-printable character shown as an escape (the path is untrusted)."""
+    return ''.join(c if c.isprintable() else c.encode('unicode_escape').decode('ascii')
+                   for c in text)
+
+
+def _local_options(args):
+    """Split the local wake options off ``args``: ``(rest, recheck, path, pid)``; ValueError refuses."""
+    parser = _InlineWait.Parser(prog='wait', add_help=False, allow_abbrev=False)
+    parser.add_argument('--recheck-in', dest='recheck_in')
+    parser.add_argument('--until-file', dest='until_file')
+    parser.add_argument('--until-exit', dest='until_exit')
+    parsed, rest = parser.parse_known_args(args)
+    recheck = None if parsed.recheck_in is None else (parsed.recheck_in, _local_duration(parsed.recheck_in))
+    path = parsed.until_file
+    if path is not None and (not path or len(path) > LOCAL_PATH_MAX or '\x00' in path):
+        raise ValueError('Invalid wait: --until-file takes a path of 1 to %d characters' % LOCAL_PATH_MAX)
+    pid = None
+    if parsed.until_exit is not None:
+        if not re.fullmatch(r'[0-9]{1,10}', parsed.until_exit) or int(parsed.until_exit) <= 0:
+            raise ValueError('Invalid wait: --until-exit takes a process id, a positive whole number')
+        pid = int(parsed.until_exit)
+    return rest, recheck, path, pid
+
+
+def _process_alive(pid, platform=None, _kill=os.kill, _ctypes=None):
+    """Whether process ``pid`` still exists. It only checks; it never signals or ends anything.
+
+    POSIX: ``kill(pid, 0)`` and nothing else (no such process: gone; not permitted: alive).
+    Windows: OpenProcess + WaitForSingleObject(handle, 0) + CloseHandle; ``os.kill`` is never
+    used there because on Windows it terminates the process.
+    """
+    if (sys.platform if platform is None else platform) != 'win32':
+        try:
+            _kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    if _ctypes is None:
+        import ctypes as _ctypes
+    kernel = _ctypes.windll.kernel32
+    open_process = kernel.OpenProcess
+    try:
+        open_process.restype = _ctypes.c_void_p   # a 64-bit handle must not be cut to 32 bits
+    except (AttributeError, TypeError):
+        pass                                     # a test's fake kernel
+    handle = open_process(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED
+    if not handle:
+        # Only ERROR_INVALID_PARAMETER (87) means there is no such process. Anything else
+        # (5, access denied: a process this account may not open) means it exists, or that
+        # we cannot tell: keep waiting rather than report an exit that did not happen.
+        return kernel.GetLastError() != 87
+    try:
+        return kernel.WaitForSingleObject(handle, 0) != 0  # WAIT_OBJECT_0: it has exited
+    finally:
+        kernel.CloseHandle(handle)
+
+
+class _LocalWake(Exception):
+    def __init__(self, kind, what):
+        Exception.__init__(self, kind)
+        self.kind = kind
+        self.what = what
+
+
+def _wait_command(args,config,project,actor,out,config_path=None,clock=None,sleep=None,
+                  wall=None,exists=os.path.exists,alive=None):
     """``client.py wait``: block until something is the caller's move (kittrial-5bb.285).
 
     The blocking is HERE, in the client, because the harness that wakes a model holds the
@@ -1321,7 +1415,11 @@ def _wait_command(args,config,project,actor,out,config_path=None):
     saw, so a restart whose read has not changed blocks instead of returning it again.
     """
     wait = _waiting_module() or _InlineWait
+    clock = time.monotonic if clock is None else clock
+    sleep = time.sleep if sleep is None else sleep
+    alive = _process_alive if alive is None else alive
     try:
+        args, recheck, until_path, until_pid = _local_options(args)
         options = wait.parse_client_args(args)
     except ValueError as error:
         sys.stderr.write('ValueError: %s\n' % error)
@@ -1366,8 +1464,38 @@ def _wait_command(args,config,project,actor,out,config_path=None):
         except (ValueError,TypeError) as error:
             raise wait.WaitUnreachable('Invalid wait response: %s' % str(error)[:200]) from None
 
-    code,view = wait.run_wait(read,since=options.since,timeout=options.timeout,
+    reads = {'n': 0}
+    counted_read = read
+    def read():
+        reads['n'] += 1
+        return counted_read()
+    local = recheck is not None or until_path is not None or until_pid is not None
+    started = clock()
+    wall_start = time.time() if wall is None else wall
+
+    def local_check():
+        if recheck is not None and clock() - started >= recheck[1]:
+            raise _LocalWake('time-reached', recheck[0])
+        if until_path is not None and exists(until_path):
+            raise _LocalWake('file-seen', _escape_path(until_path))
+        if until_pid is not None and not alive(until_pid):
+            raise _LocalWake('process-exited', str(until_pid))
+
+    def local_sleep(seconds):
+        # The poll's nap in slices of at most a second; the local conditions are looked at
+        # between slices and cost no server request.
+        local_check()
+        left = float(seconds)
+        while left > 0:
+            step = min(LOCAL_SLICE_SECONDS, left)
+            sleep(step)
+            left -= step
+            local_check()
+
+    try:
+        code,view = wait.run_wait(read,since=options.since,timeout=options.timeout,
                               interval=options.interval,
+                              clock=clock,sleep=local_sleep if local else sleep,
                               form=form,
                               idle_since=options.idle_since,
                               max_timeout=options.max_timeout,
@@ -1377,6 +1505,19 @@ def _wait_command(args,config,project,actor,out,config_path=None):
                               state_file=state_file,
                               fresh=options.fresh,
                               comments=options.comments)
+        if local and code == wait.EXIT_TIMEOUT:
+            # kittrial-5bb.588 r2 (S3): the server answered first and had nothing; a local
+            # condition already true still wakes, even with --timeout 0 (no sleep ran).
+            local_check()
+    except _LocalWake as woke:
+        moment = datetime.datetime.fromtimestamp(wall_start + (clock() - started),
+                                                 datetime.timezone.utc)
+        # The caller's own fingerprint goes back unchanged: a local wake is not news.
+        view = {'schema': wait.WAIT_SCHEMA, 'form': form, 'fingerprint': resumed,
+                'items': [], 'timed_out': False, 'polls': reads['n'],
+                'local_wake': {'kind': woke.kind, 'what': woke.what,
+                               'at': moment.strftime('%Y-%m-%dT%H:%M:%SZ')}}
+        code = 0
     text = json.dumps(view,ensure_ascii=True,indent=2)+'\n'
     if out:
         # The wait result is a result at every exit code, so --out writes it too; a
