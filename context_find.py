@@ -921,8 +921,10 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
 
 
 def format_text(answer):
-    lines = ['Find %s: %d matches; stale=%s; lower_bound=%s' %
-             (answer['phrase'], answer['total'], answer['stale'], str(answer['total_is_lower_bound']).lower())]
+    lower_bound = answer['total_is_lower_bound']
+    count = ('at least %d confirmed matches' if lower_bound else '%d matches') % answer['total']
+    lines = ['Find %s: %s; stale=%s; lower_bound=%s' %
+             (answer['phrase'], count, answer['stale'], str(lower_bound).lower())]
     for item in answer['items']:
         lines.append('%d. %s %s [%s] trust=data' % (item['rank'], item['kind'], item['pointer'], item['state']))
         lines.append('   ' + item['title']['text'])

@@ -340,6 +340,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(2, result['total'])
         self.assertIsNone(result['cursor'])
         self.assertEqual({'sample-1', 'sample-2'}, {item['task'] for item in result['items']})
+        self.assertIn('at least 2 confirmed matches', find.format_text(result))
 
     def test_time_budget_stops_nonmatching_corpus(self):
         ticks = iter([0, 0.5, 0.8, 1.2, 2.1] + [3] * 200)
