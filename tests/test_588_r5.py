@@ -27,7 +27,7 @@ sys.path.insert(0, str(KIT / 'tests'))
 
 import lanes
 import waits
-from test_lanes import A, add_checkpoint, add_lane_state, board, entry_of, task
+from test_lanes import A, add_checkpoint, add_lane_state, board, comment, entry_of, task
 from test_own_job_588 import BASE, OWN, iso
 
 
@@ -163,6 +163,136 @@ class UnreadableTimestamp(unittest.TestCase):
         _lane, entry = entry_of(board([row], now=BASE + timedelta(hours=1)), 'u-1')
         self.assertEqual('waiting-on-coordinator', entry['state'])
         self.assertEqual('coordinator', entry['waiting_on'])
+
+
+class AnotherSourceWithNoRecord(unittest.TestCase):
+    """r7 (unbound-payload): a waits.py wait from another source; CI on r6 raised UnboundLocalError on payload."""
+
+    def delivery(self, inferred=False):
+        return {'state': 'waiting-on-review', 'waiting_on': 'reviewer', 'inferred': inferred,
+                'started_at': iso(BASE + timedelta(hours=1)), 'origin_checkpoint': None,
+                'expect_by': None, 'expect_by_defaulted': True}
+
+    def held(self, row, task_id, waits_found):
+        with mock.patch.object(waits, 'task_wait_summary', return_value=waits_found):
+            return lanes.held_task(row, task_id, A, BASE + timedelta(hours=2), 15 * 60,
+                                   review={'review_state': 'awaiting-review'})
+
+    def test_a_delivery_wait_on_a_task_without_a_lane_state_record(self):
+        row = task('n-1', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        entry = self.held(row, 'n-1', [self.delivery()])
+        self.assertEqual('waiting-on-review', entry['state'])
+        self.assertTrue(entry['declared'])
+        self.assertIsNone(entry['local_fact'])          # no record, so no fact: waits.py adds none
+        # whose_move and next_actor come from the review state, not from the wait.
+        plain = self.held(row, 'n-1', [])
+        self.assertEqual((plain['whose_move'], plain['next_actor']), (entry['whose_move'], entry['next_actor']))
+        self.assertNotEqual('you', entry['whose_move'])
+
+    def test_the_board_reads_such_a_task(self):
+        # The CI case end to end: tests/test_comment_attention.py:130 through lanes.read as well.
+        row = task('n-4', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        with mock.patch.object(waits, 'task_wait_summary', return_value=[self.delivery()]):
+            _lane, entry = entry_of(board([row], now=BASE + timedelta(hours=2)), 'n-4')
+        self.assertEqual('waiting-on-review', entry['state'])
+        self.assertIsNone(entry['local_fact'])
+
+    def test_the_lanes_own_fact_is_still_shown_under_another_sources_wait(self):
+        fact = {'kind': 'job-finished', 'what': 'the suite', 'at': iso(BASE)}
+        for inferred in (False, True):
+            with self.subTest(inferred=inferred):
+                row = task('n-2', A)
+                add_checkpoint(row, 'cp-0', iso(BASE))
+                add_lane_state(row, 'ls-0', 'cp-0', iso(BASE + timedelta(seconds=1)), state='working', local_fact=fact)
+                entry = self.held(row, 'n-2', [self.delivery(inferred=inferred)])
+                self.assertEqual('the suite', (entry['local_fact'] or {}).get('what'))
+
+
+class WaitsUnreadable(unittest.TestCase):
+    """r7 (Neon MUST-2): a task waits.py cannot read is shown, marked 'waits-unreadable', never silently clean."""
+
+    def bad_comment(self, row):
+        row['comments'].append(comment('bad-1', 'a plain note', 'someone-else', 'not-a-timestamp'))
+
+    def test_a_delivery_wait_with_a_bad_comment_time_is_marked(self):
+        row = task('w-1', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        add_lane_state(row, 'ls-0', 'cp-0', iso(BASE + timedelta(seconds=1)), state='working')
+        self.bad_comment(row)
+        entry = lanes.held_task(row, 'w-1', A, BASE + timedelta(hours=2), 15 * 60,
+                                review={'review_state': 'awaiting-review'})
+        self.assertEqual('working', entry['state'])
+        self.assertIn('waits-unreadable', entry['flags'])
+        self.assertEqual('w-1 comment bad-1: created_at is not ISO-8601', entry['waits_unreadable_reason'])
+
+    def test_the_reason_is_one_printable_line_within_its_limit_and_never_the_value(self):
+        row = task('w-4', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        add_lane_state(row, 'ls-0', 'cp-0', iso(BASE + timedelta(seconds=1)), state='working')
+        row['comments'].append(comment('x\n' + 'y' * 300, 'a plain note', 'someone-else', 'secret\u202evalue'))
+        reason = lanes.held_task(row, 'w-4', A, BASE + timedelta(hours=1), 15 * 60, review={})['waits_unreadable_reason']
+        self.assertTrue(reason.startswith('w-4 comment x?yyy'), reason)
+        self.assertLessEqual(len(reason), 240)
+        self.assertTrue(reason.isprintable())
+        self.assertNotIn('secret', reason)
+
+    def test_a_readable_task_has_no_reason(self):
+        row = task('w-5', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        entry = lanes.held_task(row, 'w-5', A, BASE + timedelta(hours=1), 15 * 60, review={})
+        self.assertIsNone(entry['waits_unreadable_reason'])
+        self.assertNotIn('waits-unreadable', entry['flags'])
+
+    def test_an_overdue_declared_wait_keeps_its_own_flags(self):
+        row = task('w-2', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        add_lane_state(row, 'ls-0', 'cp-0', iso(BASE + timedelta(seconds=1)), state='waiting-on-coordinator',
+                       waiting_on='coordinator', expect_by=iso(BASE + timedelta(hours=1)))
+        self.bad_comment(row)
+        # The holder wrote five minutes ago, so your_move_idle alone would not show the wait.
+        row['comments'].append(comment('note-1', 'still here', A, iso(BASE + timedelta(hours=8, minutes=55))))
+        entry = lanes.held_task(row, 'w-2', A, BASE + timedelta(hours=9), 15 * 60, review={})
+        self.assertEqual('waiting-on-coordinator', entry['state'])
+        self.assertEqual(['expect_by_passed', 'waiting_too_long', 'waits-unreadable'],
+                         sorted(f for f in entry['flags'] if f != 'your_move_idle'))
+
+    def test_the_coordinator_view_treats_it_as_needing_attention(self):
+        import waiting
+        import client
+        row = task('w-3', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        add_lane_state(row, 'ls-0', 'cp-0', iso(BASE + timedelta(seconds=1)), state='working')
+        self.bad_comment(row)
+        row['comments'].append(comment('note-1', 'still here', A, iso(BASE + timedelta(minutes=59))))
+        result = board([row], now=BASE + timedelta(hours=1))
+        _lane, entry = entry_of(result, 'w-3')
+        self.assertEqual(['waits-unreadable'], entry['flags'])
+        self.assertEqual(['w-3'], result['items'][0]['flag_tasks']['waits-unreadable'])
+        for module in (waiting, client._InlineWait):
+            with self.subTest(view=module):
+                quiet = module.coordinator_view([], result)['triggers']['lane-quiet']
+                self.assertEqual([['waits-unreadable']], [item['flags'] for item in quiet])
+
+
+class WaitsFallbackOwnJob(unittest.TestCase):
+    """r7 (Neon SHOULD-1): the holder fallback (no checkpoint chain) opens no episode for an own-job record."""
+
+    def row(self, **state):
+        row = task('f-1', A)
+        row['comments'].append(comment('plain-1', 'working on it', A, iso(BASE)))
+        add_lane_state(row, 'ls-0', 'plain-1', iso(BASE + timedelta(seconds=1)), **state)
+        return row
+
+    def test_an_own_job_record_without_a_checkpoint_chain_opens_no_wait(self):
+        found = waits.task_wait_summary(self.row(state=OWN, job='the run'), 'f-1', A, BASE + timedelta(hours=1))
+        self.assertEqual([], found)
+
+    def test_a_coordinator_record_there_still_does(self):
+        found = waits.task_wait_summary(self.row(state='waiting-on-coordinator', waiting_on='coordinator'), 'f-1', A,
+                                        BASE + timedelta(hours=1))
+        self.assertEqual(['waiting-on-coordinator'], [w.get('state') for w in found])
 
 
 if __name__ == '__main__':

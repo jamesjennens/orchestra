@@ -32,7 +32,12 @@ LANES_LIMIT_DEFAULT = 20
 IDLE_WINDOW_HOURS = 24
 #: The open-item kinds the coordinator helper keeps; the prose fallback below uses them.
 PROSE_WAIT_ITEMS = ('blocker', 'question', 'dependency')
-FLAG_NAMES = ('waiting_too_long', 'expect_by_passed', 'your_move_idle', 'holder_retired')
+FLAG_NAMES = ('waiting_too_long', 'expect_by_passed', 'your_move_idle', 'holder_retired', 'waits-unreadable')
+#: kittrial-5bb.588 r7: the flag a held task carries when waits.py cannot read it (a comment time that does not
+#: parse); the row also carries ``waits_unreadable_reason``, one printable line of at most 240 characters:
+#: '<task> comment <cid>: created_at is not ISO-8601', or '<task>: <short reason>' for another ValueError, never the
+#: raw value (the shape kittrial-5bb.613 matches on the waiting list).
+WAITS_UNREADABLE = 'waits-unreadable'
 COVERAGE = ('One lane per registered session name; a task with no lane reads as its assignee actor. '
             'The declared state, who it waits on and expect_by come from the newest usable '
             'Kind: lane-state-v1 record; inferred true marks a row whose state is not declared. '
@@ -320,6 +325,39 @@ def holder_idle_seconds(row, actor, now):
     return seconds_since(row.get('updated_at') or row.get('created_at'), now)
 
 
+#: The longest waits_unreadable_reason (kittrial-5bb.588 r7).
+WAITS_UNREADABLE_REASON_LIMIT = 240
+
+
+def unreadable_wait_reason(row, task):
+    """``waits_unreadable_reason`` for a task whose waits waits.py could not read (kittrial-5bb.588 r7).
+
+    '<task> comment <cid>: created_at is not ISO-8601' for the first comment whose ``created_at`` does not parse (as
+    activity.parse_moment reads it), else '<task>: waits could not be read'. One printable line of at most
+    WAITS_UNREADABLE_REASON_LIMIT characters; the task and comment ids are data, so they are made printable and
+    clipped, and the unreadable value itself is never included.
+    """
+    from activity import parse_moment as activity_moment
+
+    def printable(value, limit):
+        return ''.join(ch if ch.isprintable() else '?' for ch in str(value))[:limit]
+    comment_id = None
+    for comment in row.get('comments') or []:
+        if not isinstance(comment, dict):
+            continue
+        try:
+            activity_moment(comment.get('created_at'), 'created_at')
+        except (ValueError, TypeError):
+            comment_id = comment.get('id')
+            break
+    name = printable(task, 96)
+    if comment_id is None:
+        reason = '%s: waits could not be read' % name
+    else:
+        reason = '%s comment %s: created_at is not ISO-8601' % (name, printable(comment_id, 96))
+    return reason[:WAITS_UNREADABLE_REASON_LIMIT]
+
+
 def held_task(row, task, actor, now, threshold, review=None, error=None, comment_authority=None,
               operators=None, owners=None, authority_state=None, project=None, journal=None):
     """One held task's row: the shared review facts plus the server-computed wait state.
@@ -372,6 +410,9 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     not_before = not_before_due = None
     checkpoint_id = None
     since = None
+    # kittrial-5bb.588 r7: the lane-state record's names are bound whether or not a record is found, because a
+    # waits.py wait from another source can make the row `declared` below on a task with no record at all.
+    record_comment = payload = checkpoint_comment = None
     if declared:
         record_comment, payload, checkpoint_comment = found
         checkpoint_id = str(payload.get('checkpoint'))
@@ -408,8 +449,11 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
             project=project, journal=journal,
         )
         waits_read = True
+        unreadable = None
     except ValueError:
+        # r7 (Neon MUST-2): the row stays, marked, never silently clean.
         open_waits, waits_read = [], False
+        unreadable = unreadable_wait_reason(row, task)
     # kittrial-5bb.588 r5: a declared waiting-on-own-job record is the lane's OWN wait, and lane_state alone dates
     # it: the start of its own-job run, the 4 h default and the 24 h cap the writer also enforces. waits.py opens
     # no episode for it (it waits on nobody and must page nobody; like 'working' it ends an open checkpoint
@@ -472,12 +516,15 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     flags = []
     # The own-job wait ages by its (effective) expect_by, not by the idle threshold: a long
     # test run is not "quiet" after fifteen minutes.
-    if active_wait is not None and wait_state in WAITING_ON_STATES \
+    # r7 (Neon MUST-2): when waits.py could not read the task, a declared wait on someone else keeps the flags its
+    # own record gives it (its expect_by, and its age from the checkpoint it was written with).
+    record_wait = not waits_read and declared and wait_state in WAITING_ON_STATES
+    if (active_wait is not None or record_wait) and wait_state in WAITING_ON_STATES \
             and age is not None and age > threshold:
         flags.append('waiting_too_long')
     # Slice 1 (r6) flags a waits.py wait at its expect_by instant; r4's own-job rule keeps that instant quiet
     # (own_job_quiet below) and flags it one second later, so each source keeps its own boundary.
-    if active_wait is not None and expect_moment is not None and expect_moment <= now:
+    if (active_wait is not None or record_wait) and expect_moment is not None and expect_moment <= now:
         flags.append('expect_by_passed')
     if own_job and expect_moment is not None and expect_moment < now:
         flags.append('expect_by_passed')
@@ -486,6 +533,8 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     own_job_quiet = own_job and expect_moment is not None and expect_moment >= now
     if move == 'you' and idle_seconds is not None and idle_seconds > threshold and not own_job_quiet:
         flags.append('your_move_idle')
+    if unreadable is not None:
+        flags.append(WAITS_UNREADABLE)
     return {
         'task': task,
         'title': str(row.get('title') or '')[:200],
@@ -498,7 +547,9 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         'waiting_on': waiting_on,
         'expect_by': expect_by,
         'job': job,
-        'local_fact': local_fact(payload if declared else None),
+        # kittrial-5bb.588 r7: the lane's OWN fact, from its newest record (payload, None without one), whatever
+        # decided `declared`: a waits.py wait from another source never adds a fact, and never hides the lane's.
+        'local_fact': local_fact(payload),
         'expect_by_effective': expect_effective if wait_state == OWN_JOB_STATE else None,
         'not_before': not_before,
         'not_before_due': not_before_due,
@@ -513,6 +564,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         'holder_last_write_at': holder_last_write(row, actor),
         'holder_last_write_seconds': idle_seconds,
         'flags': flags,
+        'waits_unreadable_reason': unreadable,
         'pending_review_items': pending_items,
         'redelivered': redelivered,
         'contribution_id': contribution.get('comment_id') if isinstance(contribution, dict) else None,

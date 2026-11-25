@@ -166,7 +166,7 @@ TIMER_REPOLL_SECONDS = 5.0
 #: The lane board flags a coordinator acts on: a lane quiet on its own move, or past a
 #: declared wait. ``waiting_too_long`` and ``expect_by_passed`` are the declared waits;
 #: ``your_move_idle`` is the lane's own move with no write for too long.
-LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
+LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed', 'waits-unreadable')
 
 #: The review states that mean "a delivery is waiting for a reviewer" and "approved
 #: work is waiting for integration", from the one review-state vocabulary.

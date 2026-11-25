@@ -551,7 +551,7 @@ class _InlineWait:
     TIMER_WAKE_EPSILON = 1.0
     TIMER_REPOLL_SECONDS = 5.0
     EMPTY_WAKE_TRIGGER = 3
-    LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
+    LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed', 'waits-unreadable')
     AWAITING_REVIEW_STATES = ('awaiting-review', 'legacy-review-ready')
     AWAITING_INTEGRATION_STATES = ('awaiting-integration', 'approved')
     FINGERPRINT = 'wait1:'
