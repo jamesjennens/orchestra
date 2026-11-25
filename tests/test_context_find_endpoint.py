@@ -74,6 +74,55 @@ class EndpointFindTests(unittest.TestCase):
         self.assertEqual(6, body['total'])
         self.assertEqual([mock.call(path), mock.call(path)], read.call_args_list)
 
+    def test_decision_grant_is_read_again_before_returning_a_cursor(self):
+        import test_decision_attest as attest
+        from http_authority import SCHEMA_VERSION
+        path = self.case.root / 'http-state.json'
+        snapshot = attest.web_state()
+        for field in ('memberships', 'coordinator_grants'):
+            snapshot[field][self.project] = snapshot[field].pop(attest.PROJECT)
+        snapshot['agents'][attest.AGENT]['projects'] = [self.project]
+        snapshot['schema_version'] = SCHEMA_VERSION
+        path.write_text(json.dumps(snapshot))
+        decision = row('pp-3', issue_type='decision')
+        journal = attest.Case('runTest')
+        journal.journal = self.case.root / 'projects' / self.project
+        journal.seq = 0
+        journal.attest(decision, attest.AGENT, project=self.project)
+        self.rows.append(decision)
+
+        args = self.request(['orthogonal', '--limit', '1', '--json'])
+        current = json.loads(self.execute(args)['stdout'])
+        self.assertIsNotNone(current['cursor'])
+        self.assertEqual('counts', current['items'][0]['state'])
+
+        search = context_find.search
+        def revoke_after_search(*args, **kwargs):
+            answer = search(*args, **kwargs)
+            snapshot['coordinator_grants'][self.project].clear()
+            path.write_text(json.dumps(snapshot))
+            return answer
+        with mock.patch.object(context_find, 'search', side_effect=revoke_after_search):
+            checked = json.loads(self.execute(args)['stdout'])
+        self.assertEqual('lagging', checked['stale'])
+        self.assertIsNone(checked['cursor'])
+        revoked = json.loads(self.execute(args)['stdout'])
+        self.assertNotEqual('counts', revoked['items'][0]['state'])
+
+    def test_cursor_binds_actor_but_omits_operator_authority(self):
+        args = ['orthogonal', '--limit', '1', '--json']
+        def page():
+            return json.loads(self.execute(self.request(args), key_projects={self.project})['stdout'])
+        with mock.patch.object(self.endpoint, 'configured_operators', return_value=['coordinator']):
+            first = page()
+        with mock.patch.object(self.endpoint, 'configured_operators', return_value=['another-coordinator']):
+            second = page()
+        self.assertIsNotNone(first['cursor'])
+        self.assertEqual(first['cursor'], second['cursor'])
+        with self.assertRaisesRegex(ValueError, 'start the search again'):
+            self.execute(self.request(args + ['--cursor', first['cursor']], actor='alice/session2'),
+                         key_projects={self.project})
+
     def test_configured_help_is_json_without_a_native_read(self):
         answer = self.execute(self.request(['--help']))
         self.assertEqual(0, answer['returncode'])
@@ -83,6 +132,11 @@ class EndpointFindTests(unittest.TestCase):
         self.assertEqual(5, body['default_limit'])
         self.cache.assert_not_called()
         self.assertEqual([], self.case.tracker.calls)
+
+    def test_find_help_respects_bound_project_scope(self):
+        with self.assertRaisesRegex(ValueError, 'project'):
+            self.execute(self.request(['--help']), key_projects={'different'})
+        self.cache.assert_not_called()
 
     def test_denied_project_before_native_read_missing_and_existing_identical(self):
         messages = []

@@ -161,6 +161,39 @@ class SearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'start the search again'):
             search(data, args=['--limit', '1', '--cursor', page['cursor']], actor='alice/session2')
 
+    def test_short_id_resolves_only_over_searchable_rows(self):
+        data = [row('sample-5bb.12'), row('sample-event.12', issue_type='event'),
+                row('sample-gate.12', issue_type='gate')]
+        answer = search(data, args=['--task', '.12'])
+        self.assertEqual(['sample-5bb.12'], [item['task'] for item in answer['items']])
+
+    def test_phrase_limit_is_200_characters(self):
+        find.parse_args(['a' * 200], ACTOR)
+        with self.assertRaisesRegex(ValueError, 'at most 200'):
+            find.parse_args(['a' * 201], ACTOR)
+
+    def test_cursor_refuses_extra_fields_and_positions_beyond_the_page(self):
+        data = [row('sample-1'), row('sample-2')]
+        args = ['--limit', '1']
+        page = search(data, args=args)
+        token = find._untoken(page['cursor'])
+        for change in ({'position': 3}, {'extra': 'field'}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'start the search again'):
+                search(data, args=args + ['--cursor', find._token(dict(token, **change))])
+
+    def test_unreadable_source_has_no_cursor_and_refuses_completion(self):
+        data = [row('sample-1'), row('sample-2')]
+        args = ['--limit', '1']
+        page = search(data, args=args)
+        # A broken third source contributes no eligible hit or generation input.
+        data.append(row('sample-3', malformed=True))
+        partial = search(data, args=args)
+        self.assertEqual(page['watermark']['generation'], partial['watermark']['generation'])
+        self.assertEqual('partial', partial['stale'])
+        self.assertIsNone(partial['cursor'])
+        with self.assertRaisesRegex(ValueError, 'start the search again'):
+            search(data, args=args + ['--cursor', page['cursor']])
+
     def test_write_changes_visible_generation_and_refuses_old_cursor(self):
         data = [row('sample-1'), row('sample-2')]
         page = search(data, args=['--limit', '1'])
@@ -219,6 +252,28 @@ class SearchTests(unittest.TestCase):
             self.assertNotRegex(value, r'\\u[0-9a-fA-F]{0,3}$')
         text = find.format_text(result)
         self.assertNotIn('\x1b', text)
+
+    def test_find_escapes_format_characters_in_display_and_metadata(self):
+        dirty = '\u200b\u200d\u2060\ufeff\u00ad\u034f\u180e\u3164\ufff9\U000e0041\U000e007f\ufe0f'
+        data = [row(title='orthogonal ' + dirty, text='orthogonal ' + dirty,
+                    created_by='author\x1b' + dirty, status='open\x1b' + dirty)]
+        answer = search(data)
+        hit = answer['items'][0]
+        expected = (r'\u200b\u200d\u2060\ufeff\u00ad\u034f\u180e\u3164\ufff9'
+                    r'\U000e0041\U000e007f\ufe0f')
+        for field in (hit['title']['text'], hit['excerpt']['text'], hit['author'], hit['state']):
+            self.assertIn(expected, field)
+        self.assertIn(r'\u001b', hit['author'])
+        self.assertIn(r'\u001b', hit['state'])
+        rendered = find.format_text(answer)
+        self.assertIn(expected, rendered)
+        for char in dirty:
+            self.assertNotIn(char, rendered)
+            self.assertNotIn(char, find._bytes(answer).decode())
+
+    def test_display_clipping_preserves_whole_supplementary_escape(self):
+        answer = search([row(title='a' * 195 + '\U000e0041' + 'tail')])
+        self.assertEqual('a' * 195, answer['items'][0]['title']['text'])
 
     def test_find_never_follows_paths_or_pointers(self):
         data = [row(text='orthogonal file:secret/SHA https://example.invalid /private/key')]
@@ -335,6 +390,17 @@ class SearchTests(unittest.TestCase):
         result = search(data, phrase='sample-456')
         self.assertTrue(result['items'][0]['exact'])
         self.assertEqual('task:sample-456', result['items'][0]['pointer'])
+
+    def test_exact_id_precedes_a_higher_weighted_score(self):
+        import capabilities
+        data = [row('sample-456', text='background'),
+                row('sample-other', text='sample-456 sample-456')]
+        def scores(documents, words, check_budget):
+            return {documents[0]['id']: 0.2, documents[1]['id']: 0.8}
+        with mock.patch.object(capabilities, 'bm25_scores', side_effect=scores):
+            items = search(data, phrase='sample-456')['items']
+        self.assertEqual(['sample-456', 'sample-other'], [item['task'] for item in items])
+        self.assertLess(items[0]['score'], items[1]['score'])
 
 
 class TypedReaderTests(unittest.TestCase):
