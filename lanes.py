@@ -399,23 +399,29 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     # Non-waiting declared states ('working', 'idle') and wake timers (not_before) remain above;
     # active wait state, episode origin age, inferred fallback (including 'decision' and all roles),
     # delivery waits, and verdict-cleared wait flags come from waits.py.
-    open_waits = waits_mod.task_wait_summary(
-        row, task, actor, now, review=None if error is not None else review,
-        operators=operators, owners=owners, authority_state=authority_state,
-        project=project, journal=journal,
-    )
-    active_wait = open_waits[0] if open_waits else None
+    # kittrial-5bb.588 r5: a timestamp waits.py cannot read (a malformed comment) leaves the row on its declared
+    # state with no server-computed wait, instead of failing the whole board read.
+    try:
+        open_waits = waits_mod.task_wait_summary(
+            row, task, actor, now, review=None if error is not None else review,
+            operators=operators, owners=owners, authority_state=authority_state,
+            project=project, journal=journal,
+        )
+        waits_read = True
+    except ValueError:
+        open_waits, waits_read = [], False
+    # kittrial-5bb.588 r5: a declared waiting-on-own-job record is the lane's OWN wait, and lane_state alone dates
+    # it: the start of its own-job run, the 4 h default and the 24 h cap the writer also enforces. waits.py opens
+    # no episode for it (it waits on nobody and must page nobody; like 'working' it ends an open checkpoint
+    # wait). A wait waits.py reports for the task from another source (a delivery, an approval, a named review
+    # request) does not replace the own-job row: it stays in the waiting list, and the row's whose_move and
+    # next_actor still come from the review state, so the coordinator's triggers fire as before (r4 BoardTests).
+    own_job = declared and wait_state == OWN_JOB_STATE
+    active_wait = None if own_job or not open_waits else open_waits[0]
     inferred_flag = False
-    # kittrial-5bb.588 r5: a declared waiting-on-own-job record is the lane's OWN move, so waits.py opens no
-    # episode for it (it ends a checkpoint wait as 'working' does). Its times come from lane_state alone: the
-    # start of the own-job run, the 4 h default and the 24 h cap the writer also enforces. A wait waits.py
-    # still reports for the task (a delivery, an approval, a named review request) is another party's move and
-    # governs the row, exactly as it does for a declared 'working' record.
-    own_job = declared and wait_state == OWN_JOB_STATE and active_wait is None
     if active_wait is not None:
         wait_state = active_wait.get('state') or wait_state
         waiting_on = active_wait.get('waiting_on')
-        job = None
         inferred_flag = bool(active_wait.get('inferred'))
         declared = not inferred_flag
         if active_wait.get('origin_checkpoint'):
@@ -434,7 +440,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
         began_with = own_job_episode_start(row.get('comments') or [], task)
         if began_with is not None:
             since = began_with.get('created_at')
-    elif wait_state in WAITING_ON_STATES:
+    elif waits_read and wait_state in WAITING_ON_STATES:
         # Wait was answered by a qualifying verdict or dropped by a newer holder checkpoint:
         # clear stale waiting flags (kittrial-5bb.598 §1.1 gaps 1-2).
         wait_state = waiting_on = expect_by = None
@@ -469,7 +475,11 @@ def held_task(row, task, actor, now, threshold, review=None, error=None, comment
     if active_wait is not None and wait_state in WAITING_ON_STATES \
             and age is not None and age > threshold:
         flags.append('waiting_too_long')
-    if (active_wait is not None or own_job) and expect_moment is not None and expect_moment <= now:
+    # Slice 1 (r6) flags a waits.py wait at its expect_by instant; r4's own-job rule keeps that instant quiet
+    # (own_job_quiet below) and flags it one second later, so each source keeps its own boundary.
+    if active_wait is not None and expect_moment is not None and expect_moment <= now:
+        flags.append('expect_by_passed')
+    if own_job and expect_moment is not None and expect_moment < now:
         flags.append('expect_by_passed')
     # kittrial-5bb.588 r2 (m1): a declared own-job wait is not idle before its effective expect_by;
     # after it, your_move_idle and expect_by_passed both fire, through the existing lane-quiet path.
