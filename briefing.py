@@ -2829,10 +2829,15 @@ def brief_lines_text(lines,server_line=None):
     def folded(text):
         text=unicodedata.normalize('NFKD',unicodedata.normalize('NFKD',text).casefold())
         return ''.join(ch for ch in text if unicodedata.category(ch)!='Cf' and unicodedata.category(ch)[0]!='M')
-    server=None if server_line is None else sum(str(line).count('\n')+1 for line in lines[:server_line])
+    # r4 (backstop-line-breaks): a physical line ends at every line break splitlines() knows (\r, \x0b, \x0c,
+    # \x1c-\x1e, \x85, U+2028, U+2029 as well as \n), as continued() splits, so a caller's text in a field that
+    # relies on the backstop (an attention item, the review JSON, which keeps U+2028 and U+0085 literal) cannot start
+    # a line either. Only the first physical line of lines[server_line] is the server's.
     out=[]
-    for number,line in enumerate('\n'.join(lines).split('\n')):
-        out.append('  '+line if number!=server and BRIEF_LABEL_START.match(folded(line)) else line)
+    for index,line in enumerate(lines):
+        for part,physical in enumerate(str(line).splitlines() or ['']):
+            server=index==server_line and part==0
+            out.append('  '+physical if not server and BRIEF_LABEL_START.match(folded(physical)) else physical)
     return '\n'.join(out)+'\n'
 
 def help_limits(action):

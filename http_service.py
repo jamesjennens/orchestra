@@ -7288,19 +7288,30 @@ class ApiHandler(BaseHTTPRequestHandler):
         return [(text, text) for text in sentences] + shortened + [
             (label, label.split(': ', 1)[1] if label.startswith('Allowed by: ') else label) for label in labels]
 
-    #: kittrial-5bb.540 r2 (gate-forms), widened by r3 (gate-separators): the label "approval basis" with ANY run of
-    #: separators between the words (none, spaces, newlines, markup, ".", "-", "_"), then any closing markup, quotes
-    #: or brackets, then a colon (":" or U+2236), ANYWHERE in the text; and "allowed by" in the same shape. Matched on
-    #: the folded text (:meth:`_folded_basis_text`), not on a line start.
+    #: kittrial-5bb.540 r2 (gate-forms), widened by r3 (gate-separators): the label "approval basis" with a run of
+    #: separators between the words (none, spaces, one newline, markup, ".", "-", "_"), then any closing markup,
+    #: quotes or brackets, then a colon, ANYWHERE in the text; and "allowed by" in the same shape. Matched on the
+    #: folded text (:meth:`_folded_basis_text`), not on a line start.
     BASIS_TAIL = '[\\s*_~`\'"\u2018\u2019\u201c\u201d\u00bb\u203a)\\]>}]*'
-    BASIS_LABEL = re.compile('(?<![^\\W_])approval[\\s\\W_]*basis(?P<tail>' + BASIS_TAIL + ')[:\u2236]')
+    #: r4 (honest-prose): the run between the two words never spans a sentence end (".", "!" or "?" then whitespace)
+    #: or a blank line, so "Needs approval. Basis: all tests pass." is prose; "Approval.basis:" is still the label.
+    LINE_BREAKS = '\r\n\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029'
+    BASIS_SEP = ('(?:(?![.!?][\\s]|(?:\\r\\n|[' + LINE_BREAKS + '])[^\\S' + LINE_BREAKS + ']*(?:\\r\\n|['
+                 + LINE_BREAKS + ']))[\\s\\W_])*')
+    #: r4 (gate-parity): ONE colon set for every label: ":" and the colons that survive NFKD (U+02D0, U+02F8, U+0589,
+    #: U+05C3, U+0703, U+0704, U+16EC, U+1361, U+2236, U+2982, U+A4FD, U+A789); U+FF1A, U+FE55 and U+FE13 fold to ":".
+    BASIS_COLONS = ':\u02d0\u02f8\u0589\u05c3\u0703\u0704\u16ec\u1361\u2236\u2982\ua4fd\ua789'
+    #: r4 (gate-parity): ONE dash set for every label.
+    BASIS_DASHES = '\\-\u2010\u2011\u2012\u2013\u2014\u2015\u2212'
+    BASIS_LABEL = re.compile('(?<![^\\W_])approval' + BASIS_SEP + 'basis(?P<tail>' + BASIS_TAIL + ')[' + BASIS_COLONS + ']')
     #: r3 (SHOULD-1): the label followed by a dash instead of a colon ("Approval basis \u2014 same-person-agent"). A
-    #: dash is ordinary prose after the two words, so this form is refused only when a basis follows it.
-    BASIS_DASH_LABEL = re.compile('(?<![^\\W_])approval[\\s\\W_]*basis' + BASIS_TAIL
-                                  + '[-\u2010\u2011\u2012\u2013\u2014\u2015\u2212](?P<rest>[\\s\\S]{0,400})')
+    #: dash is ordinary prose after the two words, so this form is refused only when a basis follows it. r4
+    #: (gate-parity): what follows is the WHOLE remaining text, read from a lookahead so no later label is skipped.
+    BASIS_DASH_LABEL = re.compile('(?<![^\\W_])approval' + BASIS_SEP + 'basis' + BASIS_TAIL
+                                  + '[' + BASIS_DASHES + '](?=(?P<rest>[\\s\\S]*))')
     #: What follows "allowed by" and its colon or dash, newlines included (r3: "Allowed by:\nsame-person-agent").
-    ALLOWED_BY_LABEL = re.compile('(?<![^\\W_])allowed[\\s\\W_]*by' + BASIS_TAIL
-                                  + '[:\u2236\u2013\u2014\u2212-](?P<rest>[\\s\\S]{0,400})')
+    ALLOWED_BY_LABEL = re.compile('(?<![^\\W_])allowed' + BASIS_SEP + 'by' + BASIS_TAIL
+                                  + '[' + BASIS_COLONS + BASIS_DASHES + '](?=(?P<rest>[\\s\\S]*))')
     #: The quotes a mention of the label is written in ("'Approval basis:' was wrong ...").
     BASIS_QUOTES = '\'"`\u2018\u2019\u201a\u201c\u201d\u201e\u00ab\u00bb\u2039\u203a'
     #: r3: how a basis may start after a label, compared normalized (:meth:`_normalize_basis_text`): a token, the
@@ -7327,6 +7338,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         return bool(start) and any(start.startswith(value)
                                    for value in self._basis_tokens() + list(self.BASIS_VALUE_STARTS))
 
+    #: r4 (honest-prose): after a DASH only a token or the reason counts as a basis, not the setting's words, so
+    #: "the approval basis \u2014 by-agent mode works as documented" is prose; after a colon the setting still counts.
+    BASIS_DASH_VALUE_STARTS = ('coordinatoragent', 'acoordinatoragent', 'thecoordinatoragent')
+
+    def _basis_dash_value_starts(self, rest):
+        """Whether ``rest`` (what follows the label and a dash) starts with a token or the reason (r4)."""
+        start = self._normalize_basis_text(rest)
+        return bool(start) and any(start.startswith(value)
+                                   for value in self._basis_tokens() + list(self.BASIS_DASH_VALUE_STARTS))
+
     def _basis_value_in(self, rest):
         """Whether ``rest`` names a basis anywhere: :meth:`_basis_value_starts`, or a token or "coordinator agent"
         later in it (r3: a quoted mention of the label followed by a basis in other words is a claim)."""
@@ -7352,7 +7373,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if quoted and re.match(r'\s*[^\W\d_]', after) and not self._basis_value_in(after):
                 continue
             return self.BASIS_LINE_LABEL
-        if any(self._basis_value_starts(found.group('rest')) for found in self.BASIS_DASH_LABEL.finditer(kept)):
+        if any(self._basis_dash_value_starts(found.group('rest')) for found in self.BASIS_DASH_LABEL.finditer(kept)):
             return self.BASIS_LINE_LABEL
         if any(self._basis_value_starts(found.group('rest')) for found in self.ALLOWED_BY_LABEL.finditer(kept)):
             return self.ALLOWED_BY_TEXT
