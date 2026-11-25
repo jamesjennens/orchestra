@@ -226,7 +226,7 @@ class NoUnguardedParseTests(unittest.TestCase):
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
     GUARDED_ONLY = ('artifacts.py', 'capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py',
                     'keyed_entries.py', 'project_creation.py', 'recovery.py', 'requirement_baseline_records.py',
-                    'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py',
+                    'requirement_baselines.py', 'reserved_comments.py', 'review_standards.py', 'rooms.py', 'task_assignment.py',
                     'decision_attest.py', 'delegations.py', 'host_notes.py', 'work.py')
 
     def bare(self, path):

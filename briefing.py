@@ -1573,7 +1573,8 @@ def compact_integration(value):
 
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
           independent_approval=False,owners=None,provenance_writes=True,identity_names=None,
-          field_history=None):
+          field_history=None,git_observation=None,standards_same_party_pair=None,
+          standards_active_person=None,include_standards=True):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -1803,6 +1804,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     brief_review.pop('reconciliation_needed',None)
     # Internal attention acknowledgement metadata belongs in the full projection.
     brief_review.pop('last_response',None)
+    brief_review.pop('sign_off',None)
     # The coordinator's recorded hand-back (kittrial-5bb.343): the same additive
     # block a work row carries. An APPLYING one is the assignee's move, so `next`
     # quotes the recorded text once and the shared review block names the role.
@@ -1822,6 +1824,31 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from task_assignment import notices as assignment_notices
     notice_block=assignment_notices(issue,project,actor)
     notice_records=assignment_notices(issue,project,None,limit=20)
+    std_block=None
+    if include_standards and journal is not None:
+        from pathlib import Path as _StdPath
+        import review_standards as _review_standards
+        _jpath=_StdPath(journal)
+        _std_store=_review_standards.HostStandardsStore(
+            _jpath,project,shared_loader=_review_standards.host_shared_loader_for(_jpath))
+        if _std_store.inspect_register_raw()[0]!='none':
+            from review_workflow import same_party as _rw_same_party
+            _owners_map=owners() if callable(owners) else owners
+            if _owners_map is None:
+                import sessions as _std_sessions
+                try:
+                    _owners_map=_std_sessions.owners(_jpath)
+                except Exception:
+                    _owners_map={}
+            def _std_pair(left,right):
+                if _rw_same_party(left,right,_owners_map):
+                    return True
+                if callable(standards_same_party_pair) and standards_same_party_pair(left,right):
+                    return True
+                return False
+            std_block=_review_standards.brief_standards_block(
+                _std_store,issue,review,full=full,git_observation=git_observation,
+                active_person_checker=standards_active_person,same_party_pair=_std_pair)
     result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(owner_raw or 'unassigned',96),**({'owner_name':clip(owner_name,96),'assigned_to':clip(assigned_to,200)} if owner_name and owner_name!=owner_raw else {}),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
@@ -1837,6 +1864,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
             'review':brief_review,
             **({'followon':result_followon} if result_followon is not None else {}),
+            **({'standards':std_block} if std_block is not None else {}),
             'lifecycle_matches_contribution':matches_contribution,
             'deployed_delivery':deployed_delivery,
             'deployed_delivery_is_current_contribution':deployed_current,
@@ -2638,6 +2666,7 @@ def parse_args(action,args):
     if action=='brief':
         parser.add_argument('--items-offset',type=int,default=0);parser.add_argument('--items-limit',type=int,default=5)
         parser.add_argument('--full',action='store_true')
+        parser.add_argument('--no-standards',action='store_true')
     elif action=='history':
         parser.add_argument('--limit',type=int);parser.add_argument('--since');parser.add_argument('--cursor');parser.add_argument('--body-budget',type=int,default=4000)
         parser.add_argument('--recent',type=int);parser.add_argument('--last',type=int)
@@ -3024,7 +3053,8 @@ def latest_checkpoint_read(rows,project,task,include_provenance=False):
             'evidence':{'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id'])}}
 
 def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None,
-            independent_approval=False,owners=None,identity_names=None):
+            independent_approval=False,owners=None,identity_names=None,git_observation=None,
+            standards_same_party_pair=None,standards_active_person=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
     if help_requested(args):
@@ -3105,7 +3135,11 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
                          verifiers=verifiers,actor=actor,full=a.full,
                          independent_approval=independent_approval,owners=owners,
                          provenance_writes=checkpoint_writes_enabled(root),
-                         identity_names=identity_names,field_history=field_history)
+                         identity_names=identity_names,field_history=field_history,
+                         git_observation=git_observation,
+                         standards_same_party_pair=standards_same_party_pair,
+                         standards_active_person=standards_active_person,
+                         include_standards=not a.no_standards)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

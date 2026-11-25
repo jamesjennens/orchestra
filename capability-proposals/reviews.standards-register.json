@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb.570-reviews-standards-register-r1",
+  "key": "reviews.standards-register",
+  "name": "Versioned project review standards register, single-level shared inheritance, person rule ownership, and agent drafts",
+  "aliases": [
+    "standards register",
+    "review standards",
+    "shared standards inheritance",
+    "rule owner edit",
+    "standards draft-propose",
+    "standards lint"
+  ],
+  "summary": "Projects may adopt an explicit versioned review standards register (.standards/head.json and append-only versions/v<N>.json). Projects with no head.json and no versions/ entries behave identically to projects without standards (ignoring pre-v1 drafts/, gate.json, commits/, and waivers/), whereas unreadable head.json or version entries report status damaged. Registers support one-level inheritance from a shared register (shared: true, inherits: <shared_pid>) with read-only inherited must rules, expected_version compare-and-swap on writes, R3a lint (default should severity, all_changes must count warning, ref key checks), person-only rule ownership and direct edits (notifying coordinators via unthrottled project-local member notes over HTTP and .standards/notifications.jsonl on the host, never accepted over the contributor SSH endpoint), departed-owner fallback, and agent/contributor rule drafts.",
+  "requirements": [],
+  "anchors": [
+    "docs/REVIEWS.md#zero-impact-rule-when-a-project-has-no-register",
+    "docs/REVIEWS.md#register-versions-shared-inheritance-ownership-and-drafts-r1r3-r5-r12"
+  ],
+  "code": [
+    "review_standards.py::HostStandardsStore",
+    "review_standards.py::DictStandardsStore",
+    "review_standards.py::resolve_effective_register",
+    "review_standards.py::put_register",
+    "review_standards.py::edit_rule",
+    "review_standards.py::propose_draft",
+    "review_standards.py::decide_draft",
+    "review_standards.py::endpoint_standards_action",
+    "review_standards.py::web_standards_action",
+    "review_standards.py::admin_standards_command",
+    "http_service.py::ApiHandler.standards_get",
+    "http_service.py::ApiHandler.standards_put",
+    "http_service.py::ApiHandler.standards_rule_patch",
+    "http_service.py::ApiHandler.standards_draft_propose",
+    "http_service.py::ApiHandler.standards_draft_decide",
+    "web/js/views/standards.js::page"
+  ],
+  "tests": [
+    "tests/test_review_standards.py",
+    "tests/test_http_review_standards.py",
+    "tests/test_standards_cli_and_backup.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "reviews",
+    "standards",
+    "governance",
+    "http"
+  ]
+}

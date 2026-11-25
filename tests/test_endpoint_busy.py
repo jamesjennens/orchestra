@@ -64,11 +64,12 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(answer['stderr'], 'PermissionError: %s\n' % closed)        # the line it always was, for the log
         self.assertEqual(self.answer(IsADirectoryError(21, 'Is a directory', marker))['fault'], 'configuration')
         self.assertEqual(self.answer(FileNotFoundError(2, 'No such file or directory', marker))['fault'], 'configuration')
-        # Another file, an error that names none, and a lock wait are what they were.
-        self.assertNotIn('fault', self.answer(PermissionError(13, 'Permission denied', '/srv/rt/projects/pp/views')))
-        self.assertNotIn('fault', self.answer(PermissionError(13, 'Permission denied', marker + '.lock')))
-        self.assertNotIn('fault', self.answer(OSError('disk')))
-        self.assertNotIn('fault', self.answer(OSError(9, 'Bad file descriptor', 7)))
+        # Another file or an escaping OSError carries fault 'os-error' (kittrial-5bb.570 r8/r9) so HTTP
+        # redacts host paths only on real OS errors; a lock wait still returns 75.
+        self.assertEqual(self.answer(PermissionError(13, 'Permission denied', '/srv/rt/projects/pp/views')).get('fault'), 'os-error')
+        self.assertEqual(self.answer(PermissionError(13, 'Permission denied', marker + '.lock')).get('fault'), 'os-error')
+        self.assertEqual(self.answer(OSError('disk')).get('fault'), 'os-error')
+        self.assertEqual(self.answer(OSError(9, 'Bad file descriptor', 7)).get('fault'), 'os-error')
         self.assertEqual(self.answer(TimeoutError(110, 'Timed out', marker))['returncode'], 75)
 
     def project(self, tmp, configuration):
@@ -225,7 +226,8 @@ class EndpointTests(unittest.TestCase):
         # Every one goes through guarded_write, so every one reads the configuration
         # before it reserves.
         # The fifteenth (kittrial-5bb.454 r2): `decision-attest`, an attestation of a decision's exact text.
-        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 15)
+        # The sixteenth (kittrial-5bb.570): `standards` (`draft-propose`, `std_effect`).
+        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 16)
 
     def test_an_action_that_needs_nothing_from_the_file_is_not_stopped_by_its_damage(self):
         """Review of kittrial-5bb.156: the file was read before EVERY action, so the onboarding text could

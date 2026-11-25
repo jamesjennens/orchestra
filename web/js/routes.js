@@ -15,6 +15,7 @@ export const ROUTE_PATTERNS = [
   ['agentSetup', '/setup'],
   ['project', '/p/{pid}'],
   ['reviews', '/p/{pid}/reviews'],
+  ['standards', '/p/{pid}/standards'],
   ['releases', '/p/{pid}/releases'],
   ['feedback', '/p/{pid}/feedback'],
   ['rooms', '/p/{pid}/rooms'],
@@ -82,7 +83,7 @@ export const RECORD_ROUTES = new Set(['requirements', 'requirement', 'decisions'
 const LIST_OF_RECORD = { room: ['rooms', 'room'], requirement: ['requirements', 'requirement'], decision: ['decisions', 'decision'],
   record: ['records', 'record'], referenceRecord: ['records', 'record'], capabilityRecord: ['records', 'record'] };
 // The name of each section, for the toast when the page the person left does not show it in the rail.
-export const SECTION_LABELS = { reviews: 'Reviews', releases: 'Releases', requirements: 'Requirements', records: 'Records',
+export const SECTION_LABELS = { reviews: 'Reviews', standards: 'Standards', releases: 'Releases', requirements: 'Requirements', records: 'Records',
   decisions: 'Decisions', rooms: 'Rooms', lanes: 'Lanes', program: 'Program', feedback: 'Orchestra feedback',
   people: 'People', agents: 'Agents', settings: 'Settings', setup: 'Set up', how: 'How work is found', handover: 'Handover', notes: 'Notes' };
 

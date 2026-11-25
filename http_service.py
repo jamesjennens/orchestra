@@ -73,6 +73,7 @@ from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_r
                                is_record_anchor)
 from http_auth import (Principal, AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_NUDGE_CARRY, NUDGES_SCOPE,
+                       CAP_STANDARDS_VERIFY, VERIFY_SCOPE,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
                        CAP_RELEASE,
@@ -660,7 +661,10 @@ class InProcessBackend:
               'reviews.add', 'feedback.add', 'projects.create', 'projects.archive',
               'members.set', 'members.remove', 'credentials.issue', 'credentials.revoke',
               'proposals.submit', 'proposals.dispose', 'lifecycle.scope', 'lifecycle.fact',
-              'files.record', 'files.withdraw')
+              'files.record', 'files.withdraw',
+              'standards.put', 'standards.rule-edit', 'standards.draft-propose',
+              'standards.draft-decide', 'standards.gate-set', 'standards.commit-record',
+              'standards.waiver-grant')
     #: Where this service-local backend keeps task files (kittrial-5bb.370): one folder per
     #: project under it. None (the default) means it has no store and the routes answer 501;
     #: a test or a local trial sets it.
@@ -682,7 +686,8 @@ class InProcessBackend:
     #: no deployment configuration, so a test or a local trial sets it; nothing else does.
     invites_enabled = False
 
-    def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None):
+    def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None,
+                 serving_repos=None, serving_target_ref=None):
         import actor_names
         from review_workflow import DELIVERY_SERVE_MAX_BYTES
         self.service = service
@@ -691,6 +696,39 @@ class InProcessBackend:
         self.delivery_roots = tuple(delivery_roots or ())
         self.delivery_serve_max_bytes = (
             DELIVERY_SERVE_MAX_BYTES if delivery_serve_max_bytes is None else int(delivery_serve_max_bytes)
+        )
+        self.serving_repos = dict(serving_repos or {})
+        self.serving_target_ref = dict(serving_target_ref or {})
+
+    @staticmethod
+    def _standards_error(err):
+        status = getattr(err, 'status', 422) or 422
+        code = {
+            403: 'forbidden',
+            404: 'not_found',
+            409: 'conflict',
+            422: 'invalid',
+            503: 'unavailable',
+        }.get(status, 'invalid')
+        failure = HttpError(status, code, str(err), 'StandardsRefusal: ' + str(err))
+        failure.nothing_done = True
+        return failure
+
+    def _standards_store(self, project_id, *, writable=False):
+        import review_standards
+        if writable:
+            root_dict = self.state.setdefault('standards', {})
+        else:
+            root_dict = self.state.get('standards')
+            if not isinstance(root_dict, dict):
+                root_dict = {}
+        return review_standards.DictStandardsStore(
+            root_dict,
+            project_id,
+            shared_loader=review_standards.dict_shared_loader_for(
+                root_dict,
+                project_exists=lambda pid: pid in self.service.state.get('projects', {}),
+            ),
         )
 
     def wake_project_dir(self, project_id):
@@ -787,6 +825,59 @@ class InProcessBackend:
         if route not in self.ROUTES:
             raise ValueError('Unknown canonical route %r' % (route,))
         result_key = self._result_key(principal, project_id, route, key, target) if key else None
+        prelock_git = None
+        if route == 'reviews.add' and isinstance(payload, dict) \
+                and payload.get('operation') in ('approve', 'request-changes', 'recommend'):
+            pre_contrib = None
+            needed_paths = ()
+            skip_prelock_git = False
+            with self.service.store.lock:
+                if authorize is not None:
+                    authorize()
+                if result_key is not None and self.service.has_result(result_key):
+                    WRITTEN.at = self.service.result_written_at(result_key) or False
+                    return self.service.result_get(result_key)
+                std_ro = self._standards_store(project_id, writable=False)
+                if std_ro.inspect_register_raw()[0] == 'active':
+                    import review_standards
+                    if isinstance(payload.get('checks'), list) and len(payload['checks']) > review_standards.CHECKS_MAX:
+                        skip_prelock_git = True
+                    else:
+                        records = self.state.get('contributions', {}).get(payload.get('task_id')) or []
+                        contribs = [r for r in records if r.get('kind') == 'contribution']
+                        if contribs:
+                            last_c = contribs[-1]
+                            pre_contrib = {
+                                'comment_id': last_c['id'],
+                                'commit': last_c['commit'],
+                                'delivery': dict(last_c.get('delivery') or {}),
+                            }
+                            needed_checks = []
+                            if isinstance(payload.get('checks'), list):
+                                needed_checks.extend(payload['checks'])
+                            adopt_id = payload.get('adopt_recommendation')
+                            if isinstance(adopt_id, str) and adopt_id:
+                                chk_st, rec_b = std_ro.read_recommendation_checks(adopt_id)
+                                if chk_st == 'ok' and isinstance(rec_b, dict) and isinstance(rec_b.get('checks'), list):
+                                    needed_checks.extend(rec_b['checks'])
+                            needed_paths = review_standards.collect_citation_paths_from_checks(needed_checks)
+                            if payload.get('operation') in ('request-changes', 'recommend') and not needed_paths:
+                                skip_prelock_git = True
+            if not skip_prelock_git and pre_contrib is not None and (
+                pre_contrib['delivery'].get('kind') != 'bundle'
+                or self.get_delivery_roots()
+                or self.serving_repos.get(project_id)
+            ):
+                import review_standards
+                obs = review_standards.inspect_delivery_git(
+                    pre_contrib,
+                    delivery_roots=self.get_delivery_roots(),
+                    max_bundle_bytes=self.get_delivery_serve_max_bytes(),
+                    serving_repo=self.serving_repos.get(project_id),
+                    target_ref=self.serving_target_ref.get(project_id, 'refs/heads/main'),
+                    needed_paths=needed_paths,
+                )
+                prelock_git = dict(obs, contribution_id=pre_contrib['comment_id'], commit=pre_contrib['commit'])
         # The authority re-check, the canonical write and the durable result share one
         # critical section. A concurrent revocation therefore either commits before
         # this section (and is observed by ``authorize``) or after it (and is
@@ -813,7 +904,13 @@ class InProcessBackend:
                 if reason is not None:
                     raise forbidden(actor_names.refusal(namespace, reason))
             result = (self._lifecycle_write(route, principal, project_id, payload, result_key)
-                      if route.startswith('lifecycle.') else self._dispatch(route, principal, project_id, payload))
+                      if route.startswith('lifecycle.')
+                      else self._standards_write(route, principal, project_id, payload, result_key)
+                      if route.startswith('standards.')
+                      else self._review_add(principal, project_id, payload,
+                                            prelock_git=prelock_git, operation_key=result_key)
+                      if route == 'reviews.add'
+                      else self._dispatch(route, principal, project_id, payload))
             from http_authority import server_time
             WRITTEN.at = server_time(self.service._now())
             if result_key is not None:
@@ -999,8 +1096,8 @@ class InProcessBackend:
             'tasks.update': self._task_update,
             'tasks.claim': self._task_claim,
             'tasks.comment': self._task_comment,
-            'checkpoints.add': self._checkpoint_add,
             'reviews.add': self._review_add,
+            'checkpoints.add': self._checkpoint_add,
             'feedback.add': self._feedback_add,
             'files.record': self._files_write,
             'files.withdraw': self._files_write,
@@ -1008,6 +1105,279 @@ class InProcessBackend:
         if handler is None:
             raise invalid('Backend route is not implemented for HTTP mapping')
         return handler(principal, project_id, payload)
+
+    def _standards_write(self, route, principal, project_id, payload, operation_id):
+        import http_authority as authority
+        import review_standards
+        store = self._standards_store(project_id, writable=True)
+        state = self.service.state
+        user_id = principal.user_id
+        actor = payload.get('actor') or principal.actor or user_id
+        user_rec = (state.get('users') or {}).get(user_id) or {}
+        role = (state.get('memberships') or {}).get(project_id, {}).get(user_id)
+        is_coord_or_owner = bool(user_rec.get('superuser') or role in ('coordinator', 'owner'))
+        is_person_sess = (
+            principal.via == 'session'
+            and principal.credential_id is None
+            and bool(getattr(principal, 'session_hash', None))
+        )
+        known_person, active_person, same_party_pair = review_standards._build_state_person_helpers(
+            state, project_id
+        )
+        body = payload.get('payload') if isinstance(payload.get('payload'), dict) else {}
+
+        def _can_read_other(other_pid):
+            try:
+                self.service.check_authority(principal, other_pid, CAP_READ)
+                return True
+            except HttpError:
+                return False
+
+        try:
+            if route == 'standards.draft-propose':
+                return review_standards.propose_draft(
+                    store, body, actor=actor, author_person=user_id,
+                    known_person_checker=known_person, now=self.service._now(),
+                )
+            if route == 'standards.put':
+                return review_standards.put_register(
+                    store, body, actor=actor, author_person=user_id,
+                    is_person_session=is_person_sess, is_coordinator_or_owner=is_coord_or_owner,
+                    via='web', can_read_project=_can_read_other,
+                    known_person_checker=known_person, active_person_checker=active_person,
+                    now=self.service._now(),
+                )
+            if route == 'standards.rule-edit':
+                return review_standards.edit_rule(
+                    store, str(payload.get('rule_id') or ''), body,
+                    actor=actor, author_person=user_id,
+                    is_person_session=is_person_sess, is_coordinator_or_owner=is_coord_or_owner,
+                    via='web', known_person_checker=known_person,
+                    active_person_checker=active_person, now=self.service._now(),
+                )
+            if route == 'standards.draft-decide':
+                return review_standards.decide_draft(
+                    store, str(payload.get('draft_id') or ''), body,
+                    actor=actor, author_person=user_id,
+                    is_person_session=is_person_sess, is_coordinator_or_owner=is_coord_or_owner,
+                    via='web', known_person_checker=known_person,
+                    active_person_checker=active_person, now=self.service._now(),
+                )
+            if route == 'standards.gate-set':
+                return review_standards.set_gate_mode(
+                    store, body.get('mode'), body.get('reason'),
+                    actor=actor, author_person=user_id,
+                    is_person_session=is_person_sess, is_coordinator_or_owner=is_coord_or_owner,
+                    via='web', now=self.service._now(),
+                )
+            if route == 'standards.waiver-grant':
+                task_id = str(payload.get('task_id') or '')
+                task = self._task(project_id, task_id)
+                self._refuse_record_anchor_row(task)
+                records = self.state.get('contributions', {}).get(task_id) or []
+                contribs = [r for r in records if r.get('kind') == 'contribution']
+                contrib = (
+                    {
+                        'comment_id': contribs[-1]['id'],
+                        'commit': contribs[-1]['commit'],
+                        'author': contribs[-1]['actor'],
+                    }
+                    if contribs
+                    else None
+                )
+                pinned_ver, _, _ = review_standards.resolve_pinned_version(store, contrib)
+                return review_standards.grant_waiver(
+                    store, body, task_id=task_id, contribution=contrib,
+                    task_assignee=task.get('assignee'), actor=actor, author_person=user_id,
+                    is_person_session=is_person_sess, is_coordinator_or_owner=is_coord_or_owner,
+                    same_party_checker=lambda other: (
+                        same_party_pair(actor, other)
+                        or (bool(user_id) and same_party_pair(user_id, other))
+                    ),
+                    active_person_checker=active_person, pinned_version=pinned_ver,
+                    now=self.service._now(),
+                )
+            if route == 'standards.commit-record':
+                commit_sha = str(payload.get('commit') or '')
+                op_mode = payload.get('operation')
+                if op_mode == 'record-commit-verifier':
+                    cred = (state.get('credentials') or {}).get(principal.credential_id) or {}
+                    if (
+                        principal.via != 'credential'
+                        or list(cred.get('scopes') or []) != [authority.VERIFY_SCOPE]
+                        or cred.get('agent_id')
+                    ):
+                        raise review_standards.StandardsRefusal(
+                            review_standards.refusal_commit_observation_authority(commit_sha),
+                            status=403,
+                        )
+                else:
+                    if not (is_person_sess and is_coord_or_owner):
+                        raise review_standards.StandardsRefusal(
+                            review_standards.refusal_commit_observation_authority(commit_sha),
+                            status=403,
+                        )
+                rows_for_commit = [
+                    self._standards_issue_view(t)
+                    for t in self._project_rows(project_id)
+                ]
+                return review_standards.record_commit_observation(
+                    store, commit_sha, body, actor=actor,
+                    recorded_by_user_id=user_id, recorded_by_principal=user_id,
+                    is_authorized_recorder=True,
+                    same_party_checker=lambda other: (
+                        same_party_pair(actor, other)
+                        or (bool(user_id) and same_party_pair(user_id, other))
+                    ),
+                    rows_or_tasks=rows_for_commit, now=self.service._now(),
+                )
+        except review_standards.StandardsRefusal as err:
+            raise self._standards_error(err) from None
+        raise invalid('Backend route is not implemented for HTTP mapping')
+
+    def _standards_issue_view(self, task, contributions=None):
+        tid = task['id']
+        return dict(
+            task,
+            review_records=list(
+                contributions
+                if contributions is not None
+                else (self.state.get('contributions', {}).get(tid) or [])
+            ),
+            recommendations=list(self.state.get('recommendations', {}).get(tid) or []),
+            checkpoints=list(self.state.get('checkpoints', {}).get(tid) or []),
+        )
+
+    @staticmethod
+    def _refuse_record_anchor_row(task):
+        if isinstance(task, dict) and (is_record_anchor(task) or is_merge_slot(task)):
+            raise not_found('Task not found')
+
+    def standards_gate_state(self, project_id):
+        import review_standards
+        with self.service.store.lock:
+            store = self._standards_store(project_id, writable=False)
+            try:
+                if store.inspect_register_raw()[0] == 'none':
+                    return None
+                return review_standards.get_gate_view(store)
+            except (review_standards.StandardsDamagedError, OSError) as exc:
+                return {
+                    'mode': 'unavailable',
+                    'source': 'unavailable',
+                    'status': 'unavailable',
+                    'error': review_standards._safe_store_exception_reason(exc, '.standards'),
+                }
+
+    def standards_read(self, project_id, principal, version=None):
+        import review_standards
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            store = self._standards_store(project_id, writable=False)
+            _, active_person, _ = review_standards._build_state_person_helpers(self.service.state, project_id)
+            try:
+                reg = review_standards.resolve_effective_register(
+                    store, version=version, active_person_checker=active_person
+                )
+                reg['gate'] = review_standards.get_gate_view(store)
+                return reg
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
+
+    def standards_versions(self, project_id, principal):
+        import review_standards
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            store = self._standards_store(project_id, writable=False)
+            try:
+                return review_standards.list_versions(store)
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
+
+    def standards_drafts(self, project_id, principal, status_filter=None):
+        import review_standards
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            store = self._standards_store(project_id, writable=False)
+            try:
+                return review_standards.list_drafts_view(store, status_filter=status_filter)
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
+
+    def standards_commit_read(self, project_id, principal, commit):
+        import review_standards
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            store = self._standards_store(project_id, writable=False)
+            try:
+                obs = store.read_commit_observation(str(commit).lower())
+                if obs is None:
+                    raise review_standards.StandardsRefusal(
+                        'No commit standards observation recorded for %s.' % str(commit).lower(),
+                        status=404,
+                    )
+                return obs
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
+
+    def standards_task_waivers(self, project_id, principal, task_id):
+        import review_standards
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            task = self._task(project_id, task_id)
+            self._refuse_record_anchor_row(task)
+            store = self._standards_store(project_id, writable=False)
+            records = self.state.get('contributions', {}).get(task_id) or []
+            contribs = [r for r in records if r.get('kind') == 'contribution']
+            contrib = (
+                {'comment_id': contribs[-1]['id'], 'commit': contribs[-1]['commit']}
+                if contribs
+                else None
+            )
+            try:
+                return review_standards.list_waivers_view(
+                    store, task_id, current_contribution=contrib, now=self.service._now()
+                )
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
+
+    def standards_task_signoff(self, project_id, principal, task_id, markdown=False, contribution_id=None):
+        import review_standards
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            task = self._task(project_id, task_id)
+            self._refuse_record_anchor_row(task)
+            store = self._standards_store(project_id, writable=False)
+            records = self.state.get('contributions', {}).get(task_id) or []
+            contribs = [r for r in records if r.get('kind') == 'contribution']
+            if contribution_id is not None:
+                cid = str(contribution_id)
+                ccommit = contribs[-1]['commit'] if contribs and contribs[-1]['id'] == cid else None
+            else:
+                if not contribs:
+                    raise not_found('Task %s has no delivery sign-off.' % task_id)
+                cid = contribs[-1]['id']
+                ccommit = contribs[-1]['commit']
+            app_op_id = None
+            for rec in records:
+                if rec.get('kind') == 'approve' and rec.get('contribution_id') == cid and rec.get('operation_id'):
+                    app_op_id = rec['operation_id']
+            issue_view = self._standards_issue_view(task, records)
+            try:
+                so = review_standards.read_signoff_for_contribution(
+                    store, cid, expected_commit=ccommit, approve_operation_id=app_op_id,
+                    issue=issue_view,
+                )
+                if so is None:
+                    raise review_standards.StandardsRefusal(
+                        'Task %s has no delivery sign-off for its current contribution.' % task_id,
+                        status=404,
+                    )
+                if markdown:
+                    return {'sign_off': so, 'markdown': review_standards.render_signoff_markdown(so)}
+                return so
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
 
     # -- task files (kittrial-5bb.370) ---------------------------------------------------------
     def files_project(self, project_id):
@@ -1216,15 +1586,21 @@ class InProcessBackend:
         import work
         return approval_basis_listed(work.help_payload('review'))
 
-    def _review_add(self, principal, project_id, payload):
+    def _review_add(self, principal, project_id, payload, *, prelock_git=None, operation_key=None):
+        import review_standards
+        payload, std_extracted = review_standards.strip_standards_fields(payload)
         task = self._task(project_id, payload.get('task_id'))
         operation = payload.get('operation')
         if operation not in ('contribute', 'request-changes', 'respond', 'approve', 'recommend'):
             raise invalid('Review operation must be contribute, request-changes, respond, '
                           'approve or recommend')
+        std_ro = self._standards_store(project_id, writable=False)
+        reg_status, _, _ = std_ro.inspect_register_raw()
         contributions = self.state.setdefault('contributions', {}).setdefault(task['id'], [])
         if operation == 'recommend':
-            return self._recommend(principal, project_id, task, contributions, payload)
+            return self._recommend(principal, project_id, task, contributions, payload,
+                                   std_extracted=std_extracted, reg_status=reg_status,
+                                   prelock_git=prelock_git, operation_key=operation_key)
         if operation == 'contribute':
             commit = payload.get('commit')
             base_commit = payload.get('base_commit')
@@ -1254,6 +1630,13 @@ class InProcessBackend:
                 raise invalid('bundle_sha256 must be a 64-character lowercase hex digest')
             if not isinstance(summary, str) or not summary.strip() or len(summary) > 1200:
                 raise invalid('Contribution summary must be 1-1200 characters')
+            if reg_status == 'active':
+                try:
+                    review_standards.validate_declared_tool_model(
+                        std_extracted.get('declared_tool'), std_extracted.get('declared_model')
+                    )
+                except review_standards.StandardsRefusal as err:
+                    raise self._standards_error(err) from None
             repository = payload.get('repository')
             repository = repository.strip() if isinstance(repository, str) else ''
             if isinstance(delivery, dict) and delivery.get('kind') == 'remote':
@@ -1299,7 +1682,19 @@ class InProcessBackend:
                     from review_workflow import same_commit_refusal_message
                     raise conflict(same_commit_refusal_message(review_id, answered=answered),
                                    {'review_id': review_id})
-            record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
+            con_id = 'con_' + secrets.token_hex(6)
+            if reg_status == 'active':
+                try:
+                    std_w = self._standards_store(project_id, writable=True)
+                    review_standards.record_contribution_pin(
+                        std_w, con_id, commit,
+                        declared_tool=std_extracted.get('declared_tool'),
+                        declared_model=std_extracted.get('declared_model'),
+                        now=self.service._now(),
+                    )
+                except review_standards.StandardsRefusal as err:
+                    raise self._standards_error(err) from None
+            record = {'id': con_id, 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
                       'repository': repository, 'delivery': delivery_block,
                       'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
@@ -1330,12 +1725,6 @@ class InProcessBackend:
         current = [r for r in contributions if r['kind'] == 'contribution']
         if not current:
             raise conflict('There is no contribution to review')
-        # A review names the revision it judges (canonical ``contribution``); a stale
-        # reviewer who read an older revision is refused instead of judging new work.
-        named = payload.get('contribution')
-        if named is not None and named != current[-1]['id']:
-            raise conflict('A newer contribution arrived; reread the task before reviewing',
-                           {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
         if operation == 'approve':
             # kittrial-5bb.516: an approve summary is checked as the canonical write checks it
@@ -1353,7 +1742,50 @@ class InProcessBackend:
                 raise invalid('Canonical command rejected the request', 'ValueError: %s' % error) from None
         summary = (payload.get('summary') or '')[:1200]
         operation_id = payload.get('operation_id')
+        named = payload.get('contribution')
+        if operation == 'approve' and isinstance(operation_id, str) and operation_id and reg_status != 'none':
+            for stored in contributions:
+                if stored.get('kind') != 'approve' or stored.get('operation_id') != operation_id:
+                    continue
+                if (
+                    stored.get('actor') == actor
+                    and (named is None or stored.get('contribution_id') == named)
+                    and stored.get('summary') == summary
+                ):
+                    ans = {'review': stored, 'task_version': task['version']}
+                    std_w = self._standards_store(project_id, writable=True)
+                    so = review_standards.read_signoff_for_contribution(
+                        std_w,
+                        stored['contribution_id'],
+                        approve_operation_id=operation_id,
+                        strict_operation_id=True,
+                    )
+                    if so is not None:
+                        if so.get('status') == 'staged':
+                            so = dict(so, status='committed', approval_comment_id=stored['id'])
+                            try:
+                                std_w.commit_signoff(stored['contribution_id'], operation_id, so)
+                            except (review_standards.SignoffCommitError, review_standards.StandardsDamagedError, OSError) as err:
+                                raise UncertainOutcome(
+                                    'Approval committed, but sign-off could not be finalized: %s'
+                                    % review_standards._safe_store_exception_reason(err, 'signoffs')
+                                ) from None
+                        ans['sign_off'] = so
+                        if so.get('would_have_refused'):
+                            ans['warnings'] = [
+                                'Standards gate (warn mode) would have refused in block mode: '
+                                + '; '.join(so['would_have_refused'])
+                            ]
+                    return ans
+                raise invalid('Operation ID already used with different payload or actor')
+        # A review names the revision it judges (canonical ``contribution``); a stale
+        # reviewer who read an older revision is refused instead of judging new work.
+        if named is not None and named != current[-1]['id']:
+            raise conflict('A newer contribution arrived; reread the task before reviewing',
+                           {'current_contribution': current[-1]['id']})
         items, resolutions = [], []
+        staged_signoff = None
+        eff_op_id = operation_id or operation_key or ('inproc-' + secrets.token_hex(8))
         if operation == 'request-changes':
             items = self._review_items(payload.get('items'), allow_severity=True)
             if isinstance(operation_id, str) and operation_id:
@@ -1369,6 +1801,71 @@ class InProcessBackend:
                 [{'id': 'item-1', 'text': summary}] if summary else [])
             if len(self._requests(contributions, True)) + len(blocking) > 20:
                 raise invalid('At most 20 unresolved review items are allowed')
+            if reg_status == 'active':
+                try:
+                    std_w = self._standards_store(project_id, writable=True)
+                    _, active_person, same_party_pair = review_standards._build_state_person_helpers(
+                        self.service.state, project_id
+                    )
+                    cid = current[-1]['id']
+                    ccommit = current[-1]['commit']
+                    contrib_view = {
+                        'comment_id': cid,
+                        'commit': ccommit,
+                        'author': current[-1]['actor'],
+                    }
+                    issue_view = self._standards_issue_view(task, contributions)
+                    raw_commit_obs = std_w.read_commit_observation(ccommit)
+                    commit_obs = review_standards.filter_commit_observation_for_evaluation(
+                        raw_commit_obs,
+                        issue=issue_view,
+                        contribution=contrib_view,
+                        extra_actors=(actor, principal.user_id),
+                        same_party_with_actor=lambda cand: (
+                            same_party_pair(actor, cand)
+                            or (bool(principal.user_id) and same_party_pair(principal.user_id, cand))
+                        ),
+                        same_party_pair=same_party_pair,
+                    )
+                    review_standards.validate_declared_tool_model(
+                        std_extracted.get('declared_tool'), std_extracted.get('declared_model')
+                    )
+                    if std_extracted.get('checks') is not None:
+                        pinned_ver, pinned_shared, _ = review_standards.resolve_pinned_version(
+                            std_w, {'comment_id': cid, 'commit': ccommit}
+                        )
+                        reg = review_standards.resolve_effective_register(
+                            std_w, version=pinned_ver, shared_version_override=pinned_shared,
+                            active_person_checker=active_person,
+                            include_signoff_warnings=False,
+                        )
+                        if reg['status'] == 'active':
+                            eff_git = (
+                                prelock_git if isinstance(prelock_git, dict)
+                                and prelock_git.get('contribution_id') == cid
+                                and prelock_git.get('commit') == ccommit else {}
+                            )
+                            git_tree_avail = bool(eff_git.get('tree_available'))
+                            git_timed_out = bool(eff_git.get('inspect_timed_out') or eff_git.get('lock_timed_out'))
+                            tree_avail = git_tree_avail
+                            tree_files = dict(eff_git.get('tree_files') or {})
+                            tree_recorders = None
+                            if not tree_avail and commit_obs and isinstance(commit_obs.get('tree_files'), dict):
+                                tree_avail = True
+                                tree_files = dict(commit_obs['tree_files'])
+                                tree_recorders = dict(commit_obs.get('tree_files_recorders') or {})
+                            valid_ids = review_standards.collect_valid_item_ids_for_contribution(
+                                issue_view, cid, {'items': items if items else blocking}
+                            )
+                            review_standards.validate_reviewer_checks(
+                                std_extracted['checks'], effective_rules=reg['effective_rules'],
+                                commit=ccommit, contribution_id=cid, valid_item_ids=frozenset(valid_ids),
+                                tree_available=tree_avail, tree_files=tree_files,
+                                commit_obs=commit_obs, tree_recorders=tree_recorders,
+                                git_timed_out=git_timed_out and not git_tree_avail,
+                            )
+                except review_standards.StandardsRefusal as err:
+                    raise self._standards_error(err) from None
         elif operation == 'respond':
             # Canonical rule (review_workflow.execute): only the current assignee may
             # respond, and every resolution must name a still-open request item.
@@ -1379,6 +1876,68 @@ class InProcessBackend:
         elif operation == 'approve' and self._requests(contributions, True):
             from review_workflow import unresolved_changes_approval_refusal
             raise conflict(unresolved_changes_approval_refusal(task.get('assignee')))
+        if operation == 'approve' and reg_status != 'none':
+            try:
+                std_w = self._standards_store(project_id, writable=True)
+                _, active_person, same_party_pair = review_standards._build_state_person_helpers(
+                    self.service.state, project_id
+                )
+                cid = current[-1]['id']
+                ccommit = current[-1]['commit']
+                contrib_view = {
+                    'comment_id': cid,
+                    'commit': ccommit,
+                    'author': current[-1]['actor'],
+                }
+                issue_view = self._standards_issue_view(task, contributions)
+                eff_git = (
+                    prelock_git if isinstance(prelock_git, dict)
+                    and prelock_git.get('contribution_id') == cid
+                    and prelock_git.get('commit') == ccommit else None
+                )
+                standing_recs = []
+                for srec in self._standing_recommendations(task, contributions):
+                    if same_party_pair(srec['actor'], current[-1]['actor']):
+                        continue
+                    if task.get('assignee') and same_party_pair(srec['actor'], task.get('assignee')):
+                        continue
+                    standing_recs.append({
+                        'comment_id': srec['id'],
+                        'author': srec['actor'],
+                        'contribution': srec['contribution_id'],
+                        'commit': srec['commit'],
+                        'operation_id': srec.get('operation_id'),
+                    })
+                valid_ids = frozenset(
+                    review_standards.collect_valid_item_ids_for_contribution(issue_view, cid)
+                )
+                staged_signoff = review_standards.evaluate_approval_signoff(
+                    std_w,
+                    task_id=task['id'],
+                    issue=issue_view,
+                    contribution=contrib_view,
+                    operation_id=eff_op_id,
+                    actor=actor,
+                    actor_user_id=principal.user_id,
+                    actor_owner_person=principal.user_id,
+                    actor_via=principal.via,
+                    extracted_fields=std_extracted,
+                    valid_item_ids=valid_ids,
+                    standing_recommendations=standing_recs,
+                    same_party_with_actor=lambda cand: (
+                        same_party_pair(actor, cand)
+                        or (bool(principal.user_id) and same_party_pair(principal.user_id, cand))
+                    ),
+                    same_party_with_recommender=same_party_pair,
+                    same_party_pair=same_party_pair,
+                    git_observation=eff_git,
+                    active_person_checker=active_person,
+                    now=self.service._now(),
+                )
+                if staged_signoff is not None:
+                    std_w.stage_signoff(cid, eff_op_id, staged_signoff)
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
                   'contribution_id': current[-1]['id'],
                   'summary': summary,
@@ -1401,6 +1960,8 @@ class InProcessBackend:
             record['needs_respond'] = True
             if isinstance(operation_id, str) and operation_id:
                 record['operation_id'] = operation_id
+        if operation == 'approve' and isinstance(eff_op_id, str) and eff_op_id and reg_status != 'none':
+            record['operation_id'] = eff_op_id
         if operation == 'respond':
             record['resolutions'] = resolutions
         contributions.append(record)
@@ -1411,9 +1972,27 @@ class InProcessBackend:
                                     else 'awaiting-review')
         task['version'] += 1
         self._event(project_id, task['id'], operation, principal, record['actor'])
-        return {'review': record, 'task_version': task['version']}
+        answer = {'review': record, 'task_version': task['version']}
+        if staged_signoff is not None:
+            std_w = self._standards_store(project_id, writable=True)
+            final_so = dict(staged_signoff, status='committed', approval_comment_id=record['id'])
+            try:
+                std_w.commit_signoff(current[-1]['id'], eff_op_id, final_so)
+            except (review_standards.SignoffCommitError, review_standards.StandardsDamagedError, OSError) as err:
+                raise UncertainOutcome(
+                    'Approval committed, but sign-off could not be finalized: %s'
+                    % review_standards._safe_store_exception_reason(err, 'signoffs')
+                ) from None
+            answer['sign_off'] = final_so
+            if final_so.get('would_have_refused'):
+                answer['warnings'] = [
+                    'Standards gate (warn mode) would have refused in block mode: '
+                    + '; '.join(final_so['would_have_refused'])
+                ]
+        return answer
 
-    def _recommend(self, principal, project_id, task, records, payload):
+    def _recommend(self, principal, project_id, task, records, payload, *,
+                   std_extracted=None, reg_status='none', prelock_git=None, operation_key=None):
         """A reviewer's recommendation (kittrial-5bb.115), with the canonical rules.
 
         Kept in its own list, beside the review records, so it never becomes the
@@ -1422,6 +2001,7 @@ class InProcessBackend:
         only while it awaits review, never by its author or the task's assignee.
         """
         import review_recommendations as rec
+        import review_standards
         from review_workflow import author_key, plain_text
         current = [r for r in records if r['kind'] == 'contribution']
         if not current:
@@ -1457,7 +2037,7 @@ class InProcessBackend:
                         and stored.get('commit') == payload.get('commit') \
                         and stored.get('verdict') == payload.get('verdict') \
                         and stored.get('summary') == summary.strip() and stored.get('items') == items:
-                    return {'recommendation': self._recommendation_view(stored), 'reconciled': True,
+                    return {'recommendation': self._recommendation_view(stored, project_id), 'reconciled': True,
                             'comment_id': stored['id'], 'task_version': task['version']}
                 # The canonical writer's own sentence, and its 422: the operation id is the
                 # record's identity, so it may not carry other content.
@@ -1472,23 +2052,81 @@ class InProcessBackend:
             raise forbidden('Nobody recommends their own contribution')
         if author_key(actor) in {author_key(record['actor']) for record in self._standing_recommendations(task, records)}:
             raise conflict(rec.ALREADY_RECOMMENDED % actor)
+        staged_rec = None
+        eff_op_id = operation_id or operation_key or ('inproc-rec-' + secrets.token_hex(8))
+        if reg_status == 'active':
+            try:
+                std_w = self._standards_store(project_id, writable=True)
+                _, active_person, same_party_pair = review_standards._build_state_person_helpers(
+                    self.service.state, project_id
+                )
+                eff_git = (
+                    prelock_git if isinstance(prelock_git, dict)
+                    and prelock_git.get('contribution_id') == contribution['id']
+                    and prelock_git.get('commit') == contribution['commit'] else None
+                )
+                issue_view = self._standards_issue_view(task, records)
+                valid_ids = review_standards.collect_valid_item_ids_for_contribution(
+                    issue_view, contribution['id'], {'items': items}
+                )
+                staged_rec = review_standards.validate_and_stage_recommendation_checks(
+                    std_w,
+                    contribution={
+                        'comment_id': contribution['id'],
+                        'commit': contribution['commit'],
+                        'author': contribution['actor'],
+                    },
+                    operation_id=eff_op_id,
+                    actor=actor,
+                    actor_user_id=principal.user_id,
+                    issue=issue_view,
+                    extracted_fields=std_extracted,
+                    valid_item_ids=frozenset(valid_ids),
+                    same_party_with_actor=lambda cand: (
+                        same_party_pair(actor, cand)
+                        or (bool(principal.user_id) and same_party_pair(principal.user_id, cand))
+                    ),
+                    same_party_pair=same_party_pair,
+                    git_observation=eff_git,
+                    active_person_checker=active_person,
+                    now=self.service._now(),
+                )
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
         record = {'id': 'rec_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': 'recommendation',
                   'contribution_id': contribution['id'], 'commit': contribution['commit'],
                   'verdict': payload['verdict'], 'summary': summary.strip(), 'items': items, 'actor': actor,
-                  'operation_id': operation_id,
+                  'operation_id': operation_id or (eff_op_id if staged_rec is not None else None),
                   'created_at': now_iso(self.service._now()),
                   # Its place among the review records, so a later decision makes it lapse.
                   'after': len(records)}
+        if staged_rec is not None:
+            std_w = self._standards_store(project_id, writable=True)
+            committed_rec = dict(staged_rec, status='committed', recommendation_id=record['id'])
+            std_w.commit_recommendation(eff_op_id, record['id'], committed_rec)
         self.state.setdefault('recommendations', {}).setdefault(task['id'], []).append(record)
         self._event(project_id, task['id'], 'recommend', principal, actor)
-        return {'recommendation': self._recommendation_view(record), 'task_version': task['version']}
+        return {'recommendation': self._recommendation_view(record, project_id), 'task_version': task['version']}
 
-    @staticmethod
-    def _recommendation_view(record):
-        return {'id': record['id'], 'author': record['actor'], 'at': record['created_at'],
+    def _recommendation_view(self, record, project_id=None):
+        view = {'id': record['id'], 'author': record['actor'], 'at': record['created_at'],
                 'contribution': record['contribution_id'], 'commit': record['commit'],
                 'verdict': record['verdict'], 'summary': record['summary'],
                 'items': [dict(item) for item in record['items']]}
+        if project_id is not None:
+            std_ro = self._standards_store(project_id, writable=False)
+            if std_ro.inspect_register_raw()[0] != 'none':
+                chk_st, bundle = std_ro.read_recommendation_checks(record['id'], record.get('operation_id'))
+                if chk_st == 'ok' and isinstance(bundle, dict):
+                    if bundle.get('checks') is not None:
+                        view['checks'] = [dict(c) for c in bundle['checks']]
+                    if bundle.get('register_version') is not None:
+                        view['register_version'] = bundle['register_version']
+                    if bundle.get('declared_tool') is not None:
+                        view['declared_tool'] = bundle['declared_tool']
+                    if bundle.get('declared_model') is not None:
+                        view['declared_model'] = bundle['declared_model']
+        return view
 
     def _standing_recommendations(self, task, records):
         """The recommendation RECORDS that stand for the current contribution, newest first.
@@ -1897,6 +2535,7 @@ class InProcessBackend:
         it, as canonically; a newer revision alone does not (``_requests`` keeps the
         old revision-resolves rule only for requests recorded before the respond step).
         """
+        project_id = task.get('project_id')
         records = self.state.get('contributions', {}).get(task['id'], [])
         contributions = [r for r in records if r['kind'] == 'contribution']
         requests = self._requests(records)
@@ -1908,13 +2547,13 @@ class InProcessBackend:
                             'branch': current.get('branch'), 'summary': current['summary'],
                             'author': current['actor'], 'at': current['created_at']}
         records_standing = self._standing_recommendations(task, records)
-        standing = [self._recommendation_view(record) for record in records_standing]
+        standing = [self._recommendation_view(record, project_id) for record in records_standing]
         import review_recommendations as rec
         approved = ([r for r in records if r['kind'] == 'approve'][-1:]
                     if task.get('review_state') == 'approved' else [])
         basis = approved[0].get('approval_basis') if approved else None
         import review_workflow
-        return {'state': task.get('review_state') or 'none', 'contribution': contribution,
+        view = {'state': task.get('review_state') or 'none', 'contribution': contribution,
                 # Additive (kittrial-5bb.515): why the server let the standing approval through, only when it
                 # carries the field (an approval written before it has none).
                 **({'approval_basis': {'basis': basis, 'text': review_workflow.APPROVAL_BASES.get(basis, basis),
@@ -1933,6 +2572,22 @@ class InProcessBackend:
                 'latest_id': records[-1]['id'] if records else None,
                 'latest_at': records[-1]['created_at'] if records else None,
                 'revisions': len(contributions)}
+        if project_id is not None and contribution is not None:
+            std_ro = self._standards_store(project_id, writable=False)
+            if std_ro.inspect_register_raw()[0] != 'none':
+                import review_standards
+                app_op_id = None
+                for r in records:
+                    if r.get('kind') == 'approve' and r.get('contribution_id') == contribution['id'] and r.get('operation_id'):
+                        app_op_id = r['operation_id']
+                so = review_standards.read_signoff_for_contribution(
+                    std_ro, contribution['id'], expected_commit=contribution['commit'],
+                    approve_operation_id=app_op_id,
+                    issue=self._standards_issue_view(task, records),
+                )
+                if so is not None:
+                    view['sign_off'] = so
+        return view
 
     def task_summaries(self, principal, project_id, tasks):
         from work_summary import read, clipped, NEXT_ACTION_MAX, comment_identity
@@ -1963,7 +2618,7 @@ class InProcessBackend:
                 item.update(checkpoint=None, coverage='unknown')
         return result
 
-    def task_brief(self, project_id, task_id):
+    def task_brief(self, project_id, task_id, *, include_standards=True):
         """Everything the task page shows, from one read of the in-process state."""
         task = self._task(project_id, task_id)
         from briefing import ContextPointers
@@ -1992,7 +2647,29 @@ class InProcessBackend:
                           # This backend holds the checkpoint in memory and always reads
                           # every item, so the shown list is the whole list, with no note.
                           'open_items_shown': len(items), 'open_items_total': len(items)}
-        return {**description, 'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+        review_block = self._review_view(task)
+        std_extra = {}
+        std_ro = self._standards_store(project_id, writable=False) if include_standards else None
+        if std_ro is not None and std_ro.inspect_register_raw()[0] != 'none':
+            import review_standards
+            _, active_person, same_party_pair = review_standards._build_state_person_helpers(
+                self.service.state, project_id
+            )
+            try:
+                std_block = review_standards.brief_standards_block(
+                    std_ro,
+                    self._standards_issue_view(task),
+                    review_block,
+                    full=False,
+                    active_person_checker=active_person,
+                    same_party_pair=same_party_pair,
+                    now=self.service._now(),
+                )
+            except review_standards.StandardsRefusal as err:
+                raise self._standards_error(err) from None
+            if std_block is not None:
+                std_extra['standards'] = std_block
+        return {**description, 'task': dict(task), 'checkpoint': checkpoint, 'review': review_block,
                 'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
                                      if isinstance(item, dict)] if checkpoints else [],
                 # The disposable backend records no lifecycle evidence, so every fact is
@@ -2001,6 +2678,7 @@ class InProcessBackend:
                 # This backend keeps no activity cursor; its checkpoints need none.
                 'activity_cursor': None,
                 'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None,
+                **std_extra,
                 **self._activity_blocks(task, checkpoints[-1] if checkpoints else None)}
 
     def _activity_blocks(self, task, checkpoint):
@@ -3047,6 +3725,19 @@ class EndpointBackend:
                               text)
             error.nothing_done = True
             raise error
+        if action in ('web-standards', 'standards') and isinstance(reply, dict) and (
+                reply.get('standards_status') or reply.get('records_status')):
+            status = reply.get('standards_status') or reply.get('records_status')
+            text = (reply.get('stderr') or 'Standards operation refused').strip().split('\n')[-1]
+            for prefix in ('ValueError: ', 'StandardsRefusal: '):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid'}.get(status, 'unavailable'),
+                              text)
+            error.nothing_done = True
+            raise error
         # Without a descriptor the service only reads (every write it sends carries one).
         return self._checked(reply, action, reading=authority is None)
 
@@ -3177,10 +3868,30 @@ class EndpointBackend:
         if code:
             said = stderr.strip().split('\n')[-1] if stderr.strip() else None
             detail = said[:cls._detail_limit(action, said, reply.get('refused'))] if said else None
+            detail = cls._sanitize_os_error_detail(
+                action, said, detail, is_os_error=(reply.get('fault') == 'os-error')
+            )
             if code == 2:
-                if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str) \
-                        and detail.startswith('ValueError: '):
-                    raise invalid(detail[len('ValueError: '):], detail)
+                if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str):
+                    std_status = reply.get('standards_status')
+                    if std_status in (403, 404, 409, 422, 503):
+                        clean = detail
+                        for prefix in ('StandardsRefusal: ', 'ValueError: '):
+                            if clean.startswith(prefix):
+                                clean = clean[len(prefix):]
+                                break
+                        err_code = {
+                            403: 'forbidden',
+                            404: 'not_found',
+                            409: 'conflict',
+                            422: 'invalid',
+                            503: 'unavailable',
+                        }[std_status]
+                        failure = HttpError(std_status, err_code, clean, detail)
+                        failure.nothing_done = True
+                        raise failure
+                    if detail.startswith('ValueError: '):
+                        raise invalid(detail[len('ValueError: '):], detail)
                 if action in ('ref', 'capability', 'interface') and isinstance(detail, str):
                     clean = detail
                     for prefix in ('ValueError: ', 'RecordsRefusal: '):
@@ -3283,6 +3994,30 @@ class EndpointBackend:
         said = (stderr or '').strip().split('\n')
         print('busy: the endpoint answered return code 75 for %s: %s'
               % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
+
+    @classmethod
+    def _sanitize_os_error_detail(cls, action, said, detail, *, is_os_error=False):
+        """Never forward an OSError line (which may carry a host path) to HTTP clients; log it for the operator.
+
+        Decides strictly by the endpoint's explicit ``fault == 'os-error'`` mark so member
+        payloads (e.g. a rule id containing '[Errno 13]') keep their own text and never log.
+        """
+        if not is_os_error:
+            return detail
+        if not isinstance(said, str) or not said:
+            return 'filesystem error'
+        print('os-error: the endpoint answered with an OS error for %s: %s'
+              % (action or 'a request', ascii(said[:400])), file=sys.stderr, flush=True)
+        low = said.lower()
+        if 'permission denied' in low or 'permissionerror' in low or 'errno 13' in low or 'errno 1]' in low:
+            return 'filesystem error: permission denied'
+        if 'no such file' in low or 'filenotfounderror' in low or 'errno 2]' in low:
+            return 'filesystem error: file not found'
+        if 'is a directory' in low or 'isadirectoryerror' in low:
+            return 'filesystem error: is a directory'
+        if 'not a directory' in low or 'notadirectoryerror' in low:
+            return 'filesystem error: not a directory'
+        return 'filesystem error'
 
     def _settle_actor_rows(self, principal, project_id):
         """Judge an unmarked credential's name by the tracker once and keep the outcome.
@@ -3449,8 +4184,10 @@ class EndpointBackend:
     #: request-review summary and the withdrawn/resolve dispositions are the same kind
     #: of additive field (kittrial-5bb.94 items 3 and 5).
     REVIEW_OPTIONAL_FIELDS = {
-        'contribute': ('follows',),
-        'request-changes': ('summary',),
+        'contribute': ('follows', 'declared_tool', 'declared_model'),
+        'request-changes': ('summary', 'checks', 'declared_tool', 'declared_model'),
+        'approve': ('checks', 'adopt_recommendation', 'declared_tool', 'declared_model'),
+        'recommend': ('checks', 'declared_tool', 'declared_model'),
         'request-review': ('summary',),
         'withdraw': ('disposition',),
         'resolve-item': ('disposition',),
@@ -3716,6 +4453,30 @@ class EndpointBackend:
                 args.append('@attachment:1')
                 attachments['1'] = {'flag': '--document', 'text': document}
             return (action_name, project_id, args, attachments)
+        if route.startswith('standards.'):
+            op_map = {
+                'standards.put': 'put',
+                'standards.rule-edit': 'rule-edit',
+                'standards.draft-propose': 'draft-propose',
+                'standards.draft-decide': 'draft-decide',
+                'standards.gate-set': 'set-gate',
+                'standards.waiver-grant': 'waive',
+            }
+            op_name = (
+                payload.get('operation')
+                if route in ('standards.commit-record', 'standards.draft-propose') and payload.get('operation')
+                else op_map.get(route)
+            )
+            if not op_name:
+                raise invalid('Unknown standards mutation route')
+            body = {
+                'operation': op_name,
+                'payload': payload.get('payload') if isinstance(payload.get('payload'), dict) else {},
+            }
+            for extra_key in ('rule_id', 'draft_id', 'task_id', 'commit'):
+                if payload.get(extra_key) is not None:
+                    body[extra_key] = payload[extra_key]
+            return ('web-standards', project_id, [json.dumps(body, ensure_ascii=False)], {})
         raise invalid('Backend route is not implemented for the canonical endpoint: %s' % route)
 
     # -- reads (no canonical mutation) ----------------------------------------
@@ -4408,7 +5169,7 @@ class EndpointBackend:
             raise uncertain('The canonical task summary returned an unexpected shape')
         return payload
 
-    def task_brief(self, project_id, task_id):
+    def task_brief(self, project_id, task_id, *, include_standards=True):
         """Map the canonical ``brief --json`` read onto the task page's shape.
 
         Two canonical reads: ``bd show`` for the editable task row (title,
@@ -4416,8 +5177,10 @@ class EndpointBackend:
         lifecycle facts and dependencies. Nothing is inferred beyond what they say.
         """
         task = self.get_task(project_id, task_id)
-        data = self._run('brief', project_id, self.actor_namespace + '/read',
-                         [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS)])
+        brief_args = [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS)]
+        if not include_standards:
+            brief_args.append('--no-standards')
+        data = self._run('brief', project_id, self.actor_namespace + '/read', brief_args)
         if not isinstance(data, dict):
             raise uncertain('Canonical brief returned an unexpected shape')
         checkpoint = None
@@ -4540,6 +5303,8 @@ class EndpointBackend:
                 # kittrial-5bb.425 part 2: the description's own req: and design: tokens, resolved by the brief.
                 **({'description_pointers': data['description_pointers']}
                    if isinstance(data.get('description_pointers'), dict) else {}),
+                **({'standards': data['standards']}
+                   if isinstance(data.get('standards'), dict) else {}),
                 'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'waiting_for_approval':review.get('waiting_for_approval'),
@@ -4547,6 +5312,8 @@ class EndpointBackend:
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
+                           **({'sign_off': review['sign_off']}
+                              if isinstance(review.get('sign_off'), dict) else {}),
                            # Additive (kittrial-5bb.94): the new states travel with every
                            # brief read, exactly as `review TASK` reports them.
                            'note_requests': note_requests,
@@ -4687,10 +5454,83 @@ class EndpointBackend:
         """The canonical recommendation view in the shape the in-process backend returns."""
         if not isinstance(value, dict):
             return None
-        return {'id': value.get('comment_id'), 'author': value.get('author'), 'at': value.get('timestamp'),
+        view = {'id': value.get('comment_id'), 'author': value.get('author'), 'at': value.get('timestamp'),
                 'contribution': value.get('contribution'), 'commit': value.get('commit'),
                 'verdict': value.get('verdict'), 'summary': value.get('summary'),
                 'items': [dict(item) for item in value.get('items') or [] if isinstance(item, dict)]}
+        for key in ('checks', 'register_version', 'declared_tool', 'declared_model'):
+            if key in value and value[key] is not None:
+                view[key] = [dict(c) for c in value[key]] if key == 'checks' and isinstance(value[key], list) else value[key]
+        return view
+
+    def _standards_read_call(self, project_id, principal, body):
+        reply = self._endpoint(
+            'web-standards',
+            project_id,
+            self.service.bind_actor(principal, None),
+            [json.dumps(body, ensure_ascii=False)],
+            authority=authority_request(principal, project_id, CAP_READ, now=self.service._expiry_now()),
+            require_authority=True,
+        )
+        payload = self._checked(reply, 'web-standards', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical standards read returned an unexpected shape')
+        return payload
+
+    def standards_gate_state(self, project_id):
+        import admin
+        import review_standards
+        try:
+            project = admin.project_dir(Path(self.root), project_id)
+        except ValueError:
+            return None
+        if not project.is_dir():
+            return None
+        store = review_standards.HostStandardsStore(project, project_id)
+        try:
+            if store.inspect_register_raw()[0] == 'none':
+                return None
+            return review_standards.get_gate_view(store)
+        except (review_standards.StandardsDamagedError, OSError) as exc:
+            return {
+                'mode': 'unavailable',
+                'source': 'unavailable',
+                'status': 'unavailable',
+                'error': review_standards._safe_store_exception_reason(exc, '.standards'),
+            }
+
+    def standards_read(self, project_id, principal, version=None):
+        body = {'operation': 'read'}
+        if version is not None:
+            body['version'] = version
+        return self._standards_read_call(project_id, principal, body)
+
+    def standards_versions(self, project_id, principal):
+        return self._standards_read_call(project_id, principal, {'operation': 'versions'})
+
+    def standards_drafts(self, project_id, principal, status_filter=None):
+        body = {'operation': 'draft-list'}
+        if status_filter is not None:
+            body['status'] = status_filter
+        return self._standards_read_call(project_id, principal, body)
+
+    def standards_commit_read(self, project_id, principal, commit):
+        return self._standards_read_call(
+            project_id, principal, {'operation': 'commit-read', 'commit': str(commit).lower()}
+        )
+
+    def standards_task_waivers(self, project_id, principal, task_id):
+        return self._standards_read_call(
+            project_id, principal, {'operation': 'waivers-read', 'task_id': str(task_id)}
+        )
+
+    def standards_task_signoff(self, project_id, principal, task_id, markdown=False, contribution_id=None):
+        body = {'operation': 'sign-off', 'task_id': str(task_id)}
+        if markdown:
+            body['format'] = 'markdown'
+        if contribution_id is not None:
+            body['contribution_id'] = str(contribution_id)
+        return self._standards_read_call(project_id, principal, body)
 
     #: ``GET /v1/me/work`` may reuse one principal's queue read of a project for this
     #: long, so a burst of page loads does not re-export every project each time.
@@ -5596,19 +6436,24 @@ STREAMED = set()
 #: dispatcher refuses it everywhere else before the route runs, so a route written later is closed to it
 #: by default; ``tests/test_lane_nudge_carrier.py`` sweeps every route to prove it.
 CARRIER_ROUTES = set()
+#: The only route a dedicated standards verifier credential (scope ``verify``) may call
+#: (kittrial-5bb.570): ``standards_commit_record``. Every other route is closed to it at dispatch.
+VERIFY_ROUTES = set()
 #: kittrial-5bb.418: the routes whose JSON body is read by the route itself, after its own
 #: authority checks, so the larger DESIGN_BODY_BYTES is never read for a caller who may not use it:
 #: the reference propose and revise (a design.<scope> revision carries its document).
 DEFERRED_BODY = {'references_propose', 'references_revise'}
 
 
-def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False):
+def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False, verify=False):
     compiled = re.compile('^' + pattern + '$')
 
     def register(handler):
         ROUTES.append((method, compiled, handler.__name__, anonymous, csrf))
         if carrier:
             CARRIER_ROUTES.add(handler.__name__)
+        if verify:
+            VERIFY_ROUTES.add(handler.__name__)
         if stream:
             STREAMED.add(handler.__name__)
         return handler
@@ -5945,6 +6790,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             begun = (name, ctx.idempotency_key is not None)
             if self._principal is not None and self._principal.via == 'credential' \
                     and NUDGES_SCOPE in self._principal.scopes and name not in CARRIER_ROUTES:
+                raise forbidden('Credential scope does not permit this operation')
+            if self._principal is not None and self._principal.via == 'credential' \
+                    and VERIFY_SCOPE in self._principal.scopes and name not in VERIFY_ROUTES:
                 raise forbidden('Credential scope does not permit this operation')
             status, response = getattr(self, name)(ctx)
             if status is not None:              # None: the route sent its own answer (a file download)
@@ -9714,6 +10562,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['can_set_agent_approval'] = self._may_set_agent_approval(ctx)
         result['auto_nudge'] = self.service.auto_nudge(ctx.params['pid'])
         result['can_set_auto_nudge'] = self._may_set_agent_approval(ctx)
+        gate_read = getattr(self.backend, 'standards_gate_state', None)
+        if gate_read is not None:
+            gate_val = gate_read(ctx.params['pid'])
+            if gate_val is not None:
+                result['standards_gate'] = gate_val
         return 200, result
 
     def _may_set_agent_approval(self, ctx):
@@ -10196,9 +11049,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
     def credential_issue(self, ctx):
         payload = ctx.payload or {}
+        is_verify = isinstance(payload, dict) and payload.get('scopes') == [VERIFY_SCOPE]
+        req_cap = CAP_COORDINATE if is_verify else CAP_PROJECT_ADMIN
         # Only who may issue one is told whether a name is taken: the answer says that a name
         # is an operator's or a session's, which is not for every member to probe.
-        self._project(ctx, CAP_PROJECT_ADMIN)
+        self._project(ctx, req_cap)
+        if is_verify and ctx.principal.via != 'session':
+            raise forbidden('Only a signed-in person coordinator or owner may issue a verifier credential')
         named = payload.get('actor')
         # An operator's allowance for a name the project's tracker already holds (kittrial-5bb.188
         # item 1): a superuser only, and only for the row rule -- never for a session, an
@@ -10271,7 +11128,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         audit_reason = None if waived_mark is None else \
             'waiver used for worker credential actor %s: %s' % (named, waived_mark['reason'])
         return self._mutate(ctx, 'credentials.issue', ctx.params['pid'], issue, status=201,
-                            capability=CAP_PROJECT_ADMIN, replay_status=200, reason=audit_reason)
+                            capability=req_cap, replay_status=200, reason=audit_reason)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials/'
                   r'(?P<cid>' + ID + r')/revoke')
@@ -14846,8 +15703,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not (newest and newest.get('author') in kept):
             newest = next((dict(entry) for entry in shown if 'summary' in entry), None)
         review['recommendation'] = newest
-        review['recommendations'] = [{'id': entry.get('id'), 'author': entry.get('author'), 'at': entry.get('at')}
-                                     for entry in shown]
+        review['recommendations'] = [
+            {
+                **{'id': entry.get('id'), 'author': entry.get('author'), 'at': entry.get('at')},
+                **{
+                    k: entry[k]
+                    for k in ('checks', 'register_version', 'declared_tool', 'declared_model')
+                    if k in entry and entry[k] is not None
+                },
+            }
+            for entry in shown
+        ]
         # The uncapped (author, operation id) list is for THIS SERVICE's write check
         # (kittrial-5bb.164), not for the page: it names records by the author's own person,
         # which the two lines above leave out of every read. It never leaves the service.
@@ -15113,8 +15979,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if recommending or judged:
             # A field this kit does not know is refused, not dropped, by the one rule for
             # every review operation below (kittrial-5bb.110): at most five plain names.
-            # One read serves the record-anchor check and the person rule below.
-            current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
+            # One read serves the record-anchor check and the person rule below; skip the
+            # standards block here so a warn-mode approve under a waivers fault is not
+            # refused 503 before reaching the gate (kittrial-5bb.570 r8).
+            current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'], include_standards=False)
             self._refuse_record_anchor(current.get('task'), write=True)
         else:
             self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
@@ -16458,6 +17326,301 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise not_found('No such operation')
         return 200, {'certificate': certificate,
                      'sha256': certificate_fingerprint(certificate)}
+
+    # -- review standards and accountable sign-off (kittrial-5bb.570) ---------
+
+    def _standards_require_person_session(self, ctx, message):
+        if (
+            ctx.principal is None
+            or ctx.principal.via != 'session'
+            or ctx.principal.credential_id is not None
+        ):
+            raise forbidden(message)
+
+    def _standards_emit_coordinator_note(self, ctx, pid, result):
+        if not isinstance(result, dict):
+            return result
+        out = dict(result)
+        notif_text = out.pop('coordinator_notification_text', None)
+        if notif_text and not out.get('coordinator_note_id'):
+            try:
+                note, _ = self.service.write_member_note(
+                    ctx.principal, pid, notif_text, None, 'coordinators',
+                    throttle=False, allow_any_member=True,
+                )
+                if isinstance(note, dict) and note.get('id'):
+                    out['coordinator_note_id'] = note['id']
+            except HttpError:
+                pass
+        if 'notified_coordinator' in out:
+            out['notified_coordinator'] = bool(out.get('coordinator_note_id'))
+        return out
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/standards')
+    def standards_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('version',))
+        version = None
+        if 'version' in ctx.query:
+            raw_ver = ctx.query.get('version')
+            if not isinstance(raw_ver, str) or not re.fullmatch(r'[1-9][0-9]{0,8}', raw_ver.strip()):
+                raise invalid('version must be a positive integer')
+            version = int(raw_ver.strip())
+        return 200, self.backend.standards_read(ctx.params['pid'], ctx.principal, version=version)
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/standards')
+    def standards_put(self, ctx):
+        import review_standards
+        pid = ctx.params['pid']
+        self._project(ctx, CAP_READ)
+        self._standards_require_person_session(ctx, review_standards.refusal_agent_register_edit())
+        body = dict(ctx.payload or {})
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            res = self.backend.invoke(
+                'standards.put', ctx.principal, pid, {'payload': body}, key=key, capability=CAP_READ
+            )
+            return res, res
+
+        return self._mutate(
+            ctx, 'standards.put', pid, write, status=200,
+            capability=CAP_READ, serialize=False, canonical=True,
+        )
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/standards/versions')
+    def standards_versions(self, ctx):
+        self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ())
+        return 200, self.backend.standards_versions(ctx.params['pid'], ctx.principal)
+
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/standards/rules/(?P<rid>' + ID + r')')
+    def standards_rule_patch(self, ctx):
+        import review_standards
+        pid = ctx.params['pid']
+        rid = ctx.params['rid']
+        self._project(ctx, CAP_READ)
+        self._standards_require_person_session(ctx, review_standards.refusal_agent_register_edit())
+        body = dict(ctx.payload or {})
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            res = self.backend.invoke(
+                'standards.rule-edit', ctx.principal, pid,
+                {'rule_id': rid, 'payload': body}, key=key, capability=CAP_READ,
+            )
+            res = self._standards_emit_coordinator_note(ctx, pid, res)
+            return res, res
+
+        return self._mutate(
+            ctx, 'standards.rule-edit', pid, write, status=200,
+            capability=CAP_READ, serialize=False, canonical=True, reason='rule %s' % rid,
+        )
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/standards/drafts')
+    def standards_drafts_list(self, ctx):
+        self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('status',))
+        status_filter = ctx.query.get('status')
+        return 200, self.backend.standards_drafts(ctx.params['pid'], ctx.principal, status_filter=status_filter)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/standards/drafts')
+    def standards_draft_propose(self, ctx):
+        pid = ctx.params['pid']
+        try:
+            self._project(ctx, CAP_REVIEWS)
+            cap = CAP_REVIEWS
+            op_name = 'draft-propose'
+        except HttpError as err:
+            if err.status != 403:
+                raise
+            self._project(ctx, CAP_TASKS)
+            cap = CAP_TASKS
+            op_name = 'draft-propose-tasks'
+        body = dict(ctx.payload or {})
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            res = self.backend.invoke(
+                'standards.draft-propose', ctx.principal, pid,
+                {'operation': op_name, 'payload': body}, key=key, capability=cap,
+            )
+            return res, res
+
+        return self._mutate(
+            ctx, 'standards.draft-propose', pid, write, status=201, replay_status=200,
+            capability=cap, serialize=False, canonical=True,
+        )
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/standards/drafts/(?P<did>' + ID + r')/decision')
+    def standards_draft_decide(self, ctx):
+        import review_standards
+        pid = ctx.params['pid']
+        did = ctx.params['did']
+        self._project(ctx, CAP_READ)
+        self._standards_require_person_session(ctx, review_standards.refusal_agent_register_edit())
+        body = dict(ctx.payload or {})
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            res = self.backend.invoke(
+                'standards.draft-decide', ctx.principal, pid,
+                {'draft_id': did, 'payload': body}, key=key, capability=CAP_READ,
+            )
+            res = self._standards_emit_coordinator_note(ctx, pid, res)
+            return res, res
+
+        return self._mutate(
+            ctx, 'standards.draft-decide', pid, write, status=200,
+            capability=CAP_READ, serialize=False, canonical=True, reason='draft %s' % did,
+        )
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/standards/gate')
+    def standards_gate_put(self, ctx):
+        import review_standards
+        pid = ctx.params['pid']
+        self._project(ctx, CAP_READ)
+        self._standards_require_person_session(ctx, review_standards.refusal_gate_switch_authority())
+        try:
+            self._project(ctx, CAP_COORDINATE)
+        except HttpError as err:
+            if err.status == 403:
+                raise forbidden(review_standards.refusal_gate_switch_authority()) from None
+            raise
+        body = dict(ctx.payload or {})
+        refuse_unknown_fields(body, ('mode', 'reason'), 'A standards gate change')
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            res = self.backend.invoke(
+                'standards.gate-set', ctx.principal, pid,
+                {'payload': body}, key=key, capability=CAP_COORDINATE,
+            )
+            return res, res
+
+        return self._mutate(
+            ctx, 'standards.gate-set', pid, write, status=200,
+            capability=CAP_COORDINATE, serialize=False, canonical=True,
+            audit_metadata={'mode': body.get('mode')},
+        )
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/standards/commits/(?P<commit>[0-9a-f]{40}(?:[0-9a-f]{24})?)')
+    def standards_commit_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ())
+        return 200, self.backend.standards_commit_read(ctx.params['pid'], ctx.principal, ctx.params['commit'])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/standards/commits/(?P<commit>[0-9a-f]{40}(?:[0-9a-f]{24})?)', verify=True)
+    def standards_commit_record(self, ctx):
+        import review_standards
+        pid = ctx.params['pid']
+        commit = ctx.params['commit']
+        if (
+            ctx.principal is not None
+            and ctx.principal.via == 'credential'
+            and VERIFY_SCOPE in ctx.principal.scopes
+        ):
+            self._project(ctx, CAP_STANDARDS_VERIFY)
+            op_mode = 'record-commit-verifier'
+            cap = CAP_STANDARDS_VERIFY
+        else:
+            self._project(ctx, CAP_READ)
+            self._standards_require_person_session(
+                ctx, review_standards.refusal_commit_observation_authority(commit)
+            )
+            try:
+                self._project(ctx, CAP_COORDINATE)
+            except HttpError as err:
+                if err.status == 403:
+                    raise forbidden(review_standards.refusal_commit_observation_authority(commit)) from None
+                raise
+            op_mode = 'record-commit-coordinator'
+            cap = CAP_COORDINATE
+        body = dict(ctx.payload or {})
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            res = self.backend.invoke(
+                'standards.commit-record', ctx.principal, pid,
+                {'operation': op_mode, 'commit': commit, 'payload': body},
+                key=key, capability=cap,
+            )
+            return res, res
+
+        return self._mutate(
+            ctx, 'standards.commit-record', pid, write, status=201, replay_status=200,
+            capability=cap, serialize=False, canonical=True, reason='commit %s' % commit[:12],
+        )
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/waivers')
+    def task_waivers_list(self, ctx):
+        self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ())
+        return 200, self.backend.standards_task_waivers(ctx.params['pid'], ctx.principal, ctx.params['tid'])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/waivers')
+    def task_waiver_grant(self, ctx):
+        import review_standards
+        pid = ctx.params['pid']
+        tid = ctx.params['tid']
+        self._project(ctx, CAP_READ)
+        self._standards_require_person_session(ctx, review_standards.refusal_waiver_agent())
+        self._refuse_record_anchor(self.backend.get_task(pid, tid), write=True)
+        body = dict(ctx.payload or {})
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            res = self.backend.invoke(
+                'standards.waiver-grant', ctx.principal, pid,
+                {'task_id': tid, 'payload': body}, key=key, capability=CAP_READ,
+            )
+            return res, res
+
+        return self._mutate(
+            ctx, 'standards.waiver-grant', pid, write, status=201, replay_status=200,
+            capability=CAP_READ, serialize=False, canonical=True, reason='task %s' % tid,
+        )
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/sign-off')
+    def task_sign_off_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        refuse_unknown_fields(ctx.query, ('contribution',), 'Sign-off query')
+        refuse_ambiguous_query(urlsplit(self.path).query, ('contribution',))
+        cid = ctx.query.get('contribution') or None
+        return 200, self.backend.standards_task_signoff(
+            ctx.params['pid'], ctx.principal, ctx.params['tid'], markdown=False, contribution_id=cid
+        )
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/sign-off.md')
+    def task_sign_off_markdown(self, ctx):
+        if not urlsplit(self.path).path.endswith('/sign-off.md'):
+            raise HttpError(404, 'route not found', code='not_found')
+        self._project(ctx, CAP_READ)
+        refuse_unknown_fields(ctx.query, ('contribution',), 'Sign-off query')
+        refuse_ambiguous_query(urlsplit(self.path).query, ('contribution',))
+        cid = ctx.query.get('contribution') or None
+        res = self.backend.standards_task_signoff(
+            ctx.params['pid'], ctx.principal, ctx.params['tid'], markdown=True, contribution_id=cid
+        )
+        so = res.get('sign_off') if isinstance(res, dict) else {}
+        md_text = res.get('markdown', '') if isinstance(res, dict) else ''
+        safe_tid = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(ctx.params['tid']))
+        safe_cid = re.sub(r'[^A-Za-z0-9_.-]+', '_', str((so or {}).get('contribution_id') or 'latest'))
+        filename = '%s-%s-sign-off.md' % (safe_tid, safe_cid)
+        encoded = md_text.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/markdown; charset=utf-8')
+        self.send_header('Content-Disposition', 'attachment; filename="%s"' % filename)
+        self.send_header('Content-Length', str(len(encoded)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self._send_hsts()
+        self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(encoded)
+        return None, None
 
     def _page(self, ctx, query, project_id=None):
         limit_raw = query.get('limit', str(DEFAULT_PAGE))
