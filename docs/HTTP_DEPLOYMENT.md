@@ -2589,14 +2589,20 @@ credential approved anything; this is the one place where that is lifted.
       "Allowed by:"), and either sentence without its "(project setting ...)" tail, compared after
       NFKD, casefold, and dropping format characters, marks, whitespace, punctuation, symbols and
       brackets;
-    - the label "Approval basis" followed by a colon (`:` or `∶`), anywhere and in any markup
-      (`**Approval** **basis**:`, any number of spaces, none, or a newline between the words,
-      quotes or `>` `}` `)` `]` before the colon, `Approval.basis:`, `approval_basis:`, mid-line),
-      compared after NFKD, casefold and dropping format characters and marks; and the label
-      followed by a dash when a basis follows it;
-    - "Allowed by" and a colon or dash when a basis follows it, on the same line or the next: a
+    - the label "Approval basis" followed by a colon (`:`, or a colon that survives NFKD such as
+      `∶` `ː` `꞉` `։` `˸`), anywhere and in any markup (`**Approval** **basis**:`, any number of
+      spaces, none, or a newline between the words, quotes or `>` `}` `)` `]` before the colon,
+      `Approval.basis:`, `approval_basis:`, mid-line), compared after NFKD, casefold and dropping
+      format characters and marks; and the label followed by a dash (`-`, `‐` to `―`, `−`) when a
+      basis token or "coordinator agent" follows it;
+    - "Allowed by" and any of those colons or dashes when a basis follows it, however far on: a
       basis token, "coordinator agent" (with or without "a" or "the"), "project setting",
       `agent_approval` or `by-agent`.
+
+    The two words are one label only when what lies between them is not a sentence end (`.`, `!`
+    or `?` followed by whitespace) or a blank line, so "Needs approval. Basis: all tests pass." and
+    "Ready for approval", a blank line, then "Basis: CI is green" are prose. After a dash the
+    setting's words are prose too ("the approval basis — by-agent mode works as documented").
 
     A quoted mention followed by prose ("'Approval basis:' was wrong on the previous review.") is
     allowed unless a basis token or "coordinator agent" follows it anywhere, and so are words that only resemble the texts ("approved", "basis", "Allowed by: the CI
@@ -2606,6 +2612,9 @@ credential approved anything; this is the one place where that is lifted.
     acceptance, current position, next step, an assignment reason, and each field of `brief
     --full`) has its continuation lines indented; behind that, any other line of the brief that
     starts with the label is indented too, so only the server's line starts with "Approval basis:".
+    A line ends at every line break (`\r`, `\x0b`, `\x0c`, `\x1c`-`\x1e`, U+0085, U+2028 and U+2029
+    as well as `\n`), so the rule also holds for text that reaches the brief through an attention
+    item or the review record, where U+2028 and U+0085 are kept as they are.
     The field is the protection; the gate is defence in depth for the texts drawn beside the
     server's line. The host route does not apply it, so the
     audit entry stays the authority.
