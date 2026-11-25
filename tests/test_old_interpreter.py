@@ -30,6 +30,7 @@ ADVICE = {'endpoint.py': 'Set "python" in the client configuration to an interpr
           'tools/http_rev3_probe.py': OWN, 'tools/http_rev4_probe.py': OWN, 'tools/http_rev5_probe.py': OWN,
           'tools/http_security_probe.py': OWN, 'tools/strict_canonical_endpoint.py': OWN,
           'tools/demonstrate_review_targeting.py': OWN, 'tools/read_timing.py': OWN,
+          'tools/fenced_rollback_rehearsal.py': OWN,
           'tools/authority_audit_check.py': OWN}
 ENTRY_POINTS = tuple(ADVICE)
 #: Programs with a ``__main__`` block and NO check, and why. The first two run under the host's

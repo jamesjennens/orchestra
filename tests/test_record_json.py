@@ -200,7 +200,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'endpoint.py': (6, 'bd output, host tracker metadata, and the fail-closed dependency guard'),
         'export_requirements.py': (3, 'offline native export rows use bounded parsing before duplicate-field refusal'),
         'handoff.py': (6, 'bd output; request, receipt and recovery files use the guard'),
-        'http_auth.py': (3, "the service's own store"),
+        'http_auth.py': (4, "the service's own store and its writer record beside it (kittrial-5bb.607)"),
         'http_authority.py': (3, "the service's own store and journal"),
         'http_client.py': (3, "the service's answer and caller-local input"),
         'http_service.py': (6, "the endpoint's answer and host configuration with bounded native parsing"),
