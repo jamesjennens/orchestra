@@ -337,8 +337,8 @@ class BoundTests(unittest.TestCase):
         answers --help/-h cleanly."""
         md_text = '# CLI contract\n'
         json_text = '{"schema_version": 1}\n'
-        (self.kit / onboarding.DOCUMENTS['cli-contract']).write_text(md_text, encoding='utf-8')
-        (self.kit / onboarding.DOCUMENTS['contribution-template']).write_text(json_text, encoding='utf-8')
+        (self.kit / onboarding.DOCUMENTS['cli-contract']).write_bytes(md_text.encode('utf-8'))
+        (self.kit / onboarding.DOCUMENTS['contribution-template']).write_bytes(json_text.encode('utf-8'))
 
         # Default stays plain text.
         self.assertEqual(self.docs('cli-contract'), md_text)

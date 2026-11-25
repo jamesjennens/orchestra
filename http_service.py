@@ -12461,8 +12461,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise UncertainOutcome()
             public = dict(result)
             # Additive (kittrial-5bb.531): include nested task identity alongside the existing flat id
-            # without inventing or echoing unverified request fields.
-            public['task'] = {'id': result['id'], 'parent': ctx.params['tid']}
+            # without inventing or echoing unverified request fields; take parent from the canonical row.
+            canonical_parent = (parent.get('id') if isinstance(parent, dict) else None) or ctx.params['tid']
+            public['task'] = {'id': result['id'], 'parent': canonical_parent}
             return public, public
         try:
             return self._mutate(ctx, 'tasks.create-child', ctx.params['pid'], create, status=201,

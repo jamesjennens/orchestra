@@ -106,17 +106,26 @@ def bd_env(env):
     Beads 1.2.2 warns on stderr (GH#2950) when ``beads.role`` is unset in git
     config. Setting ``beads.role=maintainer`` via ``GIT_CONFIG_COUNT`` narrowly
     on ``bd`` invocations suppresses the warning without changing
-    ``admin.environment`` for other subprocesses, preserves any existing
-    ``GIT_CONFIG_*`` entries, and leaves a preconfigured ``beads.role`` alone.
+    ``admin.environment`` for other subprocesses. Because ``GIT_CONFIG_COUNT``
+    has git command-line scope, it overrides any ``beads.role`` in file-level
+    git config (in Orchestra runtimes ``admin.environment`` already scopes
+    ``HOME`` to the runtime directory), while preserving existing
+    ``GIT_CONFIG_*`` entries in ``env`` and leaving an env-supplied
+    ``beads.role`` untouched. If ``GIT_CONFIG_COUNT`` is non-empty and not a
+    non-negative integer, ``env`` is returned untouched rather than overwriting
+    slot 0.
     """
     copy = dict(env) if env is not None else dict(os.environ)
     raw_count = copy.get('GIT_CONFIG_COUNT', '')
-    try:
-        count = int(raw_count) if raw_count != '' else 0
-    except (TypeError, ValueError):
+    if raw_count == '':
         count = 0
-    if count < 0:
-        count = 0
+    else:
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            return copy
+        if count < 0:
+            return copy
     for idx in range(count):
         if (copy.get('GIT_CONFIG_KEY_%d' % idx) or '').lower() == 'beads.role':
             return copy

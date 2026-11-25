@@ -205,6 +205,38 @@ class StrictWebCoordinatorGapsTests(_GapsMixin, unittest.TestCase):
         self.assertIsNone(getattr(backend, 'switches', None))
 
 
+class ChildCreateReplyShapeTests(unittest.TestCase):
+    """kittrial-5bb.531 r2 (S1): POST .../tasks/{tid}/children takes task.parent
+    from the canonical parent row read by get_task, not a shortened URL token."""
+
+    def test_child_reply_uses_canonical_parent_id_for_shortened_tid(self):
+        from unittest import mock
+
+        class Harness(fixes.Harness):
+            def make_backend(h):
+                return http_service.EndpointBackend(
+                    sys.executable, str(STRICT_ENDPOINT), str(h.tmp / 'root'), service=h.service)
+
+        harness = Harness(methodName='runTest')
+        harness.setUp()
+        self.addCleanup(harness._stop_server)
+        owner = harness.admin_token()
+        pid = 'shortparent'
+        reg = harness.request('POST', '/v1/projects', {'project_id': pid, 'name': 'Short Parent'}, token=owner)
+        self.assertEqual(reg.status, 201, reg.data)
+        canonical_parent = {'id': 'kittrial-5bb.1', 'title': 'Parent', 'status': 'open', 'labels': []}
+        with mock.patch.object(harness.backend, 'get_task', return_value=canonical_parent), \
+                mock.patch.object(harness.backend, 'invoke',
+                                  return_value={'id': 'kittrial-5bb.2', 'reconciled': False}):
+            made = harness.request(
+                'POST', f'/v1/projects/{pid}/tasks/5bb.1/children',
+                {'title': 'Child', 'description': 'desc', 'type': 'task'},
+                token=owner, key='short-parent-key-1')
+        self.assertEqual(made.status, 201, made.data)
+        self.assertEqual(made.data['id'], 'kittrial-5bb.2')
+        self.assertEqual(made.data['task'], {'id': 'kittrial-5bb.2', 'parent': 'kittrial-5bb.1'})
+
+
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
 class NativeWebCoordinatorGapsTests(_GapsMixin, RulesHelpers, unittest.TestCase):

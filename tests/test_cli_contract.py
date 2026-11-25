@@ -1119,6 +1119,15 @@ class StreamOrderingAndBdEnvTests(unittest.TestCase):
         self.assertEqual(kept['GIT_CONFIG_COUNT'], '1')
         self.assertEqual(kept['GIT_CONFIG_VALUE_0'], 'contributor')
 
+        for bad_count in ('abc', '-1'):
+            malformed = {
+                'GIT_CONFIG_COUNT': bad_count,
+                'GIT_CONFIG_KEY_0': 'user.name',
+                'GIT_CONFIG_VALUE_0': 'alice',
+            }
+            untouched = native.bd_env(malformed)
+            self.assertEqual(untouched, malformed)
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'deployment.private.json').write_text(
