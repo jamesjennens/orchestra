@@ -6675,11 +6675,16 @@ def prepare_http_state_restore(root,credentials):
     if not isinstance(document,dict) or document.get('schema_version')!=SCHEMA_VERSION:
         raise ValueError('The HTTP state in %s cannot be restored: it is not a web service state document of '
                          'schema %s; nothing was changed'%(source_json,SCHEMA_VERSION))
-    for key in ('sessions','credentials','reset_tokens'):
+    for key in ('sessions','credentials','reset_tokens','fenced_credentials'):
         value=document.get(key,{})
         if not isinstance(value,dict) or not all(isinstance(item,dict) for item in value.values()):
             raise ValueError('The HTTP state in %s cannot be restored: its %s are not a map of records; '
                              'nothing was changed'%(source_json,key))
+    # kittrial-5bb.607 condition 1: the fenced token index is checked as the credentials are.
+    tokens=document.get('fenced_credential_tokens',{})
+    if not isinstance(tokens,dict) or not all(isinstance(k,str) and isinstance(v,str) for k,v in tokens.items()):
+        raise ValueError('The HTTP state in %s cannot be restored: its fenced_credential_tokens are not a map of '
+                         'token digests to credential ids; nothing was changed'%source_json)
     return document
 
 def restore_http_state(root, named=None, credentials='keep', now=None):
@@ -6728,6 +6733,8 @@ def _restore_http_state(root, named=None, credentials='keep', now=None):
     revoked_before=sum(1 for record in stored.values() if record.get('revoked'))
     if credentials=='revoke':
         for record in stored.values():record['revoked']=True
+        # kittrial-5bb.607 condition 1: the fenced credentials too, which an older kit's restore cannot see.
+        for record in (document.get('fenced_credentials') or {}).values():record['revoked']=True
     live,origin=resolve_http_state_path(root,named)
     if live is None:
         # The disaster this restores from is exactly the live file being GONE, so the
@@ -6771,14 +6778,20 @@ def _write_restored_http_state(root,live,records,records_live,document,aside,cha
     import tempfile
     handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-restore-')
     try:
+        text=json.dumps(document,ensure_ascii=False,indent=2)+'\n'
         with os.fdopen(handle,'w',encoding='utf-8') as stream:
-            stream.write(json.dumps(document,ensure_ascii=False,indent=2)+'\n')
+            stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temp,0o600)
         # Review R1: a plain http_service started while the project restored (it takes no lock) is
         # looked for again here, immediately before the replace, while the office lock is still held.
         refuse_running_http_service(root,live,tail='The live HTTP state was not changed.',again='')
+        if document.get('fenced_credentials'):
+            # kittrial-5bb.607 condition 2: this kit's own restore is not taken for another kit's. The record names
+            # the restored text (and the live one, should the replace below not happen).
+            from http_auth import read_writer_record,state_digest,write_writer_record
+            write_writer_record(live,sorted(read_writer_record(live) or ())+[state_digest(text)])
         os.replace(temp,str(live))
     finally:
         if os.path.exists(temp):os.unlink(temp)
@@ -6816,6 +6829,8 @@ def _write_restored_http_state(root,live,records,records_live,document,aside,cha
     lines.append('Every session in it was revoked (%d): users and agents must sign in again.'%len(sessions))
     if credentials=='revoke':
         lines.append('Every worker and agent credential in it was revoked (%d); issue new ones.'%len(stored))
+        if document.get('fenced_credentials'):
+            lines.append('Every fenced credential in it was revoked too (%d).'%len(document['fenced_credentials']))
     else:
         lines.append('Worker and agent credentials revoked since %s UTC are live again (%d of the %d in it were '
                      'revoked in the backup and stay revoked); credentials issued after that time are not in it.'
@@ -6941,6 +6956,29 @@ def office_service_lock(root):
 
 #: What ``http_service_processes`` looks for in a process's arguments: the script, or the module of ``-m``.
 HTTP_SERVICE_NAMES=('http_service.py','http_service')
+
+FENCED_CREDENTIAL_ACTIONS=('confirm','revoke')
+
+def fenced_credentials(path,action):
+    """Decide the suspended fenced credentials of the state file at ``path`` (kittrial-5bb.607 condition 2).
+
+    The web service suspends every fenced credential when it loads a state file it did not write (an older kit's
+    restore or save). ``confirm`` lifts the suspension; ``revoke`` revokes them. Run with the service stopped: a
+    running service would write its own copy back. Returns the text to print."""
+    if action not in FENCED_CREDENTIAL_ACTIONS:
+        raise ValueError('fenced-credentials takes confirm or revoke')
+    from http_auth import Store,is_fenced
+    store=Store(path)
+    with store.lock:
+        held=[record for record in store.state['credentials'].values() if is_fenced(record) and record.get('suspended')]
+        for record in held:
+            record.pop('suspended',None)
+            if action=='revoke':record['revoked']=True
+        store.save()
+    if not held:
+        return 'No fenced credential is suspended in %s; nothing was changed.'%path
+    return '%d fenced credential(s) %s in %s.'%(len(held),'confirmed: they work again' if action=='confirm'
+                                                else 'revoked: issue new ones',path)
 
 def refuse_running_http_service(root,live,tail='Nothing was changed.',again=', then run restore-new again'):
     """Raise the refusal of ``--restore-http-state`` when an http_service process serves ``live``."""
@@ -10913,6 +10951,9 @@ def _main():
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
+    a=sub.add_parser('fenced-credentials',help='confirm or revoke the fenced credentials the web service suspended '
+                     'after another kit wrote or restored its state (kittrial-5bb.607); run with the service stopped')
+    a.add_argument('action',choices=FENCED_CREDENTIAL_ACTIONS);a.add_argument('--state',default=None,metavar='PATH')
     a=sub.add_parser('finish-project',help='complete a project creation the web interface started and that stopped half way')
     a.add_argument('project')
     a=sub.add_parser('project-creations',help='list the project creations the web interface started (JSON), or set the limit of project databases on this server')
@@ -11350,6 +11391,11 @@ def _main():
     root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
+    elif args.command=='fenced-credentials':
+        live,_origin=resolve_http_state_path(root,args.state)
+        if live is None:raise SystemExit('No web service state file was found; nothing was changed.')
+        refuse_running_http_service(root,live,again='')
+        print(fenced_credentials(live,args.action))
     elif args.command=='finish-project':
         import project_creation
         result=project_creation.finish(root,args.project)

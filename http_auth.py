@@ -54,7 +54,7 @@ import nudge_messages
 import nudges
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_NUDGE_CARRY, CAP_PROJECT_ADMIN, CAP_PROPOSALS, NUDGES_SCOPE,
-                            CAP_ROOMS_POST,
+                            CAP_ROOMS_POST, FENCED_SCOPES,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
                             CAP_COORDINATE, CAP_RELEASE, still_coordinates, account_in_project, coordinator_grant, release_grant, grant_issuer_holds,
@@ -150,6 +150,101 @@ RESULT_RETENTION_SECONDS = 24 * 60 * 60
 #: service state document. Both used to live inside the JSON document with a count/byte
 #: eviction (results) or unbounded growth (idempotency).
 RECORD_STORE_SUFFIX = '.records.sqlite3'
+#: kittrial-5bb.607: the fenced credentials. On disk a credential with a fenced scope is kept only under these two
+#: keys, never under ``credentials`` / ``credential_tokens``, so an older kit's one lookup cannot find it. In memory
+#: the store merges them back, so every reader of the credentials sees one set.
+FENCED_KEYS = ('fenced_credentials', 'fenced_credential_tokens')
+#: Beside the state file while it holds fenced credentials: the sha256 of the last state text this kit wrote, and
+#: of the one it is about to write (condition 2 of kittrial-5bb.607). A state file with any other text was written
+#: by another kit or restored by one, so every fenced credential is suspended until an operator decides.
+WRITER_SUFFIX = '.writer.json'
+CREDENTIAL_SUSPENDED_MESSAGE = (
+    'This credential is suspended: the web service state was written or restored by another kit since it was '
+    'issued. An operator confirms or revokes it with admin.py fenced-credentials.')
+
+
+def is_fenced(credential):
+    """Whether a credential record carries a fenced scope (kittrial-5bb.607)."""
+    return isinstance(credential, dict) and bool(FENCED_SCOPES.intersection(credential.get('scopes') or []))
+
+
+def merge_fenced(data):
+    """Move a state document's fenced collections into its credentials, in place. Returns their ids."""
+    fenced = data.pop('fenced_credentials', None)
+    tokens = data.pop('fenced_credential_tokens', None)
+    fenced = {} if fenced is None else fenced
+    tokens = {} if tokens is None else tokens
+    if not isinstance(fenced, dict) or not isinstance(tokens, dict) or \
+            not all(isinstance(record, dict) for record in fenced.values()):
+        raise ValueError('Unsupported or corrupt service store schema: the fenced credentials are damaged')
+    if set(fenced) & set(data['credentials']) or set(tokens) & set(data['credential_tokens']):
+        raise ValueError('A credential is recorded both fenced and unfenced in the service store; nothing was loaded')
+    data['credentials'].update(fenced)
+    data['credential_tokens'].update(tokens)
+    return set(fenced)
+
+
+def split_fenced(state):
+    """The document to write: fenced credentials under their own keys. ``state`` is not changed."""
+    fenced = {key: value for key, value in state['credentials'].items() if is_fenced(value)}
+    if not fenced:
+        return state, False
+    document = dict(state)
+    document['credentials'] = {key: value for key, value in state['credentials'].items() if key not in fenced}
+    document['credential_tokens'] = {digest: key for digest, key in state['credential_tokens'].items()
+                                     if key not in fenced}
+    document['fenced_credentials'] = fenced
+    document['fenced_credential_tokens'] = {digest: key for digest, key in state['credential_tokens'].items()
+                                            if key in fenced}
+    return document, True
+
+
+def state_digest(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def read_writer_record(path):
+    """The digests the writer record beside ``path`` accepts, or None when there is none or it is unreadable."""
+    try:
+        record = json.loads(Path(str(path) + WRITER_SUFFIX).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    digests = record.get('digests') if isinstance(record, dict) else None
+    if not isinstance(digests, list) or not all(isinstance(item, str) for item in digests):
+        return None
+    return set(digests)
+
+
+def write_writer_record(path, digests):
+    """Write the writer record beside ``path`` atomically, mode 0600, before the state file is replaced."""
+    target = Path(str(path) + WRITER_SUFFIX)
+    temporary = target.with_name('%s.%d.%s.tmp' % (target.name, os.getpid(), secrets.token_hex(4)))
+    text = json.dumps({'schema_version': 1, 'kit': 'kittrial-5bb.607',
+                       'digests': [item for item in digests if item]}) + '\n'
+    try:
+        descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary), str(target))
+    except BaseException:
+        try:
+            os.unlink(str(temporary))
+        except OSError:
+            pass
+        raise
+
+
+def suspend_fenced(credentials, ids, moment):
+    """Suspend each named fenced credential that is not revoked. Returns how many it suspended."""
+    count = 0
+    for key in sorted(ids):
+        record = credentials.get(key)
+        if isinstance(record, dict) and not record.get('revoked') and not record.get('suspended'):
+            record['suspended'] = {'at': now_iso(moment), 'reason': 'written or restored by another kit'}
+            count += 1
+    return count
 
 # Personal-agent bounds and defaults (kittrial-5bb.22). An agent is a personal
 # identity owned by one user, not a project role; every field is a bounded,
@@ -905,6 +1000,8 @@ class Store:
         #: Since when the state in memory holds something the file does not, on this store's
         #: clock: a save could not have the state lock. None when the file is current.
         self.unsaved_since = None
+        #: The sha256 of the state text this store last read or wrote (kittrial-5bb.607).
+        self.written_digest = None
         self.state = self._load()
         self.records = RecordStore(
             self.path.with_name(self.path.name + RECORD_STORE_SUFFIX),
@@ -927,8 +1024,16 @@ class Store:
         created_cursor_key = not isinstance(data.get('cursor_key'), str) or len(data['cursor_key']) < 32
         for key, value in base.items():
             data.setdefault(key, value)
+        # kittrial-5bb.607: one set of credentials in memory. A state file this kit did not write, while it holds
+        # fenced credentials, suspends every one of them (condition 2): that fails closed.
+        digest = state_digest(text)
+        fenced = merge_fenced(data)
+        self.written_digest = digest
+        suspended = bool(fenced) and digest not in (read_writer_record(self.path) or ()) and \
+            bool(suspend_fenced(data['credentials'], fenced, self.clock()))
         if created_cursor_key:
             data['cursor_key'] = base['cursor_key']
+        if created_cursor_key or suspended:
             self.state = data
             self.save()
         return data
@@ -1036,7 +1141,13 @@ class Store:
         state = self.state
         if len(state['audit']) > AUDIT_LIMIT:
             state = dict(state, audit=state['audit'][-AUDIT_LIMIT:])
+        # kittrial-5bb.607: fenced credentials go under their own keys, and while there are any the writer record
+        # names this text before the replace, beside the text already there, so a stop between the two is no alarm.
+        state, fenced = split_fenced(state)
         text = json.dumps(state, ensure_ascii=False, indent=2) + '\n'
+        digest = state_digest(text)
+        if fenced:
+            write_writer_record(self.path, [self.written_digest, digest])
         try:
             with open(temporary, 'w', encoding='utf-8') as handle:
                 handle.write(text)
@@ -1049,6 +1160,7 @@ class Store:
             except OSError:
                 pass
             raise
+        self.written_digest = digest
         # Saved. Nothing after the replace may raise (review of kittrial-5bb.487 F2): a log stream
         # that is closed or broken must not turn a written state into a failed save.
         if self.unsaved_since is not None:
@@ -2146,6 +2258,8 @@ class Service:
                 # can act without naming any other credential (kittrial-5bb.294 item 2).
                 if credential['revoked']:
                     raise unauthenticated(CREDENTIAL_REVOKED_MESSAGE)
+                if credential.get('suspended'):
+                    raise unauthenticated(CREDENTIAL_SUSPENDED_MESSAGE)
                 if self._credential_expired(credential, moment):
                     raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
                 user = self.state['users'].get(credential['user_id'])
@@ -2727,6 +2841,9 @@ class Service:
             requested = self._scope_names(scopes) or ('tasks', 'checkpoints', 'reviews', 'feedback')
             if NUDGES_SCOPE in requested:
                 raise invalid('The nudges scope belongs to an agent credential, not a project worker credential')
+            if FENCED_SCOPES.intersection(requested):
+                raise invalid('A fenced scope (%s) belongs to an agent credential, not a project worker credential'
+                              % ', '.join(sorted(FENCED_SCOPES.intersection(requested))))
             label = self._credential_label(label)
             if actor is not None and (not isinstance(actor, str) or not re.fullmatch(
                     r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', actor)):
@@ -3426,6 +3543,10 @@ class Service:
                 names.append(scope)
         if NUDGES_SCOPE in names and names != [NUDGES_SCOPE]:
             raise invalid('The nudges scope is the nudge carrier\'s alone and is never combined with another scope')
+        fenced = [name for name in names if name in FENCED_SCOPES]
+        if fenced and len(names) > 1:
+            raise invalid('The %s scope is fenced: it is never combined with another scope (kittrial-5bb.607)'
+                          % fenced[0])
         return tuple(names)
 
     def agent_scopes(self, agent, moment=None):

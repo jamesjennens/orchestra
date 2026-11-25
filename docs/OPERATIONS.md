@@ -392,6 +392,18 @@ its lifecycle report reflects the correction. Upgrade to a restore-capable kit t
 recover the retained complete generation.
 
 
+### Fenced credentials: restore and rollback (kittrial-5bb.607)
+
+- **Rolling back** below the fenced credentials leaves them in the state file under their own keys. The
+  older kit cannot use them (401), and it keeps them as they are.
+- **Rolling forward** again: the new kit sees that another kit wrote the state, and suspends every fenced
+  credential. With the service stopped, decide them: `admin.py fenced-credentials confirm` to keep them, or
+  `admin.py fenced-credentials revoke` to end them. Revoke them if anything was revoked, disabled or
+  restored on the older kit that should also apply to them: the older kit could not see them, so it changed
+  nothing in them.
+- **Restoring** with `--credentials revoke` on the new kit revokes them too. A restore made by an older kit
+  cannot, but the roll-forward suspension above catches it.
+
 ### Web integration marks: restore and rollback
 
 `restore-new SRC DST` requires an unused destination with a DIFFERENT project

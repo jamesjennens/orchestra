@@ -82,6 +82,44 @@ scope `nudges` only) polls `GET /v1/me/nudges`, sends heartbeats to `POST /v1/me
 [docs/design/LANE_NUDGE_DESIGN.md](design/LANE_NUDGE_DESIGN.md), [docs/LANE_BOARD_DESIGN.md](LANE_BOARD_DESIGN.md)
 section 12, [docs/NUDGE_CARRIER.md](NUDGE_CARRIER.md) and [tools/nudge/README.md](../tools/nudge/README.md).
 
+## Fenced credentials (kittrial-5bb.607)
+
+An older kit gives every credential but the nudge carrier's the baseline read, and grants nothing and
+refuses nothing for a scope it does not know (`credential_capabilities`, `http_authority.py:837-855` at
+`b1f2356c`). A credential made for a narrow purpose would therefore read every project of its agent after
+a rollback. So a credential whose scope is **fenced** is kept where an older kit cannot find it.
+
+- **The fenced scopes:** `rooms`, which grants `rooms.post` only (`http_authority.FENCED_SCOPES`). Rooms
+  slice 3 adds its own capabilities to the same scope, and its review checks that none of them reads tasks,
+  boards or comments. kittrial-5bb.591's interviewer credential is meant to join the set.
+- **On disk:** in `fenced_credentials` and `fenced_credential_tokens`, never in `credentials` /
+  `credential_tokens`. The schema version does not change. An older kit loads the file, keeps the two keys
+  as they are, and its one credential lookup finds nothing, so every request with a fenced token is
+  **401 "Authentication required"** there and reads nothing. In memory this kit merges the two sets, so
+  the agent pages, revocation, renewal, expiry and the audit treat a fenced credential like any other.
+- **The rules:**
+  - a fenced scope is **never combined** with another (`422`);
+  - it belongs to an **agent credential only**; a project worker credential is refused it (`422`);
+  - it holds **no baseline read and no grant**: only its scope's capabilities, bounded by the issuer's role;
+  - the dispatcher refuses it on **every route but `FENCED_ROUTES`** (the two room post routes), before the
+    route runs, so a route added later is closed to it by default;
+  - revocation, expiry, a disabled agent and the issuer's membership are checked live, as for any
+    credential.
+- **After another kit wrote the state.** While the state holds fenced credentials, this kit keeps a record
+  beside the file, `<state>.writer.json` (mode 0600). The record holds the sha256 of the text it last wrote,
+  and of the one it is about to write. A state file with any other text was written or restored by
+  another kit, for example after a rollback. This kit then **suspends every fenced credential**: each
+  answers `401` "This credential is suspended …" until an operator, with the service stopped, runs
+  `admin.py fenced-credentials confirm` (they work again) or `admin.py fenced-credentials revoke`. The same
+  happens when the record is missing and the state holds fenced credentials. That is the fail-closed
+  side: every roll-forward after a rollback needs this one decision.
+- **Restores:** `restore-new --restore-http-state --credentials revoke` revokes fenced credentials too, and
+  checks both fenced keys before anything is written. This kit's own restore writes the record for the text
+  it restores, so it is not taken for another kit's.
+- **Rehearsal:** `tools/fenced_rollback_rehearsal.py --scratch NEW_EMPTY_FOLDER` issues a rooms-only
+  credential, has the older kit (b1f2356c by default) answer 401 for it and write the state, and shows the
+  suspension and the confirmation, all under the scratch folder and on 127.0.0.1 only.
+
 ## Guidance and onboarding disclosure
 
 Every current project member, personal agent and worker credential can read this project's **whole onboarding document, including operator-written text**, at `GET /v1/projects/PROJECT/onboarding/read`. This deliberately widens the earlier edit route's disclosure. Do not place secrets in that project document. The edit route `GET /onboarding` still withholds operator-written text; these are distinct reads.

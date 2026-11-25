@@ -363,6 +363,14 @@ CAP_AGENT_SELF = 'agent.self'
 #: carrier's own account. Held by no role and by no scope but ``nudges``, which is never combined.
 CAP_NUDGE_CARRY = 'nudge.carry'
 NUDGES_SCOPE = 'nudges'
+#: Fenced scopes (kittrial-5bb.607): a credential that carries one is kept where an older kit's credential
+#: lookup cannot find it (``fenced_credentials`` in the state file), so on an older kit it answers 401 and reads
+#: nothing. It is an agent credential's alone, never combined with another scope, and holds no baseline read and
+#: no grant: only its own scope's capabilities, and only on the fenced routes (``http_service.FENCED_ROUTES``).
+#: ``rooms`` grants only ``rooms.post`` (VERIFIED condition 4); rooms slice 3 adds its capabilities to the same
+#: frozenset, and its review checks that none of them reads tasks, boards or comments.
+ROOMS_SCOPE = 'rooms'
+FENCED_SCOPES = frozenset({ROOMS_SCOPE})
 
 ROLES = ('viewer', 'contributor', 'coordinator', 'owner')
 RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
@@ -380,6 +388,8 @@ SCOPE_CAPABILITIES = {
     # The nudge carrier's whole authority (kittrial-5bb.415). Alone on its credential, never a
     # project capability and never the baseline read (``credential_capabilities``).
     NUDGES_SCOPE: frozenset({CAP_NUDGE_CARRY}),
+    # kittrial-5bb.607: fenced; see FENCED_SCOPES.
+    ROOMS_SCOPE: frozenset({CAP_ROOMS_POST}),
 }
 CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 
@@ -838,6 +848,18 @@ def credential_capabilities(state, credential, issuer, project_id):
         # A carrier's credential reads no task, board or comment and holds no project capability,
         # whatever else is on it (a mixed list is damage and fails closed).
         return frozenset()
+    fenced = FENCED_SCOPES.intersection(credential.get('scopes') or [])
+    if fenced:
+        # kittrial-5bb.607: a fenced credential holds its own scope's capabilities and nothing else: no baseline
+        # read and no coordinator or release grant, whatever else a damaged record lists beside it. The issuer's
+        # role still bounds it, as for any credential.
+        own = frozenset().union(*(SCOPE_CAPABILITIES[scope] for scope in fenced)) - CREDENTIAL_FORBIDDEN_CAPABILITIES
+        if issuer.get('superuser'):
+            return own
+        role = state.get('memberships', {}).get(project_id, {}).get(issuer['id'])
+        if role is None:
+            raise deny(403, 'forbidden', 'The credential issuer is no longer a member of this project')
+        return frozenset(cap for cap in own if cap in ROLE_CAPABILITIES.get(role, frozenset()))
     caps = {CAP_READ}
     for scope in credential.get('scopes') or []:
         caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
@@ -1184,6 +1206,9 @@ def decide(state, request, *, now=None, allow_self_user=None):
         # from issuance ON READ (item 4): a hand-edited store of years is not honoured.
         if credential.get('revoked'):
             raise deny(401, 'unauthenticated', CREDENTIAL_REVOKED_MESSAGE)
+        if credential.get('suspended'):
+            # kittrial-5bb.607 condition 2: a fenced credential suspended after another kit wrote the state.
+            raise deny(401, 'unauthenticated', 'This credential is suspended until an operator confirms or revokes it')
         if credential_stored_expired(credential, moment) or \
                 credential_age_expired(credential, moment):
             raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
@@ -1211,6 +1236,9 @@ def decide(state, request, *, now=None, allow_self_user=None):
             if not credential.get('agent_id'):
                 raise deny(403, 'forbidden',
                            'An agent credential is required to change its own claim limit')
+            if FENCED_SCOPES.intersection(credential.get('scopes') or []):
+                # kittrial-5bb.607: a fenced credential holds nothing but its scope, not even its own record.
+                raise deny(403, 'forbidden', 'Credential scope does not permit this operation')
             agent = state.get('agents', {}).get(credential.get('agent_id'))
             if not isinstance(agent, dict) or not agent.get('enabled'):
                 raise deny(401, 'unauthenticated', 'Agent is disabled')

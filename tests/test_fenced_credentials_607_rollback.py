@@ -109,5 +109,29 @@ class RollbackRehearsal(fenced.FencedCase):
         self.assertEqual(['rooms'], list(principal.scopes))
 
 
+
+class RehearsalScript(unittest.TestCase):
+    """Condition 5: the script the program manager runs on koopa, run here in a scratch folder."""
+
+    def test_a_folder_that_is_not_empty_is_refused(self):
+        scratch = Path(tempfile.mkdtemp(prefix='rehearsal-'))
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        (scratch / 'something').write_text('x', encoding='utf-8')
+        done = subprocess.run([sys.executable, str(KIT / 'tools' / 'fenced_rollback_rehearsal.py'),
+                               '--scratch', str(scratch)], capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(0, done.returncode)
+        self.assertIn('is not empty', done.stderr)
+        self.assertEqual(['something'], [p.name for p in scratch.iterdir()])
+
+    @unittest.skipUnless(older_kit_present(), 'b1f2356c is not in this repository (a shallow clone)')
+    def test_the_script_passes(self):
+        parent = Path(tempfile.mkdtemp(prefix='rehearsal-'))
+        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        done = subprocess.run([sys.executable, str(KIT / 'tools' / 'fenced_rollback_rehearsal.py'),
+                               '--scratch', str(parent / 'run')], capture_output=True, text=True, timeout=1800)
+        self.assertEqual(0, done.returncode, done.stdout[-3000:] + done.stderr[-3000:])
+        self.assertIn('REHEARSAL PASSED', done.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

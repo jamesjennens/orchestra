@@ -72,7 +72,7 @@ from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (Principal, AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
-                       CAP_NUDGE_CARRY, NUDGES_SCOPE,
+                       CAP_NUDGE_CARRY, NUDGES_SCOPE, FENCED_SCOPES,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
                        CAP_RELEASE,
@@ -5596,19 +5596,25 @@ STREAMED = set()
 #: dispatcher refuses it everywhere else before the route runs, so a route written later is closed to it
 #: by default; ``tests/test_lane_nudge_carrier.py`` sweeps every route to prove it.
 CARRIER_ROUTES = set()
+#: kittrial-5bb.607: the only routes a fenced credential (scope ``rooms``) may call: posting in a room. The
+#: dispatcher refuses it everywhere else before the route runs, so a route written later is closed to it by
+#: default; ``tests/test_fenced_credentials_607.py`` sweeps every route to prove it.
+FENCED_ROUTES = set()
 #: kittrial-5bb.418: the routes whose JSON body is read by the route itself, after its own
 #: authority checks, so the larger DESIGN_BODY_BYTES is never read for a caller who may not use it:
 #: the reference propose and revise (a design.<scope> revision carries its document).
 DEFERRED_BODY = {'references_propose', 'references_revise'}
 
 
-def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False):
+def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False, fenced=False):
     compiled = re.compile('^' + pattern + '$')
 
     def register(handler):
         ROUTES.append((method, compiled, handler.__name__, anonymous, csrf))
         if carrier:
             CARRIER_ROUTES.add(handler.__name__)
+        if fenced:
+            FENCED_ROUTES.add(handler.__name__)
         if stream:
             STREAMED.add(handler.__name__)
         return handler
@@ -5945,6 +5951,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             begun = (name, ctx.idempotency_key is not None)
             if self._principal is not None and self._principal.via == 'credential' \
                     and NUDGES_SCOPE in self._principal.scopes and name not in CARRIER_ROUTES:
+                raise forbidden('Credential scope does not permit this operation')
+            if self._principal is not None and self._principal.via == 'credential' \
+                    and FENCED_SCOPES.intersection(self._principal.scopes or ()) and name not in FENCED_ROUTES:
                 raise forbidden('Credential scope does not permit this operation')
             status, response = getattr(self, name)(ctx)
             if status is not None:              # None: the route sent its own answer (a file download)
@@ -8078,7 +8087,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return {'kind': 'decision', 'id': decision_id, 'revision': None, 'sha256': None,
                 'decision_id': decision_id, 'evidence': evidence}
 
-    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items', fenced=True)
     def rooms_item_post(self, ctx):
         project = self._rooms_project(ctx)
         if ctx.principal.via == 'credential':
@@ -8403,7 +8412,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # so an outsider gets "Project not found", never an item existence oracle.
         return self._rooms_item_event(ctx, 'answer')
 
-    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages', fenced=True)
     def rooms_post(self, ctx):
         self._rooms_project(ctx)
         _record, role = self._project(ctx, CAP_ROOMS_POST)

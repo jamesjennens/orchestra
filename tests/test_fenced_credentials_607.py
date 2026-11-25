@@ -186,6 +186,28 @@ class LiveCheckTests(FencedCase):
             http_authority.credential_capabilities(self.service.state, credential, issuer, self.project)
 
 
+class DecideTests(FencedCase):
+    """The live authority decision itself, beside the dispatcher's allowlist."""
+
+    def decision(self, capability, project=None):
+        principal = self.service.authenticate(self.rooms)
+        return http_authority.decide(self.service.state,
+                                     http_authority.authority_request(principal, project, capability))
+
+    def test_its_own_agent_record_is_refused(self):
+        with self.assertRaises(http_authority.AuthorityDenied) as refused:
+            self.decision(http_authority.CAP_AGENT_SELF)
+        self.assertEqual(403, refused.exception.status)
+
+    def test_a_suspension_is_read_live(self):
+        principal = self.service.authenticate(self.rooms)
+        self.service.state['credentials'][self.rooms_id]['suspended'] = {'at': 'x', 'reason': 'test'}
+        with self.assertRaises(http_authority.AuthorityDenied) as refused:
+            http_authority.decide(self.service.state, http_authority.authority_request(
+                principal, self.project, http_authority.CAP_ROOMS_POST))
+        self.assertEqual(401, refused.exception.status)
+
+
 class TransactionTests(FencedCase):
     """Condition 3: a failed save never resurrects or loses a fenced credential."""
 
@@ -257,10 +279,17 @@ class DetectionTests(FencedCase):
     def test_a_stop_between_the_writer_record_and_the_replace_does_not_suspend(self):
         path = Path(self.service.store.path)
         self.service.store.save()
-        with mock.patch('http_auth.os.replace', side_effect=OSError('stopped')):
+        real = http_auth.os.replace
+
+        def replace(source, target):
+            if str(target) == str(path):            # the writer record is replaced; the state file is not
+                raise OSError('stopped')
+            return real(source, target)
+        with mock.patch('http_auth.os.replace', side_effect=replace):
             self.service.state['users'][self.ids['carl']]['last_login'] = 'y'
             with self.assertRaises(OSError):
                 self.service.store._write()
+        self.assertEqual(2, len(http_auth.read_writer_record(path)))
         store = Store(path)
         self.assertFalse(store.state['credentials'][self.rooms_id].get('suspended'))
 

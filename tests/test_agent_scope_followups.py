@@ -709,6 +709,8 @@ class AgentScopePinTests(unittest.TestCase):
         offered = self.web_scopes()
         names = [scope for scope, _ in offered]
         self.assertEqual(len(names), len(set(names)))
-        expected = set(http_authority.SCOPE_CAPABILITIES) - {http_authority.NUDGES_SCOPE}
+        # kittrial-5bb.607: a fenced scope (rooms) is never combined with another, so the form's check boxes do
+        # not offer it either, as they do not offer nudges.
+        expected = set(http_authority.SCOPE_CAPABILITIES) - {http_authority.NUDGES_SCOPE} - http_authority.FENCED_SCOPES
         self.assertEqual(expected, set(names))
         self.assertIn(['records', 'File and change records'], [list(item) for item in offered])
