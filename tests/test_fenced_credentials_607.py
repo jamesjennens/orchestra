@@ -165,7 +165,7 @@ class LiveCheckTests(FencedCase):
         self.assertIn(self.rooms_id, [c['id'] for c in listed.data['credentials']])
         revoked = self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (self.rooms_agent, self.rooms_id), {},
                                token=self.tokens['carl'])
-        self.assertIn(revoked.status, (200, 201), revoked.data)
+        self.assertIn(revoked.status, (200, 201, 204), revoked.data)   # the route answers 204
         self.assertEqual(401, self.tasks(self.rooms).status)
         self.assertTrue(on_disk(self.service.store.path)['fenced_credentials'][self.rooms_id]['revoked'])
 
@@ -251,13 +251,19 @@ class DetectionTests(FencedCase):
         store = Store(path)
         return store, Service(store, public_url='https://office.example.invalid')
 
-    def assert_suspended(self, store, service):
+    def assert_suspended(self, store, service, ordinary_revoked=False):
         credential = store.state['credentials'][self.rooms_id]
         self.assertTrue(credential.get('suspended'))
         with self.assertRaises(http_auth.HttpError) as refused:
             service.authenticate(self.rooms)
         self.assertEqual(401, refused.exception.status)
         self.assertIn('suspended', str(refused.exception.body('r')))
+        if ordinary_revoked:
+            # The older kit's revoke reached the ordinary credential itself; detection adds nothing to it.
+            with self.assertRaises(http_auth.HttpError) as revoked:
+                service.authenticate(self.agent)
+            self.assertIn('revoked', str(revoked.exception.body('r')).lower())
+            return
         # The ordinary credential is not touched.
         self.assertEqual(self.agent_id, service.authenticate(self.agent).agent_id)
 
@@ -274,7 +280,7 @@ class DetectionTests(FencedCase):
                 record['revoked'] = True          # what b1f2356c's --credentials revoke does
             for session in stored['sessions'].values():
                 session['revoked'] = True
-        self.assert_suspended(*self.written_by_another_kit(restored))
+        self.assert_suspended(*self.written_by_another_kit(restored), ordinary_revoked=True)
 
     def test_a_stop_between_the_writer_record_and_the_replace_does_not_suspend(self):
         path = Path(self.service.store.path)
@@ -357,9 +363,10 @@ class RestoreTests(unittest.TestCase):
 
     def test_the_shape_check_covers_both_collections(self):
         before = self.live.read_bytes()
+        original = self.backed.read_text(encoding='utf-8')
         for key, value in (('fenced_credentials', {'cred_f': 'not a record'}),
                            ('fenced_credential_tokens', ['h'])):
-            document = json.loads(self.backed.read_text(encoding='utf-8'))
+            document = json.loads(original)          # one damaged collection at a time
             document[key] = value
             self.backed.write_text(json.dumps(document), encoding='utf-8')
             with self.subTest(key=key):
