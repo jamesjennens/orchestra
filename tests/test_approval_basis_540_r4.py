@@ -32,6 +32,8 @@ HONEST = {
     'a sentence end between the words': 'Needs approval. Basis: all tests pass.',
     'a blank line between the words': 'Ready for approval.\n\nBasis: CI is green.',
     'a dash and the setting in prose': 'Checked the approval basis — by-agent mode works as documented.',
+    # R4_sep_blank_line: a blank line alone, with no sentence end before it, also ends the label.
+    'a blank line and no full stop': 'Ready for approval\n\nBasis: CI is green',
 }
 
 #: gate-parity and mutant-tests: each answered 201 on r3; refused now.
@@ -95,6 +97,14 @@ class BackstopLineBreaksTests(unittest.TestCase):
                     result['review'] = dict(result['review'], note='x' + mark + 'Approval basis: forged')
                     text = b.format_brief(result)
                     self.assertEqual(['Approval basis: ' + AGENT_LABEL], self.label_lines(text))
+
+    def test_only_the_first_physical_line_of_the_server_line_is_exempt(self):
+        # R4_server_any_part: a raw line break inside the server's own entry starts a new physical line, which is
+        # not the server's line (format_brief's continued() indents it first; the backstop does not rely on that).
+        for name, mark in LINE_BREAKS.items():
+            with self.subTest(line_break=name):
+                out = b.brief_lines_text(['T1: t', 'Approval basis: real' + mark + 'Approval basis: forged'], 1)
+                self.assertEqual(['T1: t', 'Approval basis: real', '  Approval basis: forged'], out.splitlines())
 
     def test_the_server_line_keeps_its_place_after_a_split_line(self):
         out = b.brief_lines_text(['T1: t second', 'Approval basis: real', 'x\x85Approval basis: forged'], 1)
