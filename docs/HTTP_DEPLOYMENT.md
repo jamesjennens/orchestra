@@ -2606,7 +2606,13 @@ credential approved anything; this is the one place where that is lifted.
 
     A quoted mention followed by prose ("'Approval basis:' was wrong on the previous review.") is
     allowed unless a basis token or "coordinator agent" follows it anywhere, and so are words that only resemble the texts ("approved", "basis", "Allowed by: the CI
-    run"). Lookalike letters of another script (Cyrillic, dotless i) remain. HTML entities
+    run"). Lookalike letters of another script (Cyrillic, dotless i) remain. So do the costs of reading a
+    sentence end or a blank line as prose: "Approval. basis:", "Approval! basis:", "Approval? basis:" and
+    "Approval… basis:" pass, and so does the dash with the setting's words ("Approval basis — by-agent"); a
+    sentence end inside markup or quotes ("Needs **approval.** Basis: …"), a semicolon and the ideographic full
+    stop (U+3002) do not end the label, so those honest texts are refused. A Windows line break (`\r\n`) is
+    one break; `\r\n\r\n` is a blank line. The gate reads at most twice the summary limit after a label, and an
+    overlong contribution summary is refused by its own limit before the gate. HTML entities
     (`&#65;pproval basis:`) pass, but every surface draws summaries as plain text, so they show
     literally. In the host's text brief, a caller's multi-line field (the title, the owner, intent,
     acceptance, current position, next step, an assignment reason, and each field of `brief

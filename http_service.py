@@ -7307,11 +7307,15 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: r3 (SHOULD-1): the label followed by a dash instead of a colon ("Approval basis \u2014 same-person-agent"). A
     #: dash is ordinary prose after the two words, so this form is refused only when a basis follows it. r4
     #: (gate-parity): what follows is the WHOLE remaining text, read from a lookahead so no later label is skipped.
+    #: r5 (contribute-bound): what is read after a label is bounded. Twice the summary limit, because every route
+    #: refuses a longer summary before the gate runs and NFKD can lengthen text; the value checks then normalise only
+    #: a short prefix of it (:meth:`_basis_value_prefix`).
+    BASIS_REST_LIMIT = 2 * TEXT_LIMITS['summary']
     BASIS_DASH_LABEL = re.compile('(?<![^\\W_])approval' + BASIS_SEP + 'basis' + BASIS_TAIL
-                                  + '[' + BASIS_DASHES + '](?=(?P<rest>[\\s\\S]*))')
+                                  + '[' + BASIS_DASHES + '](?=(?P<rest>[\\s\\S]{0,%d}))' % BASIS_REST_LIMIT)
     #: What follows "allowed by" and its colon or dash, newlines included (r3: "Allowed by:\nsame-person-agent").
     ALLOWED_BY_LABEL = re.compile('(?<![^\\W_])allowed' + BASIS_SEP + 'by' + BASIS_TAIL
-                                  + '[' + BASIS_COLONS + BASIS_DASHES + '](?=(?P<rest>[\\s\\S]*))')
+                                  + '[' + BASIS_COLONS + BASIS_DASHES + '](?=(?P<rest>[\\s\\S]{0,%d}))' % BASIS_REST_LIMIT)
     #: The quotes a mention of the label is written in ("'Approval basis:' was wrong ...").
     BASIS_QUOTES = '\'"`\u2018\u2019\u201a\u201c\u201d\u201e\u00ab\u00bb\u2039\u203a'
     #: r3: how a basis may start after a label, compared normalized (:meth:`_normalize_basis_text`): a token, the
@@ -7324,17 +7328,31 @@ class ApiHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _folded_basis_text(text):
         """NFKD and case folded, format characters (Cf) and marks (M*) dropped; whitespace and punctuation KEPT."""
-        folded = unicodedata.normalize('NFKD', unicodedata.normalize('NFKD', text).casefold())
+        # r5 (crlf-one-break): a Windows line break is ONE break, so \r\n\r\n is a blank line and \r\n is not.
+        folded = unicodedata.normalize('NFKD', unicodedata.normalize('NFKD', text.replace('\r\n', '\n')).casefold())
         return ''.join(ch for ch in folded if unicodedata.category(ch) != 'Cf' and unicodedata.category(ch)[0] != 'M')
 
     def _basis_tokens(self):
         import review_workflow
         return [self._normalize_basis_text(token) for token in review_workflow.APPROVAL_BASES]
 
+    #: r5 (contribute-bound): how much normalised text a value check reads; longer than every token and start.
+    BASIS_VALUE_PREFIX = 64
+
+    def _basis_value_prefix(self, rest):
+        """The normalised start of ``rest``, at most BASIS_VALUE_PREFIX characters, read character by character so
+        the work stops there however long ``rest`` is (r5). Equal to the start of _normalize_basis_text(rest)."""
+        out = ''
+        for ch in rest:
+            out += self._normalize_basis_text(ch)
+            if len(out) >= self.BASIS_VALUE_PREFIX:
+                break
+        return out[:self.BASIS_VALUE_PREFIX]
+
     def _basis_value_starts(self, rest):
         """Whether ``rest`` (what follows a label's colon, newlines included) starts with a basis (r3: a token, "a" or
         "the coordinator agent", "coordinator agent", "project setting", "agent_approval" or "by-agent")."""
-        start = self._normalize_basis_text(rest)
+        start = self._basis_value_prefix(rest)
         return bool(start) and any(start.startswith(value)
                                    for value in self._basis_tokens() + list(self.BASIS_VALUE_STARTS))
 
@@ -7344,14 +7362,14 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _basis_dash_value_starts(self, rest):
         """Whether ``rest`` (what follows the label and a dash) starts with a token or the reason (r4)."""
-        start = self._normalize_basis_text(rest)
+        start = self._basis_value_prefix(rest)
         return bool(start) and any(start.startswith(value)
                                    for value in self._basis_tokens() + list(self.BASIS_DASH_VALUE_STARTS))
 
     def _basis_value_in(self, rest):
         """Whether ``rest`` names a basis anywhere: :meth:`_basis_value_starts`, or a token or "coordinator agent"
         later in it (r3: a quoted mention of the label followed by a basis in other words is a claim)."""
-        text = self._normalize_basis_text(rest)
+        text = self._normalize_basis_text(rest[:self.BASIS_REST_LIMIT])          # r5: bounded
         return self._basis_value_starts(rest) or any(
             value in text for value in self._basis_tokens() + list(self.BASIS_VALUE_WORDS))
 
@@ -15284,9 +15302,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         if operation == 'contribute':
             # kittrial-5bb.540 r2 (gate-fields): the contribution summary is drawn directly above the server's
-            # basis line on the task page, so a basis text in it is refused as on approve. No length check here:
-            # the canonical write keeps its own limit and words for a contribution.
-            typed = self._basis_text_in(payload.get('summary'))
+            # basis line on the task page, so a basis text in it is refused as on approve. The canonical write keeps its
+            # own limit and words for a contribution, so an overlong summary skips the gate and is refused there
+            # (r5, contribute-bound: the gate never reads more than a summary may hold).
+            summary = payload.get('summary')
+            overlong = isinstance(summary, str) and len(summary) > self.SUMMARY_MAX
+            typed = None if overlong else self._basis_text_in(summary)
             if typed is not None:
                 raise invalid(self.basis_refusal('contribution', typed))
 
