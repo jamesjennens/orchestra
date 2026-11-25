@@ -72,6 +72,19 @@ class AuditCheckTests(unittest.TestCase):
                  agent_id='agt_2', target_credential_id='cred_zz')]
         self.assertEqual(['cred_b'], [row['subject'] for row in tool.check(state)['unexplained']])
 
+    def test_a_fenced_credential_is_checked_as_any_agent_credential_is(self):
+        # kittrial-5bb.607: the state file keeps a rooms-only credential under fenced_credentials.
+        state = self.state()
+        state['coordinator_grants'] = {}
+        state['agent_approval'] = {}
+        state['credentials'] = {}
+        state['fenced_credentials'] = {
+            'cred_f': {'user_id': 'usr_o', 'agent_id': 'agt_1', 'scopes': ['rooms'], 'created_at': '2026-10-31T12:00:00Z'},
+            'cred_g': {'user_id': 'usr_o', 'agent_id': 'agt_2', 'scopes': ['rooms'], 'created_at': '2026-10-31T12:00:00Z'}}
+        state['audit'].append(dict(event('2026-10-31T12:00:00Z', 'agents.credentials.issued', 'usr_o', None),
+                                   agent_id='agt_1', target_credential_id='cred_f'))
+        self.assertEqual(['cred_g'], [row['subject'] for row in tool.check(state)['unexplained']])
+
     def test_a_superusers_event_explains_a_grant_given_for_another_account_and_a_wrong_agent_does_not(self):
         state = self.state()
         state['credentials'] = {}

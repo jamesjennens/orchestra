@@ -68,8 +68,12 @@ def entries(state):
         if isinstance(setting, dict):
             yield ('agent-approval setting', project, setting.get('mode'), setting.get('set_by'),
                    setting.get('set_at'), ('projects.agent_approval',), {'agent_approval': setting.get('mode')})
-    credentials = state.get('credentials')
-    for credential_id, credential in (credentials.items() if isinstance(credentials, dict) else ()):
+    credentials = dict(state.get('credentials')) if isinstance(state.get('credentials'), dict) else {}
+    # kittrial-5bb.607: a fenced credential (an agent's rooms-only one) is kept under its own key, where an older
+    # kit's lookup cannot find it; it is issued by the same route and checked the same way.
+    fenced = state.get('fenced_credentials')
+    credentials.update(fenced if isinstance(fenced, dict) else {})
+    for credential_id, credential in credentials.items():
         if not isinstance(credential, dict):
             continue
         if credential.get('agent_id'):
