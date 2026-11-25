@@ -2943,15 +2943,16 @@ class EndpointBackend:
             argv.append('--require-authority')
         if action == 'owner-requirements':
             argv.extend(['--terminal-endpoint-timeout', str(timeout or self.timeout)])
+        env = dict(os.environ, PYTHONUTF8='1')
         try:
             if action == 'owner-requirements':
                 import endpoint_process
                 completed = endpoint_process.run(argv, input=json.dumps(payload),
-                                                 timeout=timeout or self.timeout)
+                                                 timeout=timeout or self.timeout, env=env)
             else:
                 completed = subprocess.run(argv,
                                            input=json.dumps(payload), text=True, encoding='utf-8',
-                                           capture_output=True, timeout=timeout or self.timeout)
+                                           env=env, capture_output=True, timeout=timeout or self.timeout)
         except subprocess.TimeoutExpired:
             raise uncertain('Canonical endpoint timed out; outcome may be unknown')
         if completed.returncode:

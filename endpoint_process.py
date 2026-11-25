@@ -15,9 +15,10 @@ def stop_group(process):
         process.kill()
 
 
-def run(argv, *, input, timeout):
+def run(argv, *, input, timeout, env=None):
     options = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                   text=True, encoding='utf-8')
+                   text=True, encoding='utf-8',
+                   env=dict(os.environ, PYTHONUTF8='1') if env is None else env)
     if os.name == 'posix':
         options['start_new_session'] = True
     elif os.name == 'nt':

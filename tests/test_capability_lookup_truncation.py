@@ -20,6 +20,8 @@ Covers:
 """
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -508,6 +510,94 @@ class HttpCapabilityLookupTruncationTests(unittest.TestCase):
         )
         self.assertEqual(r_huge.status, 422, r_huge.data)
         self.assertIn('1200', json.dumps(r_huge.data))
+
+    def test_http_find_multibyte_passes_pythonutf8_and_survives_cp1252_child_pipe(self):
+        # Regression test for Windows CI failure on r1/r2 (kittrial-5bb.603 r3):
+        # 1. http_service.EndpointBackend._endpoint must pass PYTHONUTF8=1 to child
+        #    endpoint processes even when PYTHONUTF8 is unset or '0' in the parent env.
+        # 2. The canonical endpoint child must also reconfigure stdio to UTF-8 so an
+        #    explicit cp1252 PYTHONIOENCODING never crashes ensure_ascii=False output.
+        mb_summary = (
+            'B' * 195 + ' \u6f22\u5b57 \U0001f680 cafe\u0301 \u0430\u0431 TAIL-CP1252.'
+        )
+        self._propose_and_accept_http('ops.http-win-cp1252', 'HTTP Win CP1252', mb_summary, 'kwincp1252')
+
+        api = Client(f'http://127.0.0.1:{self.harness.port}')
+        api.token = self.owner_token
+
+        real_run = subprocess.run
+        seen_pythonutf8 = []
+
+        def windows_legacy_pipe(*args, **kwargs):
+            env = dict(kwargs.get('env') if kwargs.get('env') is not None else os.environ)
+            seen_pythonutf8.append(env.get('PYTHONUTF8'))
+            # Mirror Windows default: legacy cp1252 pipe when child lacks PYTHONUTF8=1.
+            env['PYTHONIOENCODING'] = 'utf-8' if env.get('PYTHONUTF8') == '1' else 'cp1252'
+            kwargs['env'] = env
+            return real_run(*args, **kwargs)
+
+        clean_env = dict(os.environ)
+        clean_env.pop('PYTHONUTF8', None)
+        with patch.dict(os.environ, clean_env, clear=True), \
+                patch.object(subprocess, 'run', side_effect=windows_legacy_pipe):
+            res_find = api.find_capabilities(self.pid, 'ops.http-win-cp1252')
+            res_get = api.get_capability(self.pid, 'ops.http-win-cp1252')
+        self.assertTrue(seen_pythonutf8)
+        self.assertEqual({'1'}, set(seen_pythonutf8))
+        self.assertEqual(res_find['records'][0]['summary'], {'text': mb_summary, 'omitted_chars': 0})
+        self.assertEqual(res_get['record']['summary'], {'text': mb_summary, 'omitted_chars': 0})
+
+        # Also force cp1252 directly (overriding PYTHONUTF8) to pin child stdio reconfigure().
+        def forced_cp1252_pipe(*args, **kwargs):
+            env = dict(kwargs.get('env') if kwargs.get('env') is not None else os.environ)
+            env.pop('PYTHONUTF8', None)
+            env['PYTHONIOENCODING'] = 'cp1252'
+            kwargs['env'] = env
+            return real_run(*args, **kwargs)
+
+        with patch.object(subprocess, 'run', side_effect=forced_cp1252_pipe):
+            res_forced = api.find_capabilities(self.pid, 'ops.http-win-cp1252')
+        self.assertEqual(res_forced['records'][0]['summary'], {'text': mb_summary, 'omitted_chars': 0})
+
+    @unittest.skipIf(os.name != 'posix', 'endpoint.py imports fcntl; POSIX only')
+    def test_real_endpoint_utf8_stdio_under_cp1252_env(self):
+        # Pin the real endpoint.py directly under forced cp1252 stdio (no PYTHONUTF8):
+        # ensure_ascii=True exercises endpoint.main()'s ensure_ascii=False stdout print of
+        # capability find JSON; ensure_ascii=False also exercises UTF-8 stdin decoding.
+        marker = 'mb-\u6f22\u5b57-\U0001f680-cafe\u0301-\u0430\u0431'
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'bin').mkdir(parents=True)
+            fake_bd = root / 'bin' / 'bd'
+            fake_bd.write_text("#!/bin/sh\nprintf '[]\\n'\n", encoding='utf-8')
+            fake_bd.chmod(0o755)
+            (root / 'projects' / 'demo' / '.beads').mkdir(parents=True)
+            (root / 'projects' / 'demo' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            priv = root / 'deployment.private.json'
+            priv.write_text('{"password": "test"}\n', encoding='utf-8')
+            priv.chmod(0o600)
+            env = dict(os.environ)
+            env.pop('PYTHONUTF8', None)
+            env['PYTHONIOENCODING'] = 'cp1252'
+            for ensure_ascii in (True, False):
+                with self.subTest(ensure_ascii=ensure_ascii):
+                    raw_in = json.dumps(
+                        {'project': 'demo', 'actor': 'tester', 'action': 'capability', 'args': ['find', marker]},
+                        ensure_ascii=ensure_ascii,
+                    ).encode('utf-8')
+                    done = subprocess.run(
+                        [sys.executable, str(KIT / 'endpoint.py'), '--root', str(root)],
+                        input=raw_in,
+                        capture_output=True,
+                        env=env,
+                        timeout=30,
+                    )
+                    self.assertEqual(done.returncode, 0, done.stderr.decode('utf-8', 'replace'))
+                    self.assertEqual(done.stderr, b'')
+                    reply = json.loads(done.stdout.decode('utf-8'))
+                    self.assertEqual(reply['returncode'], 0, reply)
+                    payload = json.loads(reply['stdout'])
+                    self.assertEqual(payload['phrase']['text'], marker)
 
 
 if __name__ == '__main__':

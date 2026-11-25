@@ -807,6 +807,11 @@ def service_action(root, request, arguments):
 
 
 def main():
+    # Mirror endpoint.py: keep stdin/stdout/stderr UTF-8 regardless of host locale or
+    # Windows legacy codepage so ensure_ascii=False JSON envelopes never hit cp1252.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', required=True)
     parser.add_argument('--authority-store')

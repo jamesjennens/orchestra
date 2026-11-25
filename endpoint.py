@@ -4028,6 +4028,11 @@ def read_request(fd):
     return record_json.loads(text),None,None
 
 def main():
+    # Keep stdin/stdout/stderr UTF-8 regardless of host locale or Windows legacy codepage:
+    # the JSON envelope uses ensure_ascii=False and callers decode it as UTF-8 (kittrial-5bb.603).
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8')
     # No prefix matching: the wrapper passes these flags exactly, and an abbreviation must
     # not silently select a different option (kittrial-5bb.223, finding 7).
     p=argparse.ArgumentParser(allow_abbrev=False);p.add_argument('--root',required=True)
