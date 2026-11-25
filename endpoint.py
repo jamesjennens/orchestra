@@ -1554,7 +1554,7 @@ def find_read(root, path, name, request, key_projects=None, key_principal=None):
     import decision_attest
     import requirement_http
     import read_cache
-    from http_authority import read_state
+    from http_authority import AuthorityDenied, read_state
     actor = request['actor']
     options = context_find.parse_args(request.get('args', []), actor)
     if set(request) - {'project', 'actor', 'action', 'args', 'attachments'} \
@@ -1586,7 +1586,7 @@ def find_read(root, path, name, request, key_projects=None, key_principal=None):
         operators = scope['operators']
         if options.get('cursor'):
             token = context_find._untoken(options['cursor'])
-            if token['scope'] != context_find._digest(scope) or token['project'] != name:
+            if token['scope'] != context_find.scope_digest(scope) or token['project'] != name:
                 raise ValueError(context_find.RESTART)
         snapshot = read_cache.cached_export_snapshot(root, path, run, name)
         rows = snapshot['rows']
@@ -1607,11 +1607,24 @@ def find_read(root, path, name, request, key_projects=None, key_principal=None):
             return requirement_http.read_snapshot(path, name, ['list'], prepared, snapshot_run,
                                                   operators, check_budget=check_budget)
 
-        decision_stamps = {}
+        def authority_state():
+            try:
+                return read_state(root / 'http-state.json')
+            except (AuthorityDenied, UnicodeError):
+                # A host-only installation can still have operator decisions.
+                # Missing web state never supplies web authority.
+                return None
+
+        def decision_stamp(view):
+            return tuple(view.get(key) for key in ('attestation', 'attested_by', 'attestation_id'))
+
+        decision_states, decision_stamps = [], {}
+
         def decision(row):
-            view = decision_attest.read_answer(row, name, read_state(root / 'http-state.json'), operators, path)
-            decision_stamps[row['id']] = (row, tuple(view.get(k) for k in
-                                        ('attestation', 'attested_by', 'attestation_id')))
+            if not decision_states:
+                decision_states.append(authority_state())
+            view = decision_attest.read_answer(row, name, decision_states[0], operators, path)
+            decision_stamps[row['id']] = (row, decision_stamp(view))
             return view
 
         deadline = time.monotonic() + context_find.COMPUTE_SECONDS
@@ -1640,11 +1653,14 @@ def find_read(root, path, name, request, key_projects=None, key_principal=None):
             elif checked['watermark']['generation'] != answer['watermark']['generation']:
                 answer['stale'] = 'lagging'
                 answer['cursor'] = None
-        for row, stamp in decision_stamps.values():
-            view = decision_attest.read_answer(row, name, read_state(root / 'http-state.json'), operators, path)
-            if tuple(view.get(k) for k in ('attestation', 'attested_by', 'attestation_id')) != stamp:
-                answer['stale'] = 'lagging'
-                answer['cursor'] = None
+        if decision_stamps:
+            fresh_state = authority_state()
+            for row, stamp in decision_stamps.values():
+                view = decision_attest.read_answer(row, name, fresh_state, operators, path)
+                if decision_stamp(view) != stamp:
+                    answer['stale'] = 'lagging'
+                    answer['cursor'] = None
+                    break
         if scope_now() != scope:
             raise ValueError(context_find.RESTART)
         # A freshness warning may have been added after the ranked page was fit.

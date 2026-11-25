@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import briefing
@@ -36,6 +37,9 @@ NOT_SEARCHED = ['superseded checkpoints', 'room messages', 'task-file contents',
                 'baseline documents', 'other projects', 'semantic or inferred answers']
 TRUST_ORDER = {'accepted-record': 0, 'decision': 1, 'checkpoint-open': 2,
                'review': 3, 'draft': 4, 'checkpoint-closed': 5, 'prose': 6}
+DISPLAY_ESCAPE = re.compile(r'\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})')
+INVISIBLE = re.compile(r'[^\x00-\x7f]')
+DECISION_MARKER = re.compile(r'\s*(?:Decision:|Kind: decision)')
 
 
 class _Parser(argparse.ArgumentParser):
@@ -142,12 +146,38 @@ def _digest(value):
     return hashlib.sha256(_bytes(value)).hexdigest()
 
 
+def scope_digest(scope):
+    """The public cursor binds read scope. Operator authority stays server-side."""
+    return _digest({key: value for key, value in scope.items() if key != 'operators'})
+
+
 def _flat(value):
-    return re.sub(r'[\n\t]', ' ', briefing.plain_text(value))
+    def escape(match):
+        char = match.group()
+        code = ord(char)
+        if (unicodedata.category(char) == 'Cf' or 0xe0000 <= code <= 0xe007f
+                or code in (0x034f, 0x3164) or 0xfe00 <= code <= 0xfe0f):
+            return ('\\u%04x' if code <= 0xffff else '\\U%08x') % code
+        return char
+    return INVISIBLE.sub(escape, briefing.plain_text(value)).replace('\n', ' ').replace('\t', ' ')
+
+
+def _clip_display(text, omitted=0):
+    end = min(len(text), 200)
+    if end < len(text):
+        for escape in DISPLAY_ESCAPE.finditer(text, 0, end + 10):
+            if escape.start() < end < escape.end():
+                end = escape.start()
+                break
+        partial = re.search(r'(?:\\u[0-9a-fA-F]{0,3}|\\U[0-9a-fA-F]{0,7})$', text[:end])
+        if partial:
+            end = partial.start()
+    return {'text': text[:end], 'omitted_chars': omitted + len(text) - end}
 
 
 def _safe(value):
-    return briefing.clip_context_label(_flat(value), 200)
+    text = str(value or '')
+    return _clip_display(_flat(text[:1200]), max(0, len(text) - 1200))
 
 
 def _scalar(value):
@@ -294,6 +324,7 @@ def _comments(row, coverage, budget, allowed, record_kind=None):
                 budget.check()
                 if coverage['comments_examined'] + queued >= MAX_COMMENTS:
                     coverage['cutoffs'].add('comments')
+                    complete = False
                     break
                 coverage['comments_examined'] += 1
                 coverage['skipped_malformed'] += 1
@@ -373,31 +404,42 @@ def _comments(row, coverage, budget, allowed, record_kind=None):
     return result
 
 
-def _window(text, words, byte_limit=MAX_TEXT_BYTES):
-    encoded = text.encode('utf-8')
-    if len(encoded) <= byte_limit:
-        return text, False
+def _match_start(text, pattern, overlap, budget):
+    # Bound each regex call, including a no-match scan over a long body. The
+    # overlap preserves a query word that spans the boundary between chunks.
+    for start in range(0, len(text), MAX_TEXT_BYTES):
+        budget.check()
+        match = pattern.search(text, start, start + MAX_TEXT_BYTES + overlap)
+        if match:
+            return match.start()
+    return 0
+
+
+def _window(text, pattern, overlap, budget, byte_limit=MAX_TEXT_BYTES):
+    if len(text) <= byte_limit and len(text.encode('utf-8')) <= byte_limit:
+        return text, False, None
     # Index a deterministic query-centred bounded window, so a late literal match
     # in a long report is recoverable. The returned hash still covers ALL text.
-    match = re.search('|'.join(re.escape(word) for word in words), text, re.IGNORECASE) if words else None
-    start = max(0, match.start() - 500) if match else 0
-    return text[start:].encode('utf-8')[:byte_limit].decode('utf-8', 'ignore'), True
+    match = _match_start(text, pattern, overlap, budget)
+    start = max(0, match - 500)
+    bounded = text[start:start + byte_limit]
+    return bounded.encode('utf-8')[:byte_limit].decode('utf-8', 'ignore'), True, match
 
 
-def _excerpt(text, words):
-    match = re.search('|'.join(re.escape(word) for word in words), text, re.IGNORECASE) if words else None
-    safe = _flat(text)
-    position = len(_flat(text[:match.start()])) if match else 0
-    start = max(0, position - 65)
-    for escaped in re.finditer(r'\\u[0-9a-fA-F]{4}', safe):
-        if escaped.start() >= start:
+def _excerpt(text, pattern, match):
+    if match is None:
+        found = pattern.search(text)
+        match = found.start() if found else 0
+    first = max(0, match - 65)
+    last = min(len(text), match + 200)
+    before = _flat(text[first:match])
+    start = max(0, len(before) - 65)
+    for escape in DISPLAY_ESCAPE.finditer(before):
+        if escape.start() < start < escape.end():
+            start = escape.end()
             break
-        if escaped.start() < start < escaped.end():
-            start = escaped.end()
-            break
-    value = briefing.clip_context_label(safe[start:], 200)
-    value['omitted_chars'] += start
-    return value
+    safe = before[start:] + _flat(text[match:last])
+    return _clip_display(safe, first + start + len(text) - last)
 
 
 def _review_text(payload):
@@ -444,6 +486,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                 'cutoffs': set(), 'not_searched': list(NOT_SEARCHED)}
     budget = _Budget(coverage, clock, deadline)
     words = capabilities.words(options['phrase'])
+    pattern = re.compile('|'.join(re.escape(word) for word in words), re.IGNORECASE)
+    overlap = max(map(len, words))
     documents, identities, related, row_index, known_ids = [], set(), {}, {}, set()
     ambiguous_ids = set()
     first = _instant(options.get('since'))
@@ -489,10 +533,12 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
             identity_parts = [str(x) for x in exact if x]
             title_clipped = False
             if kind in ('ref', 'cap', 'decision', 'task', 'requirement'):
-                rank_title, title_clipped = _window(str(title or ''), words, byte_limit=1024)
+                rank_title, title_clipped, _ = _window(str(title or ''), pattern, overlap, budget,
+                                                       byte_limit=1024)
                 identity_parts.append(rank_title)
             identity_bytes = sum(len(part.encode('utf-8')) for part in identity_parts)
-            indexed, clipped = _window(body, words, byte_limit=max(1, MAX_TEXT_BYTES - identity_bytes))
+            indexed, clipped, match = _window(body, pattern, overlap, budget,
+                                              byte_limit=max(1, MAX_TEXT_BYTES - identity_bytes))
             clipped = clipped or title_clipped
         except (UnicodeError, TypeError):
             coverage['skipped_malformed'] += 1
@@ -504,10 +550,9 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                    else 'comment:' + str(comment) if comment is not None else 'task:' + task)
         item = {'kind': kind, 'project': project, 'task': task, 'comment': comment,
                 'pointer': pointer, 'trust': 'data', 'trust_class': trust,
-                'title': _safe(title), 'excerpt': _excerpt(body, words),
-                'author': _scalar(author), 'created_at': _scalar(created) if moment else None,
-                'updated_at': _scalar(updated) if _time(updated) else None,
-                'state': _scalar(state), 'owner': _scalar(owner), 'closed': row.get('status') == 'closed',
+                'title': title, 'author': author, 'created_at': created if moment else None,
+                'updated_at': updated if _time(updated) else None, 'state': state,
+                'owner': owner, 'closed': row.get('status') == 'closed',
                 'sha256': full_hash, 'sha256_basis': hash_basis}
         if contribution is not None:
             item['contribution'] = contribution
@@ -526,8 +571,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                                 and briefing.CONTEXT_POINTER_RE.fullmatch(p)][:3]
         identities.add(identity)
         doc_id = _digest(identity)
-        documents.append({'id': doc_id, 'item': item,
-                          'indexed': indexed, 'exact': tuple(exact),
+        documents.append({'id': doc_id, 'item': item, 'body': body, 'match': match,
+                          'exact': tuple(exact),
                           'at': moment.timestamp() if moment else 0,
                           'bm25': capabilities.bm25_document(doc_id,
                                     identity_parts, [indexed])})
@@ -604,11 +649,15 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
         prepared = _Checked(sorted((row for row in prepared if row['id'] not in ambiguous_ids),
                                    key=lambda row: row['id']), budget)
 
+        # Catalog selection must never recover a protected record from a known
+        # damaged prefix. Ordinary prose can still use independent valid rows.
+        record_rows = (_Checked([row for row in prepared if row['_find_comments_complete']], budget)
+                       if selected.intersection(('ref', 'cap', 'requirement')) else ())
         for kind, module in (('ref', 'reference_records'), ('cap', 'capability_records')):
             if kind not in selected:
                 continue
             reader = __import__(module)
-            entries, incomplete = reader.catalog(prepared, operators)
+            entries, incomplete = reader.catalog(record_rows, operators)
             coverage['skipped_malformed'] += len(incomplete)
             replacements = {}
             for entry in entries:
@@ -641,7 +690,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
             coverage['skipped_malformed'] += sum(
                 is_requirement_row(row) for row in prepared)
         if 'requirement' in selected and requirement_reader is not None:
-            block = requirement_reader(prepared, budget.check)
+            block = requirement_reader(record_rows, budget.check)
             for item in block.get('items') or []:
                 budget.check()
                 if item.get('unreadable'):
@@ -747,7 +796,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                               'title': _safe(title), 'trust': 'data'}
                              for kind, cid, title in selected_pointers[:3] if ID.fullmatch(str(cid))]
             decision = decision_attest.is_decision(row)
-            if decision and 'decision' in selected:
+            if decision and 'decision' in selected and not incomplete:
                 try:
                     view = decision_reader(row) if decision_reader else None
                     if view is None:
@@ -773,8 +822,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                     body = comment.get('text')
                     if row['comments'].comment_kinds[str(comment['id'])] != 'comment':
                         continue
-                    first_line = next((line.strip() for line in body.splitlines() if line.strip()), '')
-                    marker = first_line.startswith(('Decision:', 'Kind: decision'))
+                    marker = DECISION_MARKER.match(body)
                     add('comment', task, 'Comment on ' + task, body, body, comment=str(comment['id']),
                         author=comment.get('author'), created=comment.get('created_at'), updated=comment.get('updated_at'),
                         state=row.get('status'), hint='decision-like' if marker else None)
@@ -786,7 +834,7 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
                            'related': related.get(doc['item']['task'], [])
                            if doc['item']['kind'] == 'task' else []}
                           for doc in sorted(documents, key=lambda d: d['id'])])
-    scope_hash = _digest(scope)
+    scope_hash = scope_digest(scope)
     query = {key: value for key, value in options.items() if key not in ('cursor', 'json', 'phrase')}
     query['phrase'] = ' '.join(words)
     query_hash = _digest(query)
@@ -798,21 +846,28 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
         if any(previous[key] != value for key, value in binding.items()):
             raise ValueError(RESTART)
         position = previous['position']
-    partial = bool(coverage['cutoffs'] or coverage['skipped_malformed'] or coverage['text_cutoffs'])
+    bm25 = [doc['bm25'] for doc in documents]
+    unweighted_terms = None
     try:
-        scores = capabilities.bm25_scores([doc['bm25'] for doc in documents], words,
-                                          check_budget=budget.check)
+        scores = capabilities.bm25_scores(bm25, words, check_budget=budget.check)
     except _Stop:
-        scores, partial = {}, True
+        # The extracted documents already have token sets. Recover their
+        # matches without a second weighted pass after the deadline.
+        scores = {}
+        unweighted_terms = set(capabilities.bm25_query_terms(
+            bm25, capabilities.content_words(options['phrase'])))
+    partial = bool(coverage['cutoffs'] or coverage['skipped_malformed'] or coverage['text_cutoffs'])
     # A deterministic text window can be paged while still reporting partial
     # recall. Interrupted extraction/scoring and unreadable records cannot.
     continuation_safe = not coverage['cutoffs'] and not coverage['skipped_malformed']
+    if options.get('cursor') and not continuation_safe:
+        raise ValueError(RESTART)
     exact_phrase = ' '.join(words)
     matching = []
     for doc in documents:
         exact = any(' '.join(capabilities.words(value)) == exact_phrase for value in doc['exact'] if value)
         score = scores.get(doc['id'], 0.0)
-        if exact or score > 0:
+        if exact or score > 0 or (unweighted_terms and not unweighted_terms.isdisjoint(doc['bm25']['terms'])):
             matching.append((doc, exact, score))
     matching.sort(key=lambda entry: (-int(entry[1]), -entry[2],
                                     TRUST_ORDER[entry[0]['item']['trust_class']],
@@ -825,6 +880,8 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
     warnings = []
     if partial:
         warnings.append('Only a bounded part of the permitted corpus was searched; totals are a lower bound.')
+    if unweighted_terms is not None:
+        warnings.append('The computation deadline stopped BM25 ranking; showing confirmed lexical matches.')
     if coverage['text_cutoffs']:
         warnings.append('Long documents were indexed through a bounded query-centred window.')
     result = {'schema': 'find-v1', 'project': project, 'phrase': _scalar(options['phrase']),
@@ -843,6 +900,10 @@ def search(rows, project, actor, options, scope, *, operators=(), project_path=N
     for index in range(position, min(len(matching), position + options['limit'])):
         doc, exact, score = matching[index]
         item = dict(doc['item'], rank=index + 1, exact=exact, score=round(score, 8))
+        item['title'] = _safe(item['title'])
+        item['excerpt'] = _excerpt(doc['body'], pattern, doc['match'])
+        for field in ('author', 'created_at', 'updated_at', 'state', 'owner'):
+            item[field] = _scalar(item[field])
         if item['kind'] == 'task' and related.get(item['task']):
             item['related_context'] = related[item['task']]
         candidate = dict(result, items=result['items'] + [item])

@@ -250,19 +250,17 @@ def stem(word):
 
 def _vocab_stem(word, vocab_stems):
     """Stem ``word``, applying ``-ied``/``-ies`` -> ``-y`` only when the ``-y`` singular is in ``vocab_stems``."""
+    fallback = stem(word)
+    return next((form for form in _stem_forms(word, fallback) if form in vocab_stems), fallback)
+
+
+def _stem_forms(word, fallback):
     for suffix in ('ied', 'ies'):
         if word.endswith(suffix) and len(word) - len(suffix) >= 2:
-            y_form = word[:-3] + 'y'
-            if y_form in vocab_stems:
-                return y_form
-    base = stem(word)
-    if base in vocab_stems:
-        return base
+            yield word[:-3] + 'y'
+    yield fallback
     if word.endswith('y') and len(word) >= 4:
-        i_form = word[:-1] + 'i'
-        if i_form in vocab_stems:
-            return i_form
-    return base
+        yield word[:-1] + 'i'
 
 
 def normalized(text):
@@ -352,6 +350,27 @@ def _normalize_score(ratio):
     return 0.8 + 0.14 * (excess / (excess + 0.4))
 
 
+def bm25_query_terms(documents, raw_words):
+    """Resolve filtered query words against the corpus vocabulary.
+
+    Only words with multiple stems need to consult the corpus. This also lets
+    callers recover lexical matches without computing weights for a partial read.
+    """
+    fallbacks = {word: stem(word) for word in raw_words}
+    alternatives = set()
+    for word, fallback in fallbacks.items():
+        forms = tuple(_stem_forms(word, fallback))
+        if len(forms) > 1:
+            alternatives.update(forms)
+    vocabulary = set()
+    if alternatives:
+        for doc in documents:
+            vocabulary.update(alternatives.intersection(doc['terms']))
+            if vocabulary == alternatives:
+                break
+    return list(dict.fromkeys(_vocab_stem(word, vocabulary) for word in fallbacks))
+
+
 def bm25_scores(documents, query_words, check_budget=None):
     """Score ``documents`` against ``query_words`` (phrase text or unstemmed word list) with BM25.
 
@@ -369,29 +388,21 @@ def bm25_scores(documents, query_words, check_budget=None):
     raw_words = filtered if filtered else tokens
     if not raw_words:
         return {}
-    vocab_stems = set()
-    for doc in documents:
-        vocab_stems.update(doc['terms'])
-    seen = set()
-    wanted = []
-    for word in raw_words:
-        stemmed = _vocab_stem(word, vocab_stems)
-        if stemmed and stemmed not in seen:
-            seen.add(stemmed)
-            wanted.append(stemmed)
+    if check_budget is not None:
+        check_budget()
+    wanted = bm25_query_terms(documents, raw_words)
     if not wanted:
         return {}
     total_docs = len(documents)
     avg_id_len = sum(doc['id_len'] for doc in documents) / float(total_docs) or 1.0
     avg_ctx_len = sum(doc['ctx_len'] for doc in documents) / float(total_docs) or 1.0
     df = {term: 0 for term in wanted}
+    wanted_set = set(wanted)
     for index, doc in enumerate(documents):
         if check_budget is not None and index % 256 == 0:
             check_budget()
-        terms = doc['terms']
-        for term in wanted:
-            if term in terms:
-                df[term] += 1
+        for term in wanted_set.intersection(doc['terms']):
+            df[term] += 1
     if not any(df.values()):
         return {}
     matched_idfs = [_idf(df[term], total_docs) for term in wanted if df[term] > 0]
@@ -406,7 +417,7 @@ def bm25_scores(documents, query_words, check_budget=None):
         if check_budget is not None and index % 256 == 0:
             check_budget()
         terms = doc['terms']
-        if not any(term in terms for term in wanted):
+        if wanted_set.isdisjoint(terms):
             continue
         id_tf = doc['id_tf']
         ctx_tf = doc['ctx_tf']
