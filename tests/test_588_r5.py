@@ -9,8 +9,11 @@ The resolution:
   answer it, and it must not page anybody; like ``working`` it ends an open checkpoint wait.
 - own-job-times: so the board dates an own-job record by the own-job rule alone: its own run start (not the
   start of a coordinator wait it followed) and the 24 h cap (not 72 h).
-- other-party-wins: a wait ``waits.py`` still reports for the task (a delivery, an approval, a named review request)
-  is another party's move and governs the row, as it does for a declared ``working`` record on Slice 1.
+- own-job-keeps-the-row: a wait ``waits.py`` still reports for the task from another source (a delivery, an
+  approval, a named review request) stays in the waiting list but does not replace the own-job row; the row's
+  whose_move and next_actor come from the review state, so the coordinator's triggers still fire (r4 BoardTests).
+- boundaries: each source keeps its own expect_by boundary (Slice 1 r6: flagged at the instant; r4: quiet then).
+- unreadable: a comment time waits.py cannot read keeps the declared row instead of failing the board read.
 """
 import sys
 import unittest
@@ -99,30 +102,67 @@ class OwnJobTimes(unittest.TestCase):
         self.assertIn('your_move_idle', late['flags'])
 
 
-class OtherPartyWins(unittest.TestCase):
-    """other-party-wins: a delivery or review wait from waits.py governs the row over an own-job record."""
+class OwnJobKeepsTheRow(unittest.TestCase):
+    """own-job-keeps-the-row: a wait waits.py reports from another source does not replace the own-job row."""
 
-    def test_a_delivery_wait_governs_an_own_job_row(self):
+    def delivery(self):
+        return {'state': 'waiting-on-review', 'waiting_on': 'reviewer', 'inferred': False,
+                'started_at': iso(BASE + timedelta(hours=1)), 'origin_checkpoint': None,
+                'expect_by': iso(BASE + timedelta(hours=5)), 'expect_by_defaulted': True}
+
+    def test_a_delivery_wait_leaves_the_own_job_row_and_its_times(self):
         row, started = coordinator_then_own_job('o-1', timedelta(hours=2))
-        delivery = {'state': 'waiting-on-review', 'waiting_on': 'reviewer', 'inferred': False,
-                    'started_at': iso(BASE + timedelta(hours=1)), 'origin_checkpoint': None,
-                    'expect_by': iso(BASE + timedelta(hours=5)), 'expect_by_defaulted': True}
-        now = started + timedelta(hours=1)
-        with mock.patch.object(waits, 'task_wait_summary', return_value=[delivery]):
-            entry = lanes.held_task(row, 'o-1', A, now, 15 * 60, review={'review_state': 'awaiting-review'})
-        self.assertEqual('waiting-on-review', entry['state'])
-        self.assertEqual('reviewer', entry['waiting_on'])
-        self.assertIsNone(entry['job'])
-        self.assertIsNone(entry['expect_by'])
-        self.assertIsNone(entry['expect_by_effective'])
-        self.assertEqual(iso(BASE + timedelta(hours=1)), entry['state_since'])
-
-    def test_without_one_the_own_job_record_governs(self):
-        row, started = coordinator_then_own_job('o-2', timedelta(hours=2))
-        with mock.patch.object(waits, 'task_wait_summary', return_value=[]):
-            entry = lanes.held_task(row, 'o-2', A, started + timedelta(hours=1), 15 * 60, review={})
+        with mock.patch.object(waits, 'task_wait_summary', return_value=[self.delivery()]):
+            entry = lanes.held_task(row, 'o-1', A, started + timedelta(hours=1), 15 * 60,
+                                    review={'review_state': 'awaiting-review'})
         self.assertEqual(OWN, entry['state'])
+        self.assertIsNone(entry['waiting_on'])
+        self.assertEqual('the full test run', entry['job'])
+        self.assertEqual(iso(started), entry['state_since'])
         self.assertEqual(iso(started + timedelta(hours=4)), entry['expect_by_effective'])
+        self.assertNotIn('waiting_too_long', entry['flags'])
+
+    def test_the_review_state_still_names_the_next_actor(self):
+        # r4's BoardTests pin the coordinator's trigger; here the row's move comes from the review, not the record.
+        row, started = coordinator_then_own_job('o-2', timedelta(hours=2))
+        entry = lanes.held_task(row, 'o-2', A, started + timedelta(hours=1), 15 * 60,
+                                review={'review_state': 'awaiting-integration'})
+        self.assertEqual(OWN, entry['state'])
+        self.assertEqual('coordinator', entry['next_actor'])
+
+
+class EachSourceKeepsItsBoundary(unittest.TestCase):
+    """boundaries: Slice 1 (r6) flags a waits.py wait AT its expect_by; r4 keeps an own-job wait quiet then."""
+
+    def test_an_own_job_wait_is_quiet_at_the_instant_and_flagged_a_second_later(self):
+        row, started = coordinator_then_own_job('b-1', timedelta(hours=2), expect_by=iso(BASE + timedelta(hours=3)))
+        _lane, entry = entry_of(board([row], now=BASE + timedelta(hours=3)), 'b-1')
+        self.assertNotIn('expect_by_passed', entry['flags'])
+        _lane, entry = entry_of(board([row], now=BASE + timedelta(hours=3, seconds=1)), 'b-1')
+        self.assertIn('expect_by_passed', entry['flags'])
+
+    def test_a_waits_wait_is_flagged_at_the_instant(self):
+        row = task('b-2', A)
+        add_checkpoint(row, 'cp-0', iso(BASE))
+        add_lane_state(row, 'ls-0', 'cp-0', iso(BASE + timedelta(seconds=1)), state='waiting-on-coordinator',
+                       waiting_on='coordinator', expect_by=iso(BASE + timedelta(hours=2)))
+        _lane, entry = entry_of(board([row], now=BASE + timedelta(hours=2)), 'b-2')
+        self.assertIn('expect_by_passed', entry['flags'])
+
+
+class UnreadableTimestamp(unittest.TestCase):
+    """unreadable: waits.py raises on a comment time it cannot read; the board keeps the declared row."""
+
+    def test_a_declared_coordinator_wait_with_a_bad_time_stays_on_the_board(self):
+        row = task('u-1', A)
+        add_checkpoint(row, 'cp-0', 'not-a-timestamp')
+        add_lane_state(row, 'ls-0', 'cp-0', iso(BASE + timedelta(seconds=1)), state='waiting-on-coordinator',
+                       waiting_on='coordinator')
+        with self.assertRaises(ValueError):
+            waits.task_wait_summary(row, 'u-1', A, BASE + timedelta(hours=1))
+        _lane, entry = entry_of(board([row], now=BASE + timedelta(hours=1)), 'u-1')
+        self.assertEqual('waiting-on-coordinator', entry['state'])
+        self.assertEqual('coordinator', entry['waiting_on'])
 
 
 if __name__ == '__main__':
