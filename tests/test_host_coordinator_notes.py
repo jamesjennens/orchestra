@@ -228,6 +228,30 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
         self.assertEqual('Renamed North', disk['projects']['north']['name'])
         self.assertEqual(sent['note']['id'], disk['coordinator_notes']['notes'][0]['id'])
 
+    def test_host_send_retries_after_a_generation_conflict_rolls_back(self):
+        from http_auth import Store
+
+        store = self.service.store
+        other = Store(store.path)
+        other.state['projects']['north']['name'] = 'Renamed North'
+        save = store.save
+
+        def replace_before_save():
+            other.save()
+            save()
+
+        with mock.patch.object(store, 'save', side_effect=replace_before_save):
+            with self.assertRaises(hn.Refusal) as refused:
+                self.send_host()
+        self.assertEqual(503, refused.exception.status)
+        self.assertEqual([], self.service._notes())
+        self.assertIsNone(store.unsaved_since)
+
+        sent = self.send_host()
+        disk = json.loads(store.path.read_bytes())
+        self.assertEqual('Renamed North', disk['projects']['north']['name'])
+        self.assertEqual([sent['note']['id']], [n['id'] for n in disk['coordinator_notes']['notes']])
+
     def test_store_save_failure_does_not_leave_a_pending_note_for_a_later_save(self):
         with mock.patch.object(self.service.store, 'save', side_effect=OSError('CANARY-PRIVATE-SAVE')):
             with self.assertRaises(hn.Refusal) as e: self.send_host()

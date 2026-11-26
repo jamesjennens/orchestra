@@ -346,6 +346,7 @@ def state_change(service, *, audit=False, web=False):
             raise
     durable_keys = ('coordinator_notes', 'host_note_requests')
     before = {k: copy.deepcopy(service.state.get(k)) for k in durable_keys + (('audit',) if audit else ())}
+    unsaved_before = service.store.unsaved_since
     manager.local.depth = depth + 1
     try:
         yield
@@ -360,6 +361,7 @@ def state_change(service, *, audit=False, web=False):
             for k, value in before.items():
                 if value is None: service.state.pop(k, None)
                 else: service.state[k] = value
+            service.store.unsaved_since = unsaved_before
         if web and isinstance(error, Refusal) and error.status == 503:
             raise http_unavailable(error) from None
         raise
