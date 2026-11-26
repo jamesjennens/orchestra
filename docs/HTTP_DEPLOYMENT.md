@@ -1212,9 +1212,10 @@ stopped half way through is finished or removed with the same two commands
 - **Authentication activity is saved at most once per 60-second stamp window** for
   each live session or credential under ordinary operation (kittrial-5bb.592).
   A credential's first use can be saved immediately. A due activity stamp travels
-  with a state-changing route's save when one is available. A read's optional save
-  tries the state file lock without waiting. Agent presence in the serving process
-  uses the latest successful in-memory observation. Other processes and a restart
+  with a state-changing route's save when one is available. A read or a successful
+  replay can try an optional save without waiting for the state file lock. Agent
+  presence in the serving process uses the latest successful in-memory observation.
+  Other processes and a restart
   read the durable observation.
   - The service and the canonical endpoint use the same durable session deadlines.
     A pending observation never authorizes a request. If a stamp cannot be saved or

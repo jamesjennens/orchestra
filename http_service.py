@@ -5589,6 +5589,7 @@ class RouteContext:
 
 
 ROUTES = []
+WRITE_METHODS = ('POST', 'PUT', 'PATCH', 'DELETE')
 #: The routes that read their own body as a stream (kittrial-5bb.370): the task-file upload
 #: only. Every other route's body is read whole, bounded by ``max_body``, before it runs.
 STREAMED = set()
@@ -5948,6 +5949,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise forbidden('Credential scope does not permit this operation')
             status, response = getattr(self, name)(ctx)
             if status is not None:              # None: the route sent its own answer (a file download)
+                if status < 400 and method in WRITE_METHODS and ctx.principal is not None:
+                    self.service.complete_activity(ctx.principal)
                 self._send_json(status, response)
         except HttpError as error:
             self._note_denied(error, request_id)
@@ -6256,7 +6259,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         auth_source = None
         if not anonymous:
             self._principal, auth_source = self._authenticate()
-            if csrf and method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            if csrf and method in WRITE_METHODS:
                 if auth_source == 'cookie':
                     supplied = self.headers.get('X-CSRF-Token')
                     if not isinstance(supplied, str) or not secrets.compare_digest(
@@ -6332,7 +6335,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     break
         if not token:
             raise unauthenticated()
-        defer_activity = self.command in ('POST', 'PUT', 'PATCH', 'DELETE')
+        defer_activity = self.command in WRITE_METHODS
         return self.service.authenticate(token, source=self._source(), defer_activity=defer_activity), source
 
     def _note_denied(self, error, request_id):

@@ -507,11 +507,11 @@ class Principal:
 
     __slots__ = ('user_id', 'display_name', 'superuser', 'via', 'credential_id',
                  'credential_project', 'scopes', 'actor', 'csrf', 'session_hash',
-                 'agent_id')
+                 'agent_id', '_deferred_activity')
 
     def __init__(self, user_id, display_name, superuser, via, actor, *, credential_id=None,
                  credential_project=None, scopes=(), csrf=None, session_hash=None,
-                 agent_id=None):
+                 agent_id=None, deferred_activity=None):
         self.user_id = user_id
         self.display_name = display_name
         self.superuser = superuser
@@ -523,6 +523,7 @@ class Principal:
         self.csrf = csrf
         self.session_hash = session_hash
         self.agent_id = agent_id
+        self._deferred_activity = deferred_activity
 
     def __repr__(self):
         return 'Principal(user_id=%r, via=%r, credential_id=%r)' % (
@@ -2297,10 +2298,24 @@ class Service:
             self._agent_activity[stamp.agent_id] = stamp
         if len(self._pending_activity) > self.ACTIVITY_LIMIT:
             self._discard_activity(next(iter(self._pending_activity)))
-        if not defer:
-            if self.store.unsaved_since is not None:
-                self.store.save_soon('the pending state changes')
-            elif self._activity_due(stamp, record):
+        if defer:
+            return stamp
+        if self.store.unsaved_since is not None:
+            self.store.save_soon('the pending state changes')
+        elif self._activity_due(stamp, record):
+            self._flush_activity()
+
+    def complete_activity(self, principal):
+        """Try a due stamp on a successful write-method reply with no route save."""
+        stamp = getattr(principal, '_deferred_activity', None)
+        if stamp is None:
+            return
+        with self.store.lock:
+            key = (stamp.via, stamp.key)
+            if self._activity_closed or self._pending_activity.get(key) is not stamp:
+                return
+            record = self._activity_record(stamp)
+            if record is not None and self._activity_due(stamp, record):
                 self._flush_activity()
 
     def _activity_due(self, stamp, record, force=False):
@@ -2466,12 +2481,12 @@ class Service:
                 user = self.state['users'].get(session['user_id'])
                 if user is None or user['disabled']:
                     raise unauthenticated('Session expired or revoked')
-                self._observe_activity(_Activity('session', digest, digest, user['id'], None,
-                                                 session.get('issued_at'), moment, self._raw_now()),
-                                       session, defer_activity)
+                stamp = _Activity('session', digest, digest, user['id'], None,
+                                  session.get('issued_at'), moment, self._raw_now())
+                deferred = self._observe_activity(stamp, session, defer_activity)
                 return Principal(user['id'], user['display_name'], user['superuser'],
                                  'session', user['id'], csrf=session['csrf'],
-                                 session_hash=digest)
+                                 session_hash=digest, deferred_activity=deferred)
             credential_id = self.state['credential_tokens'].get(digest)
             credential = self.state['credentials'].get(credential_id) if credential_id else None
             if credential is not None:
@@ -2497,9 +2512,9 @@ class Service:
                     agent = self.state['agents'].get(agent_id)
                     if not isinstance(agent, dict) or not agent.get('enabled'):
                         raise unauthenticated('Agent is disabled')
-                self._observe_activity(_Activity('credential', credential_id, digest, user['id'], agent_id,
-                                                 credential.get('created_at'), moment, self._raw_now()),
-                                       credential, defer_activity)
+                stamp = _Activity('credential', credential_id, digest, user['id'], agent_id,
+                                  credential.get('created_at'), moment, self._raw_now())
+                deferred = self._observe_activity(stamp, credential, defer_activity)
                 # A credential carries ONLY the authority granted by its type, project
                 # and scopes. It never inherits the issuing account's global superuser
                 # authority: ``superuser`` is always False here, and scopes are the
@@ -2507,7 +2522,7 @@ class Service:
                 return Principal(user['id'], user['display_name'], False,
                                  'credential', actor, credential_id=credential['id'],
                                  credential_project=credential['project_id'],
-                                 scopes=credential['scopes'], agent_id=agent_id)
+                                 scopes=credential['scopes'], agent_id=agent_id, deferred_activity=deferred)
         raise unauthenticated('Authentication required')
 
     # -- live authority --------------------------------------------------------
