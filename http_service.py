@@ -6332,7 +6332,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                     break
         if not token:
             raise unauthenticated()
-        return self.service.authenticate(token, source=self._source()), source
+        defer_activity = self.command in ('POST', 'PUT', 'PATCH', 'DELETE')
+        return self.service.authenticate(token, source=self._source(), defer_activity=defer_activity), source
 
     def _note_denied(self, error, request_id):
         if getattr(self, '_audited_refusal', False):

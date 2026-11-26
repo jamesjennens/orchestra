@@ -25,14 +25,14 @@ service. Authorization state is one JSON document written with an atomic replace
 idempotency receipts and canonical result replays live in a SQLite record store beside
 it (:class:`RecordStore`) with time-only retention, so the JSON document no longer
 grows with the number of keyed operations and no keyed operation rewrites it.
-Multi-process concurrency is out of scope for the disposable validation build; the
-service is a single process with a per-process lock, and the deployment runbook pins
-that.
+The deployment uses one HTTP writer. The store also detects committed changes
+from another process and refuses a write based on a superseded snapshot.
 """
 import hashlib
 import heapq
 import copy
-from contextlib import contextmanager
+from collections import OrderedDict, namedtuple
+from contextlib import contextmanager, nullcontext
 import hmac
 from server_address import ps_quote, sh_quote
 import ipaddress
@@ -42,6 +42,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 from contextlib import closing
 import sys
 import threading
@@ -71,6 +72,7 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
                             actor_person as http_actor_person,
                             actor_parties as full_actor_parties, namespace_holds)
 import http_authority
+from regular_file import open_regular
 
 # Password verifier policy. n=2**14, r=8 needs ~16 MiB per hash; scrypt is the
 # memory-hard scheme available in the standard library without third-party wheels.
@@ -895,8 +897,14 @@ class RecordStore:
         return report
 
 
+class _ActivityExpired(Exception):
+    """A staged observation no longer has a live durable source."""
+
+
 class Store:
-    """Atomic JSON persistence plus the SQLite record store. One writer process."""
+    """Atomic JSON persistence and the cross-process authority snapshot."""
+
+    GENERATION_WAIT = 5.0
 
     def __init__(self, path, clock=time.time):
         self.path = Path(path)
@@ -905,7 +913,15 @@ class Store:
         #: Since when the state in memory holds something the file does not, on this store's
         #: clock: a save could not have the state lock. None when the file is current.
         self.unsaved_since = None
+        self._stat_fast_path = sys.platform.startswith('linux')
+        self._generation = None
+        self._state_pin = None
+        self._fold_activity = None
+        self._activity_write = None
         self.state = self._load()
+        if self.state['cursor_key'] is None:
+            self.state['cursor_key'] = secrets.token_hex(32)
+            self.save()
         self.records = RecordStore(
             self.path.with_name(self.path.name + RECORD_STORE_SUFFIX),
             clock=lambda: self.clock())
@@ -914,24 +930,120 @@ class Store:
     def now(self):
         return self.clock()
 
-    def _load(self):
+    @staticmethod
+    def _identity(info):
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('The service state must be a regular file')
+        return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+    def _path_identity(self):
         try:
-            from admin import read_regular_text
-            text = read_regular_text(Path(os.path.realpath(str(self.path))))
+            return self._identity(self.path.stat())
         except FileNotFoundError:
+            return None
+
+    def _read_image(self):
+        try:
+            handle = open_regular(Path(os.path.realpath(str(self.path))))
+        except FileNotFoundError:
+            if self._path_identity() is not None:
+                raise ValueError('The service state changed while opening') from None
+            return None, None, None
+        try:
+            identity = self._identity(os.fstat(handle.fileno()))
+            raw = handle.read()
+            if identity != self._path_identity() or len(raw) != identity[-1]:
+                raise ValueError('The service state changed while reading')
+            if self._stat_fast_path:
+                pin, handle = handle, None
+                return identity, raw, pin
+            return hashlib.sha256(raw).digest(), raw, None
+        finally:
+            if handle is not None:
+                handle.close()
+
+    def _pin_generation(self, generation, pin):
+        # The open handle prevents reuse of the inode of our cached Linux image.
+        old_pin = self._state_pin
+        self._state_pin, self._generation = pin, generation
+        if old_pin is not None:
+            try:
+                old_pin.close()
+            except OSError:
+                pass
+
+    def _load(self, image=None):
+        generation, raw, pin = self._read_image() if image is None else image
+        if raw is None:
             return _blank_state()
-        data = json.loads(text)
-        if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
-            raise ValueError('Unsupported or corrupt service store schema')
-        base = _blank_state()
-        created_cursor_key = not isinstance(data.get('cursor_key'), str) or len(data['cursor_key']) < 32
-        for key, value in base.items():
-            data.setdefault(key, value)
-        if created_cursor_key:
-            data['cursor_key'] = base['cursor_key']
-            self.state = data
-            self.save()
+        try:
+            data = json.loads(raw.decode('utf-8'))
+            if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
+                raise ValueError('Unsupported or corrupt service store schema')
+            cursor_key = data.get('cursor_key')
+            for key, default in _blank_state().items():
+                value = data.setdefault(key, default)
+                if isinstance(default, (dict, list)) and not isinstance(value, type(default)):
+                    raise ValueError('Corrupt service store field: ' + key)
+            if not isinstance(cursor_key, str) or len(cursor_key) < 32:
+                data['cursor_key'] = None
+        except BaseException:
+            if pin is not None:
+                pin.close()
+            raise
+        self._pin_generation(generation, pin)
         return data
+
+    def _warm_generation(self):
+        if self._stat_fast_path:
+            try:
+                return self._path_identity() == self._generation
+            except (OSError, ValueError):
+                pass
+        return False
+
+    def refresh_authority(self, *, reload=False):
+        """Prove current state. Only a request boundary can replace the live view.
+
+        A stable Linux identity needs a stat alone. Changed images and all
+        Windows reads use the same file fence as the canonical endpoint. A
+        nested recheck may hold references into a staged mutation, so it can
+        refuse a changed image but cannot substitute a new state dictionary.
+        """
+        if not reload and self._warm_generation():
+            return
+        with self.lock:
+            if self._warm_generation():
+                return
+            try:
+                with file_lock(str(self.path) + '.lock', timeout=self.GENERATION_WAIT, shared=True):
+                    if self._stat_fast_path:
+                        current = self._path_identity()
+                        if current == self._generation:
+                            return
+                        image = None
+                    else:
+                        image = self._read_image()
+                        current = image[0]
+                        if current == self._generation:
+                            return
+                    if current is None or not reload or self.unsaved_since is not None:
+                        raise busy()
+                    if image is None:
+                        image = self._read_image()
+                    if image[0] is None:
+                        raise busy()
+                    self.state = self._load(image)
+            except (OSError, ValueError, RecursionError):
+                raise busy() from None
+
+    def _require_write_generation(self):
+        try:
+            current = self._path_identity() if self._stat_fast_path else self._read_image()[0]
+        except (OSError, ValueError):
+            raise TimeoutError('The service state generation could not be proved') from None
+        if current != self._generation:
+            raise TimeoutError('The service state was superseded by another writer')
 
     def _migrate_records(self):
         """Move a pre-revision-8 ``idempotency``/``results`` document into the store.
@@ -992,7 +1104,7 @@ class Store:
                           file=sys.stderr, flush=True)
                 return False
 
-    def save(self, wait=60.0):
+    def save(self, wait=60.0, *, activity_only=False, force_activity=False):
         # One unique temporary per write, then an atomic replace. A fixed
         # ``<name>.tmp`` would let a second writer (or a stale process) clobber an
         # in-flight snapshot before it is renamed, so the name carries the pid and a
@@ -1007,8 +1119,22 @@ class Store:
             written = False
             try:
                 with file_lock(str(self.path) + '.lock', timeout=wait):
-                    self._write()
-                    written = True
+                    self._require_write_generation()
+                    stamps = (self._fold_activity(force=force_activity)
+                              if self._fold_activity is not None else nullcontext(None))
+                    try:
+                        with stamps as staged:
+                            if staged is not None or not activity_only:
+                                self._activity_write = staged
+                                try:
+                                    self._write()
+                                    written = True
+                                finally:
+                                    self._activity_write = None
+                    except _ActivityExpired:
+                        if not activity_only:
+                            self._write()
+                            written = True
             except TimeoutError:
                 if written:
                     return
@@ -1033,22 +1159,34 @@ class Store:
             '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
         # Credential rollback holds the old audit prefix until saving succeeds.
         # Serialize its bounded tail without dropping that rollback evidence in memory.
-        state = self.state
+        activity = self._activity_write
+        state = self.state if activity is None else activity.state
         if len(state['audit']) > AUDIT_LIMIT:
             state = dict(state, audit=state['audit'][-AUDIT_LIMIT:])
         text = json.dumps(state, ensure_ascii=False, indent=2) + '\n'
+        pin = None
         try:
-            with open(temporary, 'w', encoding='utf-8') as handle:
+            with open(temporary, 'w', encoding='utf-8', newline='\n') as handle:
                 handle.write(text)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if self._stat_fast_path:
+                pin = open_regular(temporary)
+                generation = self._identity(os.fstat(pin.fileno()))
+            else:
+                generation = hashlib.sha256(text.encode('utf-8')).digest()
+            if activity is not None:
+                activity.check()
             os.replace(temporary, self.path)
         except BaseException:
+            if pin is not None:
+                pin.close()
             try:
                 os.unlink(temporary)
             except OSError:
                 pass
             raise
+        self._pin_generation(generation, pin)
         # Saved. Nothing after the replace may raise (review of kittrial-5bb.487 F2): a log stream
         # that is closed or broken must not turn a written state into a failed save.
         if self.unsaved_since is not None:
@@ -1132,6 +1270,9 @@ def session_limit_seconds(idle_minutes=None, absolute_hours=None):
 #: Marks an entry that did not exist before a mutation wrote it (kittrial-5bb.487).
 _ABSENT = object()
 
+_Activity = namedtuple('_Activity', 'via key digest user_id agent_id created moment raw')
+_ActivityWrite = namedtuple('_ActivityWrite', 'state check')
+
 
 class _Widening:
     """What one authority-WIDENING mutation wrote, so a failed save can take it back (kittrial-5bb.487).
@@ -1213,6 +1354,9 @@ class Service:
     no client-supplied role or actor label is trusted.
     """
 
+    ACTIVITY_CADENCE = 60.0
+    ACTIVITY_LIMIT = 4096
+
     def __init__(self, store, *, session_idle=SESSION_IDLE_SECONDS,
                  session_absolute=SESSION_ABSOLUTE_SECONDS,
                  credential_ttl=CREDENTIAL_TTL_SECONDS, reset_ttl=RESET_TTL_SECONDS,
@@ -1223,6 +1367,10 @@ class Service:
                  approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT,
                  password_min_length=DEFAULT_PASSWORD_MIN):
         self.store = store
+        self._pending_activity = OrderedDict()
+        self._agent_activity = {}
+        self._activity_closed = False
+        store._fold_activity = self._persist_activity
         #: Per-agent locks spanning the claim gate's held-set read and the claim write
         #: (kittrial-5bb.276 revision; per-agent in kittrial-5bb.300). Keyed by the
         #: agent id so concurrent claims by one agent serialize while unrelated agents'
@@ -1362,6 +1510,12 @@ class Service:
             return False
         return self._raw_now() - float(issued_raw) >= float(lifetime)
 
+    def _session_expired(self, session, moment):
+        return self._expired(moment, expires_at=session['absolute_expires'],
+                             issued_raw=session.get('issued_raw'), lifetime=self.session_absolute) or \
+            self._expired(moment, expires_at=session['idle_expires'],
+                          issued_raw=session.get('last_used_raw'), lifetime=self.session_idle)
+
     def _credential_expired(self, credential, moment):
         """Agent deadlines belong to the key; worker/legacy clock rules stay unchanged.
 
@@ -1424,12 +1578,7 @@ class Service:
             return True
         if principal.via == 'session':
             session = self.state['sessions'].get(principal.session_hash)
-            return session is None or session.get('revoked') or self._expired(
-                moment, expires_at=session.get('absolute_expires'),
-                issued_raw=session.get('issued_raw'), lifetime=self.session_absolute) or \
-                self._expired(moment, expires_at=session.get('idle_expires'),
-                              issued_raw=session.get('last_used_raw'),
-                              lifetime=self.session_idle)
+            return session is None or session.get('revoked') or self._session_expired(session, moment)
         if principal.via == 'credential':
             credential = self.state['credentials'].get(principal.credential_id)
             if credential is None or credential.get('revoked') or self._credential_expired(credential, moment):
@@ -2062,6 +2211,7 @@ class Service:
             self.store.save()
             raise
         with self.store.lock:
+            self.store.refresh_authority(reload=True)
             user_id = self.state['usernames'].get((username or '').lower())
             user = self.state['users'].get(user_id) if user_id else None
             # An account with no password yet (invited) is checked against the dummy too, so it
@@ -2106,36 +2256,148 @@ class Service:
                 'idle_expires_at': now_iso(moment + self.session_idle),
                 'user': self._public_user(user)}
 
-    def authenticate(self, token, *, source='local', required_scope=None):
+    def _discard_activity(self, key):
+        stamp = self._pending_activity.pop(key, None)
+        if stamp is not None and self._agent_activity.get(stamp.agent_id) is stamp:
+            del self._agent_activity[stamp.agent_id]
+
+    def _observe_activity(self, stamp, record, defer):
+        if self._activity_closed:
+            return
+        key = (stamp.via, stamp.key)
+        self._discard_activity(key)
+        self._pending_activity[key] = stamp
+        if stamp.agent_id is not None:
+            self._agent_activity[stamp.agent_id] = stamp
+        if len(self._pending_activity) > self.ACTIVITY_LIMIT:
+            self._discard_activity(next(iter(self._pending_activity)))
+        if not defer and self._activity_due(stamp, record):
+            self._flush_activity()
+
+    def _activity_due(self, stamp, record, force=False):
+        previous = record.get('last_used')
+        if previous is None:
+            return True
+        if stamp.moment < previous:
+            return False
+        raw = record.get('last_used_raw') if stamp.via == 'session' else None
+        if force:
+            return stamp.moment > previous or raw is not None and stamp.raw > raw or stamp.agent_id is not None
+        return (stamp.moment - previous >= self.ACTIVITY_CADENCE or
+                raw is not None and stamp.raw - raw >= self.ACTIVITY_CADENCE)
+
+    def _activity_record(self, stamp):
+        if stamp.via == 'session':
+            record = self.state['sessions'].get(stamp.key)
+            created_field = 'issued_at'
+        else:
+            if self.state['credential_tokens'].get(stamp.digest) != stamp.key:
+                return None
+            record = self.state['credentials'].get(stamp.key)
+            created_field = 'created_at'
+        if record is None or record.get('revoked') or record.get('user_id') != stamp.user_id \
+                or record.get(created_field) != stamp.created or record.get('agent_id') != stamp.agent_id:
+            return None
+        user = self.state['users'].get(stamp.user_id)
+        if user is None or user.get('disabled'):
+            return None
+        if stamp.agent_id is not None:
+            agent = self.state['agents'].get(stamp.agent_id)
+            if not agent or not agent.get('enabled') or agent.get('owner') != stamp.user_id:
+                return None
+        return record
+
+    @contextmanager
+    def _persist_activity(self, force=False):
+        """Fold due observations into a save, keeping the durable view on failure."""
+        applied, saved, obsolete = [], [], []
+        views = {}
+        moment = None
+
+        def stamp_fields(table, identity, record, values):
+            if table not in views:
+                views[table] = dict(self.state[table])
+            views[table][identity] = dict(record, **values)
+            applied.append((record, values))
+
+        def expired(stamp, record, at):
+            return (self._session_expired(record, at) if stamp.via == 'session'
+                    else self._credential_expired(record, at))
+
+        def check():
+            at = self._expiry_now()
+            expired_keys = [key for key, stamp, record in saved if expired(stamp, record, at)]
+            if expired_keys:
+                obsolete.extend(expired_keys)
+                raise _ActivityExpired()
+
+        try:
+            for key, stamp in self._pending_activity.items():
+                record = self._activity_record(stamp)
+                if record is None:
+                    obsolete.append(key)
+                    continue
+                if not self._activity_due(stamp, record, force):
+                    continue
+                if moment is None:
+                    moment = self._expiry_now()
+                if expired(stamp, record, moment):
+                    obsolete.append(key)
+                    continue
+                if stamp.via == 'session':
+                    stamp_fields('sessions', stamp.key, record,
+                                 {'last_used': stamp.moment, 'last_used_raw': stamp.raw,
+                                  'idle_expires': min(record['absolute_expires'],
+                                                      stamp.moment + self.session_idle)})
+                else:
+                    stamp_fields('credentials', stamp.key, record, {'last_used': stamp.moment})
+                    if self._agent_activity.get(stamp.agent_id) is stamp:
+                        agent = self.state['agents'][stamp.agent_id]
+                        stamp_fields('agents', stamp.agent_id, agent, {'last_seen_at': now_iso(stamp.raw)})
+                saved.append((key, stamp, record))
+            yield _ActivityWrite(dict(self.state, **views), check) if saved else None
+            for record, values in applied:
+                record.update(values)
+            for key, _, _ in saved:
+                self._discard_activity(key)
+        finally:
+            for key in obsolete:
+                self._discard_activity(key)
+
+    def _flush_activity(self, *, force=False, wait=0.0):
+        unsaved = self.store.unsaved_since
+        try:
+            self.store.save(wait=wait, activity_only=True, force_activity=force)
+        except Exception:
+            # Optional use stamps never change a user's authority or schedule a
+            # pre-effect save. Preserve any earlier real mutation or audit mark.
+            self.store.unsaved_since = unsaved
+
+    def authenticate(self, token, *, source='local', required_scope=None, defer_activity=False):
         """Resolve a bearer session/credential value to a principal, or raise 401.
 
         Session and credential expiry are evaluated on the monotone clock
         (:meth:`_expiry_now`), never on the raw clock alone, so a backward step cannot
         revive an expired item; the item's raw issuance/last-use stamp adds its real
-        lifetime as a second, independent expiry (:meth:`_expired`). An idle refresh
-        stamps the new idle deadline on the monotone clock and the new raw last-use.
+        lifetime as a second, independent expiry (:meth:`_expired`). Both checks
+        use durable timestamps. A successful observation can refresh them once
+        due or be carried by the mutation's own save.
         """
         digest = token_hash(token)
-        moment = self._expiry_now()
         with self.store.lock:
+            self.store.refresh_authority(reload=True)
+            moment = self._expiry_now()
             session = self.state['sessions'].get(digest)
             if session is not None:
-                if session['revoked'] or self._expired(
-                        moment, expires_at=session['absolute_expires'],
-                        issued_raw=session.get('issued_raw'),
-                        lifetime=self.session_absolute) or self._expired(
-                        moment, expires_at=session['idle_expires'],
-                        issued_raw=session.get('last_used_raw'),
-                        lifetime=self.session_idle):
+                if session['revoked'] or self._session_expired(session, moment):
+                    self._discard_activity(('session', digest))
                     raise unauthenticated('Session expired or revoked')
                 user = self.state['users'].get(session['user_id'])
                 if user is None or user['disabled']:
                     raise unauthenticated('Session expired or revoked')
-                session['last_used'] = moment
-                session['last_used_raw'] = self._raw_now()
-                session['idle_expires'] = moment + self.session_idle
-                # The answer of a request does not wait a minute for this stamp (kittrial-5bb.156).
-                self.store.save_soon()
+                self._observe_activity(_Activity('session', digest, digest, user['id'], None,
+                                                 session.get('issued_at'), moment, self._raw_now()),
+                                       session, defer_activity)
                 return Principal(user['id'], user['display_name'], user['superuser'],
                                  'session', user['id'], csrf=session['csrf'],
                                  session_hash=digest)
@@ -2153,7 +2415,6 @@ class Service:
                     raise unauthenticated('Authentication is no longer valid')
                 if required_scope and required_scope not in credential['scopes']:
                     raise forbidden('Credential scope does not permit this operation')
-                credential['last_used'] = moment
                 actor = credential.get('actor') or user['id']
                 # An agent credential resolves to its agent record on every request: a
                 # missing or disabled agent stops it even when the token itself was never
@@ -2165,8 +2426,9 @@ class Service:
                     agent = self.state['agents'].get(agent_id)
                     if not isinstance(agent, dict) or not agent.get('enabled'):
                         raise unauthenticated('Agent is disabled')
-                    agent['last_seen_at'] = now_iso(self._now())
-                self.store.save_soon()
+                self._observe_activity(_Activity('credential', credential_id, digest, user['id'], agent_id,
+                                                 credential.get('created_at'), moment, self._raw_now()),
+                                       credential, defer_activity)
                 # A credential carries ONLY the authority granted by its type, project
                 # and scopes. It never inherits the issuing account's global superuser
                 # authority: ``superuser`` is always False here, and scopes are the
@@ -2193,16 +2455,11 @@ class Service:
         """
         if principal is None:
             raise unauthenticated()
+        self.store.refresh_authority()
         moment = self._expiry_now() if moment is None else moment
         if principal.via == 'session':
             session = self.state['sessions'].get(principal.session_hash)
-            if session is None or session['revoked'] or self._expired(
-                    moment, expires_at=session['absolute_expires'],
-                    issued_raw=session.get('issued_raw'),
-                    lifetime=self.session_absolute) or self._expired(
-                    moment, expires_at=session['idle_expires'],
-                    issued_raw=session.get('last_used_raw'),
-                    lifetime=self.session_idle):
+            if session is None or session['revoked'] or self._session_expired(session, moment):
                 raise unauthenticated('Session expired or revoked')
             user = self.state['users'].get(session['user_id'])
             if user is None or user['disabled']:
@@ -2244,6 +2501,10 @@ class Service:
         live item's raw real lifetime is applied first (:meth:`_live_item_expired`), so a
         pinned monotone floor does not list capabilities for a genuinely expired item.
         """
+        try:
+            self.store.refresh_authority()
+        except HttpError:
+            return frozenset()
         moment = self._expiry_now()
         if self._live_item_expired(moment, principal):
             return frozenset()
@@ -2309,7 +2570,7 @@ class Service:
         The authenticated session read is the light touch a browser keeps an open set-up
         wizard alive with, so it answers what that page needs: the idle window this
         installation configured (``idle_seconds``) and the live deadlines of this session
-        (``idle_expires_at``, refreshed by every authenticated request, and
+        (``idle_expires_at``, from the latest durable observation, and
         ``absolute_expires_at``, which no use extends). Nothing about another session is
         read and no secret is included. A credential (a worker or agent key) has no browser
         session, so it gets ``None`` and the read answers exactly what it did before.
@@ -2320,9 +2581,11 @@ class Service:
         if not isinstance(session, dict):
             return None
         view = {'idle_seconds': self.session_idle, 'absolute_seconds': self.session_absolute}
-        for key, stored in (('idle_expires_at', 'idle_expires'),
-                            ('absolute_expires_at', 'absolute_expires')):
-            deadline = session.get(stored)
+        deadlines = {}
+        for key, stored, raw_start, lifetime in (
+                ('idle_expires_at', 'idle_expires', 'last_used_raw', self.session_idle),
+                ('absolute_expires_at', 'absolute_expires', 'issued_raw', self.session_absolute)):
+            deadline, raw = session.get(stored), session.get(raw_start)
             if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
                     or not math.isfinite(deadline):
                 # A damaged deadline is not invented: the read says nothing about it rather
@@ -2330,9 +2593,14 @@ class Service:
                 # session itself when its own deadline is unusable.
                 return None
             try:
-                view[key] = now_iso(deadline)
-            except (ValueError, OverflowError, OSError):
+                deadlines[key] = min(deadline, float(raw) + lifetime) if raw is not None else deadline
+            except (TypeError, ValueError, OverflowError, OSError):
                 return None
+        try:
+            view['absolute_expires_at'] = now_iso(deadlines['absolute_expires_at'])
+            view['idle_expires_at'] = now_iso(min(deadlines.values()))
+        except (ValueError, OverflowError, OSError):
+            return None
         return view
 
     def logout(self, principal, request_id=None):
@@ -2851,11 +3119,15 @@ class Service:
                 'expires_soon': bool(working and remaining is not None and remaining <= 7 * 86400)}
 
     def credential_view(self, credential, moment=None):
+        stamp = self._pending_activity.get(('credential', credential['id']))
+        last_used = credential.get('last_used')
+        if stamp is not None and self._activity_record(stamp) is credential:
+            last_used = stamp.moment if last_used is None else max(last_used, stamp.moment)
         view = {'id': credential['id'], 'project': credential['project_id'],
                 'agent': credential.get('agent_id'),
                 'label': credential['label'], 'scopes': list(credential['scopes']),
                 'actor': credential.get('actor'), 'revoked': credential['revoked'],
-                'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
+                'created_at': credential['created_at'], 'last_used': last_used,
                 'expires_at': now_iso(credential['expires_at'])}
         if credential.get('agent_id'):
             view.update(self.agent_credential_expiry_view(credential, moment=moment))
@@ -3637,6 +3909,12 @@ class Service:
                                                    if event.get('target_credential_ids') is not None else None)})
             return rows
 
+    def _agent_last_seen(self, agent):
+        stamp = self._agent_activity.get(agent['id'])
+        if stamp is not None and self._activity_record(stamp) is not None:
+            return now_iso(stamp.raw)
+        return agent.get('last_seen_at')
+
     def agent_view(self, agent, principal, moment=None):
         """The owner-visible agent record. The path never leaks to anyone else."""
         moment = self._expiry_now() if moment is None else moment
@@ -3656,7 +3934,7 @@ class Service:
             # memberships are never revealed.
             'owner_grantable_projects': self._owner_grantable_projects(agent['owner'], principal),
             'created_at': agent.get('created_at'),
-            'last_seen_at': agent.get('last_seen_at'),
+            'last_seen_at': self._agent_last_seen(agent),
             # Every credential that works (at most AGENT_MAX_CREDENTIALS) and the newest few that
             # do not; ``working`` says which is which (an expired one is not ``revoked``).
             'credentials': self._agent_credentials_shown(agent, moment=moment),
@@ -3773,7 +4051,7 @@ class Service:
             'owner_display_name': self._owner_name(agent['owner']),
             'actor': self.agent_actor(agent),
             'enabled': bool(agent.get('enabled')),
-            'last_seen_at': agent.get('last_seen_at'),
+            'last_seen_at': self._agent_last_seen(agent),
         }
         shown = {c['id'] for c in self._agent_credentials_shown(agent, moment=moment)}
         view['credentials'] = [self.agent_credential_expiry_view(c, moment=moment)
@@ -3888,7 +4166,7 @@ class Service:
                     continue
                 has = project_id in (agent.get('projects') or [])
                 agents.append({'id': agent['id'], 'name': agent['name'], 'has_project': has,
-                               'enabled': bool(agent.get('enabled')), 'last_seen_at': agent.get('last_seen_at'),
+                               'enabled': bool(agent.get('enabled')), 'last_seen_at': self._agent_last_seen(agent),
                                'coordinator': self.coordinator_view(project_id, agent) if has else None,
                                # Its newest report of its own first check here (kittrial-5bb.444), for step C2.
                                'self_check': self._self_check_for(agent, project_id)})
