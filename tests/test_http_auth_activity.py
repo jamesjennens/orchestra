@@ -300,6 +300,26 @@ class CanonicalActivityTests(EndpointCase):
         self.assertEqual(1, writes.call_count)
         self.assertEqual(1, sum(row['id'] == made.data['id'] for row in self.canonical_rows()))
 
+    def test_successful_replay_saves_due_activity_without_repeating_the_effect(self):
+        tick = [self.store.now()]
+        self.store.clock = lambda: tick[0]
+        token, project = self.setup_project()
+        key = 'activity-replay-request'
+        first = self.create_task(token, project, 'one replayed task', key=key)
+        self.assertEqual(201, first.status, first.data)
+
+        tick[0] += 60
+        with mock.patch.object(self.store, '_write', wraps=self.store._write) as writes:
+            same = self.create_task(token, project, 'one replayed task', key=key)
+        self.assertEqual(first.status, same.status)
+        self.assertEqual(first.data['id'], same.data['id'])
+        self.assertEqual(1, sum(row['id'] == first.data['id'] for row in self.canonical_rows()))
+        self.assertEqual(1, writes.call_count)
+        digest = http_auth.token_hash(token)
+        stored = json.loads(self.store.path.read_text())['sessions'][digest]
+        self.assertEqual(tick[0], stored['last_used'])
+        self.assertEqual(tick[0], stored['last_used_raw'])
+
     def test_first_credential_row_mark_saves_ahead_of_the_canonical_effect(self):
         tick = [self.store.now()]
         self.store.clock = lambda: tick[0]
