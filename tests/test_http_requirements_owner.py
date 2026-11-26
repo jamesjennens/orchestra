@@ -428,6 +428,7 @@ class OwnerHttpTests(EndpointCase):
         import threading
         import http_authority
         first = self.create_requirement()
+        admin = self.admin_token()
         route = self.base + '/requirements/' + first['id'] + '/accept'
         armed = threading.Event(); armed.set()
         opened = threading.Event(); release = threading.Event()
@@ -461,27 +462,34 @@ class OwnerHttpTests(EndpointCase):
                 overlapping_write.set()
             return write()
 
-        def accept(number):
+        def accept():
             return self.request('POST', route, self.expected(first), token=self.owner_token,
-                                key='reader-accept-' + str(number))
+                                key='reader-accept')
+
+        def create_account():
+            # An independent, durable route guarantees a save is attempted during the read.
+            return self.request('POST', '/v1/accounts', {'username': 'fence-writer'}, token=admin)
 
         with mock.patch.object(http_authority, 'read_state', hold_reader), \
                 mock.patch.object(self.service.store, 'save', observe_save), \
                 mock.patch.object(self.service.store, '_write', observe_write):
             with ThreadPoolExecutor(max_workers=2) as pool:
-                one = pool.submit(accept, 1)
+                one = pool.submit(accept)
                 try:
                     self.assertTrue(opened.wait(10), 'First request did not open the authority file')
-                    two = pool.submit(accept, 2)
+                    two = pool.submit(create_account)
                     self.assertTrue(second_save.wait(10), 'Second request did not attempt to save state')
                     # Keep the reader open while the competing save attempts
                     # its replacement. A correctly locked save must wait here.
                     overlapping_write.wait(.5)
                 finally:
                     release.set()
-                responses = [one.result(), two.result()]
+                accepted, created = one.result(), two.result()
         self.assertFalse(overlapping_write.is_set(), 'State replacement raced an open owner preflight reader')
-        self.assertEqual(sorted(r.status for r in responses), [200, 409], [r.data for r in responses])
+        self.assertEqual(200, accepted.status, accepted.data)
+        self.assertEqual(201, created.status, created.data)
+        disk = json.loads(self.service.store.path.read_bytes())
+        self.assertEqual('fence-writer', disk['users'][created.data['id']]['username'])
         self.assertEqual(len(owner_records.existing_acceptances(self.backend.native.row(first['id']))), 1)
         self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 1)
 
