@@ -489,6 +489,7 @@ class Manager:
         if request['payload']['operation'] in ('send', 'reply'):
             with locked(self.root), self.service.store.lock:
                 authorize(self.root, request)
+                self.service.store.refresh_authority(reload=True)
                 retention_now = self.request_time()
                 replay = self.request_key(request) in self.request_history(retention_now)
             # Like the web route, tracker I/O holds neither enrollment nor web-state locks.
@@ -497,6 +498,8 @@ class Manager:
                 paired = self.pairing(request['project'], request['payload']['to'])
         with locked(self.root), self.service.store.lock:
             authorize(self.root, request)
+            # Each host pass is a request boundary, including after a store repair.
+            self.service.store.refresh_authority(reload=True)
             with state_change(self.service, audit=request['payload']['operation'] in ('send', 'reply', 'noted')):
                 return self.effect(request, paired=paired, retention_now=retention_now)
 

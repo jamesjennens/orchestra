@@ -2512,8 +2512,10 @@ class Service:
                     agent = self.state['agents'].get(agent_id)
                     if not isinstance(agent, dict) or not agent.get('enabled'):
                         raise unauthenticated('Agent is disabled')
+                # Agent presence and grant timestamps use the same informational clock.
+                observed_at = self._now() if agent_id else self._raw_now()
                 stamp = _Activity('credential', credential_id, digest, user['id'], agent_id,
-                                  credential.get('created_at'), moment, self._raw_now())
+                                  credential.get('created_at'), moment, observed_at)
                 deferred = self._observe_activity(stamp, credential, defer_activity)
                 # A credential carries ONLY the authority granted by its type, project
                 # and scopes. It never inherits the issuing account's global superuser

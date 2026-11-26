@@ -1227,6 +1227,8 @@ stopped half way through is finished or removed with the same two commands
     it. Windows performs a locked read. A saved revocation is seen by the next
     authentication in another service process. A save based on an older generation
     fails, and a pending audit or narrowing is kept in memory for reconciliation.
+    The private host notes adapter also checks the current generation before each
+    operation and each wait read.
   - Authority saves and the existing audit and first-credential-write records keep
     their own persistence rules. The canonical endpoint still checks durable live
     authority before an effect. Login and mutation saves can wait for the state lock.

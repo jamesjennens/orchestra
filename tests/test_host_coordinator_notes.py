@@ -215,6 +215,19 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
         result = self.host(requests[0], text=TEXT)
         self.assertEqual(result['note']['id'], self.host(requests[0], text=TEXT)['note']['id'])
 
+    def test_host_send_preserves_a_newer_state_image(self):
+        from http_auth import Store
+
+        state_path = self.service.store.path
+        other = Store(state_path)
+        other.state['projects']['north']['name'] = 'Renamed North'
+        other.save()
+
+        sent = self.send_host()
+        disk = json.loads(state_path.read_bytes())
+        self.assertEqual('Renamed North', disk['projects']['north']['name'])
+        self.assertEqual(sent['note']['id'], disk['coordinator_notes']['notes'][0]['id'])
+
     def test_store_save_failure_does_not_leave_a_pending_note_for_a_later_save(self):
         with mock.patch.object(self.service.store, 'save', side_effect=OSError('CANARY-PRIVATE-SAVE')):
             with self.assertRaises(hn.Refusal) as e: self.send_host()
