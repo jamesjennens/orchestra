@@ -16616,6 +16616,10 @@ class _WatchedWriter:
         return getattr(self._inner, name)
 
 
+class _StopServing(Exception):
+    """Leave the serve loop after the main thread receives SIGTERM."""
+
+
 class GuardedServer(ThreadingHTTPServer):
     """One thread per connection, with what an open port needs (kittrial-5bb.163 review).
 
@@ -16647,6 +16651,7 @@ class GuardedServer(ThreadingHTTPServer):
     TIMEOUT_MARGIN = 2.0
     TLS_LINE_EVERY = 5.0
     ADDRESS_LINE_EVERY = 60.0
+    stop_requested = False
 
     def __init__(self, *args, **kwargs):
         # Before the base class binds: when the bind fails it closes the server, and
@@ -16888,6 +16893,11 @@ class GuardedServer(ThreadingHTTPServer):
         # bind fails): nothing here may need a field that is made later.
         self._stopping.set()
         super().server_close()
+
+    def service_actions(self):
+        if self.stop_requested:
+            raise _StopServing()
+        super().service_actions()
 
 
 def quiet_memory_errors():
@@ -17373,12 +17383,27 @@ def main(argv=None):
           % (args.host, httpd.server_address[1], args.backend,
              'off' if args.no_web else args.web_root))
     quiet_memory_errors()
+    import signal
+
+    def request_stop(_signum, _frame):
+        httpd.stop_requested = True
+
+    previous_term = None
     try:
+        if threading.current_thread() is threading.main_thread():
+            previous_term = signal.signal(signal.SIGTERM, request_stop)
         httpd.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, _StopServing):
         pass
     finally:
-        httpd.server_close()
+        try:
+            httpd.server_close()
+        finally:
+            try:
+                service.stop_activity()
+            finally:
+                if previous_term is not None:
+                    signal.signal(signal.SIGTERM, previous_term)
     return 0
 
 

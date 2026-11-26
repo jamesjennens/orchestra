@@ -1002,7 +1002,7 @@ class Store:
                 pass
         return False
 
-    def refresh_authority(self, *, reload=False):
+    def refresh_authority(self, *, reload=False, wait=None):
         """Prove current state. Only a request boundary can replace the live view.
 
         A stable Linux identity needs a stat alone. Changed images and all
@@ -1016,7 +1016,8 @@ class Store:
             if self._warm_generation():
                 return
             try:
-                with file_lock(str(self.path) + '.lock', timeout=self.GENERATION_WAIT, shared=True):
+                with file_lock(str(self.path) + '.lock',
+                               timeout=self.GENERATION_WAIT if wait is None else wait, shared=True):
                     if self._stat_fast_path:
                         current = self._path_identity()
                         if current == self._generation:
@@ -1356,6 +1357,7 @@ class Service:
 
     ACTIVITY_CADENCE = 60.0
     ACTIVITY_LIMIT = 4096
+    ACTIVITY_STOP_SECONDS = 2.0
 
     def __init__(self, store, *, session_idle=SESSION_IDLE_SECONDS,
                  session_absolute=SESSION_ABSOLUTE_SECONDS,
@@ -2310,6 +2312,9 @@ class Service:
     @contextmanager
     def _persist_activity(self, force=False):
         """Fold due observations into a save, keeping the durable view on failure."""
+        if self._activity_closed and not force:
+            yield None
+            return
         applied, saved, obsolete = [], [], []
         views = {}
         moment = None
@@ -2372,6 +2377,36 @@ class Service:
             # Optional use stamps never change a user's authority or schedule a
             # pre-effect save. Preserve any earlier real mutation or audit mark.
             self.store.unsaved_since = unsaved
+
+    def stop_activity(self):
+        """Close stamp admission and allow one bounded final durability attempt."""
+        if self._activity_closed:
+            return
+        self._activity_closed = True
+        deadline = time.monotonic() + self.ACTIVITY_STOP_SECONDS
+
+        def finish():
+            if not self.store.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                return
+            try:
+                if not self._pending_activity or time.monotonic() >= deadline:
+                    return
+                self.store.refresh_authority(reload=True, wait=max(0.0, deadline - time.monotonic()))
+                if time.monotonic() < deadline:
+                    self._flush_activity(force=True, wait=max(0.0, deadline - time.monotonic()))
+            except HttpError:
+                pass
+            finally:
+                self.store.lock.release()
+
+        # Disk and SQLite I/O do not inherit the file-lock timeout. A stopped
+        # process may lose the attempt, which leaves the earlier durable deadline.
+        worker = threading.Thread(target=finish, name='activity-stop', daemon=True)
+        try:
+            worker.start()
+        except RuntimeError:
+            return
+        worker.join(max(0.0, deadline - time.monotonic()))
 
     def authenticate(self, token, *, source='local', required_scope=None, defer_activity=False):
         """Resolve a bearer session/credential value to a principal, or raise 401.
