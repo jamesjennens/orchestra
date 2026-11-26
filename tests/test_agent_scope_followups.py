@@ -261,9 +261,15 @@ class AgentScopeFollowupTests(AgentHarness):
         aid, _, _ = self.agent(['read'])
         before = copy.deepcopy(self.service.state['credentials'])
         with mock.patch.object(self.store, '_write', side_effect=TimeoutError('synthetic busy state')):
+            with self.store.lock:
+                queued = self.service.audit('pending-before', None, 'fixture', 'committed')
+                self.assertFalse(self.store.save_soon('the queued fixture audit'))
+                pending_since = self.store.unsaved_since
+            self.assertIsNotNone(pending_since)
             reply = self.renew(aid, ['read', 'tasks'], key='failed-issue')
         self.assertEqual(503, reply.status, reply.data)
-        self.assertIsNotNone(self.store.unsaved_since)
+        self.assertEqual(pending_since, self.store.unsaved_since)
+        self.assertIn(queued, self.service.state['audit'])
         self.assertEqual(before, self.service.state['credentials'])
         self.assertEqual(['read'], self.service.state['agents'][aid]['scopes'])
         self.assertFalse(any(event.get('scopes_after') == ['read', 'tasks']
@@ -271,6 +277,8 @@ class AgentScopeFollowupTests(AgentHarness):
         self.service.audit('unrelated-after', None, 'fixture', 'committed')
         self.store.save()
         self.assertEqual('unrelated-after', self.service.state['audit'][-1]['request_id'])
+        disk = json.loads(self.store.path.read_text(encoding='utf-8'))
+        self.assertIn(queued, disk['audit'])
 
     def test_concurrent_audit_waits_for_failed_issue_and_survives(self):
         aid, _, _ = self.agent(['read'])
