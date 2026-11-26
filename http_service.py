@@ -6520,17 +6520,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             # creation) say what was refused; the error code stays first. A refusal marked
             # ``quiet_audit`` is a repeat its route has already audited once in this window (the
             # first-check report's 429s, kittrial-5bb.444 review B2): it is answered, not logged again.
-            if not getattr(error, 'quiet_audit', False):
-                self.service.audit(ctx.request_id, ctx.principal, route_name,
-                                   'denied' if error.status in (401, 403) else 'rejected',
-                                   project_id=project_id,
-                                   reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
+            with self.service.store.lock:
+                try:
+                    # The mutation boundary has unwound. Choose the current
+                    # image before staging this separate refusal audit entry.
+                    self.service.store.refresh_authority(reload=True)
+                except HttpError:
+                    # An older unsaved narrowing or audit keeps its refusal and
+                    # remains the service's outstanding state.
+                    pass
+                if not getattr(error, 'quiet_audit', False):
+                    self.service.audit(ctx.request_id, ctx.principal, route_name,
+                                       'denied' if error.status in (401, 403) else 'rejected',
+                                       project_id=project_id,
+                                       reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
+                # A refusal remains the answer if its audit cannot be saved now.
+                self.service.store.save_soon('the audit entry of a refusal')
             if not audit_success:
                 self._audited_refusal = True
-            # The refusal is the answer whether or not its audit entry can be saved now
-            # (kittrial-5bb.156): nothing was carried out, so a lock wait that runs out here
-            # must not turn it into "cannot say". The entry is written with the next save.
-            self.service.store.save_soon('the audit entry of a refusal')
             raise
         except Exception as error:
             self.service.idempotency_release(digest)

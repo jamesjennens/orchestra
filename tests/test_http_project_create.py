@@ -1573,12 +1573,12 @@ class HeldLockTests(Case):
         real, case = http_auth.file_lock, self
 
         @contextlib.contextmanager
-        def file_lock(path, timeout=60.0, poll=0.02):
+        def file_lock(path, timeout=60.0, poll=0.02, shared=False):
             """The state lock as another process holds it: every wait for it runs out, at once."""
             if case.held and str(path) == str(case.store.path) + '.lock':
                 case.waits.append(timeout)
                 raise TimeoutError('Timed out waiting for lock %s' % path)
-            with real(path, timeout=timeout, poll=poll):
+            with real(path, timeout=timeout, poll=poll, shared=shared):
                 yield
         patcher = patch.object(http_auth, 'file_lock', file_lock)
         patcher.start()
@@ -2004,33 +2004,27 @@ class HeldLockTests(Case):
         self.assertEqual(set(self.waits), {5.0, 0.0})                             # nobody waited a minute
 
     # ---- 6. a read does not wait a minute for its last-use stamp -------------------------------------------
-    def test_a_read_goes_on_and_its_stamp_is_written_with_the_next_save(self):
+    def test_a_due_read_keeps_its_stamp_pending_until_the_next_save(self):
         digest = self.session_of(self.olive)
-        self.request('GET', '/v1/projects', token=self.olive)
         saved = self.on_disk()['sessions'][digest]
+        used = saved['last_used'] + 61
+        self.store.clock = lambda: used
         self.held = True
-        import time
-        time.sleep(0.01)
-        first, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
-        self.assertEqual(first.status, 200, first.data)
-        self.assertEqual(self.waits, [5.0])                                       # five seconds, once
-        self.assertEqual(log.count('busy: a last-use stamp was not saved'), 1)
-        self.assertNotIn(str(self.tmp), json.dumps(first.data))
-        for _ in range(3):                                                        # and then without waiting at all
-            again, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
-            self.assertEqual((again.status, log), (200, ''))
-        self.assertEqual(self.waits, [5.0, 0.0, 0.0, 0.0])
-        # In memory the session was used; in the file it reads as used earlier: the safe side.
-        memory = self.service.state['sessions'][digest]
-        self.assertEqual(self.on_disk()['sessions'][digest], saved)
-        self.assertGreater(memory['idle_expires'], saved['idle_expires'])
-        self.assertGreater(memory['last_used_raw'], saved['last_used_raw'])
-        # The next request after the lock is free writes it.
-        self.held = False
-        _, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
-        self.assertIn('The state is saved again', log)
+        for _ in range(4):
+            reply, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+            self.assertEqual((reply.status, log), (200, ''))
+            self.assertNotIn(str(self.tmp), json.dumps(reply.data))
+        self.assertEqual([0.0] * 4, self.waits)
         self.assertIsNone(self.store.unsaved_since)
-        self.assertGreaterEqual(self.on_disk()['sessions'][digest]['idle_expires'], memory['idle_expires'])
+        self.assertEqual(saved, self.service.state['sessions'][digest])
+        self.assertEqual(saved, self.on_disk()['sessions'][digest])
+        self.assertEqual(used, self.service._pending_activity[('session', digest)].moment)
+
+        self.held = False
+        reply, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+        self.assertEqual((reply.status, log), (200, ''))
+        self.assertEqual(used, self.on_disk()['sessions'][digest]['last_used'])
+        self.assertNotIn(('session', digest), self.service._pending_activity)
 
     def test_a_session_past_its_deadline_is_refused_while_the_lock_is_held(self):
         """An unsaved stamp never keeps a session alive: the service decides from its own memory first."""
@@ -2040,18 +2034,23 @@ class HeldLockTests(Case):
         self.service.state['sessions'][digest]['idle_expires'] = 1
         self.assertEqual(401, self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))[0].status)
 
-    def test_a_write_saves_what_was_left_before_the_endpoint_reads_the_deadline(self):
-        """The endpoint reads the idle deadline from the file. A live session whose stamp is only in
-        memory is never refused as idle for it: the write saves first, or is answered busy."""
+    def test_a_write_keeps_the_pre_effect_fence_for_real_unsaved_state(self):
         self.assertEqual(201, self.create(self.olive, 'alpha').status)
         digest = self.session_of(self.olive)
+        saved = self.on_disk()['sessions'][digest]
+        used = saved['last_used'] + 61
+        self.store.clock = lambda: used
         self.held = True
         self.assertEqual(200, self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))[0].status)
-        # The deadline in the file runs out during the hold; in memory the session is live.
-        stale = self.on_disk()
-        stale['sessions'][digest]['idle_expires'] = 1
-        self.store.path.write_text(json.dumps(stale), encoding='utf-8')
-        # While the lock is held: busy, and nothing reached the endpoint.
+        self.assertIsNone(self.store.unsaved_since)
+
+        def blocked_audit():
+            with self.store.lock:
+                self.service.audit('fixture-audit', None, 'fixture.unsaved', 'denied')
+                return self.store.save_soon('the audit entry of a refusal')
+
+        self.assertFalse(self.logged(blocked_audit)[0])
+        self.assertIsNotNone(self.store.unsaved_since)
         sent = []
         real = self.backend._endpoint.__func__
 
@@ -2059,33 +2058,35 @@ class HeldLockTests(Case):
             answer = real(backend, action, *args, **kwargs)
             sent.append(action)
             return answer
+
         with patch.object(http_service.EndpointBackend, '_endpoint', counted):
             waiting, log = self.logged(lambda: self.create_task(self.olive, 'alpha', 'a task'))
             self.assertEqual(self.said(waiting), (503, 'busy', self.BUSY))
             self.assertEqual(waiting.headers.get('retry-after'), '30')
             self.assertEqual(sent, [])
-            self.assertIn(60.0, self.waits)                                       # a write may wait the full time
+            self.assertIn(60.0, self.waits)
             self.assertIn('so it was not sent', log)
-            # The lock is free: the write saves the stamp first, and the endpoint finds the session live.
             self.held = False
             made = self.create_task(self.olive, 'alpha', 'a task')
             self.assertEqual(made.status, 201, made.data)
             self.assertEqual(sent, ['bd'])
-        self.assertGreater(self.on_disk()['sessions'][digest]['idle_expires'], 1)
+        disk = self.on_disk()
+        self.assertEqual(used, disk['sessions'][digest]['last_used'])
+        self.assertTrue(any(event['action'] == 'fixture.unsaved' for event in disk['audit']))
 
-    def test_if_the_service_stops_before_the_next_save_the_last_use_is_lost(self):
+    def test_a_restart_without_a_stamp_save_keeps_the_durable_deadline(self):
         import http_auth
         digest = self.session_of(self.olive)
-        self.request('GET', '/v1/projects', token=self.olive)
-        saved = self.on_disk()['sessions'][digest]['idle_expires']
+        saved = self.on_disk()['sessions'][digest]
+        used = saved['last_used'] + 61
+        self.store.clock = lambda: used
         self.held = True
-        import time
-        time.sleep(0.01)
-        self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+        self.assertEqual(200, self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))[0].status)
+        self.assertEqual(used, self.service._pending_activity[('session', digest)].moment)
         self.held = False
-        restarted = http_auth.Store(self.store.path)
-        self.assertEqual(restarted.state['sessions'][digest]['idle_expires'], saved)
-        self.assertLess(saved, self.service.state['sessions'][digest]['idle_expires'])
+        restarted = http_auth.Store(self.store.path, clock=lambda: used)
+        self.assertEqual(saved, restarted.state['sessions'][digest])
+        self.assertEqual(saved, self.service.state['sessions'][digest])
 
     def test_a_write_the_service_answers_itself_writes_the_stamp_or_says_it_cannot_say(self):
         digest = self.session_of(self.admin)

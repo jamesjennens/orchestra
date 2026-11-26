@@ -754,6 +754,13 @@ class RecordStore:
         high = state.get('high_water')
         return moment if high is None else max(moment, float(high))
 
+    def activity_expiry_now(self):
+        """Use the durable expiry floor to check a stamp without observing a request."""
+        with self._connection() as connection:
+            high = clock_state(connection).get('high_water')
+        now = self._now()
+        return now if high is None else max(now, float(high))
+
     def get(self, kind, key):
         """The stored record, or ``None``. Never returns an expired record."""
         moment = self._now()
@@ -917,6 +924,7 @@ class Store:
         self._stat_fast_path = sys.platform.startswith('linux')
         self._generation = None
         self._state_pin = None
+        self._refreshing_generation = False
         self._fold_activity = None
         self._activity_write = None
         self.state = self._load()
@@ -972,7 +980,7 @@ class Store:
 
     def _hold_pin(self, handle):
         # The open handle prevents reuse of the inode of our cached Linux image.
-        return weakref.finalize(self, Store._close_pin, handle) if handle is not None else None
+        return weakref.finalize(self, self._close_pin, handle) if handle is not None else None
 
     def _pin_generation(self, generation, pin):
         old_pin = self._state_pin
@@ -1004,7 +1012,7 @@ class Store:
         return data
 
     def _warm_generation(self):
-        if self._stat_fast_path:
+        if self._stat_fast_path and not self._refreshing_generation:
             try:
                 return self._path_identity() == self._generation
             except (OSError, ValueError):
@@ -1043,7 +1051,11 @@ class Store:
                         image = self._read_image()
                     if image[0] is None:
                         raise busy()
-                    self.state = self._load(image)
+                    self._refreshing_generation = True
+                    try:
+                        self.state = self._load(image)
+                    finally:
+                        self._refreshing_generation = False
             except (OSError, ValueError, RecursionError):
                 raise busy() from None
 
@@ -1519,10 +1531,16 @@ class Service:
         return self._raw_now() - float(issued_raw) >= float(lifetime)
 
     def _session_expired(self, session, moment):
-        return self._expired(moment, expires_at=session['absolute_expires'],
-                             issued_raw=session.get('issued_raw'), lifetime=self.session_absolute) or \
-            self._expired(moment, expires_at=session['idle_expires'],
-                          issued_raw=session.get('last_used_raw'), lifetime=self.session_idle)
+        try:
+            absolute, idle = session['absolute_expires'], session['idle_expires']
+            if not math.isfinite(absolute) or not math.isfinite(idle):
+                return True
+            return self._expired(moment, expires_at=absolute, issued_raw=session.get('issued_raw'),
+                                 lifetime=self.session_absolute) or self._expired(
+                                     moment, expires_at=idle, issued_raw=session.get('last_used_raw'),
+                                     lifetime=self.session_idle)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return True
 
     def _credential_expired(self, credential, moment):
         """Agent deadlines belong to the key; worker/legacy clock rules stay unchanged.
@@ -2279,13 +2297,18 @@ class Service:
             self._agent_activity[stamp.agent_id] = stamp
         if len(self._pending_activity) > self.ACTIVITY_LIMIT:
             self._discard_activity(next(iter(self._pending_activity)))
-        if not defer and self._activity_due(stamp, record):
-            self._flush_activity()
+        if not defer:
+            if self.store.unsaved_since is not None:
+                self.store.save_soon('the pending state changes')
+            elif self._activity_due(stamp, record):
+                self._flush_activity()
 
     def _activity_due(self, stamp, record, force=False):
         previous = record.get('last_used')
         if previous is None:
             return True
+        if not isinstance(previous, (int, float)) or not math.isfinite(previous):
+            return False
         if stamp.moment < previous:
             return False
         raw = record.get('last_used_raw') if stamp.via == 'session' else None
@@ -2336,7 +2359,10 @@ class Service:
                     else self._credential_expired(record, at))
 
         def check():
-            at = self._expiry_now()
+            try:
+                at = self.store.records.activity_expiry_now()
+            except (sqlite3.Error, ValueError, OSError):
+                raise _ActivityExpired() from None
             expired_keys = [key for key, stamp, record in saved if expired(stamp, record, at)]
             if expired_keys:
                 obsolete.extend(expired_keys)
@@ -2351,7 +2377,11 @@ class Service:
                 if not self._activity_due(stamp, record, force):
                     continue
                 if moment is None:
-                    moment = self._expiry_now()
+                    try:
+                        moment = self.store.records.activity_expiry_now()
+                    except (sqlite3.Error, ValueError, OSError):
+                        yield None
+                        return
                 if expired(stamp, record, moment):
                     obsolete.append(key)
                     continue

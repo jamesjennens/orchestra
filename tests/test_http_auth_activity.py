@@ -92,25 +92,39 @@ class ActivityTests(LimitedHarness):
     def test_session_and_credential_revocation_wins_in_process_and_across_processes(self):
         project = self.create_project(self.token, 'Activity')
         worker = self.worker(project)
+        agent, agent_token, _ = self.agent_secret(self.token, projects=[project])
         session = self.login_with_session().data['session']['token']
         self.assertEqual(200, self.session(session).status)
         route = '/v1/projects/%s/tasks' % project
         self.assertEqual(200, self.request('GET', route, token=worker['secret']).status)
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=agent_token).status)
+        self.tick[0] += 59
+        self.assertEqual(200, self.session(session).status)
+        self.assertEqual(200, self.request('GET', route, token=worker['secret']).status)
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=agent_token).status)
         stale = http_auth.Store(self.store.path, clock=lambda: self.tick[0])
         child = """
 import json
 import sys
-from http_auth import Store, Service
+from http_auth import HttpError, Store, Service
 data = json.load(sys.stdin)
 store = Store(data['path'], clock=lambda: data['now'])
 service = Service(store)
 owner = service.authenticate(data['owner'])
 service.revoke_session(data['session_hash'])
 service.revoke_credential(owner, data['project'], data['credential'])
+service.disable_agent(owner, data['agent'])
+for token in data['checked']:
+    try:
+        service.authenticate(token)
+    except HttpError as error:
+        assert error.status == 401
+    else:
+        raise AssertionError('A revoked token still authenticates')
 """
         payload = dict(path=str(self.store.path), now=self.tick[0], owner=self.token,
                        session_hash=http_auth.token_hash(session), project=project,
-                       credential=worker['id'])
+                       credential=worker['id'], agent=agent, checked=[session, worker['secret'], agent_token])
         done = subprocess.run([sys.executable, '-c', child], input=json.dumps(payload),
                               text=True, cwd=KIT, capture_output=True, timeout=30)
         self.assertEqual(0, done.returncode, done.stderr)
@@ -121,7 +135,13 @@ service.revoke_credential(owner, data['project'], data['credential'])
         with mock.patch.object(self.store, '_load', wraps=self.store._load) as refreshes:
             self.assertEqual(401, self.session(session).status)
             self.assertEqual(401, self.request('GET', route, token=worker['secret']).status)
+            self.assertEqual(401, self.request('GET', '/v1/agents/me', token=agent_token).status)
         self.assertEqual(1, refreshes.call_count)
+        self.service.stop_activity()
+        final = json.loads(self.store.path.read_text())
+        self.assertTrue(final['sessions'][http_auth.token_hash(session)]['revoked'])
+        self.assertTrue(final['credentials'][worker['id']]['revoked'])
+        self.assertFalse(final['agents'][agent]['enabled'])
 
     def test_external_restore_revokes_next_warm_request(self):
         import admin
@@ -279,6 +299,34 @@ class CanonicalActivityTests(EndpointCase):
         self.assertEqual(201, made.status)
         self.assertEqual(1, writes.call_count)
         self.assertEqual(1, sum(row['id'] == made.data['id'] for row in self.canonical_rows()))
+
+    def test_first_credential_row_mark_saves_ahead_of_the_canonical_effect(self):
+        tick = [self.store.now()]
+        self.store.clock = lambda: tick[0]
+        owner, project = self.setup_project()
+        credential = self.issue_credential(owner, project, label='activity', actor='activity-lane')
+        record = self.store.state['credentials'][credential['id']]
+        # This installed key predates the once-per-credential rows check.
+        record.pop('actor_rows_checked', None)
+        self.store.save()
+        self.assertIsNone(record['last_used'])
+
+        actual = self.store._write
+        saved = []
+
+        def record_save():
+            actual()
+            row = json.loads(self.store.path.read_text())['credentials'][credential['id']]
+            saved.append((row.get('actor_rows_checked'), row['last_used']))
+
+        with mock.patch.object(self.store, '_write', side_effect=record_save):
+            first = self.create_task(credential['secret'], project, 'first actor row')
+            self.assertEqual(201, first.status, first.data)
+            self.assertEqual([(True, tick[0]), (True, tick[0])], saved)
+            saved.clear()
+            second = self.create_task(credential['secret'], project, 'second actor row')
+            self.assertEqual(201, second.status, second.data)
+            self.assertEqual([(True, tick[0])], saved)
 
 
 if __name__ == '__main__':
