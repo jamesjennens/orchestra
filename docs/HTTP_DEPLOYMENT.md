@@ -1209,30 +1209,26 @@ stopped half way through is finished or removed with the same two commands
     "retired"}`, shown on the name like any other refusal, with no link. The service
     reads that from the root itself (no endpoint process, no lock).
   - The digest is the service's own. It is not part of the project view any reader gets.
-- **The last-use stamp of a request does not wait a minute** (kittrial-5bb.156). Every
-  authenticated request stamps the session's (or credential's, and agent's) last use
-  and saves the state, because the endpoint checks a session's idle deadline against
-  the file. That save waits 5 seconds for the lock the first time; when the lock cannot
-  be had the stamp stays in memory, the request goes on, and until a save succeeds every
-  further request tries once without waiting (log: `busy: a last-use stamp was not
-  saved ...`, once, then `The state is saved again ...`). What follows from a stamp that
-  is only in memory, both ways:
-  - If the service stops before the next save, the last use is lost and the session
-    reads as idle sooner after the restart. That is the safe side. Nothing lets a
-    session live past its deadline: the service decides from its own memory first, where
-    a deadline that has passed refuses the request whatever is unsaved.
-  - A live session is not refused as idle by the endpoint because of it. A read does not
-    carry the session to the endpoint. A write that does is not sent until the state is
-    saved: the service saves first (waiting up to the full minute) and, when the lock
-    still cannot be had, answers 503 `busy`, "not completed", having sent nothing (log:
-    `busy: the state could not be saved before ACTION was sent to the endpoint, so it was
-    not sent`). So the longest a stamp stays unsaved is until the next request after the
-    lock is free, and never past a write that reaches the endpoint.
-  What this does NOT change, while the lock is held: only a read the service answers by
-  itself is answered at once. A read that needs the endpoint still waits for the
-  endpoint's own wait (up to 60 seconds) and is then answered 503 `busy`, as before.
-  And a request that arrives while a write or a log-in is itself waiting for the lock
-  queues behind it in the service (a read was seen to wait 54 seconds that way).
+- **Authentication activity is saved at most once per 60-second stamp window** for
+  each live session or credential under ordinary operation (kittrial-5bb.592).
+  A credential's first use can be saved immediately. A due activity stamp travels
+  with a state-changing route's save when one is available. A read's optional save
+  tries the state file lock without waiting. Agent presence in the serving process
+  uses the latest successful in-memory observation. Other processes and a restart
+  read the durable observation.
+  - The service and the canonical endpoint use the same durable session deadlines.
+    A pending observation never authorizes a request. If a stamp cannot be saved or
+    is lost in a crash, the session can expire earlier. A clean shutdown gives any
+    still-live observations one final bounded attempt and uses each observation's
+    timestamp.
+  - Linux checks a stable, pinned file generation with a stat. If the file changes,
+    the service checks the new generation under the state file's lock before using
+    it. Windows performs a locked read. A saved revocation is seen by the next
+    authentication in another service process. A save based on an older generation
+    fails, and a pending audit or narrowing is kept in memory for reconciliation.
+  - Authority saves and the existing audit and first-credential-write records keep
+    their own persistence rules. The canonical endpoint still checks durable live
+    authority before an effect. Login and mutation saves can wait for the state lock.
 - **The server's configuration file cannot be read** (kittrial-5bb.156). Every failure
   to read `deployment.private.json` is one fault of the server: the file is not there,
   is not a regular file (a directory, a dangling link, a FIFO: refused at once, the
@@ -4242,13 +4238,14 @@ existed.
 
 To change them, edit the private office JSON named by `--config` (or, where the web service
 is run by a unit of its own, the two flags in its `ExecStart`) and restart the service. A
-session that is already signed in is not rewritten: it keeps the deadlines it was issued
-with, and the next sign-in carries the new ones. The idle deadline is refreshed by every
-authenticated request; the absolute deadline is never extended by use.
+session that is already signed in keeps the deadlines it was issued with. The next
+sign-in carries the new ones. A successful authentication can refresh the idle
+deadline at the 60-second activity cadence, up to the absolute limit.
 
 `GET /v1/sessions/current` answers a browser session with the window and its own deadlines:
-`idle_seconds`, `absolute_seconds`, `idle_expires_at` (the idle window from this session's
-last authenticated request) and `absolute_expires_at` (which no use extends). A worker or
+`idle_seconds`, `absolute_seconds`, `idle_expires_at` (the usable durable idle deadline)
+and `absolute_expires_at` (which no use extends). During healthy use the idle deadline
+can be up to 60 seconds earlier than one computed from the latest request. A worker or
 agent credential has no browser session and the answer carries none of those fields, exactly
 as before.
 
@@ -4257,9 +4254,9 @@ session read, and `keepAliveWhileVisible({intervalMs, warnMs})` repeats it only 
 `document.visibilityState === 'visible'` (a hidden tab makes no request), stops on a
 sign-out and on an expired session's `401`, and dispatches `orchestra:session-idle-warning`
 (a `CustomEvent` on the document, with `idleSeconds`, `idleExpiresAt` and `remainingSeconds`)
-shortly before the idle deadline it last heard about. That warning is for the case where the
-touches stop reaching the service; while they do arrive, the session simply stays alive. The
-agent set-up wizard is what uses it (kittrial-5bb.329).
+shortly before the idle deadline it last heard about. The browser touches once per
+half idle window, at least 150 seconds apart, so a healthy touch can persist its stamp
+before the usable deadline. The agent set-up wizard uses this check (kittrial-5bb.329).
 
 ## Password rule
 

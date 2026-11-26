@@ -48,6 +48,7 @@ import sys
 import threading
 import time
 import unicodedata
+import weakref
 from pathlib import Path
 
 import claim_limit
@@ -962,15 +963,22 @@ class Store:
             if handle is not None:
                 handle.close()
 
-    def _pin_generation(self, generation, pin):
+    @staticmethod
+    def _close_pin(handle):
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+    def _hold_pin(self, handle):
         # The open handle prevents reuse of the inode of our cached Linux image.
+        return weakref.finalize(self, Store._close_pin, handle) if handle is not None else None
+
+    def _pin_generation(self, generation, pin):
         old_pin = self._state_pin
         self._state_pin, self._generation = pin, generation
         if old_pin is not None:
-            try:
-                old_pin.close()
-            except OSError:
-                pass
+            old_pin()
 
     def _load(self, image=None):
         generation, raw, pin = self._read_image() if image is None else image
@@ -987,11 +995,12 @@ class Store:
                     raise ValueError('Corrupt service store field: ' + key)
             if not isinstance(cursor_key, str) or len(cursor_key) < 32:
                 data['cursor_key'] = None
+            held = self._hold_pin(pin)
         except BaseException:
             if pin is not None:
-                pin.close()
+                self._close_pin(pin)
             raise
-        self._pin_generation(generation, pin)
+        self._pin_generation(generation, held)
         return data
 
     def _warm_generation(self):
@@ -1080,18 +1089,11 @@ class Store:
     def save_soon(self, what='a last-use stamp'):
         """Save, without making the caller wait a minute for it. Returns whether it was saved.
 
-        For what a request's answer does not depend on: the last-use stamp every
-        authenticated request leaves, and the audit entry of a refusal. The first time the
-        state lock cannot be had within :attr:`SOON_WAIT` seconds the change stays in
-        memory, and until a save succeeds every further call tries once without waiting,
-        so requests sent together do not queue behind one another. The whole state is
-        written by every save, so the next save that succeeds writes what was left; a
-        write that goes to the endpoint saves first (``EndpointBackend._endpoint``),
-        because the endpoint reads a session's idle deadline from the file.
-
-        What follows from a stamp that is not saved, both ways: if the service stops
-        before the next save the last use is lost and the session reads as idle sooner
-        (the safe side); nothing lets a session live past its deadline.
+        For state changes a request's answer can do without, such as a refusal's audit
+        entry. The first timeout keeps the change in memory, and subsequent calls try
+        without waiting until it is saved. The canonical backend preserves its existing
+        pre-effect fence when durable state is still outstanding. Authentication use
+        observations have their own in-memory storage and do not set this unsaved mark.
         """
         with self.lock:
             first = self.unsaved_since is None
@@ -1121,8 +1123,8 @@ class Store:
             try:
                 with file_lock(str(self.path) + '.lock', timeout=wait):
                     self._require_write_generation()
-                    stamps = (self._fold_activity(force=force_activity)
-                              if self._fold_activity is not None else nullcontext(None))
+                    fold_activity = self._fold_activity() if self._fold_activity is not None else None
+                    stamps = fold_activity(force=force_activity) if fold_activity is not None else nullcontext(None)
                     try:
                         with stamps as staged:
                             if staged is not None or not activity_only:
@@ -1165,7 +1167,7 @@ class Store:
         if len(state['audit']) > AUDIT_LIMIT:
             state = dict(state, audit=state['audit'][-AUDIT_LIMIT:])
         text = json.dumps(state, ensure_ascii=False, indent=2) + '\n'
-        pin = None
+        pin = held = None
         try:
             with open(temporary, 'w', encoding='utf-8', newline='\n') as handle:
                 handle.write(text)
@@ -1174,6 +1176,8 @@ class Store:
             if self._stat_fast_path:
                 pin = open_regular(temporary)
                 generation = self._identity(os.fstat(pin.fileno()))
+                held = self._hold_pin(pin)
+                pin = None
             else:
                 generation = hashlib.sha256(text.encode('utf-8')).digest()
             if activity is not None:
@@ -1181,13 +1185,15 @@ class Store:
             os.replace(temporary, self.path)
         except BaseException:
             if pin is not None:
-                pin.close()
+                self._close_pin(pin)
+            if held is not None:
+                held()
             try:
                 os.unlink(temporary)
             except OSError:
                 pass
             raise
-        self._pin_generation(generation, pin)
+        self._pin_generation(generation, held)
         # Saved. Nothing after the replace may raise (review of kittrial-5bb.487 F2): a log stream
         # that is closed or broken must not turn a written state into a failed save.
         if self.unsaved_since is not None:
@@ -1372,7 +1378,7 @@ class Service:
         self._pending_activity = OrderedDict()
         self._agent_activity = {}
         self._activity_closed = False
-        store._fold_activity = self._persist_activity
+        store._fold_activity = weakref.WeakMethod(self._persist_activity)
         #: Per-agent locks spanning the claim gate's held-set read and the claim write
         #: (kittrial-5bb.276 revision; per-agent in kittrial-5bb.300). Keyed by the
         #: agent id so concurrent claims by one agent serialize while unrelated agents'

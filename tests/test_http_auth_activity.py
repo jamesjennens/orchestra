@@ -136,7 +136,7 @@ service.revoke_credential(owner, data['project'], data['credential'])
         # The HTTP fixture is in this process. Suppress system process discovery
         # while running the real restore-new publisher against our own state.
         with mock.patch.object(admin, 'http_service_processes', return_value=[]):
-            message = admin.restore_http_state(self.tmp_path, named=self.store.path,
+            message = admin.restore_http_state(self.tmp_path, named=str(self.store.path),
                                                credentials='revoke', now=self.tick[0])
         self.assertIn('Every session in it was revoked', message)
         self.assertEqual(401, self.session(self.token).status)
